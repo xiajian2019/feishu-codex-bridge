@@ -1,0 +1,14 @@
+node_modules/
+dist/
+release/
+.pnpm-store/
+tmp/
+.DS_Store
+runtime/*
+!runtime/
+runtime/logs/*
+!runtime/logs/
+!runtime/logs/.gitkeep
+config.json
+!package-lock.json
+*.log

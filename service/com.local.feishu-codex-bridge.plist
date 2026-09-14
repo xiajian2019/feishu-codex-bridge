@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.local.feishu-codex-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/xiajian/.nvm/versions/node/v22.13.1/bin/node</string>
+    <string>/Users/xiajian/works/feishu-codex-bridge/dist/main.js</string>
+    <string>--config</string>
+    <string>/Users/xiajian/works/feishu-codex-bridge/config.json</string>
+    <string>--db</string>
+    <string>/Users/xiajian/works/feishu-codex-bridge/runtime/bridge.db</string>
+    <string>--execution-mode</string>
+    <string>feishu-sqlite-codex</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/xiajian/works/feishu-codex-bridge</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/xiajian/works/feishu-codex-bridge/runtime/logs/bridge.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/xiajian/works/feishu-codex-bridge/runtime/logs/bridge.stderr.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/xiajian/.nvm/versions/node/v22.13.1/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>

@@ -1,0 +1,85 @@
+{
+  "pollIntervalSeconds": 20,
+  "maxConcurrency": 1,
+  "runTimeoutSeconds": 3600,
+  "execution": {
+    "mode": "aamp-relay"
+  },
+  "aamp": {
+    "enabled": true,
+    "stopOnShutdown": false,
+    "worktree": {
+      "enabled": true,
+      "projectMapPath": "/Users/xiajian/.codex/project-map.yaml",
+      "globalAgentsPath": "/Users/xiajian/.codex/AGENTS.md",
+      "taskDir": "/Users/xiajian/works/ai_work/codex/tasks",
+      "worktreeRoot": "/Users/xiajian/.codex/worktrees",
+      "baseRef": "HEAD",
+      "branchPrefix": "xiajian/agent"
+    }
+  },
+  "relay": {
+    "enabled": true,
+    "aampHost": "http://127.0.0.1:8787",
+    "statusUrl": "http://127.0.0.1:8787/api/tasks"
+  },
+  "direct": {
+    "feishu": {
+      "appIdEnv": "FEISHU_APP_ID",
+      "appSecretEnv": "FEISHU_APP_SECRET",
+      "groupAllowlist": [],
+      "dmMode": "open",
+      "dmAllowlist": [],
+      "allowedSenderOpenIds": [],
+      "requireMention": true,
+      "replyInThread": false
+    },
+    "permissions": {
+      "defaultAllow": true,
+      "allowAttachments": true,
+      "allowCancel": true,
+      "rules": []
+    }
+  },
+  "web": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 7310
+  },
+  "lark": {
+    "profile": "aamp-feishu-task-cli_replace-with-app-id",
+    "configDir": "/Users/xiajian/.lark-cli-aamp-one-click-v1",
+    "cliPath": "/Users/xiajian/.aamp/npm-global/bin/lark-cli",
+    "tasklistGuid": "replace-with-codex-workbench-tasklist-guid",
+    "projectFieldGuid": "replace-with-project-field-guid",
+    "modeFieldGuid": "replace-with-mode-field-guid",
+    "allowedCreatorOpenIds": []
+  },
+  "codex": {
+    "cliPath": "/opt/homebrew/bin/codex",
+    "env": {
+      "HTTP_PROXY": "http://127.0.0.1:7897",
+      "HTTPS_PROXY": "http://127.0.0.1:7897"
+    }
+  },
+  "projects": {
+    "food": {
+      "optionGuid": "replace-with-food-option-guid",
+      "repo": "/Users/xiajian/works/boohee/food"
+    },
+    "go-boohee": {
+      "optionGuid": "replace-with-go-boohee-option-guid",
+      "repo": "/Users/xiajian/works/boohee/go-boohee"
+    }
+  },
+  "modes": {
+    "implement": {
+      "optionGuid": "replace-with-implement-option-guid",
+      "sandboxMode": "workspace-write"
+    },
+    "review": {
+      "optionGuid": "replace-with-review-option-guid",
+      "sandboxMode": "read-only"
+    }
+  }
+}
