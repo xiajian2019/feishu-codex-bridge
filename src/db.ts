@@ -1003,11 +1003,20 @@ export class StateDatabase {
     });
   }
 
-  /** Persist a slash command and deliver its global V2 card through the durable outbox. */
-  public ingestDirectControlCard(input: DirectMessageInput, card: object): boolean {
+  /**
+   * Persist a slash command or card-action response through the durable outbox.
+   * When updateMessageId is present, the delivery worker updates that existing
+   * Feishu card instead of sending a second card.
+   */
+  public ingestDirectControlCard(
+    input: DirectMessageInput,
+    card: object,
+    updateMessageId?: string,
+  ): boolean {
     return this.ingestDirectControlOutbox(input, "feishu.send_card", {
       chatId: input.chatId,
       card,
+      ...(updateMessageId?.trim() ? { updateMessageId: updateMessageId.trim() } : {}),
     });
   }
 
@@ -1108,6 +1117,54 @@ export class StateDatabase {
         this.noteChange({ kind: "bridge_task", taskGuid: taskId, at: now });
       }
       return result.changes > 0;
+    });
+  }
+
+  /** Schedule a transient Codex/runtime failure for a later durable retry. */
+  public scheduleBridgeTaskRetry(
+    bridgeTaskId: string,
+    workerId: string,
+    reason: string,
+    nextAttemptAt: string,
+  ): boolean {
+    const taskId = requireNonEmpty(bridgeTaskId, "bridgeTaskId");
+    const owner = requireNonEmpty(workerId, "workerId");
+    const normalizedReason = requireNonEmpty(reason, "reason");
+    const retryAt = requireNonEmpty(nextAttemptAt, "nextAttemptAt");
+    if (!Number.isFinite(Date.parse(retryAt))) throw new Error("nextAttemptAt must be an ISO timestamp");
+    return this.transaction(() => {
+      const task = this.getBridgeTask(taskId);
+      if (!task || task.lease_owner !== owner || task.status !== "RUNNING") return false;
+      const now = this.timestamp();
+      const result = this.db
+        .prepare(
+          `UPDATE bridge_tasks SET status = 'QUEUED', next_attempt_at = ?,
+             lease_owner = NULL, lease_expires_at = NULL,
+             last_progress_event = 'retry.scheduled', last_progress_text = ?,
+             last_progress_at = ?, updated_at = ?
+           WHERE bridge_task_id = ? AND lease_owner = ? AND status = 'RUNNING'`,
+        )
+        .run(retryAt, normalizedReason, now, now, taskId, owner);
+      if (result.changes === 0) return false;
+      this.db
+        .prepare(
+          `UPDATE bridge_task_followups SET status = 'QUEUED', updated_at = ?
+           WHERE bridge_task_id = ? AND status = 'RUNNING'`,
+        )
+        .run(now, taskId);
+      this.db
+        .prepare(
+          `INSERT INTO bridge_task_events
+            (bridge_task_id, event_type, payload_json, created_at)
+           VALUES (?, 'retry.scheduled', ?, ?)`,
+        )
+        .run(taskId, encodeJson({
+          reason: normalizedReason,
+          nextAttemptAt: retryAt,
+          attempt: task.attempt,
+        }), now);
+      this.noteChange({ kind: "bridge_task", taskGuid: taskId, at: now });
+      return true;
     });
   }
 

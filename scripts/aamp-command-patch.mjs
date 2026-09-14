@@ -7,8 +7,10 @@ import {
   readSync,
   statSync,
 } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const PATCHED = Symbol.for('feishu-codex-bridge.aamp-command-patched');
 export const AAMP_COMMAND_ACTION_KIND = 'aamp_command';
@@ -16,14 +18,21 @@ export const AAMP_TASK_CANCEL_ACTION_KIND = 'task_cancel';
 export const AAMP_TASK_HIDE_ACTION_KIND = 'aamp_task_hide';
 export const GLOBAL_TASK_MODES = Object.freeze({ AAMP: 'aamp', DIRECT: 'direct' });
 const hiddenTaskIdsByRuntime = new WeakMap();
+const BRIDGE_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const RECENT_PROMPT_INLINE_LIMIT = 32;
 const RECENT_PROMPT_PREVIEW_LIMIT = 28;
+const MAX_THREADS_CARD_ITEMS = 10;
+const THREAD_QUERY_TIMEOUT_MS = 20_000;
+const AAMP_RECEIVED_REACTION = 'Get';
+const AAMP_THINKING_REACTION = 'Think';
+const REACTION_MAX_ATTEMPTS = 3;
 
 const COMMAND_ALIASES = new Map([
   ['cancel', 'cancel'],
   ['status', 'status'],
   ['usage', 'usage'],
   ['recent', 'recent'],
+  ['threads', 'threads'],
   ['tasks', 'tasks'],
   ['task', 'tasks'],
   ['help', 'help'],
@@ -42,6 +51,10 @@ const STATUS_LABELS = {
   queued: '排队中',
   dispatching: '派发中',
   pending: '等待 Agent',
+  notloaded: '未加载',
+  idle: '空闲',
+  active: '执行中',
+  systemerror: '系统错误',
   streaming: '执行中',
   running: '执行中',
   cancel_requested: '取消中',
@@ -59,6 +72,10 @@ const STATUS_COLORS = {
   queued: 'orange',
   dispatching: 'blue',
   pending: 'orange',
+  notloaded: 'grey',
+  idle: 'green',
+  active: 'blue',
+  systemerror: 'red',
   streaming: 'blue',
   running: 'blue',
   cancel_requested: 'orange',
@@ -104,11 +121,52 @@ export function parseAampCommand(content) {
   const command = COMMAND_ALIASES.get(match[1].toLowerCase());
   if (!command) return undefined;
   const argumentText = match[2]?.trim() || '';
+  const args = command === 'threads'
+    ? tokenizeCommandArguments(argumentText)
+    : argumentText ? argumentText.split(/\s+/) : [];
   return {
     command,
-    args: argumentText ? argumentText.split(/\s+/) : [],
+    args,
     raw: text,
   };
+}
+
+function tokenizeCommandArguments(value) {
+  if (!value) return [];
+  const tokens = [];
+  let token = '';
+  let quote;
+  let escaping = false;
+  for (const character of value) {
+    if (escaping) {
+      token += character;
+      escaping = false;
+      continue;
+    }
+    if (character === '\\' && quote !== "'") {
+      escaping = true;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) quote = undefined;
+      else token += character;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+    } else if (/\s/.test(character)) {
+      if (token) {
+        tokens.push(token);
+        token = '';
+      }
+    } else {
+      token += character;
+    }
+  }
+  if (escaping) token += '\\';
+  if (quote) return [];
+  if (token) tokens.push(token);
+  return tokens;
 }
 
 /**
@@ -208,6 +266,26 @@ function stripLeadingMention(text) {
     .trim();
 }
 
+function scheduleAampMessageReaction(runtime, messageId, emojiType) {
+  const channel = runtime?.channel;
+  if (!channel || typeof channel.addReaction !== 'function' || !normalizeString(messageId)) return;
+  setImmediate(() => {
+    void (async () => {
+      let lastError;
+      for (let attempt = 1; attempt <= REACTION_MAX_ATTEMPTS; attempt += 1) {
+        try {
+          await channel.addReaction(messageId, emojiType);
+          return;
+        } catch (error) {
+          lastError = error;
+          if (attempt < REACTION_MAX_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+        }
+      }
+      runtime.logger?.warn?.(`[AAMP compatibility] failed to add message reaction=${emojiType} message=${messageId}: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+    })();
+  });
+}
+
 export function patchAampCommands(Runtime) {
   const prototype = Runtime?.prototype;
   if (!prototype || prototype[PATCHED]) return;
@@ -229,7 +307,12 @@ export function patchAampCommands(Runtime) {
 
   prototype.handleIncomingMessage = async function handleIncomingMessageWithCommands(message) {
     const command = parseAampCommand(message?.content);
-    if (!command) return originalIncoming.call(this, message);
+    if (!command) {
+      scheduleAampMessageReaction(this, message?.messageId, AAMP_RECEIVED_REACTION);
+      const result = originalIncoming.call(this, message);
+      scheduleAampMessageReaction(this, message?.messageId, AAMP_THINKING_REACTION);
+      return result;
+    }
 
     const botIdentity = this.channel?.botIdentity;
     if (botIdentity && message.senderId === botIdentity.openId) return;
@@ -265,15 +348,21 @@ export function patchAampCommands(Runtime) {
     if (value?.kind !== AAMP_COMMAND_ACTION_KIND) {
       return originalCardAction.call(this, event);
     }
+    if (['native_thread', 'native_thread_detail', 'threads_tab', 'thread_detail'].includes(value.source)) {
+      scheduleAampCommandAction(this, event, value);
+      return;
+    }
     await executeAampCommandAction(this, event, value);
   };
 
   Object.defineProperty(prototype, PATCHED, { value: true });
-  console.error('[AAMP compatibility] global Feishu slash commands active: /help /status /usage /recent /tasks');
+  console.error('[AAMP compatibility] global Feishu slash commands active: /help /status /usage /recent /tasks /threads');
 }
 
 async function executeAampCommand(runtime, message, command) {
-  const card = buildCommandCard(runtime, message.chatId, command);
+  const card = command.command === 'threads'
+    ? await buildThreadsCommandCard(runtime, message.chatId, command.args)
+    : buildCommandCard(runtime, message.chatId, command);
   await sendCommandCard(runtime, message.chatId, card);
 }
 
@@ -281,12 +370,233 @@ async function executeAampCommandAction(runtime, event, value) {
   const chatId = normalizeString(event?.chatId);
   const command = COMMAND_ALIASES.get(normalizeString(value?.command)?.toLowerCase());
   if (!chatId || !command) return;
-  const card = buildCommandCard(runtime, chatId, {
+  const commandValue = {
     command,
     args: value.taskId ? [String(value.taskId)] : [],
     raw: value.commandText || `/${command}`,
+  };
+  if (command === 'thread' && ['native_thread', 'native_thread_detail'].includes(value.source)) {
+    const result = await queryNativeCodexThread(runtime, commandValue.args[0]);
+    const card = result.thread
+      ? buildCodexThreadDetailCard(runtime, result.thread)
+      : buildDirectInfoCard(runtime, '读取 Codex Thread 失败', [
+        result.error || '没有返回有效的 thread 详情。',
+        `Thread：${commandValue.args[0] || '暂无'}`,
+      ]);
+    await sendCommandCard(
+      runtime,
+      chatId,
+      card,
+      value.source === 'native_thread_detail' ? event.messageId : undefined,
+    );
+    return;
+  }
+  const card = command === 'threads'
+    ? await buildThreadsCommandCard(runtime, chatId, commandValue.args, value.tab)
+    : buildCommandCard(runtime, chatId, commandValue);
+  await sendCommandCard(
+    runtime,
+    chatId,
+    card,
+    ['threads', 'threads_tab', 'thread_detail'].includes(value.source) ? event.messageId : undefined,
+  );
+}
+
+function scheduleAampCommandAction(runtime, event, value) {
+  setImmediate(() => {
+    void executeAampCommandAction(runtime, event, value).catch((error) => {
+      runtime.logger?.error?.(`[AAMP compatibility] failed to handle thread card action: ${error instanceof Error ? error.message : String(error)}`);
+    });
   });
-  await sendCommandCard(runtime, chatId, card);
+}
+
+async function buildThreadsCommandCard(runtime, chatId, args, activeTab) {
+  const nativeResult = await queryNativeCodexThreads(runtime, args);
+  const aampTasks = listRuntimeTasks(runtime, chatId)
+    .filter((task) => taskSourceMode(task) === GLOBAL_TASK_MODES.AAMP)
+    .slice(0, MAX_THREADS_CARD_ITEMS);
+  const nativeThreads = nativeResult.items.slice(0, MAX_THREADS_CARD_ITEMS);
+  return buildThreadsOverviewCard(runtime, chatId, {
+    title: `Codex Threads（AAMP ${aampTasks.length} · App/CLI ${nativeThreads.length}）`,
+    nativeTitle: `Codex App/CLI threads（${nativeThreads.length}${nativeResult.total === undefined ? (nativeResult.nextCursor ? '+' : '') : `/${nativeResult.total}`}）`,
+    nativeCount: nativeThreads.length,
+    nativeThreads,
+    activeTab,
+    nativeLines: nativeResult.error
+      ? [`查询 App/CLI threads 失败：${nativeResult.error}`]
+      : nativeThreads.length === 0
+        ? ['没有找到匹配的 Codex App/CLI thread。']
+        : nativeThreads.flatMap(formatNativeThread),
+    nativeMoreText: nativeResult.items.length > nativeThreads.length
+      ? `仅展示前 ${MAX_THREADS_CARD_ITEMS} 条 App/CLI thread；需要更多结果时可在终端使用 codex:threads。`
+      : undefined,
+  });
+}
+
+async function queryNativeCodexThreads(runtime, args) {
+  if (typeof runtime.queryCodexThreads === 'function') {
+    try {
+      return normalizeNativeThreadResult(await runtime.queryCodexThreads(args));
+    } catch (error) {
+      return { items: [], error: sanitizeThreadQueryError(error) };
+    }
+  }
+
+  const entrypoint = join(BRIDGE_ROOT, 'dist', 'codex-cli.js');
+  if (!existsSync(entrypoint)) {
+    return { items: [], error: 'Bridge 编译产物不存在，请先执行 npm run build。' };
+  }
+  const configPath = process.env.AAMP_COMMAND_CONFIG_PATH || join(BRIDGE_ROOT, 'config.json');
+  const forwardedArgs = (args || []).filter((argument) => argument !== '--json');
+  const result = await runThreadQueryProcess(
+    process.execPath,
+    [entrypoint, 'threads', '--config', configPath, ...forwardedArgs, '--json'],
+    buildThreadQueryEnvironment(),
+  );
+  if (result.timedOut) return { items: [], error: `查询超过 ${THREAD_QUERY_TIMEOUT_MS / 1_000} 秒，已停止本次只读查询。` };
+  if (result.exitCode !== 0) return { items: [], error: sanitizeThreadQueryError(result.stderr) || 'Codex thread 查询进程失败。' };
+  const parsed = parseJson(result.stdout);
+  if (!isRecord(parsed) || !Array.isArray(parsed.items)) {
+    return { items: [], error: 'Bridge 没有返回有效的 Codex thread 查询结果。' };
+  }
+  return normalizeNativeThreadResult(parsed);
+}
+
+async function queryNativeCodexThread(runtime, threadId) {
+  const normalizedThreadId = normalizeString(threadId);
+  if (!normalizedThreadId) return { error: '缺少 Codex thread ID。' };
+  if (typeof runtime.queryCodexThread === 'function') {
+    try {
+      const value = await runtime.queryCodexThread(normalizedThreadId);
+      const record = isRecord(value) ? value : {};
+      const thread = isRecord(record.thread)
+        ? record.thread
+        : isRecord(value) && normalizeString(value.id) ? value : undefined;
+      return thread ? { thread } : { error: '运行时没有返回有效的 thread 详情。' };
+    } catch (error) {
+      return { error: sanitizeThreadQueryError(error) };
+    }
+  }
+
+  const entrypoint = join(BRIDGE_ROOT, 'dist', 'codex-cli.js');
+  if (!existsSync(entrypoint)) {
+    return { error: 'Bridge 编译产物不存在，请先执行 npm run build。' };
+  }
+  const configPath = process.env.AAMP_COMMAND_CONFIG_PATH || join(BRIDGE_ROOT, 'config.json');
+  const result = await runThreadQueryProcess(
+    process.execPath,
+    [entrypoint, 'thread', normalizedThreadId, '--turns', '--config', configPath, '--json'],
+    buildThreadQueryEnvironment(),
+  );
+  if (result.timedOut) return { error: `读取超过 ${THREAD_QUERY_TIMEOUT_MS / 1_000} 秒，已停止本次只读查询。` };
+  if (result.exitCode !== 0) return { error: sanitizeThreadQueryError(result.stderr) || 'Codex thread 读取进程失败。' };
+  const parsed = parseJson(result.stdout);
+  const thread = isRecord(parsed?.thread) ? parsed.thread : undefined;
+  return thread
+    ? { thread }
+    : { error: 'Bridge 没有返回有效的 Codex thread 详情。' };
+}
+
+function normalizeNativeThreadResult(value) {
+  const record = isRecord(value) ? value : {};
+  const items = Array.isArray(record.items)
+    ? record.items.filter((item) => isRecord(item) && normalizeString(item.id))
+    : [];
+  return {
+    items,
+    ...(typeof record.total === 'number' ? { total: record.total } : {}),
+    ...(typeof record.nextCursor === 'string' && record.nextCursor ? { nextCursor: record.nextCursor } : {}),
+    ...(normalizeString(record.error) ? { error: normalizeString(record.error) } : {}),
+  };
+}
+
+function buildThreadQueryEnvironment() {
+  const environment = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (typeof value !== 'string') continue;
+    if (key === 'NODE_OPTIONS' || key.startsWith('LARK_') || key.startsWith('FEISHU_')) continue;
+    environment[key] = value;
+  }
+  return environment;
+}
+
+function runThreadQueryProcess(file, args, env) {
+  return new Promise((resolvePromise) => {
+    let settled = false;
+    let timedOut = false;
+    let stdout = '';
+    let stderr = '';
+    let child;
+    let timer;
+    const finish = (exitCode) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolvePromise({ exitCode, stdout, stderr, timedOut });
+    };
+    try {
+      child = spawn(file, args, {
+        cwd: BRIDGE_ROOT,
+        env,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      stderr = String(error);
+      finish(127);
+      return;
+    }
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout = `${stdout}${chunk}`.slice(-2_000_000); });
+    child.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-8_000); });
+    child.once('error', (error) => { stderr = `${stderr}${String(error)}`.slice(-8_000); finish(127); });
+    child.once('close', (exitCode) => finish(exitCode ?? 1));
+    timer = setTimeout(() => {
+      timedOut = true;
+      if (!settled) child.kill('SIGTERM');
+      setTimeout(() => finish(124), 500);
+    }, THREAD_QUERY_TIMEOUT_MS);
+  });
+}
+
+function formatAampThreadTask(task) {
+  const taskId = normalizeString(task?.taskId) || '(unknown)';
+  const title = truncate(singleLine(task?.title || task?.userMessageText || '（无标题）'), 180);
+  const status = displayTaskStatus(task);
+  const updatedAt = formatTimestamp(task?.updatedAt || task?.createdAt);
+  const lines = [`- [AAMP] ${status} · \`${taskId}\``, `  标题：${title}`, `  更新时间：${updatedAt}`];
+  const prompt = truncate(singleLine(task?.userMessageText), 240);
+  if (prompt && prompt !== title) lines.push(`  请求：${prompt}`);
+  lines.push('');
+  return lines;
+}
+
+function formatNativeThread(thread) {
+  const status = normalizeString(thread?.status?.type) || 'unknown';
+  const source = nativeThreadSource(thread?.source || thread?.threadSource);
+  const title = truncate(singleLine(thread?.name || thread?.preview || '（无标题）'), 180);
+  const cwd = truncate(singleLine(thread?.cwd), 240) || '—';
+  const lines = [`- [${source}] ${status} · \`${normalizeString(thread?.id) || '(unknown)'}\``, `  标题：${title}`, `  目录：${cwd}`, `  更新时间：${formatNativeThreadTimestamp(thread?.updatedAt)}`, ''];
+  return lines;
+}
+
+function nativeThreadSource(source) {
+  if (typeof source === 'string' && source) return source;
+  if (isRecord(source) && normalizeString(source.custom)) return `custom:${normalizeString(source.custom)}`;
+  if (isRecord(source) && isRecord(source.subAgent)) return 'subAgent';
+  return 'unknown';
+}
+
+function formatNativeThreadTimestamp(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '(未知)';
+  return formatTimestamp(new Date(value * 1_000).toISOString());
+}
+
+function sanitizeThreadQueryError(error) {
+  return String(error instanceof Error ? error.message : error || 'unknown error')
+    .replace(/(access[_-]?token|app[_-]?secret|api[_-]?key|authorization)(\s*[:=]\s*)[^\s,;]+/gi, '$1$2[REDACTED]')
+    .slice(0, 800);
 }
 
 export function buildCommandCard(runtime, chatId, command) {
@@ -301,6 +611,12 @@ export function buildCommandCard(runtime, chatId, command) {
       return buildRecentCard(runtime, chatId, parseRecentLimit(command.args));
     case 'tasks':
       return buildTaskCommandCard(runtime, chatId, command.args[0]);
+    case 'threads':
+      return buildCard(runtime, [markdown(runtime, [
+        '**Codex Threads**',
+        '',
+        '请重新发送 `/threads` 获取最新任务和 thread 列表。',
+      ].join('\n'))]);
     case 'thread':
     case 'resume':
     case 'retry':
@@ -319,12 +635,379 @@ export function buildCommandCard(runtime, chatId, command) {
 
 export function buildDirectInfoCard(runtime, title, lines) {
   return buildCard(runtime, [
-    markdown(runtime, [`**${title}**`, '', ...lines].join('\n')),
+    markdown(runtime, [
+      `**${title}**`,
+      ...(lines.length > 0 ? ['', truncate(String(lines[0]), 500)] : []),
+    ].join('\n'), 'direct_info_title'),
+    { tag: 'hr', element_id: 'direct_info_divider' },
+    collapsible(
+      runtime,
+      '详细信息',
+      lines.length > 0 ? lines.join('\n') : '暂无可显示的信息。',
+      'direct_info_details',
+      true,
+    ),
     buttonRow('direct_command_actions', [
       button('direct_command_recent', '返回最近任务', actionValue('recent'), 'primary'),
       button('direct_command_help', '查看帮助', actionValue('help'), 'default'),
     ]),
   ]);
+}
+
+/**
+ * Render the cross-runtime thread list as separate task rows. Both AAMP tasks
+ * and native App/CLI threads get an operation button; native threads are read
+ * through the Codex app-server/CLI detail path because they have no Feishu
+ * task record of their own.
+ */
+export function buildThreadsOverviewCard(runtime, chatId, options = {}) {
+  const aampTasks = listRuntimeTasks(runtime, chatId)
+    .filter((task) => taskSourceMode(task) === GLOBAL_TASK_MODES.AAMP)
+    .slice(0, MAX_THREADS_CARD_ITEMS);
+  const nativeLines = Array.isArray(options.nativeLines)
+    ? options.nativeLines.map((line) => truncate(String(line), 1_000)).slice(0, 80)
+    : [];
+  const nativeCount = typeof options.nativeCount === 'number'
+    ? options.nativeCount
+    : nativeLines.length;
+  const nativeThreads = Array.isArray(options.nativeThreads)
+    ? options.nativeThreads
+      .filter((thread) => isRecord(thread) && normalizeString(thread.id))
+      .slice(0, MAX_THREADS_CARD_ITEMS)
+    : [];
+  const activeTab = options.activeTab === 'aamp' ? 'aamp' : 'native';
+  const elements = [
+    markdown(runtime, `**${String(options.title || 'Codex Threads').replace(/（[^）]*）$/, '')}**`, 'threads_title'),
+    buttonRow('threads_tabs', [
+      button(
+        'threads_tab_native',
+        `Codex App/CLI（${nativeCount}）`,
+        actionValue('threads', undefined, 'threads_tab', { tab: 'native' }),
+        activeTab === 'native' ? 'primary' : 'default',
+      ),
+      button(
+        'threads_tab_aamp',
+        `AAMP（${aampTasks.length}）`,
+        actionValue('threads', undefined, 'threads_tab', { tab: 'aamp' }),
+        activeTab === 'aamp' ? 'primary' : 'default',
+      ),
+    ]),
+    { tag: 'hr', element_id: 'threads_header_divider' },
+  ];
+
+  if (activeTab === 'aamp') {
+    if (aampTasks.length === 0) {
+      elements.push(markdown(runtime, '_当前会话没有 AAMP 任务。_', 'threads_aamp_empty'));
+    } else {
+      for (const [index, task] of aampTasks.entries()) {
+        elements.push(buildThreadTaskBlock(runtime, task, index));
+        if (index < aampTasks.length - 1) {
+          elements.push({ tag: 'hr', element_id: `threads_aamp_divider_${index}` });
+        }
+      }
+    }
+  } else {
+    if (nativeThreads.length > 0) {
+      for (const [index, thread] of nativeThreads.entries()) {
+        elements.push(buildNativeThreadBlock(runtime, thread, index));
+        if (index < nativeThreads.length - 1) {
+          elements.push({ tag: 'hr', element_id: `threads_native_row_divider_${index}` });
+        }
+      }
+    } else {
+      elements.push(collapsible(
+        runtime,
+        'Codex App/CLI threads',
+        nativeLines.length > 0 ? nativeLines.join('\n') : '暂无 App/CLI thread 信息。',
+        'threads_native_details',
+        false,
+      ));
+    }
+  }
+  if (options.nativeMoreText) {
+    elements.push(markdown(runtime, truncate(String(options.nativeMoreText), 1_000), 'threads_native_more'));
+  }
+  elements.push(buttonRow('threads_actions', [
+    button('threads_recent', '查看最近任务', actionValue('recent'), 'primary'),
+    button('threads_help', '查看帮助', actionValue('help'), 'default'),
+  ]));
+  return compactGlobalCard(buildCard(runtime, elements));
+}
+
+function buildNativeThreadBlock(runtime, thread, index) {
+  const threadId = normalizeString(thread.id) || '(unknown)';
+  const title = truncate(singleLine(thread.name || thread.preview || '（无标题）'), 180);
+  const executionStatus = threadExecutionStatus(thread);
+  const status = executionStatus.label;
+  const cwd = truncate(singleLine(thread.cwd), 240) || '—';
+  const updatedAt = formatNativeThreadTimestamp(thread.updatedAt);
+  return {
+    tag: 'column_set',
+    element_id: `threads_native_row_${index}`,
+    flex_mode: 'flow',
+    horizontal_spacing: '8px',
+    columns: [{
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      vertical_spacing: '4px',
+      elements: [
+        markdown(runtime, `**${coloredText(status, executionStatus.color)} · ${truncate(threadId, 180)}**`, `threads_native_title_${index}`),
+        markdown(runtime, `标题：${title}\n目录：${cwd}\n更新时间：${updatedAt}`, `threads_native_meta_${index}`),
+        buttonRow(`threads_native_actions_${index}`, [
+          button(
+            `threads_native_detail_${index}`,
+            '查看执行',
+            actionValue('thread', threadId, 'native_thread'),
+            'primary',
+          ),
+        ]),
+      ],
+    }],
+  };
+}
+
+export function buildCodexThreadDetailCard(runtime, rawThread) {
+  const thread = isRecord(rawThread) ? rawThread : {};
+  const threadId = normalizeString(thread.id) || '(unknown)';
+  const title = truncate(singleLine(thread.name || thread.preview || '（无标题）'), 240);
+  const executionStatus = threadExecutionStatus(thread);
+  const status = executionStatus.label;
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  const metadata = [
+    `标题：${title}`,
+    `目录：${truncate(singleLine(thread.cwd), 240) || '—'}`,
+    `更新时间：${formatNativeThreadTimestamp(thread.updatedAt)}`,
+  ];
+  const conclusion = extractThreadConclusion(thread, turns);
+  const elements = [
+    markdown(runtime, `**Codex Thread 执行详情**\n\nThread：${truncate(threadId, 240)} · ${coloredText(status, executionStatus.color)}`, 'thread_detail_title'),
+    markdown(runtime, metadata.join('\n'), 'thread_detail_metadata'),
+    collapsible(runtime, '最后总结', conclusion, 'thread_detail_conclusion', true),
+    buttonRow('thread_detail_actions', [
+      button('thread_detail_refresh', '刷新详情', actionValue('thread', threadId, 'native_thread_detail'), 'primary'),
+    ]),
+  ];
+  return compactGlobalCard(buildCard(runtime, elements));
+}
+
+function threadExecutionStatus(thread) {
+  const rawStatus = normalizeString(thread?.status?.type)?.toLowerCase() || '';
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  const lastTurn = turns.at(-1);
+  const lastTurnStatus = normalizeString(lastTurn?.status || lastTurn?.state)?.toLowerCase() || '';
+  if (['systemerror', 'error', 'failed', 'failure'].includes(rawStatus)
+    || ['error', 'failed', 'failure'].includes(lastTurnStatus)) {
+    return { label: '失败', color: statusColor('failed') };
+  }
+  if (['active', 'running', 'streaming', 'in_progress', 'processing'].includes(rawStatus)
+    || ['active', 'running', 'streaming', 'in_progress', 'processing'].includes(lastTurnStatus)) {
+    return { label: '执行中', color: statusColor('active') };
+  }
+  if (['completed', 'complete', 'done', 'succeeded', 'success'].includes(rawStatus)
+    || ['completed', 'complete', 'done', 'succeeded', 'success'].includes(lastTurnStatus)) {
+    return { label: '已完成', color: statusColor('completed') };
+  }
+  if (rawStatus === 'notloaded') {
+    return turns.length > 0
+      ? { label: '已完成', color: statusColor('completed') }
+      : { label: '已结束', color: statusColor('completed') };
+  }
+  if (rawStatus === 'idle') {
+    return turns.length > 0
+      ? { label: '已完成', color: statusColor('completed') }
+      : { label: '已结束', color: statusColor('completed') };
+  }
+  return { label: displayStatus(rawStatus || 'unknown'), color: statusColor(rawStatus || 'unknown') };
+}
+
+function extractThreadConclusion(thread, turns) {
+  for (const turn of [...turns].reverse()) {
+    const items = Array.isArray(turn?.items) ? turn.items : [turn];
+    for (const item of [...items].reverse()) {
+      const value = isRecord(item) ? item : {};
+      const type = normalizeString(value.type || value.kind || value.role).toLowerCase();
+      const text = normalizeString(value.text || value.message || value.content || value.preview);
+      if (text && (type.includes('agentmessage') || type.includes('agent_message') || type === 'assistant' || type === 'message')) {
+        return truncate(text, MAX_TASK_TEXT);
+      }
+    }
+  }
+  const preview = normalizeString(thread.preview || thread.name);
+  return preview ? truncate(preview, MAX_TASK_TEXT) : 'Codex 没有返回最后总结。';
+}
+
+function buildThreadTaskBlock(runtime, task, index) {
+  const taskId = normalizeString(task?.taskId) || '(unknown)';
+  const status = displayTaskStatus(task);
+  const title = truncate(singleLine(task?.title || task?.userMessageText || '（无标题）'), 180);
+  const updatedAt = formatTimestamp(task?.updatedAt || task?.createdAt);
+  const actions = [button(
+    `threads_detail_${index}`,
+    '查看详情',
+    actionValue('tasks', taskId, 'threads'),
+    'primary',
+  )];
+  if (isCancellableTask(runtime, task)) {
+    actions.push(button(
+      `threads_cancel_${index}`,
+      '中断',
+      cancelActionValue(task),
+      'danger',
+    ));
+  }
+  return {
+    tag: 'column_set',
+    element_id: `threads_aamp_row_${index}`,
+    flex_mode: 'flow',
+    horizontal_spacing: '8px',
+    columns: [{
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      vertical_spacing: '4px',
+      elements: [
+        markdown(runtime, `**${coloredText(status, taskStatusColor(task))} · ${truncate(taskId, 180)}**`, `threads_task_title_${index}`),
+        markdown(runtime, `标题：${title}\n更新时间：${updatedAt}`, `threads_task_meta_${index}`),
+        buttonRow(`threads_task_actions_${index}`, actions),
+      ],
+    }],
+  };
+}
+
+/**
+ * Build the task card used by the native direct runtime. Keeping the task
+ * summary and the long-running output in separate elements makes the card
+ * readable on mobile while leaving the task actions visible at all times.
+ * The same action payload is understood by the global card-action handler, so
+ * a task can be opened from a streaming card without first sending /recent.
+ */
+export function buildDirectTaskCard(runtime, rawTask, attachmentNames = []) {
+  const task = normalizeDirectTask(rawTask);
+  const taskId = task.taskId || '(未知任务)';
+  const status = displayTaskStatus(task);
+  const terminal = isTerminalTask(task);
+  const statusColorValue = taskStatusColor(task);
+  const elements = [
+    markdown(runtime, [
+      `**Codex 直连 · ${coloredText(status, statusColorValue)}**`,
+      `\`${truncate(taskId, 180)}\``,
+    ].join('\n'), 'direct_task_title'),
+    directTaskSummary(runtime, task, status, statusColorValue),
+    { tag: 'hr', element_id: 'direct_task_divider' },
+  ];
+
+  const request = task.userMessageText;
+  if (request) {
+    elements.push(collapsible(
+      runtime,
+      '任务请求',
+      truncate(request, MAX_TASK_TEXT),
+      'direct_task_request',
+      false,
+    ));
+  }
+
+  const progress = task.streamText || task.lastProgressText;
+  if (progress || !terminal) {
+    elements.push(collapsible(
+      runtime,
+      terminal ? '最后进度' : '执行进度',
+      progress || 'Codex 正在准备执行……',
+      'direct_task_progress',
+      !terminal,
+    ));
+  }
+
+  if (task.outputText) {
+    elements.push(collapsible(
+      runtime,
+      '执行结果',
+      truncate(task.outputText, MAX_TASK_TEXT),
+      'direct_task_result',
+      true,
+    ));
+  }
+  if (task.resultError) {
+    elements.push(collapsible(
+      runtime,
+      '错误信息',
+      truncate(task.resultError, MAX_TASK_TEXT),
+      'direct_task_error',
+      true,
+    ));
+  }
+  if (attachmentNames.length > 0) {
+    elements.push(collapsible(
+      runtime,
+      `附件（${attachmentNames.length}）`,
+      attachmentNames.map((name) => `- \`${truncate(String(name), 240)}\``).join('\n'),
+      'direct_task_attachments',
+      false,
+    ));
+  }
+  if (task.recoveryCount > 0) {
+    elements.push(markdown(runtime, `恢复次数：${task.recoveryCount}`, 'direct_task_recovery'));
+  }
+
+  const actions = [
+    button('direct_task_detail', '查看详情', actionValue('tasks', taskId, 'direct_task'), 'primary'),
+    button('direct_task_events', '事件', actionValue('events', taskId, 'direct_task'), 'default'),
+  ];
+  if (!terminal) {
+    actions.push(button('direct_task_cancel', '中断', cancelActionValue({
+      ...task,
+      sourceMode: GLOBAL_TASK_MODES.DIRECT,
+    }), 'danger'));
+  } else if (task.status === 'FAILED' || task.status === 'CANCELLED') {
+    actions.push(button('direct_task_retry', '重试', actionValue('retry', taskId, 'direct_task'), 'default'));
+  } else {
+    actions.push(button('direct_task_changes', '变更', actionValue('changes', taskId, 'direct_task'), 'default'));
+  }
+  elements.push(buttonRow('direct_task_actions', actions));
+  return compactGlobalCard(buildCard(runtime, elements));
+}
+
+function normalizeDirectTask(rawTask) {
+  const value = isRecord(rawTask) ? rawTask : {};
+  const taskId = normalizeString(value.taskId || value.bridge_task_id);
+  const status = normalizeString(value.status).toUpperCase() || 'RUNNING';
+  return {
+    ...value,
+    taskId,
+    status,
+    sourceMode: GLOBAL_TASK_MODES.DIRECT,
+    userMessageText: normalizeString(value.userMessageText || value.text),
+    outputText: normalizeString(value.outputText || value.final_response),
+    streamText: normalizeString(value.streamText || value.last_progress_text),
+    lastProgressText: normalizeString(value.lastProgressText || value.last_progress_text),
+    resultError: normalizeString(value.resultError || value.error),
+    threadId: normalizeString(value.threadId || value.thread_id),
+    createdAt: normalizeString(value.createdAt || value.created_at),
+    updatedAt: normalizeString(value.updatedAt || value.updated_at),
+    recoveryCount: Number(value.recoveryCount || value.recovery_count || 0) || 0,
+  };
+}
+
+function directTaskSummary(runtime, task, status, statusColorValue) {
+  const fields = [
+    ['状态', coloredText(status, statusColorValue)],
+    ['任务 ID', `\`${truncate(task.taskId || '未知', 80)}\``],
+    ['Thread', task.threadId ? `\`${truncate(task.threadId, 80)}\`` : '暂无'],
+  ];
+  return {
+    tag: 'column_set',
+    element_id: 'direct_task_summary',
+    flex_mode: 'flow',
+    horizontal_spacing: '8px',
+    columns: fields.map(([label, value], index) => ({
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      vertical_align: 'center',
+      elements: [markdown(runtime, `<font color='grey'>${label}</font>\n${value}`, `direct_task_summary_${index}`)],
+    })),
+  };
 }
 
 // Feishu limits the total number of card elements. Keep a safety net for long
@@ -355,9 +1038,13 @@ function countCardElements(value) {
   return (value.tag ? 1 : 0) + Object.values(value).reduce((total, item) => total + countCardElements(item), 0);
 }
 
-async function sendCommandCard(runtime, chatId, card) {
+async function sendCommandCard(runtime, chatId, card, updateMessageId) {
   if (!runtime.channel || typeof runtime.channel.send !== 'function') {
     throw new Error('AAMP compatibility: Feishu channel.send is unavailable');
+  }
+  if (updateMessageId && typeof runtime.channel.updateCard === 'function') {
+    await runtime.channel.updateCard(updateMessageId, compactGlobalCard(card));
+    return;
   }
   // Slash commands are standalone navigation/status messages. Deliberately
   // omit replyTo so Feishu does not render them as a reply to /status, etc.
@@ -389,6 +1076,7 @@ export function buildHelpCard(runtime) {
       '`/recent` 查看当前会话的 AAMP 与直连任务',
       '`/tasks <任务ID>` 查看具体任务详情',
       '`/task <任务ID>` `/tasks` 的别名',
+      '`/threads [筛选参数]` 查看当前会话的 AAMP 任务及本机 Codex App/CLI threads',
       ...directCommands,
       '',
       '任务列表中的“查看详情”按钮会直接打开对应任务详情。',
@@ -485,7 +1173,12 @@ export function buildRecentCard(runtime, chatId, limit = MAX_RECENT_TASKS) {
   const tasks = listRuntimeTasks(runtime, chatId).slice(0, limit);
   const metadata = loadWorktreeMetadata();
   const elements = [
-    markdown(runtime, `**Codex 最近任务（${tasks.length}）**`),
+    markdown(runtime, [
+      `**Codex 最近任务（${tasks.length}）**`,
+      '',
+      '点击“详情”查看完整请求、结果和执行记录。',
+    ].join('\n'), 'recent_title'),
+    { tag: 'hr', element_id: 'recent_header_divider' },
   ];
 
   if (tasks.length === 0) {
@@ -496,7 +1189,7 @@ export function buildRecentCard(runtime, chatId, limit = MAX_RECENT_TASKS) {
       const actions = [button(
         `recent_detail_${index}`,
         '详情',
-        actionValue('tasks', task.taskId),
+        actionValue('tasks', task.taskId, 'recent'),
         'primary',
       )];
       if (isCancellableTask(runtime, task)) {
@@ -520,6 +1213,9 @@ export function buildRecentCard(runtime, chatId, limit = MAX_RECENT_TASKS) {
         index,
         actions,
       ));
+      if (index < tasks.length - 1) {
+        elements.push({ tag: 'hr', element_id: `recent_divider_${index}` });
+      }
     }
   }
   elements.push(
@@ -635,7 +1331,9 @@ export function buildTaskDetailCard(runtime, rawTask) {
     '',
     `ID：\`${task.taskId}\``,
   ].join('\n'))];
+  elements.push({ tag: 'hr', element_id: 'task_header_divider' });
   appendPromptElement(runtime, elements, request, 'task_request');
+  elements.push({ tag: 'hr', element_id: 'task_request_divider' });
 
   const detailLines = [
     `接入模式：${sourceModeLabel(taskSourceMode(task))}`,
@@ -654,6 +1352,7 @@ export function buildTaskDetailCard(runtime, rawTask) {
   const usage = findTaskUsage(task.taskId);
   if (usage) detailLines.push(formatTaskUsage(usage));
   elements.push(markdown(runtime, detailLines.join('\n'), 'task_metadata'));
+  elements.push({ tag: 'hr', element_id: 'task_metadata_divider' });
 
   if (!usage && taskSourceMode(task) === GLOBAL_TASK_MODES.AAMP) {
     elements.push(markdown(runtime, '_该任务暂未发现 ACP token 用量记录。_'));
@@ -664,9 +1363,17 @@ export function buildTaskDetailCard(runtime, rawTask) {
 
   const taskActions = [
     button('task_back_recent', '返回最近任务', actionValue('recent'), 'primary'),
-    button('task_refresh', '刷新详情', actionValue('tasks', task.taskId), 'default'),
+    button('task_refresh', '刷新详情', actionValue('tasks', task.taskId, 'detail'), 'default'),
   ];
   if (taskSourceMode(task) === GLOBAL_TASK_MODES.DIRECT) {
+    if (!isTerminalTask(task)) {
+      taskActions.push(button(
+        'task_cancel',
+        '中断',
+        cancelActionValue({ ...task, sourceMode: GLOBAL_TASK_MODES.DIRECT }, 'detail'),
+        'danger',
+      ));
+    }
     for (const [command, label] of [
       ['progress', '进度'],
       ['events', '事件'],
@@ -674,7 +1381,7 @@ export function buildTaskDetailCard(runtime, rawTask) {
       ['commands', '命令'],
       ['tools', '工具'],
     ]) {
-      taskActions.push(button(`task_${command}`, label, actionValue(command, task.taskId), 'default'));
+      taskActions.push(button(`task_${command}`, label, actionValue(command, task.taskId, 'detail'), 'default'));
     }
   }
   elements.push(buttonRow('task_actions', taskActions));
@@ -754,7 +1461,9 @@ function buttonRow(elementId, buttons) {
   return {
     tag: 'column_set',
     element_id: elementId,
-    flex_mode: 'none',
+    // Let action rows wrap on narrow mobile cards instead of clipping the
+    // last buttons off-screen. A two-column row still renders as one line.
+    flex_mode: 'flow',
     horizontal_spacing: '8px',
     columns: buttons.map((item) => ({
       tag: 'column',
@@ -819,20 +1528,22 @@ function safeCardText(runtime, content) {
     : String(content);
 }
 
-function actionValue(command, taskId) {
+function actionValue(command, taskId, source, extra) {
   return {
     kind: AAMP_COMMAND_ACTION_KIND,
     command,
-    ...(taskId ? { taskId, commandText: `/tasks ${taskId}` } : {}),
+    ...(taskId ? { taskId, commandText: `/${command} ${taskId}` } : {}),
+    ...(source ? { source } : {}),
+    ...(isRecord(extra) ? extra : {}),
   };
 }
 
-function cancelActionValue(task) {
+function cancelActionValue(task, source = 'recent') {
   return {
     kind: AAMP_TASK_CANCEL_ACTION_KIND,
     taskId: task.taskId,
     sourceMode: taskSourceMode(task),
-    source: 'recent',
+    source,
   };
 }
 

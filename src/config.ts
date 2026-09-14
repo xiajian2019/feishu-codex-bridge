@@ -84,9 +84,24 @@ const directPermissionsSchema = z.object({
   rules: z.array(directPermissionRuleSchema).default([]),
 }).strict();
 
+const directRetrySchema = z.object({
+  maxAttempts: z.number().int().min(1).max(10).default(3),
+  initialDelaySeconds: z.number().int().min(1).max(300).default(5),
+  maxDelaySeconds: z.number().int().min(1).max(3_600).default(120),
+}).strict().superRefine((retry, context) => {
+  if (retry.maxDelaySeconds < retry.initialDelaySeconds) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["maxDelaySeconds"],
+      message: "must be greater than or equal to initialDelaySeconds",
+    });
+  }
+});
+
 const directSchema = z.object({
   projectKey: z.string().trim().min(1).optional(),
   mode: z.string().trim().min(1).optional(),
+  retry: directRetrySchema.default({}),
   feishu: directFeishuSchema.default({}),
   permissions: directPermissionsSchema.default({}),
 }).strict();

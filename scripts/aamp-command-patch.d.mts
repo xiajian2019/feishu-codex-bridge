@@ -4,11 +4,13 @@ export const AAMP_TASK_HIDE_ACTION_KIND: "aamp_task_hide";
 export const GLOBAL_TASK_MODES: Readonly<{ AAMP: "aamp"; DIRECT: "direct" }>;
 
 export interface GlobalCommand {
-  command: "help" | "cancel" | "status" | "usage" | "recent" | "tasks"
+  command: "help" | "cancel" | "status" | "usage" | "recent" | "tasks" | "threads"
     | "thread" | "resume" | "retry" | "queue" | "progress" | "events"
     | "changes" | "commands" | "tools";
   args: string[];
   raw?: string;
+  tab?: "native" | "aamp";
+  source?: string;
 }
 
 export interface GlobalCardRuntime {
@@ -27,6 +29,28 @@ export function buildCommandCard(
   runtime: GlobalCardRuntime,
   chatId: string,
   command: GlobalCommand,
+): object;
+export function buildDirectTaskCard(
+  runtime: GlobalCardRuntime,
+  task: Record<string, unknown>,
+  attachmentNames?: string[],
+): object;
+export function buildThreadsOverviewCard(
+  runtime: GlobalCardRuntime,
+  chatId: string,
+  options?: {
+    title?: string;
+    nativeTitle?: string;
+    nativeLines?: string[];
+    nativeCount?: number;
+    nativeThreads?: Array<Record<string, unknown>>;
+    activeTab?: "native" | "aamp";
+    nativeMoreText?: string;
+  },
+): object;
+export function buildCodexThreadDetailCard(
+  runtime: GlobalCardRuntime,
+  thread: Record<string, unknown>,
 ): object;
 export function buildDirectInfoCard(runtime: GlobalCardRuntime, title: string, lines: string[]): object;
 export function compactGlobalCard(card: object, maxElements?: number): object;

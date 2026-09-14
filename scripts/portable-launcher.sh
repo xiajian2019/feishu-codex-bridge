@@ -185,7 +185,7 @@ case "$1" in
       aamp aamp:install aamp:start aamp:stop aamp:restart aamp:status aamp:logs aamp:update aamp:add aamp:remove \
       aamp:recent aamp:task aamp:inspect aamp:worktrees \
       codex codex:install codex:setup codex:start codex:stop codex:restart codex:status codex:logs \
-      codex:recent codex:task codex:inspect codex:attachments codex:outbox \
+      codex:recent codex:list codex:threads codex:thread codex:task codex:inspect codex:attachments codex:outbox \
       codex:cancel codex:retry codex:recover codex:worktrees codex:doctor codex:update \
       codex:uninstall codex:remove
     exit 0

@@ -64,6 +64,8 @@ describe("native Codex CLI", () => {
     expect(plist).toContain("<string>--execution-mode</string>");
     expect(plist).toContain("<string>feishu-sqlite-codex</string>");
     expect(plist).toContain("<key>KeepAlive</key>");
+    expect(plist).toContain("<key>ThrottleInterval</key>");
+    expect(plist).toContain("<integer>10</integer>");
     expect(plist).toContain("<string>Background</string>");
   });
 

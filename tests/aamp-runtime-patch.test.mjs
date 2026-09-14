@@ -166,9 +166,13 @@ describe('SDK help replay protection', () => {
 
     await runtime.start();
 
-    expect(runtime.terminalCard.body.elements.at(-1)).toMatchObject({
+    expect(runtime.terminalCard.body.elements.find((element) => element.tag === 'markdown')).toMatchObject({
       tag: 'markdown',
       content: 'recovered output',
+    });
+    expect(runtime.terminalCard.body.elements.find((element) => element.tag === 'button')).toMatchObject({
+      text: { content: '查看详情' },
+      value: { kind: 'aamp_command', command: 'tasks', taskId: 't' },
     });
     expect(runtime.state.tasks.t.bridgeMessageId).toBe('recovered-card');
   });
@@ -180,12 +184,18 @@ describe('AAMP streaming-card cancellation', () => {
     const card = runtime.buildStreamingCard(runtime.state.tasks.t);
     const actions = card.body.elements.filter((element) => element.tag === 'button');
 
-    expect(actions).toHaveLength(1);
-    expect(actions[0]).toMatchObject({
+    expect(actions).toHaveLength(2);
+    expect(actions.find((action) => action.value?.kind === 'task_cancel')).toMatchObject({
       tag: 'button',
       type: 'danger',
       text: { content: '中断执行' },
       value: { kind: 'task_cancel', taskId: 't' },
+    });
+    expect(actions.find((action) => action.value?.kind === 'aamp_command')).toMatchObject({
+      tag: 'button',
+      type: 'primary',
+      text: { content: '查看详情' },
+      value: { kind: 'aamp_command', command: 'tasks', taskId: 't' },
     });
   });
 
@@ -217,7 +227,9 @@ describe('AAMP streaming-card cancellation', () => {
       allowNewMessageFallback: false,
       includeReplay: true,
     });
-    expect(runtime.terminalCard.body.elements.at(-1).content).toContain('本轮执行已中断');
+    expect(runtime.terminalCard.body.elements
+      .filter((element) => element.tag === 'markdown')
+      .some((element) => element.content.includes('本轮执行已中断'))).toBe(true);
     expect(runtime.terminalCard.body.elements.some((element) => element.tag === 'action')).toBe(false);
 
     await runtime.handleTaskResult({ taskId: 't', status: 'completed', output: 'late result' });

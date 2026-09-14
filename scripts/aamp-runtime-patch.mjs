@@ -2,6 +2,7 @@ const patched = Symbol.for('feishu-codex-bridge.help-card-patch');
 
 const TERMINAL_TASK_STATUSES = new Set(['completed', 'rejected', 'failed']);
 const CANCEL_ACTION_KIND = 'task_cancel';
+const COMMAND_ACTION_KIND = 'aamp_command';
 const CANCEL_REASON = '用户通过飞书卡片请求中断本轮执行。';
 const taskQueues = new WeakMap();
 
@@ -24,7 +25,15 @@ function isRecord(value) {
 }
 
 function readCardActionValue(event) {
-  return isRecord(event?.action?.value) ? event.action.value : undefined;
+  const value = event?.action?.value;
+  if (isRecord(value)) return value;
+  if (typeof value !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function isCancelAction(event) {
@@ -120,6 +129,66 @@ function appendCancelAction(card, task) {
   };
 }
 
+function appendDetailsAction(card, task) {
+  if (!task?.taskId) return card;
+  const normalizedCard = normalizeV2CardActions(card);
+  const body = normalizedCard?.body;
+  if (!isRecord(body) || !Array.isArray(body.elements)) {
+    throw new Error('AAMP compatibility: streaming card has no body.elements; review upstream update');
+  }
+
+  const alreadyHasDetails = body.elements.some((element) => {
+    if (!isRecord(element)) return false;
+    const actions = element.tag === 'button'
+      ? [element]
+      : element.tag === 'action' && Array.isArray(element.actions)
+        ? element.actions
+        : [];
+    return actions.some((action) => {
+      const value = readCardActionValue({ action });
+      return value?.kind === COMMAND_ACTION_KIND
+        && value?.command === 'tasks'
+        && value?.taskId === task.taskId;
+    });
+  });
+  if (alreadyHasDetails) return normalizedCard;
+
+  const detailsButton = {
+    tag: 'button',
+    element_id: 'st_details',
+    text: {
+      tag: 'plain_text',
+      content: '查看详情',
+    },
+    type: 'primary',
+    value: {
+      kind: COMMAND_ACTION_KIND,
+      command: 'tasks',
+      taskId: task.taskId,
+      source: 'task-card',
+    },
+  };
+  const detailsElement = isV2Card(normalizedCard)
+    ? detailsButton
+    : {
+        tag: 'action',
+        element_id: 'st_details',
+        actions: [{
+          tag: 'button',
+          text: detailsButton.text,
+          type: detailsButton.type,
+          value: detailsButton.value,
+        }],
+      };
+  return {
+    ...normalizedCard,
+    body: {
+      ...body,
+      elements: [...body.elements, detailsElement],
+    },
+  };
+}
+
 function buildCancelledCard(runtime, task) {
   const elements = [];
   const hasTimeline = Boolean(
@@ -138,7 +207,7 @@ function buildCancelledCard(runtime, task) {
       task.bridgeCancelReason || CANCEL_REASON,
     ].join('\n\n')),
   });
-  return runtime.buildCardShell(elements);
+  return appendDetailsAction(runtime.buildCardShell(elements), task);
 }
 
 async function updateStreamingCardAfterCancelFailure(runtime, task) {
@@ -354,11 +423,14 @@ export function patchHelpCards(Runtime) {
     return appendCancelAction(card, task);
   };
   prototype.buildStreamingCard = function (task, ...args) {
-    return appendCancelAction(originalStreamingCard.call(this, task, ...args), task);
+    return appendDetailsAction(
+      appendCancelAction(originalStreamingCard.call(this, task, ...args), task),
+      task,
+    );
   };
   prototype.buildTerminalCard = function (task, ...args) {
     if (task?.bridgeCancelledAt) return buildCancelledCard(this, task);
-    return originalTerminalCard.call(this, task, ...args);
+    return appendDetailsAction(originalTerminalCard.call(this, task, ...args), task);
   };
   prototype.sendHelpCard = async function (task) {
     if (!task.helpCardMessageId) return originalSend.call(this, task);

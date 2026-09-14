@@ -185,6 +185,36 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
+  let fatalExitPromise: Promise<void> | undefined;
+  const handleFatalProcessError = (kind: string, reason: unknown): void => {
+    if (fatalExitPromise) return;
+    const message = reason instanceof Error
+      ? reason.stack ?? reason.message
+      : String(reason);
+    logger.error(`direct runtime ${kind}`, { error: message });
+    fatalExitPromise = (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          stop(),
+          new Promise<void>((resolvePromise) => {
+            timer = setTimeout(resolvePromise, 5_000);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+        process.exit(1);
+      }
+    })();
+  };
+  const onUncaughtException = (error: Error): void => {
+    handleFatalProcessError("uncaught exception", error);
+  };
+  const onUnhandledRejection = (reason: unknown): void => {
+    handleFatalProcessError("unhandled rejection", reason);
+  };
+  process.on("uncaughtException", onUncaughtException);
+  process.on("unhandledRejection", onUnhandledRejection);
 
   try {
     if (dashboard) {
@@ -201,6 +231,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   } finally {
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
+    process.off("uncaughtException", onUncaughtException);
+    process.off("unhandledRejection", onUnhandledRejection);
     await stop();
   }
 }
@@ -274,6 +306,7 @@ async function runAampMode(
 
   const runtime = new AampTaskAgentRuntime(config, {
     projectRoot,
+    configPath: args.configPath,
     sqlitePath: dbPath,
     attachmentsDir: join(projectRoot, "runtime", "aamp", "attachments"),
     logger,

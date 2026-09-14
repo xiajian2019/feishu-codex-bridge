@@ -14,7 +14,9 @@ const DEFAULT_RELEASE_DIR = join(PROJECT_ROOT, "release");
 
 export function parsePortableRestartArguments(argv, cwd = process.cwd()) {
   let configPath = resolve(cwd, "config.json");
+  let dbPath = resolve(cwd, "runtime", "bridge.db");
   let releaseDir = DEFAULT_RELEASE_DIR;
+  let executionMode = "feishu-sqlite-codex";
   let skipBuild = false;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -29,6 +31,28 @@ export function parsePortableRestartArguments(argv, cwd = process.cwd()) {
       configPath = resolve(cwd, value);
       continue;
     }
+    if (arg === "--db" || arg.startsWith("--db=")) {
+      const value = arg.startsWith("--db=") ? arg.slice("--db=".length) : argv[++index];
+      if (!value || value.startsWith("--")) throw new Error("--db 需要一个路径");
+      dbPath = resolve(cwd, value);
+      continue;
+    }
+    if (
+      arg === "--mode"
+      || arg === "--execution-mode"
+      || arg.startsWith("--mode=")
+      || arg.startsWith("--execution-mode=")
+    ) {
+      const prefix = arg.startsWith("--execution-mode=")
+        ? "--execution-mode="
+        : arg.startsWith("--mode=")
+          ? "--mode="
+          : undefined;
+      const value = prefix ? arg.slice(prefix.length) : argv[++index];
+      if (!value || value.startsWith("--")) throw new Error(`${prefix ? prefix.slice(0, -1) : arg} 需要一个执行模式`);
+      executionMode = value;
+      continue;
+    }
     if (arg === "--output" || arg.startsWith("--output=")) {
       const value = arg.startsWith("--output=") ? arg.slice("--output=".length) : argv[++index];
       if (!value || value.startsWith("--")) throw new Error("--output 需要一个路径");
@@ -37,13 +61,15 @@ export function parsePortableRestartArguments(argv, cwd = process.cwd()) {
     }
     throw new Error(`未知参数：${arg}`);
   }
-  return { configPath, releaseDir, skipBuild };
+  return { configPath, dbPath, releaseDir, executionMode, skipBuild };
 }
 
 export async function restartPortableRelease(options = {}) {
   const projectRoot = resolve(options.projectRoot || PROJECT_ROOT);
   const releaseDir = resolve(options.releaseDir || join(projectRoot, "release"));
   const configPath = resolve(options.configPath || join(projectRoot, "config.json"));
+  const dbPath = resolve(options.dbPath || join(projectRoot, "runtime", "bridge.db"));
+  const executionMode = options.executionMode || "feishu-sqlite-codex";
   const buildRelease = options.buildRelease || buildPortableRelease;
   const runCommand = options.runCommand || run;
   const target = targetName(process.platform, process.arch);
@@ -57,12 +83,29 @@ export async function restartPortableRelease(options = {}) {
     throw new Error(`portable 启动器未生成：${launcher}`);
   }
 
-  console.log("停止当前 Codex 直连服务…");
-  await runCommand(launcher, ["codex:stop", "--config", configPath], projectRoot);
-  console.log("从新 release 启动 Codex 直连服务…");
-  await runCommand(launcher, ["codex:start", "--config", configPath], projectRoot);
-  await runCommand(launcher, ["codex:status", "--config", configPath], projectRoot);
-  return { releaseDir, launcher, configPath };
+  console.log("从新 release 重启 Codex 直连服务…");
+  const serviceArgs = [
+    "service",
+    "restart",
+    "--config",
+    configPath,
+    "--db",
+    dbPath,
+    "--mode",
+    executionMode,
+  ];
+  await runCommand(launcher, serviceArgs, projectRoot);
+  await runCommand(launcher, [
+    "service",
+    "status",
+    "--config",
+    configPath,
+    "--db",
+    dbPath,
+    "--mode",
+    executionMode,
+  ], projectRoot);
+  return { releaseDir, launcher, configPath, dbPath, executionMode };
 }
 
 function run(file, args, cwd) {

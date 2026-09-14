@@ -100,6 +100,14 @@ export interface BridgeConfig {
   direct: {
     projectKey?: string;
     mode?: string;
+    retry: {
+      /** Total Codex attempts, including the initial attempt. */
+      maxAttempts: number;
+      /** Initial delay before retrying a transient Codex/runtime error. */
+      initialDelaySeconds: number;
+      /** Upper bound for exponential retry delay. */
+      maxDelaySeconds: number;
+    };
     feishu: {
       /** Optional; defaults to the selected AAMP Codex binding in direct mode. */
       appId?: string;

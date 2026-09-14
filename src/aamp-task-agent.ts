@@ -66,6 +66,8 @@ export interface AampCardDedupEntry {
 
 export interface AampTaskAgentOptions {
   projectRoot: string;
+  /** Bridge config path used by read-only cross-mode Codex queries. */
+  configPath?: string;
   inheritedEnv?: NodeJS.ProcessEnv;
   /** SQLite path shared with the AAMP runtime persistence patch. */
   sqlitePath?: string;
@@ -85,6 +87,7 @@ export interface AampTaskAgentOptions {
 export class AampTaskAgentRuntime {
   private readonly config: BridgeConfig;
   private readonly projectRoot: string;
+  private readonly configPath: string;
   private readonly inheritedEnv: NodeJS.ProcessEnv;
   private readonly logger?: Logger;
   private readonly shimDir: string;
@@ -99,6 +102,7 @@ export class AampTaskAgentRuntime {
   constructor(config: BridgeConfig, options: AampTaskAgentOptions) {
     this.config = config;
     this.projectRoot = resolve(options.projectRoot);
+    this.configPath = resolve(options.configPath ?? join(this.projectRoot, "config.json"));
     this.inheritedEnv = options.inheritedEnv ?? process.env;
     this.logger = options.logger;
     this.shimDir = join(this.projectRoot, "runtime", "aamp", "bin");
@@ -390,6 +394,8 @@ export class AampTaskAgentRuntime {
           environment: {
             ...buildAampNetworkEnvironment(this.config),
             AAMP_TASK_SKIP_MACOS_QUARANTINE: AAMP_SKIP_MACOS_QUARANTINE,
+            AAMP_COMMAND_CONFIG_PATH: this.configPath,
+            ...(this.inheritedEnv.CODEX_HOME ? { CODEX_HOME: this.inheritedEnv.CODEX_HOME } : {}),
             NPM_CONFIG_CACHE: resolveAampNpmCacheDir(this.inheritedEnv),
             ...buildAampPersistenceEnvironment(this.config, this.sqlitePath, this.attachmentsDir),
             ...buildAampWorktreeEnvironment(
@@ -436,6 +442,7 @@ export class AampTaskAgentRuntime {
       delete env.AAMP_LARK_CLI_BIN;
       delete env.AAMP_TASK_BOOTSTRAP_PATH;
     }
+    env.AAMP_COMMAND_CONFIG_PATH = this.configPath;
     return env;
   }
 
@@ -1227,6 +1234,8 @@ function doubleQuoteValue(value: string): string {
 function isSupportedAampServiceEnvironmentKey(key: string): boolean {
   return /^AAMP_CODEX_[A-Z0-9_]+$/.test(key)
     || /^AAMP_BRIDGE_[A-Z0-9_]+$/.test(key)
+    || key === "AAMP_COMMAND_CONFIG_PATH"
+    || key === "CODEX_HOME"
     || key === "AAMP_TASK_AAMP_HOST"
     || key === "AAMP_TASK_HTTP_PROXY"
     || key === "AAMP_TASK_HTTPS_PROXY"

@@ -170,6 +170,11 @@ async function writePortableConfigExample(appDir) {
     direct: {
       projectKey: "default",
       mode: "implement",
+      retry: {
+        maxAttempts: 3,
+        initialDelaySeconds: 5,
+        maxDelaySeconds: 120,
+      },
       feishu: {
         appIdEnv: "FEISHU_APP_ID",
         appSecretEnv: "FEISHU_APP_SECRET",

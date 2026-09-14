@@ -6,10 +6,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AAMP_COMMAND_ACTION_KIND,
   AAMP_TASK_HIDE_ACTION_KIND,
+  buildDirectTaskCard,
   buildHelpCard,
   buildRecentCard,
   buildStatusCard,
   buildTaskCommandCard,
+  buildThreadsOverviewCard,
   buildUsageCard,
   parseAampCommand,
   patchAampCommands,
@@ -20,6 +22,7 @@ const temporaryDirectories = [];
 const environmentKeys = [
   'AAMP_COMMAND_ACPX_SESSIONS_DIR',
   'AAMP_COMMAND_CODEX_SESSIONS_DIR',
+  'AAMP_COMMAND_CONFIG_PATH',
   'AAMP_CODEX_WORKTREE_METADATA_DIR',
   'AAMP_TASK_STATE_HOME',
   'AAMP_LOG_DIR',
@@ -70,6 +73,10 @@ describe('AAMP Feishu slash commands', () => {
     expect(parseAampCommand('/recent')).toMatchObject({ command: 'recent', args: [] });
     expect(parseAampCommand('/help')).toMatchObject({ command: 'help', args: [] });
     expect(parseAampCommand('/tasks task-123')).toMatchObject({ command: 'tasks', args: ['task-123'] });
+    expect(parseAampCommand('/threads --project food --search "fix bug"')).toMatchObject({
+      command: 'threads',
+      args: ['--project', 'food', '--search', 'fix bug'],
+    });
     expect(parseAampCommand('/thread')).toMatchObject({ command: 'thread', args: [] });
     expect(parseAampCommand('/events task-123')).toMatchObject({ command: 'events', args: ['task-123'] });
     expect(parseAampCommand('@Codex /recent')).toMatchObject({ command: 'recent', args: [] });
@@ -93,6 +100,20 @@ describe('AAMP Feishu slash commands', () => {
     expect(runtime.forwarded).toBe(true);
   });
 
+  it('adds received and thinking reactions around ordinary AAMP tasks', async () => {
+    const runtime = createRuntime();
+
+    await runtime.handleIncomingMessage(message('普通任务'));
+    for (let attempt = 0; attempt < 10 && runtime.channel.addReaction.mock.calls.length < 2; attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    expect(runtime.channel.addReaction.mock.calls).toEqual([
+      ['message-普通任务', 'Get'],
+      ['message-普通任务', 'Think'],
+    ]);
+  });
+
   it('intercepts /help and lists every supported slash command', async () => {
     const runtime = createRuntime();
 
@@ -107,7 +128,8 @@ describe('AAMP Feishu slash commands', () => {
     expect(content).toContain('/recent');
     expect(content).toContain('/tasks <任务ID>');
     expect(content).toContain('/cancel [任务ID]');
-    expect(content).not.toContain('/thread');
+    expect(content).toContain('/threads [筛选参数]');
+    expect(content).not.toContain('`/thread` 查看');
     expect(content).toContain('/task <任务ID>');
     expect(runtime.forwarded).toBe(false);
 
@@ -134,6 +156,109 @@ describe('AAMP Feishu slash commands', () => {
     expect(directCard.body.elements[0].content).toContain('/help');
     runtime.globalTaskMode = 'direct';
     expect(buildHelpCard(runtime).body.elements[0].content).toContain('/thread');
+  });
+
+  it('keeps direct task actions visible while separating long task content', () => {
+    const runtime = createRuntime();
+    const card = buildDirectTaskCard(runtime, {
+      bridge_task_id: 'bridge-direct-1',
+      status: 'RUNNING',
+      text: '检查仓库并运行测试',
+      last_progress_text: '正在执行 pnpm test',
+      thread_id: 'thread-1',
+      created_at: '2026-09-14T00:00:00.000Z',
+      updated_at: '2026-09-14T00:01:00.000Z',
+    }, ['screen.png']);
+
+    expect(card.body.elements.some((element) => element.tag === 'collapsible_panel'))
+      .toBe(true);
+    const actions = card.body.elements.find((element) => element.element_id === 'direct_task_actions');
+    expect(actions.columns.map((column) => column.elements[0].text.content)).toEqual([
+      '查看详情', '事件', '中断',
+    ]);
+    expect(actions.columns[0].elements[0].value).toMatchObject({
+      kind: 'aamp_command',
+      command: 'tasks',
+      taskId: 'bridge-direct-1',
+    });
+  });
+
+  it('shows AAMP tasks and App/CLI threads from the mode-independent /threads command', async () => {
+    const runtime = createRuntime();
+    runtime.queryCodexThreads = vi.fn(async (args) => {
+      expect(args).toEqual(['--project', 'food', '--search', 'fix bug']);
+      return {
+        items: [{
+          id: 'thr-cli',
+          preview: 'Fix bug from CLI',
+          source: 'cli',
+          cwd: '/tmp/food',
+          status: { type: 'idle' },
+          updatedAt: 1757030400,
+        }],
+        total: 1,
+        nextCursor: null,
+      };
+    });
+
+    await runtime.handleIncomingMessage(message('/threads --project food --search "fix bug"'));
+
+    expect(runtime.forwarded).toBe(false);
+    expect(runtime.persisted).toBe(1);
+    expect(runtime.channel.send).toHaveBeenCalledTimes(1);
+    const card = runtime.channel.send.mock.calls[0][1].card;
+    const content = JSON.stringify(card);
+    expect(content).toContain('Codex Threads');
+    expect(content).toContain('Codex App/CLI（1）');
+    expect(content).toContain('thr-cli');
+    expect(content).toContain('Fix bug from CLI');
+
+    const nativeRow = card.body.elements.find((element) => element.element_id === 'threads_native_row_0');
+    const nativeAction = nativeRow.columns[0].elements
+      .find((element) => element.element_id === 'threads_native_actions_0')
+      .columns[0].elements[0];
+    expect(nativeAction).toMatchObject({
+      text: { content: '查看执行' },
+      value: {
+        kind: 'aamp_command',
+        command: 'thread',
+        taskId: 'thr-cli',
+        source: 'native_thread',
+      },
+    });
+
+    const aampTab = card.body.elements.find((element) => element.element_id === 'threads_tabs')
+      .columns[1].elements[0];
+    await runtime.handleCardAction({
+      chatId: 'chat-1',
+      messageId: 'threads-card',
+      action: { value: aampTab.value },
+    });
+    for (let attempt = 0; attempt < 10 && !runtime.channel.updateCard.mock.calls.length; attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const aampCard = runtime.channel.updateCard.mock.calls.at(-1)[1];
+    expect(JSON.stringify(aampCard)).toContain('task-123');
+
+    const taskRow = aampCard.body.elements.find((element) => element.element_id === 'threads_aamp_row_0');
+    const detailButton = taskRow.columns[0].elements
+      .find((element) => element.element_id === 'threads_task_actions_0')
+      .columns[0].elements[0];
+    expect(detailButton).toMatchObject({
+      text: { content: '查看详情' },
+      value: { kind: 'aamp_command', command: 'tasks', taskId: 'task-123' },
+    });
+    await runtime.handleCardAction({
+      chatId: 'chat-1',
+      messageId: 'threads-card',
+      action: { value: detailButton.value },
+    });
+    expect(runtime.channel.send).toHaveBeenCalledTimes(1);
+    expect(runtime.channel.updateCard).toHaveBeenCalledWith(
+      'threads-card',
+      expect.objectContaining({ body: expect.objectContaining({ elements: expect.any(Array) }) }),
+    );
+    expect(JSON.stringify(runtime.channel.updateCard.mock.calls.at(-1)[1])).toContain('task-123');
   });
 
   it('opens task details from the list card action and keeps chat scoping', async () => {
@@ -173,6 +298,51 @@ describe('AAMP Feishu slash commands', () => {
 
     const hidden = buildTaskCommandCard(runtime, 'other-chat', 'task-123');
     expect(hidden.body.elements[0].content).toContain('没有找到');
+  });
+
+  it('opens native thread execution details in a new card', async () => {
+    const runtime = createRuntime();
+    runtime.queryCodexThread = vi.fn(async (threadId) => ({
+      thread: {
+        id: threadId,
+        preview: 'CLI execution detail',
+        source: 'cli',
+        cwd: '/tmp/food',
+        status: { type: 'idle' },
+        updatedAt: 1757030400,
+        turns: [{ type: 'command_execution', command: 'npm test', status: 'completed' }],
+      },
+    }));
+    const card = buildThreadsOverviewCard(runtime, 'chat-1', {
+      nativeThreads: [{
+        id: 'thr-cli-detail',
+        preview: 'CLI execution detail',
+        source: 'cli',
+        cwd: '/tmp/food',
+        status: { type: 'idle' },
+        updatedAt: 1757030400,
+      }],
+      nativeCount: 1,
+    });
+    const action = card.body.elements
+      .find((element) => element.element_id === 'threads_native_row_0')
+      .columns[0].elements
+      .find((element) => element.element_id === 'threads_native_actions_0')
+      .columns[0].elements[0];
+
+    await runtime.handleCardAction({
+      chatId: 'chat-1',
+      messageId: 'threads-card-native',
+      action: { value: action.value },
+    });
+    expect(runtime.queryCodexThread).not.toHaveBeenCalled();
+    for (let attempt = 0; attempt < 10 && !runtime.queryCodexThread.mock.calls.length; attempt += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(runtime.queryCodexThread).toHaveBeenCalledWith('thr-cli-detail');
+    expect(runtime.channel.updateCard).not.toHaveBeenCalled();
+    expect(runtime.channel.send).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(runtime.channel.send.mock.calls[0][1].card)).toContain('Codex Thread 执行详情');
   });
 
   it('renders compact task rows with a prompt preview and an interrupt action', async () => {
@@ -283,9 +453,16 @@ describe('AAMP Feishu slash commands', () => {
     expect(JSON.stringify(directDetail)).toContain('Codex 任务详情');
     expect(JSON.stringify(directDetail)).toContain('接入模式：Codex 直连');
     const detailActions = directDetail.body.elements.find((element) => element.element_id === 'task_actions');
-    expect(detailActions.columns.slice(2).map((column) => column.elements[0].text.content)).toEqual([
+    expect(detailActions.columns.map((column) => column.elements[0].text.content)).toEqual([
+      '返回最近任务', '刷新详情', '中断',
       '进度', '事件', '变更', '命令', '工具',
     ]);
+    expect(detailActions.columns[2].elements[0].value).toMatchObject({
+      kind: 'task_cancel',
+      taskId: 'bridge-direct-1',
+      sourceMode: 'direct',
+      source: 'detail',
+    });
 
     await runtime.handleCardAction({
       chatId: 'chat-1',
@@ -476,6 +653,7 @@ function createRuntime() {
       botIdentity: { openId: 'bot-1', name: 'Codex' },
       send: vi.fn(async () => ({ messageId: 'reply-1' })),
       updateCard: vi.fn(async () => {}),
+      addReaction: vi.fn(async () => 'reaction-1'),
     };
     forwarded = false;
     cardForwarded = false;

@@ -32,6 +32,11 @@ describe("config validation", () => {
     expect(config.execution.mode).toBe("legacy-polling");
     expect(config.aamp).toEqual({ enabled: false, stopOnShutdown: false });
     expect(config.relay).toEqual({ enabled: false });
+    expect(config.direct.retry).toEqual({
+      maxAttempts: 3,
+      initialDelaySeconds: 5,
+      maxDelaySeconds: 120,
+    });
   });
 
   it("selects the native direct mode and keeps the ACP name as an alias", () => {
@@ -156,6 +161,27 @@ describe("config validation", () => {
         permissions: { rules: [{}] },
       },
     }, { checkRepositories: false })).toThrow(/at least one of chatId/);
+  });
+
+  it("validates bounded transient retry settings", () => {
+    const config = parseConfig({
+      ...base,
+      execution: { mode: "feishu-sqlite-codex" },
+      direct: {
+        feishu: {},
+        retry: { maxAttempts: 4, initialDelaySeconds: 2, maxDelaySeconds: 30 },
+      },
+    }, { checkRepositories: false });
+    expect(config.direct.retry).toEqual({
+      maxAttempts: 4,
+      initialDelaySeconds: 2,
+      maxDelaySeconds: 30,
+    });
+    expect(() => parseConfig({
+      ...base,
+      execution: { mode: "feishu-sqlite-codex" },
+      direct: { feishu: {}, retry: { initialDelaySeconds: 30, maxDelaySeconds: 5 } },
+    }, { checkRepositories: false })).toThrow(/maxDelaySeconds/);
   });
 
   it("rejects duplicate field and option GUIDs", () => {

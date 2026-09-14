@@ -51,7 +51,7 @@ export async function runAampCli(argv = process.argv.slice(2)): Promise<void> {
   const config = loadConfig(args.configPath);
   const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
   if (await runAampInspectionCommand(args.command, config, projectRoot)) return;
-  const runtime = new AampTaskAgentRuntime(config, { projectRoot });
+  const runtime = new AampTaskAgentRuntime(config, { projectRoot, configPath: args.configPath });
   await runtime.run(args.command);
 }
 

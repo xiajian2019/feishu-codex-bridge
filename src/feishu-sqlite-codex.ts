@@ -18,7 +18,10 @@ import {
   GLOBAL_TASK_MODES,
   buildCommandCard,
   compactGlobalCard,
+  buildDirectTaskCard,
   buildDirectInfoCard,
+  buildCodexThreadDetailCard,
+  buildThreadsOverviewCard,
   buildRecentCard,
   readAampCanonicalTaskStates,
   readCommandActionValue,
@@ -26,6 +29,11 @@ import {
   type GlobalCommand,
 } from "../scripts/aamp-command-patch.mjs";
 
+import {
+  buildCodexAppServerEnvironment,
+  CodexAppServerClient,
+  type CodexAppServerQueryClient,
+} from "./codex-app-server.js";
 import { isDirectExecutionMode } from "./config.js";
 import { readProjectMap, resolveMappedProject } from "./project-map.js";
 import type { StateDatabase } from "./db.js";
@@ -46,6 +54,7 @@ import type {
   StoredBridgeTaskAttachment,
   StoredAampTask,
 } from "./types.js";
+import type { CodexThreadQuery } from "./codex-cli.js";
 
 interface TextOutboxPayload {
   chatId: string;
@@ -62,12 +71,14 @@ interface StreamCardOutboxPayload {
 interface CommandCardOutboxPayload {
   chatId: string;
   card: object;
+  updateMessageId?: string;
 }
 
 export interface DirectRuntimeOptions {
   db: StateDatabase;
   logger: Logger;
   attachmentsDir?: string;
+  createCodexAppServerClient?: () => CodexAppServerQueryClient;
 }
 
 export interface DirectPermissionContext {
@@ -104,7 +115,7 @@ export type DirectTaskRouteResult =
     }
   | { ok: false; message: string };
 
-type DirectControlCommand = "help" | "status" | "recent" | "task" | "usage"
+type DirectControlCommand = "help" | "status" | "recent" | "task" | "usage" | "threads"
   | "thread" | "resume" | "retry" | "queue" | "progress" | "events"
   | "changes" | "commands" | "tools";
 type DirectDetailCommand = "thread" | "resume" | "retry" | "queue" | "progress" | "events" | "changes" | "commands" | "tools";
@@ -115,8 +126,14 @@ const RUNTIME_HEARTBEAT_MS = 10_000;
 const TASK_LEASE_MS = 120_000;
 const TASK_HEARTBEAT_MS = 15_000;
 const CARD_POLL_MS = 250;
-const CARD_MAX_FAILURE_ATTEMPTS = 3;
+const CARD_MAX_FAILURE_ATTEMPTS = 8;
 const CARD_CONTENT_LIMIT = 28_000;
+const CHANNEL_CONNECT_ATTEMPTS = 4;
+const CHANNEL_CONNECT_INITIAL_DELAY_MS = 1_000;
+const CHANNEL_HEALTH_CHECK_MS = 30_000;
+const DIRECT_RECEIVED_REACTION = "Get";
+const DIRECT_THINKING_REACTION = "Think";
+const REACTION_MAX_ATTEMPTS = 3;
 
 /**
  * Small direct runtime for the personal Feishu workflow.
@@ -132,16 +149,21 @@ export class FeishuSqliteCodexRuntime {
   private readonly logger: Logger;
   private readonly workerId = `feishu-codex-${process.pid}-${randomUUID().slice(0, 8)}`;
   private readonly codex: Codex;
+  private readonly createCodexAppServerClient: () => CodexAppServerQueryClient;
   private readonly attachmentsDir: string;
   private readonly stopped: Promise<void>;
   private readonly activeCardDeliveries = new Map<number, Promise<void>>();
   private resolveStopped: (() => void) | undefined;
   private channel: LarkChannel | undefined;
+  private commandCardFlushPromise: Promise<void> | undefined;
+  private commandCardFlushRequested = false;
   private pumpTimer: ReturnType<typeof setTimeout> | undefined;
   private pumpPromise: Promise<void> | undefined;
   private activeAbortController: AbortController | undefined;
   private activeTaskId: string | undefined;
   private runtimeLeaseTimer: ReturnType<typeof setInterval> | undefined;
+  private channelHealthTimer: ReturnType<typeof setInterval> | undefined;
+  private channelRecoveryPromise: Promise<void> | undefined;
   private pumping = false;
   private started = false;
   private stopping = false;
@@ -162,6 +184,14 @@ export class FeishuSqliteCodexRuntime {
     this.attachmentsDir = resolve(
       options.attachmentsDir ?? join(process.cwd(), "runtime", "direct", "attachments"),
     );
+    this.createCodexAppServerClient = options.createCodexAppServerClient
+      ?? (() => new CodexAppServerClient({
+        executable: config.codex.cliPath,
+        cwd: process.cwd(),
+        env: buildCodexAppServerEnvironment(config),
+        clientName: "feishu_codex_bridge_readonly",
+        clientTitle: "Feishu Codex Bridge (read-only)",
+      }));
     this.codex = new Codex({
       codexPathOverride: config.codex.cliPath,
       env: buildDirectCodexEnvironment(config),
@@ -214,6 +244,7 @@ export class FeishuSqliteCodexRuntime {
           streamThrottleMs: 250,
           streamThrottleChars: 80,
           streamInitialText: "正在连接 Codex…",
+          retry: { maxAttempts: 5, baseDelayMs: 1_000 },
         },
         domain: resolveDirectLarkDomain(this.config.direct.feishu.domain, credentials.tenantBrand),
         source: "feishu-codex-bridge",
@@ -246,18 +277,21 @@ export class FeishuSqliteCodexRuntime {
       });
       this.channel.on("reconnected", () => {
         this.logger.info("Feishu channel reconnected");
+        this.scheduleCommandCardDelivery();
         this.schedulePump(0);
       });
 
-      await this.channel.connect();
+      await this.connectChannelWithRetry();
       this.started = true;
       this.startedAt = new Date().toISOString();
+      this.channelHealthTimer = setInterval(() => this.checkChannelHealth(), CHANNEL_HEALTH_CHECK_MS);
       this.logger.info("direct Feishu channel connected", {
         mode: this.config.execution.mode,
         project: this.config.direct.projectKey ?? "按任务选择",
         codexMode: this.config.direct.mode ?? "按任务选择",
         workerId: this.workerId,
       });
+      this.scheduleCommandCardDelivery();
       this.schedulePump(0);
     } catch (error) {
       if (this.runtimeLeaseTimer) {
@@ -267,6 +301,62 @@ export class FeishuSqliteCodexRuntime {
       this.db.releaseRuntimeLease(DIRECT_RUNTIME_LEASE_NAME, this.workerId);
       throw error;
     }
+  }
+
+  private async connectChannelWithRetry(): Promise<void> {
+    if (!this.channel) throw new Error("direct Feishu channel has not been created");
+    let lastError: Error | undefined;
+    for (let attempt = 1; attempt <= CHANNEL_CONNECT_ATTEMPTS; attempt += 1) {
+      if (this.stopping) throw new Error("direct runtime is stopping");
+      try {
+        await this.channel.connect();
+        return;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        if (attempt === CHANNEL_CONNECT_ATTEMPTS) break;
+        const delayMs = CHANNEL_CONNECT_INITIAL_DELAY_MS * 2 ** (attempt - 1);
+        this.logger.warn("direct Feishu channel connection failed; retrying", {
+          attempt,
+          maxAttempts: CHANNEL_CONNECT_ATTEMPTS,
+          delayMs,
+          error: sanitizeError(lastError.message),
+        });
+        await delay(delayMs);
+      }
+    }
+    throw lastError ?? new Error("direct Feishu channel connection failed");
+  }
+
+  private checkChannelHealth(): void {
+    if (this.stopping || !this.started || !this.channel || this.channelRecoveryPromise) return;
+    const status = this.channel.getConnectionStatus?.();
+    if (!status || status.state !== "failed") return;
+    this.logger.warn("direct Feishu channel entered failed state; starting recovery", {
+      reconnectAttempts: status.reconnectAttempts,
+    });
+    this.channelRecoveryPromise = this.recoverChannel()
+      .catch((error) => {
+        this.logger.error("direct Feishu channel recovery failed", {
+          error: sanitizeError(error instanceof Error ? error.message : String(error)),
+        });
+      })
+      .finally(() => {
+        this.channelRecoveryPromise = undefined;
+      });
+  }
+
+  private async recoverChannel(): Promise<void> {
+    const channel = this.channel;
+    if (!channel || this.stopping) return;
+    await channel.disconnect().catch((error) => {
+      this.logger.warn("failed to close failed Feishu channel before recovery", {
+        error: sanitizeError(error instanceof Error ? error.message : String(error)),
+      });
+    });
+    if (this.stopping) return;
+    await this.connectChannelWithRetry();
+    this.scheduleCommandCardDelivery();
+    this.schedulePump(0);
   }
 
   public async waitUntilStopped(): Promise<void> {
@@ -307,6 +397,10 @@ export class FeishuSqliteCodexRuntime {
       clearInterval(this.runtimeLeaseTimer);
       this.runtimeLeaseTimer = undefined;
     }
+    if (this.channelHealthTimer) {
+      clearInterval(this.channelHealthTimer);
+      this.channelHealthTimer = undefined;
+    }
     this.activeAbortController?.abort();
     try {
       await this.pumpPromise;
@@ -319,6 +413,11 @@ export class FeishuSqliteCodexRuntime {
     // them before closing SQLite; an in-flight task/card outbox remains
     // undelivered and is recovered on the next process start.
     await Promise.allSettled([...this.activeCardDeliveries.values()]);
+    await this.commandCardFlushPromise?.catch((error) => {
+      this.logger.warn("direct command card delivery stopped with an error", {
+        error: sanitizeError(error instanceof Error ? error.message : String(error)),
+      });
+    });
     await this.channel?.disconnect().catch((error) => {
       this.logger.warn("failed to disconnect Feishu channel", {
         error: sanitizeError(error instanceof Error ? error.message : String(error)),
@@ -380,6 +479,7 @@ export class FeishuSqliteCodexRuntime {
 
     const result = this.db.ingestDirectMessage(input);
     if (result.created) {
+      this.scheduleMessageReaction(message.messageId, DIRECT_RECEIVED_REACTION);
       this.logger.info("direct Feishu message persisted", {
         bridgeTaskId: result.task.bridge_task_id,
         messageId: message.messageId,
@@ -388,6 +488,31 @@ export class FeishuSqliteCodexRuntime {
       });
     }
     this.schedulePump(0);
+  }
+
+  private scheduleMessageReaction(messageId: string, emojiType: string): void {
+    const channel = this.channel;
+    if (!channel || typeof channel.addReaction !== "function" || !messageId.trim()) return;
+    setImmediate(() => {
+      void (async () => {
+        let lastError: unknown;
+        for (let attempt = 1; attempt <= REACTION_MAX_ATTEMPTS; attempt += 1) {
+          try {
+            await channel.addReaction(messageId, emojiType);
+            return;
+          } catch (error) {
+            lastError = error;
+            if (attempt < REACTION_MAX_ATTEMPTS) await delay(250 * attempt);
+          }
+        }
+        this.logger.warn("direct Feishu message reaction failed", {
+          messageId,
+          emojiType,
+          attempts: REACTION_MAX_ATTEMPTS,
+          error: sanitizeError(lastError instanceof Error ? lastError.message : String(lastError)),
+        });
+      })();
+    });
   }
 
   private persistControlReply(input: DirectMessageInput, text: string): void {
@@ -428,6 +553,11 @@ export class FeishuSqliteCodexRuntime {
     command: DirectControlCommand,
     argument?: string,
   ): Promise<void> {
+    if (command === "threads") {
+      const card = await this.buildDirectThreadsCard(input.chatId, argument);
+      if (this.db.ingestDirectControlCard(input, card)) this.schedulePump(0);
+      return;
+    }
     if (isDirectDetailCommand(command)) {
       const card = this.buildDirectDetailCommandCard(input, command, argument);
       if (this.db.ingestDirectControlCard(input, card)) this.schedulePump(0);
@@ -440,6 +570,77 @@ export class FeishuSqliteCodexRuntime {
     };
     const card = buildCommandCard(this.globalCardRuntime(), input.chatId, globalCommand);
     if (this.db.ingestDirectControlCard(input, card)) this.schedulePump(0);
+  }
+
+  private async buildDirectThreadsCard(
+    chatId: string,
+    argument?: string,
+    activeTab?: GlobalCommand["tab"],
+  ): Promise<object> {
+    const { formatCodexThreads, parseCodexThreadQuery, queryCodexThreads } = await import("./codex-cli.js");
+    let commandArgs: string[];
+    let query: CodexThreadQuery;
+    try {
+      commandArgs = parseDirectCommandArguments(argument);
+      query = parseCodexThreadQuery(commandArgs, this.config.projects);
+    } catch (error) {
+      return buildDirectInfoCard(this.globalCardRuntime(), "查询 Codex Threads", [
+        `参数错误：${sanitizeError(error instanceof Error ? error.message : String(error))}`,
+        "用法：/threads [--project 项目名|--cwd 绝对路径] [--source cli,appServer] [--search 关键词] [--status active,idle] [--limit N]",
+      ]);
+    }
+
+    const client = this.createCodexAppServerClient();
+    try {
+      const result = await queryCodexThreads(client, query);
+      const visibleItems = result.items.slice(0, 10);
+      const rendered = formatCodexThreads({ ...result, items: visibleItems }, query);
+      const lines = rendered.split(/\r?\n/);
+      const title = lines.shift() || "Codex Threads";
+      return buildThreadsOverviewCard(this.globalCardRuntime(), chatId, {
+        title,
+        nativeTitle: `Codex App/CLI threads（${visibleItems.length}${result.items.length > visibleItems.length ? "+" : ""}）`,
+        nativeCount: visibleItems.length,
+        nativeThreads: visibleItems,
+        activeTab,
+        nativeLines: lines.map((line) => truncate(line, 1_000)).slice(0, 70),
+        nativeMoreText: result.items.length > visibleItems.length
+          ? `为适配飞书卡片，仅展示前 ${visibleItems.length} 条；终端可用相同筛选查看完整结果。`
+          : undefined,
+      });
+    } catch (error) {
+      return buildDirectInfoCard(this.globalCardRuntime(), "查询 Codex Threads 失败", [
+        sanitizeError(error instanceof Error ? error.message : String(error)),
+        "请确认 Bridge 与 Codex App/CLI 使用同一个 CODEX_HOME，并检查 Codex CLI 状态。",
+      ]);
+    } finally {
+      await client.close();
+    }
+  }
+
+  private async buildDirectCodexThreadCard(threadId?: string): Promise<object> {
+    const normalizedThreadId = threadId?.trim();
+    if (!normalizedThreadId) {
+      return buildDirectInfoCard(this.globalCardRuntime(), "读取 Codex Thread", [
+        "缺少 thread ID。",
+      ]);
+    }
+    const client = this.createCodexAppServerClient();
+    try {
+      if (typeof client.readThread !== "function") {
+        throw new Error("当前 Codex 只读客户端不支持 thread/read");
+      }
+      const result = await client.readThread(normalizedThreadId, true);
+      return buildCodexThreadDetailCard(this.globalCardRuntime(), result.thread);
+    } catch (error) {
+      return buildDirectInfoCard(this.globalCardRuntime(), "读取 Codex Thread 失败", [
+        sanitizeError(error instanceof Error ? error.message : String(error)),
+        `Thread：${normalizedThreadId}`,
+        "请确认 Codex App/CLI 与 Bridge 使用同一个 CODEX_HOME。",
+      ]);
+    } finally {
+      await client.close();
+    }
   }
 
   private buildDirectDetailCommandCard(
@@ -579,16 +780,34 @@ export class FeishuSqliteCodexRuntime {
     if (kind === AAMP_COMMAND_ACTION_KIND) {
       const command = normalizeGlobalCommand(value);
       if (!command) return;
-      if (isDirectDetailCommand(command.command)) {
-        const input = directInputFromCardAction(event, command);
-        await this.channel.send(event.chatId, {
-          card: this.buildDirectDetailCommandCard(input, command.command, command.args[0]),
-        });
+      if (
+        command.command === "threads"
+        || (
+          command.command === "thread"
+          && ["native_thread", "native_thread_detail"].includes(stringValue(value.source))
+        )
+      ) {
+        this.scheduleCodexThreadCardAction(event, command);
         return;
       }
-      await this.channel.send(event.chatId, {
-        card: buildCommandCard(this.globalCardRuntime(), event.chatId, command),
-      });
+      const input = directInputFromCardAction(event, command);
+      const card = isDirectDetailCommand(command.command)
+        ? this.buildDirectDetailCommandCard(input, command.command, command.args[0])
+        : buildCommandCard(this.globalCardRuntime(), event.chatId, command);
+      // A live direct task card has its own streaming producer. Opening a
+      // detail/diagnostic view from that card must create a separate card so
+      // the producer does not immediately overwrite the user's view. Once a
+      // detail card exists, its refresh/actions carry `source=detail` and are
+      // safely applied in-place.
+      const updateMessageId = stringValue(value.source) === "direct_task"
+        ? undefined
+        : event.messageId;
+      if (this.db.ingestDirectControlCard(input, card, updateMessageId)) {
+        // Do not wait for Feishu network I/O in the card-action callback. The
+        // SDK can acknowledge the action as soon as this SQLite write returns;
+        // the independent delivery worker updates the original card later.
+        this.scheduleCommandCardDelivery();
+      }
       return;
     }
     if (kind === AAMP_TASK_HIDE_ACTION_KIND) {
@@ -600,8 +819,9 @@ export class FeishuSqliteCodexRuntime {
       });
       if (!taskId || !task) return;
       this.db.hideGlobalTask(taskId, event.chatId);
-      await this.channel.updateCard(
-        event.messageId,
+      this.enqueueCardActionCard(
+        event,
+        { command: "recent", args: [], raw: "/recent" },
         buildRecentCard(this.globalCardRuntime(), event.chatId),
       );
       return;
@@ -626,10 +846,96 @@ export class FeishuSqliteCodexRuntime {
     const updated = this.db.requestBridgeTaskCancellation(task.bridge_task_id);
     if (updated && this.activeTaskId === updated.bridge_task_id) this.activeAbortController?.abort();
     this.schedulePump(0);
-    await this.channel.updateCard(
-      event.messageId,
-      buildRecentCard(this.globalCardRuntime(), event.chatId),
+    const responseCard = stringValue(value.source) === "detail"
+      ? buildCommandCard(this.globalCardRuntime(), event.chatId, {
+        command: "tasks",
+        args: [task.bridge_task_id],
+        raw: `/tasks ${task.bridge_task_id}`,
+      })
+      : buildRecentCard(this.globalCardRuntime(), event.chatId);
+    this.enqueueCardActionCard(
+      event,
+      { command: "recent", args: [], raw: "/recent" },
+      responseCard,
     );
+  }
+
+  private enqueueCardActionCard(
+    event: CardActionEvent,
+    command: GlobalCommand,
+    card: object,
+  ): void {
+    const input = directInputFromCardAction(event, command);
+    if (this.db.ingestDirectControlCard(input, card, event.messageId)) {
+      this.scheduleCommandCardDelivery();
+    }
+  }
+
+  private scheduleCodexThreadCardAction(
+    event: CardActionEvent,
+    command: GlobalCommand,
+  ): void {
+    const isNewNativeThread = command.command === "thread" && command.source === "native_thread";
+    const updateMessageId = isNewNativeThread ? undefined : event.messageId;
+    const title = command.command === "threads"
+      ? "查询 Codex Threads"
+      : "读取 Codex Thread 执行情况";
+    const detail = command.command === "threads"
+      ? "正在重新查询本机 Codex App/CLI threads，请稍候。"
+      : `正在读取 thread：${command.args[0] ?? "暂无"}`;
+    if (updateMessageId) {
+      const input = directInputFromCardAction(event, command);
+      if (this.db.ingestDirectControlCard(
+        input,
+        buildDirectInfoCard(this.globalCardRuntime(), title, [detail]),
+        updateMessageId,
+      )) {
+        this.scheduleCommandCardDelivery();
+      }
+    }
+
+    // The card-action callback must return before app-server/CLI I/O starts.
+    setImmediate(() => {
+      void (async () => {
+        const card = command.command === "threads"
+          ? await this.buildDirectThreadsCard(event.chatId, undefined, command.tab)
+          : await this.buildDirectCodexThreadCard(command.args[0]);
+        if (this.stopping) return;
+        const resultInput = directInputFromCardAction(event, command);
+        if (this.db.ingestDirectControlCard(resultInput, card, updateMessageId)) {
+          this.scheduleCommandCardDelivery();
+        }
+      })().catch((error) => {
+        this.logger.warn("direct Codex thread card action failed", {
+          command: command.command,
+          threadId: command.args[0],
+          error: sanitizeError(error instanceof Error ? error.message : String(error)),
+        });
+      });
+    });
+  }
+
+  /**
+   * Start card-action delivery after the event handler has returned to the
+   * Lark SDK. The normal task pump also drains this outbox on startup and
+   * reconnect, so this fast path is only a latency optimization.
+   */
+  private scheduleCommandCardDelivery(): void {
+    if (this.stopping || !this.channel) return;
+    this.commandCardFlushRequested = true;
+    if (this.commandCardFlushPromise) return;
+    // setImmediate lets the SDK finish its own card-action promise/ack path
+    // before any Feishu API request is started. A microtask would run before
+    // the SDK's await continuation and could still prolong the callback.
+    setImmediate(() => {
+      if (this.stopping || !this.channel || this.commandCardFlushPromise) return;
+      this.commandCardFlushRequested = false;
+      void this.flushCommandCardOutbox().catch((error) => {
+        this.logger.warn("direct command card delivery failed", {
+          error: sanitizeError(error instanceof Error ? error.message : String(error)),
+        });
+      });
+    });
   }
 
   private schedulePump(delayMs: number): void {
@@ -705,6 +1011,11 @@ export class FeishuSqliteCodexRuntime {
       return;
     }
     const { projectKey, modeKey, project, mode } = route;
+
+    this.scheduleMessageReaction(
+      followup?.message_id ?? task.message_id,
+      DIRECT_THINKING_REACTION,
+    );
 
     const controller = new AbortController();
     this.activeAbortController = controller;
@@ -857,7 +1168,10 @@ export class FeishuSqliteCodexRuntime {
           bridgeTaskId: task.bridge_task_id,
           error: message,
         });
-      } else {
+      } else if (
+        currentTask?.status === "CANCEL_REQUESTED"
+        || !this.scheduleTransientRetry(task, message)
+      ) {
         this.db.finishBridgeTaskTurn(
           task.bridge_task_id,
           followup?.followup_id,
@@ -881,6 +1195,31 @@ export class FeishuSqliteCodexRuntime {
         this.activeTaskLeaseLost = false;
       }
     }
+  }
+
+  private scheduleTransientRetry(task: StoredBridgeTask, message: string): boolean {
+    const policy = this.config.direct.retry;
+    if (task.attempt >= policy.maxAttempts || !isTransientDirectError(message)) return false;
+    const delayMs = calculateDirectRetryDelayMs(policy, task.attempt);
+    const retryAt = new Date(Date.now() + delayMs).toISOString();
+    const reason = `Codex 暂时性错误，第 ${task.attempt}/${policy.maxAttempts} 次尝试失败，将在 ${retryAt} 自动重试：${message}`;
+    const scheduled = this.db.scheduleBridgeTaskRetry(
+      task.bridge_task_id,
+      this.workerId,
+      reason,
+      retryAt,
+    );
+    if (scheduled) {
+      this.logger.warn("direct Codex task scheduled for transient retry", {
+        bridgeTaskId: task.bridge_task_id,
+        attempt: task.attempt,
+        maxAttempts: policy.maxAttempts,
+        delayMs,
+        retryAt,
+        error: message,
+      });
+    }
+    return scheduled;
   }
 
   private async prepareTaskAttachments(
@@ -938,22 +1277,8 @@ export class FeishuSqliteCodexRuntime {
 
   private async flushOutbox(): Promise<void> {
     if (!this.channel || this.stopping) return;
-    const commandCardEntries = this.db.getDueOutbox(50, ["feishu.send_card"]);
-    for (const entry of commandCardEntries) {
-      if (this.stopping) return;
-      try {
-        const payload = parseCommandCardOutboxPayload(entry.payload_json);
-        await this.channel.send(payload.chatId, { card: compactGlobalCard(payload.card) });
-        this.db.markOutboxDelivered(entry.id);
-      } catch (error) {
-        const attempts = this.db.markOutboxFailed(entry.id);
-        this.logger.warn("direct Feishu command card outbox delivery failed", {
-          outboxId: entry.id,
-          attempts,
-          error: sanitizeError(error instanceof Error ? error.message : String(error)),
-        });
-      }
-    }
+    await this.flushCommandCardOutbox();
+    if (this.stopping) return;
 
     const textEntries = this.db.getDueOutbox(50, ["feishu.send_text"]);
     for (const entry of textEntries) {
@@ -996,6 +1321,51 @@ export class FeishuSqliteCodexRuntime {
     }
   }
 
+  private async flushCommandCardOutbox(): Promise<void> {
+    if (!this.channel || this.stopping) return;
+    if (this.commandCardFlushPromise) {
+      await this.commandCardFlushPromise;
+      return;
+    }
+    const flush = this.flushCommandCardOutboxInternal();
+    this.commandCardFlushPromise = flush;
+    try {
+      await flush;
+    } finally {
+      if (this.commandCardFlushPromise === flush) {
+        this.commandCardFlushPromise = undefined;
+        if (this.commandCardFlushRequested) this.scheduleCommandCardDelivery();
+      }
+    }
+  }
+
+  private async flushCommandCardOutboxInternal(): Promise<void> {
+    if (!this.channel || this.stopping) return;
+    while (!this.stopping) {
+      const commandCardEntries = this.db.getDueOutbox(50, ["feishu.send_card"]);
+      if (commandCardEntries.length === 0) return;
+      for (const entry of commandCardEntries) {
+        if (this.stopping) return;
+        try {
+          const payload = parseCommandCardOutboxPayload(entry.payload_json);
+          if (payload.updateMessageId) {
+            await this.channel.updateCard(payload.updateMessageId, compactGlobalCard(payload.card));
+          } else {
+            await this.channel.send(payload.chatId, { card: compactGlobalCard(payload.card) });
+          }
+          this.db.markOutboxDelivered(entry.id);
+        } catch (error) {
+          const attempts = this.db.markOutboxFailed(entry.id);
+          this.logger.warn("direct Feishu command card outbox delivery failed", {
+            outboxId: entry.id,
+            attempts,
+            error: sanitizeError(error instanceof Error ? error.message : String(error)),
+          });
+        }
+      }
+    }
+  }
+
   private async deliverStreamCard(entry: {
     id: number;
     payload_json: string;
@@ -1009,31 +1379,52 @@ export class FeishuSqliteCodexRuntime {
         await this.deliverExistingCard(streamPayload, entry.id, existingTask.card_message_id);
         return;
       }
+      const initialTask = this.db.getBridgeTask(streamPayload.bridgeTaskId);
+      if (!initialTask) {
+        this.db.markOutboxDelivered(entry.id);
+        return;
+      }
+      const initialAttachments = this.db
+        .getBridgeTaskAttachments(initialTask.bridge_task_id)
+        .map((attachment) => attachment.file_name ?? attachment.file_key);
       await this.channel!.stream(
         streamPayload.chatId,
         {
-          markdown: async (controller) => {
-            let lastContent = "";
-            while (!this.stopping) {
-              const task = this.db.getBridgeTask(streamPayload.bridgeTaskId);
-              if (!task) return;
-              const attachmentNames = this.db
-                .getBridgeTaskAttachments(task.bridge_task_id)
-                .map((attachment) => attachment.file_name ?? attachment.file_key);
-              const content = renderDirectCardContent(task, attachmentNames);
-              if (content !== lastContent) {
-                await controller.setContent(content);
-                this.db.markBridgeCardStreaming(task.bridge_task_id, controller.messageId);
-                this.db.saveBridgeCardContent(task.bridge_task_id, content);
-                lastContent = content;
-              } else if (!task.card_message_id && controller.messageId) {
-                this.db.markBridgeCardStreaming(task.bridge_task_id, controller.messageId);
+          card: {
+            initial: buildDirectTaskCard(
+              this.globalCardRuntime(),
+              { ...initialTask, sourceMode: GLOBAL_TASK_MODES.DIRECT },
+              initialAttachments,
+            ),
+            producer: async (controller) => {
+              let lastCard = "";
+              while (!this.stopping) {
+                const task = this.db.getBridgeTask(streamPayload.bridgeTaskId);
+                if (!task) return;
+                const attachmentNames = this.db
+                  .getBridgeTaskAttachments(task.bridge_task_id)
+                  .map((attachment) => attachment.file_name ?? attachment.file_key);
+                const card = buildDirectTaskCard(
+                  this.globalCardRuntime(),
+                  { ...task, sourceMode: GLOBAL_TASK_MODES.DIRECT },
+                  attachmentNames,
+                );
+                const serializedCard = JSON.stringify(card);
+                if (serializedCard !== lastCard) {
+                  await controller.update(card);
+                  this.db.markBridgeCardStreaming(task.bridge_task_id, controller.messageId);
+                  this.db.saveBridgeCardContent(
+                    task.bridge_task_id,
+                    renderDirectCardContent(task, attachmentNames),
+                  );
+                  lastCard = serializedCard;
+                } else if (!task.card_message_id && controller.messageId) {
+                  this.db.markBridgeCardStreaming(task.bridge_task_id, controller.messageId);
+                }
+                if (isTerminalDirectTaskStatus(task.status)) return;
+                await delay(CARD_POLL_MS);
               }
-              if (isTerminalDirectTaskStatus(task.status)) {
-                return;
-              }
-              await delay(CARD_POLL_MS);
-            }
+            },
           },
         },
         {
@@ -1079,7 +1470,7 @@ export class FeishuSqliteCodexRuntime {
     outboxId: number,
     messageId: string,
   ): Promise<void> {
-    let lastContent = "";
+    let lastCard = "";
     while (!this.stopping) {
       const task = this.db.getBridgeTask(payload.bridgeTaskId);
       if (!task) {
@@ -1090,11 +1481,17 @@ export class FeishuSqliteCodexRuntime {
         .getBridgeTaskAttachments(task.bridge_task_id)
         .map((attachment) => attachment.file_name ?? attachment.file_key);
       const content = renderDirectCardContent(task, attachmentNames);
-      if (content !== lastContent) {
-        await this.channel!.updateCard(messageId, buildDirectCard(content));
+      const card = buildDirectTaskCard(
+        this.globalCardRuntime(),
+        { ...task, sourceMode: GLOBAL_TASK_MODES.DIRECT },
+        attachmentNames,
+      );
+      const serializedCard = JSON.stringify(card);
+      if (serializedCard !== lastCard) {
+        await this.channel!.updateCard(messageId, card);
         this.db.markBridgeCardStreaming(task.bridge_task_id, messageId);
         this.db.saveBridgeCardContent(task.bridge_task_id, content);
-        lastContent = content;
+        lastCard = serializedCard;
       }
       if (isTerminalDirectTaskStatus(task.status)) {
         this.db.markBridgeCardCompleted(task.bridge_task_id);
@@ -1332,6 +1729,31 @@ export function summarizeCodexEvent(event: Record<string, unknown>): string {
   return type;
 }
 
+export function isTransientDirectError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  if (
+    /codex 运行超时|运行租约已丢失|桥接服务正在停止|用户请求取消/.test(normalized)
+    || /authentication|unauthorized|forbidden|permission denied|invalid|malformed|not found|no such file|unsupported|sandbox|approval/.test(normalized)
+  ) {
+    return false;
+  }
+  return /econnreset|econnrefused|etimedout|eai_again|enetunreach|ehostunreach|epipe|socket hang up|connection (?:reset|closed|timed out|refused)|network|fetch failed|request timeout|timed out|rate limit|too many requests|\b429\b|\b5\d\d\b|overloaded|temporarily unavailable|service unavailable|upstream|database is locked|sqlite_busy|codex (?:cli|process|app-server) (?:exited|exit|crash)|process exited/i.test(normalized);
+}
+
+export function calculateDirectRetryDelayMs(
+  policy: BridgeConfig["direct"]["retry"],
+  attempt: number,
+  randomValue = Math.random(),
+): number {
+  const exponent = Math.max(0, attempt - 1);
+  const baseMs = Math.min(
+    policy.maxDelaySeconds * 1_000,
+    policy.initialDelaySeconds * 1_000 * 2 ** exponent,
+  );
+  const jitter = Math.min(1, Math.max(0, randomValue)) * Math.min(5_000, Math.floor(baseMs * 0.2));
+  return baseMs + Math.floor(jitter);
+}
+
 export function renderDirectCardContent(
   task: StoredBridgeTask,
   attachmentNames: string[] = [],
@@ -1566,6 +1988,10 @@ function eventSummary(payloadJson: string): string {
 export function parseDirectControlCommand(
   text: string,
 ): { command: DirectControlCommand; argument?: string } | undefined {
+  const threadsMatch = text.match(/^\/threads(?:\s+([\s\S]*))?\s*$/i);
+  if (threadsMatch) {
+    return { command: "threads", argument: threadsMatch[1]?.trim() || undefined };
+  }
   const match = text.match(/^\/(help|status|recent|tasks?|usage|thread|resume|retry|queue|progress|events|changes|commands|tools)(?:\s+([^\s]+))?\s*$/i);
   if (!match) return undefined;
   const name = match[1].toLowerCase();
@@ -1575,15 +2001,58 @@ export function parseDirectControlCommand(
   return { command, argument: match[2] };
 }
 
+function parseDirectCommandArguments(argument?: string): string[] {
+  const value = argument?.trim();
+  if (!value) return [];
+  const tokens: string[] = [];
+  let token = "";
+  let quote: "'" | '"' | undefined;
+  let escaping = false;
+  for (const character of value) {
+    if (escaping) {
+      token += character;
+      escaping = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "'") {
+      escaping = true;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) quote = undefined;
+      else token += character;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+    } else if (/\s/.test(character)) {
+      if (token) {
+        tokens.push(token);
+        token = "";
+      }
+    } else {
+      token += character;
+    }
+  }
+  if (escaping) token += "\\";
+  if (quote) throw new Error("命令参数中的引号没有闭合");
+  if (token) tokens.push(token);
+  return tokens;
+}
+
 function normalizeGlobalCommand(value: Record<string, unknown>): GlobalCommand | undefined {
   const raw = stringValue(value.command).toLowerCase();
   const command = raw === "task" ? "tasks" : raw;
-  if (!["help", "cancel", "status", "usage", "recent", "tasks", "thread", "resume", "retry", "queue", "progress", "events", "changes", "commands", "tools"].includes(command)) return undefined;
+  if (!["help", "cancel", "status", "usage", "recent", "tasks", "threads", "thread", "resume", "retry", "queue", "progress", "events", "changes", "commands", "tools"].includes(command)) return undefined;
   const taskId = stringValue(value.taskId);
+  const tab = value.tab === "aamp" || value.tab === "native" ? value.tab : undefined;
+  const source = stringValue(value.source) || undefined;
   return {
     command: command as GlobalCommand["command"],
     args: taskId ? [taskId] : [],
     raw: stringValue(value.commandText) || `/${command}`,
+    ...(tab ? { tab } : {}),
+    ...(source ? { source } : {}),
   };
 }
 
@@ -1659,10 +2128,11 @@ function parseCommandCardOutboxPayload(payloadJson: string): CommandCardOutboxPa
   const value = JSON.parse(payloadJson) as Record<string, unknown>;
   const chatId = stringValue(value.chatId);
   const card = asRecord(value.card);
+  const updateMessageId = stringValue(value.updateMessageId) || undefined;
   if (!chatId || Object.keys(card).length === 0) {
     throw new Error("invalid feishu.send_card payload");
   }
-  return { chatId, card };
+  return { chatId, card, updateMessageId };
 }
 
 function parseStreamCardOutboxPayload(payloadJson: string): StreamCardOutboxPayload {
@@ -1689,16 +2159,6 @@ function fallbackTextForTask(task: StoredBridgeTask): string {
   if (task.status === "SUCCEEDED") return task.final_response ?? "Codex 已完成，但没有返回文本。";
   if (task.status === "CANCELLED") return `任务已取消：${task.cancel_reason ?? "用户请求取消。"}`;
   return `Codex 执行失败：${task.error ?? "未知错误"}`;
-}
-
-function buildDirectCard(content: string): object {
-  return {
-    schema: "2.0",
-    config: { wide_screen_mode: true },
-    body: {
-      elements: [{ tag: "markdown", element_id: "direct_codex_output", content }],
-    },
-  };
 }
 
 function isTerminalDirectTaskStatus(status: StoredBridgeTask["status"]): boolean {

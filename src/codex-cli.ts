@@ -1,5 +1,5 @@
 import { constants as fsConstants } from "node:fs";
-import { access, chmod, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -7,6 +7,22 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { isDirectExecutionMode, loadConfig, parseExecutionMode } from "./config.js";
+import {
+  CODEX_THREAD_SOURCE_KINDS,
+  CODEX_THREAD_STATUS_TYPES,
+  buildCodexAppServerEnvironment,
+  CodexAppServerClient,
+  codexThreadSourceLabel,
+  codexThreadStatusType,
+  codexThreadTimestampMs,
+  type CodexThread,
+  type CodexAppServerQueryClient,
+  type CodexThreadListParams,
+  type CodexThreadSortDirection,
+  type CodexThreadSortKey,
+  type CodexThreadSourceKind,
+  type CodexThreadStatusType,
+} from "./codex-app-server.js";
 import { DIRECT_RUNTIME_LEASE_NAME } from "./feishu-sqlite-codex.js";
 import { resolveSharedFeishuCredentials, type FeishuCredentialSource } from "./feishu-credentials.js";
 import { StateDatabase, type OutboxSummary, type RuntimeLeaseRecord } from "./db.js";
@@ -28,6 +44,21 @@ const MIN_NODE_VERSION = [22, 13, 1] as const;
 const DEFAULT_CODEX_EXECUTION_MODE: ExecutionMode = "feishu-sqlite-codex";
 const DEFAULT_LOG_LINE_COUNT = 80;
 const MAX_LOG_BYTES = 8 * 1024 * 1024;
+const DEFAULT_CODEX_THREAD_LIMIT = 20;
+const CODEX_THREAD_PAGE_SIZE = 200;
+const MAX_CODEX_THREAD_SCAN = 10_000;
+const LAUNCHD_BOOTSTRAP_ATTEMPTS = 6;
+const LAUNCHD_RETRY_INITIAL_DELAY_MS = 250;
+const LAUNCHD_RETRY_MAX_DELAY_MS = 4_000;
+const LAUNCHD_OPERATION_LOCK_PATH = join(
+  homedir(),
+  "Library",
+  "Caches",
+  "feishu-codex-bridge",
+  "launchd-control.lock",
+);
+const LAUNCHD_LOCK_TIMEOUT_MS = 30_000;
+const LAUNCHD_LOCK_STALE_MS = 120_000;
 
 export interface CodexCliArguments {
   configPath: string;
@@ -69,6 +100,29 @@ export interface LaunchdStatus {
 export interface DirectRecentFormatOptions {
   fullMessage?: boolean;
   databasePath?: string;
+}
+
+export interface CodexThreadQuery {
+  sourceKinds: CodexThreadSourceKind[];
+  modelProviders?: string[];
+  cwd?: string[];
+  searchTerm?: string;
+  archived: boolean;
+  statuses: CodexThreadStatusType[];
+  sinceMs?: number;
+  untilMs?: number;
+  sortKey: CodexThreadSortKey;
+  sortDirection: CodexThreadSortDirection;
+  limit: number;
+  cursor?: string;
+}
+
+export interface CodexThreadQueryResult {
+  items: CodexThread[];
+  total?: number;
+  nextCursor: string | null;
+  backwardsCursor: string | null;
+  scanned?: number;
 }
 
 export function parseCodexCliArguments(
@@ -201,6 +255,14 @@ export async function runCodexCli(argv = process.argv.slice(2)): Promise<void> {
     case "list":
       await withDatabase(args.dbPath, (db) => runCodexRecent(db, args, commandArgs));
       return;
+    case "threads":
+    case "sessions":
+      await runCodexThreads(config, commandArgs);
+      return;
+    case "thread":
+    case "session":
+      await runCodexThread(config, commandArgs);
+      return;
     case "task":
     case "inspect":
       await withDatabase(args.dbPath, (db) => runCodexTask(db, commandArgs));
@@ -250,6 +312,8 @@ export function printCodexUsage(): void {
       "任务与持久化状态：",
       "  recent|list         查看最近任务（--limit N --status STATUS --json）",
       "  task|inspect ID     查看任务、事件、附件和 outbox（支持唯一前缀）",
+      "  threads|sessions    只读查询 Codex App/CLI threads（支持筛选）",
+      "  thread|session ID   只读查看 Codex thread（--turns 展开轮次）",
       "  attachments ID      查看任务附件及本地缓存路径",
       "  outbox              查看 durable outbox（--pending --task ID）",
       "  cancel ID           请求取消任务（--reason TEXT）",
@@ -267,6 +331,9 @@ export function printCodexUsage(): void {
       "示例：",
       "  pnpm run codex:status",
       "  pnpm run codex:recent -- --limit 10",
+      "  pnpm run codex:threads -- --project food --source cli,appServer",
+      "  pnpm run codex:threads -- --search 'fix' --status active --json",
+      "  pnpm run codex:thread -- thr_123 --turns",
       "  pnpm run codex:task -- bridge_20260910 --json",
       "  pnpm run codex:cancel -- bridge_20260910 --reason '不再需要'",
       "  pnpm run codex:restart",
@@ -318,6 +385,8 @@ export function buildCodexLaunchAgentPlist(options: CodexLaunchAgentOptions): st
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
@@ -410,6 +479,348 @@ export function formatDirectTask(
   return lines.join("\n");
 }
 
+export async function runCodexThreads(
+  config: BridgeConfig,
+  commandArgs: string[],
+): Promise<void> {
+  const query = parseCodexThreadQuery(commandArgs, config.projects);
+  const client = new CodexAppServerClient({
+    executable: config.codex.cliPath,
+    cwd: PROJECT_ROOT,
+    env: buildCodexAppServerEnvironment(config),
+    clientName: "feishu_codex_bridge_readonly",
+    clientTitle: "Feishu Codex Bridge (read-only)",
+  });
+  try {
+    const result = await queryCodexThreads(client, query);
+    if (hasFlag(commandArgs, "--json")) {
+      console.log(JSON.stringify({
+        generatedAt: new Date().toISOString(),
+        dataSource: "codex-app-server",
+        filters: serializeCodexThreadFilters(query),
+        ...result,
+      }, null, 2));
+      return;
+    }
+    console.log(formatCodexThreads(result, query));
+  } finally {
+    await client.close();
+  }
+}
+
+export async function runCodexThread(
+  config: BridgeConfig,
+  commandArgs: string[],
+): Promise<void> {
+  const selector = firstPositional(commandArgs);
+  if (!selector) throw new Error("thread/session requires a Codex thread ID");
+  const includeTurns = hasFlag(commandArgs, "--turns") || hasFlag(commandArgs, "--full");
+  const client = new CodexAppServerClient({
+    executable: config.codex.cliPath,
+    cwd: PROJECT_ROOT,
+    env: buildCodexAppServerEnvironment(config),
+    clientName: "feishu_codex_bridge_readonly",
+    clientTitle: "Feishu Codex Bridge (read-only)",
+  });
+  try {
+    const result = await client.readThread(selector, includeTurns);
+    if (hasFlag(commandArgs, "--json")) {
+      console.log(JSON.stringify({
+        generatedAt: new Date().toISOString(),
+        dataSource: "codex-app-server",
+        includeTurns,
+        thread: result.thread,
+      }, null, 2));
+      return;
+    }
+    console.log(formatCodexThread(result.thread, includeTurns));
+  } finally {
+    await client.close();
+  }
+}
+
+export function parseCodexThreadQuery(
+  args: string[],
+  projects: Record<string, { repo: string }> = {},
+): CodexThreadQuery {
+  const rawSources = parseCsvOptions(args, ["--source", "--source-kind"]);
+  const sourceKinds = rawSources.length > 0
+    ? parseCodexThreadSources(rawSources)
+    : ["cli", "appServer"] as CodexThreadSourceKind[];
+  const rawProviders = parseCsvOptions(args, ["--provider", "--model-provider"]);
+  const projectKeys = optionValues(args, "--project").map((value) => value.trim()).filter(Boolean);
+  const rawCwds = optionValues(args, "--cwd").map((value) => value.trim()).filter(Boolean);
+  if (projectKeys.length > 0 && rawCwds.length > 0) {
+    throw new Error("--project and --cwd cannot be used together; choose one exact cwd filter");
+  }
+  const cwd = projectKeys.length > 0
+    ? uniqueStrings(projectKeys.map((projectKey) => {
+        const project = projects[projectKey];
+        if (!project) throw new Error(`未找到项目：${projectKey}`);
+        return resolve(project.repo);
+      }))
+    : uniqueStrings(rawCwds.map((value) => resolve(value)));
+  const searchTerm = optionValue(args, "--search")?.trim() || undefined;
+  const statuses = parseCodexThreadStatuses(args);
+  const sinceMs = parseCodexThreadDateOption(args, "--since");
+  const untilMs = parseCodexThreadDateOption(args, "--until");
+  if (sinceMs !== undefined && untilMs !== undefined && sinceMs > untilMs) {
+    throw new Error("--since must be earlier than or equal to --until");
+  }
+  const sortKey = parseEnumOption(
+    args,
+    "--sort",
+    ["created_at", "updated_at", "recency_at"] as const,
+    "recency_at",
+    "Codex thread 排序字段",
+  );
+  const sortDirection = parseEnumOption(
+    args,
+    "--direction",
+    ["asc", "desc"] as const,
+    "desc",
+    "Codex thread 排序方向",
+  );
+  return {
+    sourceKinds,
+    modelProviders: rawProviders.length > 0 ? rawProviders : undefined,
+    cwd: cwd.length > 0 ? cwd : undefined,
+    searchTerm,
+    archived: hasFlag(args, "--archived"),
+    statuses,
+    sinceMs,
+    untilMs,
+    sortKey,
+    sortDirection,
+    limit: parsePositiveIntegerOption(args, "--limit", DEFAULT_CODEX_THREAD_LIMIT, 1, 200),
+    cursor: optionValue(args, "--cursor"),
+  };
+}
+
+export function parseCodexThreadSources(values: string[]): CodexThreadSourceKind[] {
+  const sources: CodexThreadSourceKind[] = [];
+  for (const value of values.flatMap((item) => item.split(","))) {
+    const source = value.trim();
+    if (!source) continue;
+    if (!CODEX_THREAD_SOURCE_KINDS.includes(source as CodexThreadSourceKind)) {
+      throw new Error(`未知 Codex thread 来源：${source}；可选值：${CODEX_THREAD_SOURCE_KINDS.join(", ")}`);
+    }
+    const typed = source as CodexThreadSourceKind;
+    if (!sources.includes(typed)) sources.push(typed);
+  }
+  if (sources.length === 0) throw new Error("Codex thread 来源不能为空");
+  return sources;
+}
+
+export function parseCodexThreadStatuses(args: string[]): CodexThreadStatusType[] {
+  const values = parseCsvOptions(args, ["--status"]);
+  const statuses: CodexThreadStatusType[] = [];
+  for (const value of values) {
+    if (!CODEX_THREAD_STATUS_TYPES.includes(value as CodexThreadStatusType)) {
+      throw new Error(`未知 Codex thread 状态：${value}；可选值：${CODEX_THREAD_STATUS_TYPES.join(", ")}`);
+    }
+    const status = value as CodexThreadStatusType;
+    if (!statuses.includes(status)) statuses.push(status);
+  }
+  return statuses;
+}
+
+export function filterCodexThreads(
+  threads: CodexThread[],
+  query: Pick<CodexThreadQuery, "statuses" | "sinceMs" | "untilMs">,
+): CodexThread[] {
+  return threads.filter((thread) => {
+    const status = codexThreadStatusType(thread.status);
+    if (query.statuses.length > 0 && !query.statuses.includes(status as CodexThreadStatusType)) {
+      return false;
+    }
+    if (query.sinceMs !== undefined || query.untilMs !== undefined) {
+      const timestamp = codexThreadTimestampMs(thread);
+      if (timestamp === null) return false;
+      if (query.sinceMs !== undefined && timestamp < query.sinceMs) return false;
+      if (query.untilMs !== undefined && timestamp > query.untilMs) return false;
+    }
+    return true;
+  });
+}
+
+export function formatCodexThreads(
+  result: CodexThreadQueryResult,
+  query: CodexThreadQuery,
+): string {
+  const count = result.total === undefined
+    ? `${result.items.length}${result.nextCursor ? "+" : ""}`
+    : `${result.items.length}/${result.total}`;
+  const lines = [
+    `Codex Threads（${count}）`,
+    `来源：${query.sourceKinds.join(", ")}；归档：${query.archived ? "仅归档" : "未归档"}`,
+    `排序：${query.sortKey} ${query.sortDirection}`,
+  ];
+  if (query.cwd?.length) lines.push(`工作目录：${query.cwd.join(", ")}`);
+  if (query.modelProviders?.length) lines.push(`模型提供方：${query.modelProviders.join(", ")}`);
+  if (query.searchTerm) lines.push(`标题搜索：${query.searchTerm}`);
+  if (query.statuses.length) lines.push(`运行状态：${query.statuses.join(", ")}`);
+  if (query.sinceMs !== undefined) lines.push(`更新时间起点：${new Date(query.sinceMs).toISOString()}`);
+  if (query.untilMs !== undefined) lines.push(`更新时间终点：${new Date(query.untilMs).toISOString()}`);
+  if (result.scanned !== undefined) lines.push(`扫描线程：${result.scanned}（状态/时间筛选在本地完成）`);
+  lines.push("");
+  if (result.items.length === 0) {
+    lines.push("没有找到匹配的 Codex thread。可以尝试去掉 --project、--search 或 --status 筛选。");
+    return lines.join("\n");
+  }
+  for (const [index, thread] of result.items.entries()) {
+    const title = thread.name?.trim() || thread.preview?.trim() || "（无标题）";
+    const source = codexThreadSourceLabel(thread.source ?? thread.threadSource);
+    const status = codexThreadStatusType(thread.status);
+    lines.push(`${index + 1}. [${status}] ${title}`);
+    lines.push(`   Thread：${thread.id}`);
+    lines.push(`   来源：${source}；目录：${thread.cwd || "—"}`);
+    lines.push(`   创建：${formatCodexThreadTimestamp(thread.createdAt)}；更新：${formatCodexThreadTimestamp(thread.updatedAt)}`);
+    if (thread.modelProvider || thread.model) {
+      lines.push(`   模型：${thread.modelProvider || "—"}${thread.model ? ` / ${thread.model}` : ""}`);
+    }
+    if (thread.cliVersion) lines.push(`   CLI 版本：${thread.cliVersion}`);
+    if (Array.isArray(thread.turns)) lines.push(`   轮次：${thread.turns.length}`);
+    lines.push("");
+  }
+  if (result.nextCursor) lines.push(`还有更多结果，使用 --cursor '${result.nextCursor}' 查询下一页。`);
+  return lines.join("\n").trimEnd();
+}
+
+export function formatCodexThread(thread: CodexThread, includeTurns = false): string {
+  const lines = [
+    `Codex Thread：${thread.id}`,
+    `标题：${thread.name?.trim() || thread.preview?.trim() || "（无标题）"}`,
+    `状态：${codexThreadStatusType(thread.status)}`,
+    `来源：${codexThreadSourceLabel(thread.source ?? thread.threadSource)}`,
+    `目录：${thread.cwd || "—"}`,
+    `模型：${thread.modelProvider || "—"}${thread.model ? ` / ${thread.model}` : ""}`,
+    `创建时间：${formatCodexThreadTimestamp(thread.createdAt)}`,
+    `更新时间：${formatCodexThreadTimestamp(thread.updatedAt)}`,
+    `Session：${thread.sessionId || "—"}`,
+  ];
+  if (thread.forkedFromId) lines.push(`Fork 来源：${thread.forkedFromId}`);
+  if (thread.parentThreadId) lines.push(`父 Thread：${thread.parentThreadId}`);
+  if (thread.cliVersion) lines.push(`CLI 版本：${thread.cliVersion}`);
+  if (includeTurns) {
+    lines.push("", "轮次详情：", JSON.stringify(thread.turns || [], null, 2));
+  } else if (Array.isArray(thread.turns)) {
+    lines.push(`轮次：${thread.turns.length}（使用 --turns 展开）`);
+  }
+  return lines.join("\n");
+}
+
+function parseCodexThreadDateOption(args: string[], name: string): number | undefined {
+  const value = optionValue(args, name);
+  if (value === undefined) return undefined;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) throw new Error(`${name} must be an ISO date/time, for example 2026-09-01T00:00:00+08:00`);
+  return timestamp;
+}
+
+function parseEnumOption<T extends string>(
+  args: string[],
+  name: string,
+  values: readonly T[],
+  defaultValue: T,
+  label: string,
+): T {
+  const value = optionValue(args, name) || defaultValue;
+  if (!values.includes(value as T)) throw new Error(`未知${label}：${value}；可选值：${values.join(", ")}`);
+  return value as T;
+}
+
+function parseCsvOptions(args: string[], names: string[]): string[] {
+  const values = names.flatMap((name) => optionValues(args, name));
+  return uniqueStrings(values.flatMap((value) => value.split(",").map((item) => item.trim()).filter(Boolean)));
+}
+
+export async function queryCodexThreads(
+  client: CodexAppServerQueryClient,
+  query: CodexThreadQuery,
+): Promise<CodexThreadQueryResult> {
+  const requiresLocalFiltering = query.statuses.length > 0
+    || query.sinceMs !== undefined
+    || query.untilMs !== undefined;
+  if (!requiresLocalFiltering) {
+    const page = await client.listThreads(buildCodexThreadListParams(query));
+    return {
+      items: page.data,
+      nextCursor: page.nextCursor,
+      backwardsCursor: page.backwardsCursor,
+    };
+  }
+
+  const items: CodexThread[] = [];
+  let cursor = query.cursor;
+  let backwardsCursor: string | null = null;
+  const seenCursors = new Set<string>();
+  while (true) {
+    const page = await client.listThreads(buildCodexThreadListParams(query, cursor, CODEX_THREAD_PAGE_SIZE));
+    if (backwardsCursor === null) backwardsCursor = page.backwardsCursor;
+    items.push(...page.data);
+    if (!page.nextCursor) break;
+    if (seenCursors.has(page.nextCursor)) throw new Error("Codex app-server returned a repeated pagination cursor");
+    seenCursors.add(page.nextCursor);
+    cursor = page.nextCursor;
+    if (items.length >= MAX_CODEX_THREAD_SCAN) {
+      throw new Error(`本地状态/时间筛选最多扫描 ${MAX_CODEX_THREAD_SCAN} 个线程；请先增加 --project、--cwd 或 --search 缩小范围`);
+    }
+  }
+  const filtered = filterCodexThreads(items, query);
+  return {
+    items: filtered.slice(0, query.limit),
+    total: filtered.length,
+    nextCursor: null,
+    backwardsCursor,
+    scanned: items.length,
+  };
+}
+
+function buildCodexThreadListParams(
+  query: CodexThreadQuery,
+  cursor = query.cursor,
+  limit = query.limit,
+): CodexThreadListParams {
+  return {
+    cursor,
+    limit,
+    sortKey: query.sortKey,
+    sortDirection: query.sortDirection,
+    sourceKinds: query.sourceKinds,
+    modelProviders: query.modelProviders,
+    archived: query.archived,
+    cwd: query.cwd?.length === 1 ? query.cwd[0] : query.cwd,
+    searchTerm: query.searchTerm,
+    // A read-only bridge query must not ask app-server to scan JSONL and
+    // repair its state database as a side effect.
+    useStateDbOnly: true,
+  };
+}
+
+function serializeCodexThreadFilters(query: CodexThreadQuery): Record<string, unknown> {
+  return {
+    sourceKinds: query.sourceKinds,
+    modelProviders: query.modelProviders,
+    cwd: query.cwd,
+    searchTerm: query.searchTerm,
+    archived: query.archived,
+    statuses: query.statuses,
+    since: query.sinceMs === undefined ? undefined : new Date(query.sinceMs).toISOString(),
+    until: query.untilMs === undefined ? undefined : new Date(query.untilMs).toISOString(),
+    sortKey: query.sortKey,
+    sortDirection: query.sortDirection,
+    limit: query.limit,
+    cursor: query.cursor,
+  };
+}
+
+function formatCodexThreadTimestamp(value: number | undefined): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? new Date(value * 1_000).toISOString()
+    : "—";
+}
+
 export function parseDirectTaskStatuses(args: string[]): DirectTaskStatus[] | undefined {
   const rawValues = optionValues(args, "--status");
   if (rawValues.length === 0) return undefined;
@@ -478,23 +889,24 @@ async function writeCodexLaunchAgent(
 }
 
 async function startCodexLaunchAgent(args: CodexCliArguments): Promise<void> {
-  await assertBuiltRuntime();
-  const paths = await writeCodexLaunchAgent(args);
-  assertDarwinLaunchd();
-  const target = launchdTarget();
-  const current = await launchctl(["print", target]);
-  if (current.exitCode === 0) {
-    const kicked = await launchctl(["kickstart", "-k", target]);
-    if (kicked.exitCode !== 0) throw launchctlError("启动 Codex LaunchAgent 失败", kicked);
-    console.log(`Codex LaunchAgent 已重启：${target}`);
-    return;
-  }
-  const bootstrapped = await launchctl(["bootstrap", `gui/${currentUid()}`, paths.plistPath]);
-  if (bootstrapped.exitCode !== 0) {
-    const fallback = await launchctl(["kickstart", "-k", target]);
-    if (fallback.exitCode !== 0) throw launchctlError("加载 Codex LaunchAgent 失败", bootstrapped);
-  }
-  console.log(`Codex LaunchAgent 已启动：${target}`);
+  await withLaunchdOperationLock(async () => {
+    await assertBuiltRuntime();
+    const paths = await writeCodexLaunchAgent(args);
+    assertDarwinLaunchd();
+    const target = launchdTarget();
+    const current = await launchctl(["print", target]);
+    if (current.exitCode === 0) {
+      const kicked = await kickstartLaunchAgentWithRetry(target);
+      if (kicked.exitCode !== 0) throw launchctlError("启动 Codex LaunchAgent 失败", kicked);
+      console.log(`Codex LaunchAgent 已重启：${target}`);
+      return;
+    }
+    const bootstrapped = await bootstrapLaunchAgentWithRetry(paths.plistPath, target);
+    if (bootstrapped.exitCode !== 0) {
+      throw launchctlError("加载 Codex LaunchAgent 失败", bootstrapped);
+    }
+    console.log(`Codex LaunchAgent 已启动：${target}`);
+  });
 }
 
 async function uninstallCodexLaunchAgent(): Promise<void> {
@@ -530,23 +942,25 @@ async function stopCodexLaunchAgent(): Promise<void> {
 }
 
 async function restartCodexLaunchAgent(args: CodexCliArguments): Promise<void> {
-  await assertBuiltRuntime();
-  const paths = await writeCodexLaunchAgent(args);
-  assertDarwinLaunchd();
-  const target = launchdTarget();
-  const current = await launchctl(["print", target]);
-  if (current.exitCode === 0) {
-    const stopped = await launchctl(["bootout", target]);
-    if (stopped.exitCode !== 0 && !isLaunchdNotLoaded(stopped)) {
-      throw launchctlError("重启前停止 Codex LaunchAgent 失败", stopped);
+  await withLaunchdOperationLock(async () => {
+    await assertBuiltRuntime();
+    const paths = await writeCodexLaunchAgent(args);
+    assertDarwinLaunchd();
+    const target = launchdTarget();
+    const current = await launchctl(["print", target]);
+    if (current.exitCode === 0) {
+      const stopped = await launchctl(["bootout", target]);
+      if (stopped.exitCode !== 0 && !isLaunchdNotLoaded(stopped)) {
+        throw launchctlError("重启前停止 Codex LaunchAgent 失败", stopped);
+      }
+      await waitForLaunchdUnloaded(target);
     }
-    await waitForLaunchdUnloaded(target);
-  }
-  const started = await launchctl(["bootstrap", `gui/${currentUid()}`, paths.plistPath]);
-  if (started.exitCode !== 0) throw launchctlError("重载 Codex LaunchAgent 失败", started);
-  const kicked = await launchctl(["kickstart", "-k", target]);
-  if (kicked.exitCode !== 0) throw launchctlError("启动 Codex LaunchAgent 失败", kicked);
-  console.log(`Codex LaunchAgent 已重启：${target}`);
+    const started = await bootstrapLaunchAgentWithRetry(paths.plistPath, target);
+    if (started.exitCode !== 0) throw launchctlError("重载 Codex LaunchAgent 失败", started);
+    const kicked = await kickstartLaunchAgentWithRetry(target);
+    if (kicked.exitCode !== 0) throw launchctlError("启动 Codex LaunchAgent 失败", kicked);
+    console.log(`Codex LaunchAgent 已重启：${target}`);
+  });
 }
 
 async function runCodexStatus(
@@ -968,6 +1382,16 @@ function firstPositional(args: string[]): string | undefined {
     "--task",
     "--operation",
     "--project",
+    "--source",
+    "--source-kind",
+    "--provider",
+    "--model-provider",
+    "--cwd",
+    "--since",
+    "--until",
+    "--sort",
+    "--direction",
+    "--cursor",
     "--lines",
   ]);
   for (let index = 0; index < args.length; index += 1) {
@@ -1202,6 +1626,117 @@ function isLaunchdNotLoaded(result: CapturedProcess): boolean {
     || text.includes("no such process")
     || text.includes("service is not loaded")
     || text.includes("failed to find service");
+}
+
+async function bootstrapLaunchAgentWithRetry(
+  plistPath: string,
+  target: string,
+): Promise<CapturedProcess> {
+  let last: CapturedProcess = {
+    exitCode: 1,
+    stdout: "",
+    stderr: "bootstrap was not attempted",
+  };
+  for (let attempt = 1; attempt <= LAUNCHD_BOOTSTRAP_ATTEMPTS; attempt += 1) {
+    const current = await launchctl(["print", target]);
+    if (current.exitCode === 0) return current;
+
+    last = await launchctl(["bootstrap", `gui/${currentUid()}`, plistPath]);
+    if (last.exitCode === 0) return last;
+    if (!isLaunchdRetryable(last) || attempt === LAUNCHD_BOOTSTRAP_ATTEMPTS) return last;
+
+    const delayMs = Math.min(
+      LAUNCHD_RETRY_MAX_DELAY_MS,
+      LAUNCHD_RETRY_INITIAL_DELAY_MS * 2 ** (attempt - 1),
+    );
+    await delay(delayMs);
+  }
+  return last;
+}
+
+async function kickstartLaunchAgentWithRetry(target: string): Promise<CapturedProcess> {
+  let last: CapturedProcess = {
+    exitCode: 1,
+    stdout: "",
+    stderr: "kickstart was not attempted",
+  };
+  for (let attempt = 1; attempt <= LAUNCHD_BOOTSTRAP_ATTEMPTS; attempt += 1) {
+    last = await launchctl(["kickstart", "-k", target]);
+    if (last.exitCode === 0) return last;
+    if (!isLaunchdRetryable(last) || attempt === LAUNCHD_BOOTSTRAP_ATTEMPTS) return last;
+    const delayMs = Math.min(
+      LAUNCHD_RETRY_MAX_DELAY_MS,
+      LAUNCHD_RETRY_INITIAL_DELAY_MS * 2 ** (attempt - 1),
+    );
+    await delay(delayMs);
+  }
+  return last;
+}
+
+function isLaunchdRetryable(result: CapturedProcess): boolean {
+  const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return result.exitCode === 37
+    || text.includes("operation already in progress")
+    || text.includes("try again")
+    || text.includes("temporarily unavailable");
+}
+
+async function withLaunchdOperationLock<T>(callback: () => Promise<T>): Promise<T> {
+  const lockParent = dirname(LAUNCHD_OPERATION_LOCK_PATH);
+  await mkdir(lockParent, { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + LAUNCHD_LOCK_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    let acquired = false;
+    try {
+      await mkdir(LAUNCHD_OPERATION_LOCK_PATH, { mode: 0o700 });
+      acquired = true;
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+      if (code !== "EEXIST") throw error;
+      if (await isStaleLaunchdOperationLock()) {
+        await rm(LAUNCHD_OPERATION_LOCK_PATH, { recursive: true, force: true });
+        continue;
+      }
+      await delay(250);
+      continue;
+    }
+    try {
+      await writeFile(
+        join(LAUNCHD_OPERATION_LOCK_PATH, "owner.json"),
+        JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }),
+        { encoding: "utf8", mode: 0o600 },
+      );
+      return await callback();
+    } finally {
+      if (acquired) await rm(LAUNCHD_OPERATION_LOCK_PATH, { recursive: true, force: true });
+    }
+  }
+  throw new Error("另一个 Codex LaunchAgent 操作仍在进行，请稍后重试。");
+}
+
+async function isStaleLaunchdOperationLock(): Promise<boolean> {
+  try {
+    const ownerPath = join(LAUNCHD_OPERATION_LOCK_PATH, "owner.json");
+    const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { pid?: unknown };
+    const pid = Number(owner.pid);
+    if (Number.isInteger(pid) && pid > 0) {
+      try {
+        process.kill(pid, 0);
+        return false;
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+        if (code === "EPERM") return false;
+      }
+    }
+  } catch {
+    // The owner file can be between mkdir and write; use the age fallback.
+  }
+  try {
+    const lock = await stat(LAUNCHD_OPERATION_LOCK_PATH);
+    return Date.now() - lock.mtimeMs > LAUNCHD_LOCK_STALE_MS;
+  } catch {
+    return false;
+  }
 }
 
 async function waitForLaunchdUnloaded(target: string): Promise<void> {

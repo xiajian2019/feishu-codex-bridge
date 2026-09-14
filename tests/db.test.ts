@@ -83,7 +83,11 @@ describe("StateDatabase", () => {
       text: "/recent",
       sessionKey: "chat:oc_chat",
     };
-    expect(db.ingestDirectControlCard(input, { schema: "2.0", body: { elements: [] } })).toBe(true);
+    expect(db.ingestDirectControlCard(
+      input,
+      { schema: "2.0", body: { elements: [] } },
+      "om-existing-card",
+    )).toBe(true);
     expect(db.ingestDirectControlCard(input, { schema: "2.0" })).toBe(false);
     expect(db.listBridgeTasks({ chatId: "oc_chat" }).total).toBe(0);
     const outbox = db.getDueOutbox(10, ["feishu.send_card"]);
@@ -91,6 +95,7 @@ describe("StateDatabase", () => {
     expect(JSON.parse(outbox[0].payload_json)).toMatchObject({
       chatId: "oc_chat",
       card: { schema: "2.0" },
+      updateMessageId: "om-existing-card",
     });
     db.close();
   });
@@ -326,6 +331,45 @@ describe("StateDatabase", () => {
       final_response: "测试结果也正常",
     });
     expect(db.listBridgeTasks({ chatId: "oc-reply" }).total).toBe(1);
+    db.close();
+  });
+
+  it("schedules a transient direct task retry without losing its thread or card outbox", () => {
+    const db = new StateDatabase(":memory:");
+    const created = db.ingestDirectMessage({
+      sourceEventId: "evt-transient-retry",
+      eventType: "im.message.receive_v1",
+      messageId: "om-transient-retry",
+      chatId: "oc-transient-retry",
+      chatType: "p2p",
+      senderId: "ou-transient-retry",
+      text: "临时网络错误后重试",
+      sessionKey: "chat:oc-transient-retry",
+    });
+    const claimed = db.claimDueBridgeTask("worker-transient", 60_000);
+    expect(claimed).toMatchObject({
+      bridge_task_id: created.task.bridge_task_id,
+      status: "RUNNING",
+      attempt: 1,
+    });
+    expect(db.saveBridgeThreadId(created.task.bridge_task_id, "thread-transient", "worker-transient")).toBe(true);
+    expect(db.scheduleBridgeTaskRetry(
+      created.task.bridge_task_id,
+      "worker-transient",
+      "Codex 网络连接暂时失败，将自动重试。",
+      "2026-09-01T00:00:05.000Z",
+    )).toBe(true);
+    expect(db.getBridgeTask(created.task.bridge_task_id)).toMatchObject({
+      status: "QUEUED",
+      attempt: 1,
+      thread_id: "thread-transient",
+      next_attempt_at: "2026-09-01T00:00:05.000Z",
+      last_progress_event: "retry.scheduled",
+    });
+    expect(db.listBridgeTaskEvents(created.task.bridge_task_id).at(-1)).toMatchObject({
+      event_type: "retry.scheduled",
+    });
+    expect(db.getDueOutbox(50, ["feishu.stream_card"])).toHaveLength(1);
     db.close();
   });
 

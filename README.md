@@ -35,13 +35,21 @@ feishu-codex-bridge install
 pnpm run portable:release
 ```
 
-如需一条命令完成重建、停止当前直连服务并从新 `release/` 包启动：
+如需一条命令完成重建、使用真实配置/数据库从新 `release/` 包重启直连服务，并校验 LaunchAgent 状态：
 
 ```bash
 pnpm run portable:restart
 ```
 
-该命令会先完成构建和 smoke test；构建失败时不会停止正在运行的服务。可用 `--config <path>` 指定配置，`--skip-build` 仅重用现有 `dist` 打包。
+该命令会先完成构建和 smoke test，再执行带有 `--config`、`--db` 和 `--mode feishu-sqlite-codex` 的 `service restart`，最后执行 `service status`；构建失败时不会停止正在运行的服务。可用 `--config <path>`、`--db <path>` 和 `--mode <mode>` 覆盖默认值，`--skip-build` 仅重用现有 `dist` 打包。
+
+发布 GitHub Release（默认使用 `package.json` 版本生成 `v0.1.0` tag）：
+
+```bash
+pnpm run release:github
+```
+
+该命令会构建 portable release、提交并推送当前分支和版本 tag；GitHub Actions 会自动生成 macOS arm64 release asset 并上传到对应 Release。可用 `--tag`、`--message`、`--skip-build` 或 `--dry-run` 覆盖默认行为。
 
 产物默认写入根目录 `release/`，包含已构建的 Bridge 和生产依赖，不包含源码、测试、配置密钥或运行数据。启动器会优先使用系统中满足 `>=22.13.1` 的 Node；如果没有，会从 Node 官方发行目录下载固定版本到当前包的 `runtime/` 目录，不修改用户全局环境。可以用 `--output <path>` 覆盖默认目录。接收方解压后执行：
 
@@ -163,7 +171,7 @@ binding；只使用 `state=ready/pending` 且 `environment=online` 的记录。A
 修复食物单位换算问题，并运行相关测试。
 ```
 
-也支持 `project: food`、`mode=implement`。当消息没有路由头时，会依次使用 `direct.projectKey`/`direct.mode`；如果对应注册表恰好只有一个值，也会自动使用唯一值。项目和模式仍必须来自配置注册表，不能通过 Feishu 文本绕过本地仓库白名单。飞书消息、Codex 事件、卡片状态和附件元数据会先写入 SQLite；卡片流投递在独立 outbox worker 中运行，不会阻塞 Codex。图片作为 `local_image` 输入，文件以任务专属本地路径提供给 Codex；附件保留在 `runtime/direct/attachments/<bridge-task-id>/` 供故障排查和恢复复用。同一会话会复用已保存的 Codex thread；切换到不同项目或沙箱模式时会自动新建 thread，避免跨仓库恢复旧会话。回复直连任务的原始消息、机器人结果卡或 Feishu thread 时，会作为同一任务的后续 turn 处理，不会新增任务 ID，并继续更新原卡片；续问中省略的项目和模式会继承父任务。
+也支持 `project: food`、`mode=implement`。当消息没有路由头时，会依次使用 `direct.projectKey`/`direct.mode`；如果对应注册表恰好只有一个值，也会自动使用唯一值。项目和模式仍必须来自配置注册表，不能通过 Feishu 文本绕过本地仓库白名单。飞书消息、Codex 事件、卡片状态和附件元数据会先写入 SQLite；卡片流和卡片操作响应都通过独立 outbox worker 投递，不会让卡片回调等待 Feishu 网络请求。图片作为 `local_image` 输入，文件以任务专属本地路径提供给 Codex；附件保留在 `runtime/direct/attachments/<bridge-task-id>/` 供故障排查和恢复复用。同一会话会复用已保存的 Codex thread；切换到不同项目或沙箱模式时会自动新建 thread，避免跨仓库恢复旧会话。任务卡片按“状态摘要—请求/进度/结果折叠区—操作区”分组，执行期间也能点击“查看详情”，不必先发送 `/recent`。回复直连任务的原始消息、机器人结果卡或 Feishu thread 时，会作为同一任务的后续 turn 处理，不会新增任务 ID，并继续更新原卡片；续问中省略的项目和模式会继承父任务。
 
 权限规则按 `chatId`、`senderOpenId`、`chatType` 匹配，匹配字段越多优先级越高；规则可分别控制消息、附件和取消能力。例如：
 
@@ -197,6 +205,8 @@ pnpm run codex:install     # 只生成 plist；即使 config.json 仍是 AAMP �
 pnpm run codex:start       # 安装并启动原生直连 LaunchAgent
 pnpm run codex:status
 pnpm run codex:recent -- --limit 10
+pnpm run codex:threads -- --project food --source cli,appServer
+pnpm run codex:thread -- thr_123 --turns
 pnpm run codex:task -- bridge_20260910 --json
 pnpm run codex:cancel -- bridge_20260910 --reason "不再需要"
 pnpm run codex:retry -- bridge_20260910
@@ -214,6 +224,20 @@ pnpm run start -- --mode feishu-sqlite-codex
 ```
 
 `codex:install`/`codex:setup` 只生成用户目录下的 LaunchAgent，不自动启动，且不要求当前 `execution.mode` 已经是直连模式；`codex:start`/`codex:restart` 会把选中的直连模式写入 LaunchAgent 的 `--execution-mode` 参数，再启动服务。实际启动不要求 `direct.projectKey`、`direct.mode`，但首次处理任务时必须能从消息路由头、默认值或唯一注册表项解析出项目和模式；飞书凭据仍必须有效。`--node /path/to/node` 可显式指定 LaunchAgent 使用的 Node；默认会优先寻找满足项目要求的 Node 22，不依赖 launchd 加载 shell 的 nvm 配置。`codex:uninstall`/`codex:remove` 会停止并删除该 plist；`codex:recover` 负责接管已过期任务，`--force` 前必须先停止服务。`codex:task` 会同时显示任务事件、附件和 durable outbox，`codex:worktrees` 只查看配置仓库的 Git worktree，原生直连不会像 AAMP ACP 模式那样为每条消息创建隔离 worktree。
+
+`codex:threads`/`codex:thread` 是独立的只读 Codex app-server 查询，不会写入 Bridge SQLite，也不会启动或继续执行任务。默认查询未归档的 `cli` 和 `appServer` 来源；可用以下参数筛选：
+
+- `--source cli,appServer` 或重复传入 `--source`：线程来源。
+- `--project food`：按已配置项目对应的仓库路径筛选；也可以使用重复的 `--cwd /absolute/path`。
+- `--provider openai`：模型提供方；`--search TEXT`：按 Codex 提取的线程标题搜索。
+- `--archived`：只查询归档线程；默认只查询未归档线程。
+- `--status active,idle`：按运行时状态筛选；`--since`/`--until`：按最近更新时间筛选，接受 ISO 日期/时间。
+- `--sort recency_at --direction desc`：排序字段和方向；`--limit N`、`--cursor CURSOR`：分页。
+- `--json`：输出结构化结果；使用 `codex:thread -- <thread-id> --turns` 查看指定线程的只读轮次详情。
+
+状态和时间筛选属于本地二次筛选，因此会分页读取最多 10,000 个匹配来源的线程后再计算结果；默认 `useStateDbOnly=true`，避免查询为了修复 Codex 元数据而扫描并更新 JSONL 日志。App、CLI 和 Bridge 必须使用同一个本地 Codex 状态目录（默认 `~/.codex`，或同一个 `CODEX_HOME`），否则不会出现在同一份查询结果中。
+
+直连服务的容错策略：LaunchAgent 保持 `KeepAlive`，并设置 `ThrottleInterval=10` 防止异常退出时快速重启风暴；`codex:start`/`codex:restart` 对 launchd 的 `Operation already in progress`（exit 37）使用串行锁和指数退避。Feishu WebSocket 初次连接失败会在进程内重试，已连接后的失败状态会由健康检查触发恢复。Codex 的网络断开、连接重置、临时服务不可用、限流和 SQLite busy 等暂时性错误默认最多尝试 3 次，等待 5 秒、10 秒、20 秒并加入少量抖动；认证、权限、配置和明确的业务/执行错误不会自动重跑。可在 `direct.retry` 中调整 `maxAttempts`、`initialDelaySeconds` 和 `maxDelaySeconds`。
 
 `codex:update` 默认更新项目中的 `@openai/codex-sdk` 依赖；`codex:update -- --check` 只检查 SDK 和系统 Codex CLI 版本，不会自动升级系统 CLI。LaunchAgent 不会继承当前终端临时 `export` 的飞书凭据；后台运行时优先复用 AAMP binding，也可以在未提交的 `config.json` 中配置凭据，或在用户目录的 plist 中配置环境变量。
 
@@ -413,7 +437,9 @@ AAMP 和原生直连模式都会在 Feishu 入站消息进入正常任务派发�
 - `/recent`：以飞书卡片合并列出当前会话最近的 10 个 AAMP 和直连任务，按更新时间倒序，每条明确标注接入模式。
 - `/tasks <任务ID>`：显示 AAMP 或直连任务详情；任务 ID 支持完整值或唯一前缀。
 
-仅原生直连任务支持以下诊断和恢复命令，AAMP 任务不会在这些命令或卡片中展示：
+`/threads` 与当前 Feishu 接入模式无关；它会展示当前会话的 AAMP 任务，并补充本机 Codex App/CLI threads。卡片会为每条任务/thread 单独显示“查看详情”或“查看执行”操作，点击后查看具体执行情况。支持的筛选参数见上文。
+
+仅以下诊断和恢复命令属于原生直连任务，AAMP 任务不会在这些命令或卡片中展示：
 
 - `/thread`：当前 thread ID、项目、模式和最近任务。
 - `/resume <任务ID或thread ID>`：从历史 Codex thread 创建一轮继续任务。
@@ -425,7 +451,9 @@ AAMP 和原生直连模式都会在 Feishu 入站消息进入正常任务派发�
 - `/commands <任务ID>`：查看 shell 命令及状态。
 - `/tools <任务ID>`：查看 MCP 工具调用记录。
 
-`/recent` 会跳过提示词以 `/` 开头的系统辅助命令；每条任务提供“详情”和“屏蔽”操作。只有当任务的接入模式与当前运行模式一致时才显示“中断”：AAMP 模式只能中断 AAMP 任务，直连模式只能中断直连任务。回调处理也会再次校验任务来源，旧卡片或伪造回调不能跨模式取消。屏蔽记录保存在共享 SQLite 中；任务列表和详情始终按当前 Feishu `chat_id` 隔离。
+例如：`/threads --project food --source cli,appServer --search "fix bug" --status active`
+
+`/recent` 会跳过提示词以 `/` 开头的系统辅助命令；每条任务提供“详情”和“屏蔽”操作，长请求默认折叠，任务之间用分隔线区分。AAMP 和直连任务卡均提供可点击的“查看详情”；只有当任务的接入模式与当前运行模式一致时才显示“中断”：AAMP 模式只能中断 AAMP 任务，直连模式只能中断直连任务。回调处理也会再次校验任务来源，旧卡片或伪造回调不能跨模式取消。屏蔽记录保存在共享 SQLite 中；任务列表和详情始终按当前 Feishu `chat_id` 隔离。
 
 `/usage` 的账户限额来自本机 Codex session 日志中最近一次 `rate_limits` 快照；AAMP ACP 会话用量来自 `~/.acpx/sessions` 中对应任务的累计 token 记录。任一来源没有数据时，卡片会明确显示暂无，不会用估算值代替。
 
