@@ -43,7 +43,7 @@ describe("portable release restart", () => {
       },
       verifyLauncher: false,
     });
-    expect(result.launcher).toMatch(/\/release\/feishu-codex-bridge-darwin-(arm64|x64)\/feishu-codex-bridge$/);
+    expect(result.launcher).toMatch(/\/release\/feishu-codex-bridge-direct-darwin-(arm64|x64)\/feishu-codex-bridge$/);
     expect(calls[0]).toEqual(["build", "/workspace/bridge/release"]);
     expect(calls.slice(1).map((call) => call[1])).toEqual([
       result.launcher,

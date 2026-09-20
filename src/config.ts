@@ -106,6 +106,13 @@ const directSchema = z.object({
   permissions: directPermissionsSchema.default({}),
 }).strict();
 
+const localNotificationsSchema = z.object({
+  // Disabled by default so existing installations do not change behavior until
+  // the user explicitly opts into local system notifications.
+  enabled: z.boolean().default(false),
+  intervalSeconds: z.number().int().min(10).max(3_600).default(60),
+}).strict();
+
 const configSchema = z.object({
   pollIntervalSeconds: z.number().int().positive().default(20),
   maxConcurrency: z.literal(1).default(1),
@@ -120,6 +127,7 @@ const configSchema = z.object({
   }).strict().default({}),
   relay: relaySchema.default({}),
   direct: directSchema.default({}),
+  localNotifications: localNotificationsSchema.default({}),
   web: webSchema.default({}),
   lark: z.object({
     profile: z.string().trim().min(1),

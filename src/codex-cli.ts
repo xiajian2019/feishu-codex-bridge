@@ -25,6 +25,7 @@ import {
 } from "./codex-app-server.js";
 import { DIRECT_RUNTIME_LEASE_NAME } from "./feishu-sqlite-codex.js";
 import { resolveSharedFeishuCredentials, type FeishuCredentialSource } from "./feishu-credentials.js";
+import { LocalCodexNotificationWatcher } from "./local-codex-notifications.js";
 import { StateDatabase, type OutboxSummary, type RuntimeLeaseRecord } from "./db.js";
 import {
   DIRECT_TASK_STATUSES,
@@ -255,6 +256,9 @@ export async function runCodexCli(argv = process.argv.slice(2)): Promise<void> {
     case "list":
       await withDatabase(args.dbPath, (db) => runCodexRecent(db, args, commandArgs));
       return;
+    case "notify":
+      await runCodexLocalNotifications(config, commandArgs);
+      return;
     case "threads":
     case "sessions":
       await runCodexThreads(config, commandArgs);
@@ -311,6 +315,7 @@ export function printCodexUsage(): void {
       "",
       "任务与持久化状态：",
       "  recent|list         查看最近任务（--limit N --status STATUS --json）",
+      "  notify              轮询并发送 macOS 系统完成通知（--interval N --once）",
       "  task|inspect ID     查看任务、事件、附件和 outbox（支持唯一前缀）",
       "  threads|sessions    只读查询 Codex App/CLI threads（支持筛选）",
       "  thread|session ID   只读查看 Codex thread（--turns 展开轮次）",
@@ -1073,6 +1078,56 @@ async function runCodexRecent(
     fullMessage: hasFlag(commandArgs, "--full-message"),
     databasePath: args.dbPath,
   }));
+}
+
+async function runCodexLocalNotifications(
+  config: BridgeConfig,
+  commandArgs: string[],
+): Promise<void> {
+  const intervalSeconds = parsePositiveIntegerOption(commandArgs, "--interval", 60, 10, 3_600);
+  const statePath = resolve(
+    optionValue(commandArgs, "--state") || join(PROJECT_ROOT, "runtime", "codex-local-notifications.json"),
+  );
+  const watcher = new LocalCodexNotificationWatcher({
+    createClient: () => new CodexAppServerClient({
+      executable: config.codex.cliPath,
+      cwd: PROJECT_ROOT,
+      env: buildCodexAppServerEnvironment(config),
+      clientName: "feishu_codex_bridge_notifications",
+      clientTitle: "Feishu Codex Bridge Notifications",
+    }),
+    statePath,
+    logger: {
+      info: (message, details) => console.log(JSON.stringify({ level: "info", message, details })),
+      warn: (message, details) => console.warn(JSON.stringify({ level: "warn", message, details })),
+      error: (message, details) => console.error(JSON.stringify({ level: "error", message, details })),
+    },
+  });
+  let stopped = false;
+  let resolveStopped: (() => void) | undefined;
+  const stoppedPromise = new Promise<void>((resolvePromise) => {
+    resolveStopped = resolvePromise;
+  });
+  const stop = async (): Promise<void> => {
+    if (stopped) return;
+    stopped = true;
+    await watcher.stop();
+    resolveStopped?.();
+  };
+  const onSignal = (): void => {
+    void stop();
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+  try {
+    await watcher.start(intervalSeconds);
+    if (hasFlag(commandArgs, "--once")) return;
+    await stoppedPromise;
+  } finally {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    await stop();
+  }
 }
 
 async function runCodexTask(db: StateDatabase, commandArgs: string[]): Promise<void> {

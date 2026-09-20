@@ -70,7 +70,8 @@ export async function publishGithubRelease(options = {}, runCommand = run) {
   if (existingTag.trim()) throw new Error(`tag 已存在：${parsed.tag}`);
 
   if (!parsed.skipBuild) await runCommand("npm", ["run", "build"], PROJECT_ROOT);
-  await runCommand("npm", ["run", "portable:release", "--", "--skip-build", "--json"], PROJECT_ROOT);
+  await runCommand("npm", ["run", "release", "--", "--skip-build", "--json"], PROJECT_ROOT);
+  await runCommand("npm", ["run", "release", "--", "--mode", "lite", "--skip-build", "--json"], PROJECT_ROOT);
 
   const commands = [
     ["git", ["add", "-A"]],

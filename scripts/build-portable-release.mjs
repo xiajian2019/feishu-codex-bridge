@@ -1,21 +1,25 @@
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { chmod, cp, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, copyFile, mkdir, mkdtemp, readFile, readlink, readdir, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MIN_NODE_VERSION = [22, 13, 1];
 const DEFAULT_OUTPUT_DIR = join(PROJECT_ROOT, "release");
 const LAUNCHER_SOURCE = join(PROJECT_ROOT, "scripts", "portable-launcher.sh");
+const INSTALL_COMMAND_SOURCE = join(PROJECT_ROOT, "install.command");
+const RELEASE_MODES = ["lite", "direct"];
+const DEFAULT_RELEASE_MODE = "direct";
 
 export function parsePortableReleaseArguments(argv, cwd = process.cwd()) {
   const args = {
     outputDir: DEFAULT_OUTPUT_DIR,
     nodePath: process.execPath,
     pnpmPath: process.env.PNPM_BIN || "pnpm",
+    mode: DEFAULT_RELEASE_MODE,
     skipBuild: false,
     keepSourceMaps: false,
     bundleNode: false,
@@ -42,16 +46,24 @@ export function parsePortableReleaseArguments(argv, cwd = process.cwd()) {
       args.bundleNode = true;
       continue;
     }
+    if (arg === "--direct") {
+      args.mode = "direct";
+      continue;
+    }
     if (arg === "--json") {
       args.json = true;
       continue;
     }
-    const option = readOption(argv, index, arg, ["--output", "--node", "--pnpm"]);
+    const option = readOption(argv, index, arg, ["--output", "--node", "--pnpm", "--mode"]);
     if (!option) throw new Error(`未知参数：${arg}`);
     const [name, value, consumed] = option;
     if (name === "--output") args.outputDir = resolve(cwd, value);
     if (name === "--node") args.nodePath = resolve(cwd, value);
     if (name === "--pnpm") args.pnpmPath = resolve(cwd, value);
+    if (name === "--mode") {
+      if (!RELEASE_MODES.includes(value)) throw new Error(`未知 portable 发布模式：${value}`);
+      args.mode = value;
+    }
     index += consumed;
   }
   return args;
@@ -70,7 +82,7 @@ function readOption(argv, index, arg, names) {
   return [name, value, 1];
 }
 
-export function targetName(platform = process.platform, arch = process.arch) {
+export function targetName(platform = process.platform, arch = process.arch, mode = DEFAULT_RELEASE_MODE) {
   const platformName = platform === "darwin" ? "darwin" : undefined;
   const archName = {
     arm64: "arm64",
@@ -79,12 +91,15 @@ export function targetName(platform = process.platform, arch = process.arch) {
   if (!platformName || !archName) {
     throw new Error(`Portable Runtime Lite 当前只支持 macOS arm64/x64：${platform}/${arch}`);
   }
-  return `feishu-codex-bridge-${platformName}-${archName}`;
+  if (!RELEASE_MODES.includes(mode)) throw new Error(`未知 portable 发布模式：${mode}`);
+  return mode === "direct"
+    ? `feishu-codex-bridge-direct-${platformName}-${archName}`
+    : `feishu-codex-bridge-${platformName}-${archName}`;
 }
 
 export function printPortableReleaseUsage() {
   console.log([
-    "用法：pnpm run portable:release [选项]",
+    "用法：pnpm run release [选项]",
     "",
     "构建接收方无需预装 Node/pnpm 的 Portable Runtime Lite 压缩包。",
     "",
@@ -92,6 +107,8 @@ export function printPortableReleaseUsage() {
     "  --output path          输出目录（默认：./release）",
     "  --node path            要内置的 Node 可执行文件（默认：当前 Node）",
     "  --pnpm path            构建生产依赖使用的 pnpm（默认：pnpm）",
+    "  --mode MODE            发布模式：lite 或 direct（默认：direct）",
+    "  --direct               --mode direct 的别名；内置 lark-cli 和双架构 Node",
     "  --skip-build           复用现有 dist，不重新执行 pnpm run build",
     "  --keep-source-maps     保留 dist 中的 source map",
     "  --bundle-node          将当前 Node 一并放入发布包（默认按需下载）",
@@ -100,7 +117,7 @@ export function printPortableReleaseUsage() {
 }
 
 export async function buildPortableRelease(options) {
-  const packageName = targetName();
+  const packageName = targetName(process.platform, process.arch, options.mode || DEFAULT_RELEASE_MODE);
   const outputDir = resolve(options.outputDir);
   const archivePath = join(outputDir, `${packageName}.tar.gz`);
   const packageDir = join(outputDir, packageName);
@@ -120,22 +137,33 @@ export async function buildPortableRelease(options) {
     const appDir = join(stageDir, "app");
     const runtimeDir = join(stageDir, "runtime");
     await mkdir(appDir, { recursive: true, mode: 0o755 });
-    await copyApplication(appDir, options.keepSourceMaps);
-    await installProductionDependencies(appDir, options.pnpmPath);
-    if (options.bundleNode) await copyNodeRuntime(runtimeDir, options.nodePath);
+    if (options.mode === "direct" || options.bundleNode) {
+      await mkdir(runtimeDir, { recursive: true, mode: 0o755 });
+    }
+    await copyApplication(appDir, options.keepSourceMaps, options.mode || DEFAULT_RELEASE_MODE);
+    await installProductionDependencies(appDir, options.pnpmPath, options.mode || DEFAULT_RELEASE_MODE);
+    if (options.mode === "direct") {
+      await copyUniversalNodeRuntime(runtimeDir, options.nodePath);
+    } else if (options.bundleNode) {
+      await copyNodeRuntime(runtimeDir, options.nodePath);
+    }
     await copyFile(LAUNCHER_SOURCE, join(stageDir, "feishu-codex-bridge"));
     await chmod(join(stageDir, "feishu-codex-bridge"), 0o755);
+    await copyFile(INSTALL_COMMAND_SOURCE, join(stageDir, "install.command"));
+    await chmod(join(stageDir, "install.command"), 0o755);
+    await writeReleaseManifest(stageDir, packageName, options.mode || DEFAULT_RELEASE_MODE);
     await writePortableReadme(stageDir, packageName);
-    await runSmokeTests(stageDir, options.nodePath);
+    await runSmokeTests(stageDir, options.nodePath, options.mode || DEFAULT_RELEASE_MODE);
 
     await rm(archivePath, { force: true });
     await run("tar", ["-czf", archivePath, "-C", stageParent, packageName]);
     await rm(packageDir, { recursive: true, force: true });
-    await cp(stageDir, packageDir, { recursive: true });
+    await cp(stageDir, packageDir, { recursive: true, verbatimSymlinks: true });
     const checksum = await sha256(archivePath);
     await writeFile(`${archivePath}.sha256`, `${checksum}  ${packageName}.tar.gz\n`, "utf8");
     const result = {
       packageName,
+      mode: options.mode || DEFAULT_RELEASE_MODE,
       archivePath,
       packageDir,
       checksum,
@@ -155,13 +183,33 @@ export async function buildPortableRelease(options) {
   }
 }
 
-async function copyApplication(appDir, keepSourceMaps) {
+async function copyApplication(appDir, keepSourceMaps, mode) {
   const distDir = join(PROJECT_ROOT, "dist");
   const scriptsDir = join(PROJECT_ROOT, "scripts");
   await copyFiltered(distDir, join(appDir, "dist"), keepSourceMaps ? undefined : (source) => !source.endsWith(".map"));
   await copyFiltered(scriptsDir, join(appDir, "scripts"), (source) => !source.endsWith(".test.mjs"));
   await writePortableConfigExample(appDir);
   await copyFile(join(PROJECT_ROOT, "package.json"), join(appDir, "package.json"));
+}
+
+async function writePortablePackageJson(appDir, mode) {
+  const packageJson = JSON.parse(await readFile(join(PROJECT_ROOT, "package.json"), "utf8"));
+  if (mode === "direct") {
+    delete packageJson.dependencies?.["@larktask/aamp-feishu-task-agent"];
+  } else {
+    delete packageJson.dependencies?.["@larksuite/cli"];
+  }
+  await writeFile(join(appDir, "package.json"), `${JSON.stringify(packageJson, null, 2)}\n`, "utf8");
+}
+
+async function writeReleaseManifest(stageDir, packageName, mode) {
+  const packageJson = JSON.parse(await readFile(join(PROJECT_ROOT, "package.json"), "utf8"));
+  await writeFile(join(stageDir, "release-manifest.json"), `${JSON.stringify({
+    version: packageJson.version,
+    packageName,
+    mode,
+    generatedAt: new Date().toISOString(),
+  }, null, 2)}\n`, "utf8");
 }
 
 async function writePortableConfigExample(appDir) {
@@ -219,7 +267,7 @@ async function writePortableConfigExample(appDir) {
   await writeFile(join(appDir, "config.example.json"), `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
-async function installProductionDependencies(appDir, pnpmPath) {
+async function installProductionDependencies(appDir, pnpmPath, mode) {
   await copyFile(join(PROJECT_ROOT, "pnpm-lock.yaml"), join(appDir, "pnpm-lock.yaml"));
   await run(
     pnpmPath,
@@ -233,6 +281,19 @@ async function installProductionDependencies(appDir, pnpmPath) {
   // changing the source package's development workflow.
   await removePackage(nodeModules, "react");
   await removePackage(nodeModules, "react-dom");
+
+  if (mode === "direct") {
+    // Direct mode uses only the extracted Feishu registration/profile flow;
+    // it must not carry the AAMP runtime or its service controller.
+    await removePackage(nodeModules, "@larktask/aamp-feishu-task-agent");
+    for (const entry of ["aamp-feishu-task-agent", "aamp-logs", "feishu-task-agent"]) {
+      await rm(join(nodeModules, ".bin", entry), { force: true });
+    }
+  } else {
+    // Lite/AAMP releases let the official AAMP bootstrap install lark-cli on
+    // demand instead of shipping its large native binary.
+    await removePackage(nodeModules, "@larksuite/cli");
+  }
 
   // @openai/codex-sdk is configured to use the recipient's standalone/system
   // Codex CLI through codexPathOverride. The optional platform packages contain
@@ -249,7 +310,9 @@ async function installProductionDependencies(appDir, pnpmPath) {
   if (existsSync(pnpmRoot)) {
     for (const entry of await readdir(pnpmRoot)) {
       if (/^@openai\+codex@.*-(darwin|linux|win32)-/.test(entry)
-        || /^react(?:-dom)?@/.test(entry)) {
+        || /^react(?:-dom)?@/.test(entry)
+        || (mode === "direct" && /^@larktask\+aamp-feishu-task-agent@/.test(entry))
+        || (mode !== "direct" && /^@larksuite\+cli@/.test(entry))) {
         await rm(join(pnpmRoot, entry), { recursive: true, force: true });
       }
     }
@@ -260,20 +323,71 @@ async function installProductionDependencies(appDir, pnpmPath) {
   if (!existsSync(join(nodeModules, "@openai", "codex-sdk"))) {
     throw new Error("生产依赖中缺少 @openai/codex-sdk");
   }
+  if (mode === "direct") await ensureLarkCliBinary(appDir);
+  await relativizeNodeModuleSymlinks(appDir);
+  await writePortablePackageJson(appDir, mode);
+}
+
+async function relativizeNodeModuleSymlinks(appDir) {
+  const root = resolve(appDir);
+  let rewritten = 0;
+  async function visit(directory) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isSymbolicLink()) {
+        const target = await readlink(path);
+        if (!isAbsolute(target)) continue;
+        const normalizedTarget = resolve(target);
+        if (normalizedTarget !== root && !normalizedTarget.startsWith(`${root}/`)) {
+          throw new Error(`生产依赖包含指向包外的 symlink：${path} -> ${target}`);
+        }
+        await unlink(path);
+        await symlink(relative(dirname(path), normalizedTarget), path);
+        rewritten += 1;
+      } else if (entry.isDirectory()) {
+        await visit(path);
+      }
+    }
+  }
+  await visit(join(root, "node_modules"));
+  if (rewritten > 0) console.log(`已规范化生产依赖 symlink：${rewritten} 个`);
+}
+
+async function ensureLarkCliBinary(appDir) {
+  const packageRoot = join(appDir, "node_modules", "@larksuite", "cli");
+  const binary = join(packageRoot, "bin", process.platform === "win32" ? "lark-cli.exe" : "lark-cli");
+  if (!existsSync(binary)) {
+    const installer = join(packageRoot, "scripts", "install.js");
+    if (!existsSync(installer)) throw new Error(`lark-cli 安装脚本缺失：${installer}`);
+    await run(process.execPath, [installer], { cwd: appDir, env: process.env });
+  }
+  if (!existsSync(binary)) throw new Error(`lark-cli 二进制未生成：${binary}`);
+  const shim = join(appDir, "node_modules", ".bin", "lark-cli");
+  await writeFile(
+    shim,
+    "#!/bin/sh\nset -eu\nSELF_DIR=$(CDPATH= cd -P -- \"$(dirname -- \"$0\")\" && pwd -P)\nexec node \"$SELF_DIR/../@larksuite/cli/scripts/run.js\" \"$@\"\n",
+    { encoding: "utf8", mode: 0o755 },
+  );
+  await chmod(shim, 0o755);
 }
 
 async function copyNodeRuntime(runtimeDir, requestedNodePath) {
   const nodePath = await realpath(requestedNodePath);
   const prefix = resolve(dirname(nodePath), "..");
+  await copyNodeRuntimeTree(runtimeDir, prefix);
+  await writeFile(join(runtimeDir, ".bundled-node"), `${nodePath}\n`, "utf8");
+}
+
+async function copyNodeRuntimeTree(runtimeDir, prefix) {
   const npmSource = join(prefix, "lib", "node_modules", "npm");
   if (!existsSync(npmSource)) {
     throw new Error(`Node 安装中缺少 npm：${npmSource}`);
   }
   const binDir = join(runtimeDir, "bin");
   await mkdir(binDir, { recursive: true, mode: 0o755 });
-  await copyFile(nodePath, join(binDir, "node"));
+  await copyFile(join(prefix, "bin", "node"), join(binDir, "node"));
   await chmod(join(binDir, "node"), 0o755);
-  await writeFile(join(runtimeDir, ".bundled-node"), `${nodePath}\n`, "utf8");
   await mkdir(join(runtimeDir, "lib", "node_modules"), { recursive: true, mode: 0o755 });
   await cp(npmSource, join(runtimeDir, "lib", "node_modules", "npm"), { recursive: true });
   await removeSourceMaps(join(runtimeDir, "lib", "node_modules", "npm"));
@@ -285,7 +399,55 @@ async function copyNodeRuntime(runtimeDir, requestedNodePath) {
   }
 }
 
-async function runSmokeTests(stageDir, buildNodePath) {
+async function copyUniversalNodeRuntime(runtimeDir, requestedNodePath) {
+  const nodePath = await realpath(requestedNodePath);
+  const version = execFileSync(nodePath, ["-p", "process.versions.node"], { encoding: "utf8" }).trim().replace(/^v/, "");
+  const currentArch = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : undefined;
+  if (!currentArch) throw new Error(`direct Portable 暂不支持当前 CPU：${process.arch}`);
+
+  const stageParent = await mkdirTemp("feishu-codex-node-universal-");
+  const universalRoot = join(stageParent, "node-universal");
+  try {
+    for (const arch of ["arm64", "x64"]) {
+      const sourceRoot = arch === currentArch
+        ? resolve(dirname(nodePath), "..")
+        : await downloadNodeDistribution(version, arch, stageParent);
+      await copyNodeRuntimeTree(join(universalRoot, arch), sourceRoot);
+    }
+    await run(
+      "tar",
+      ["-czf", join(runtimeDir, "node-universal.tar.gz"), "-C", stageParent, "node-universal"],
+      { cwd: PROJECT_ROOT },
+    );
+  } finally {
+    await rm(stageParent, { recursive: true, force: true });
+  }
+}
+
+async function downloadNodeDistribution(version, arch, destination) {
+  const prefix = `node-v${version}-darwin-${arch}`;
+  const archive = `${prefix}.tar.gz`;
+  const archivePath = join(destination, archive);
+  const checksumsPath = join(destination, "SHASUMS256.txt");
+  const baseUrl = `https://nodejs.org/dist/v${version}`;
+  await run("curl", ["--proto", "=https", "--tlsv1.2", "-fsSL", `${baseUrl}/${archive}`, "-o", archivePath], {
+    cwd: destination,
+  });
+  await run("curl", ["--proto", "=https", "--tlsv1.2", "-fsSL", `${baseUrl}/SHASUMS256.txt`, "-o", checksumsPath], {
+    cwd: destination,
+  });
+  const checksums = await readFile(checksumsPath, "utf8");
+  const expected = checksums
+    .split(/\r?\n/)
+    .map((line) => line.trim().split(/\s+/))
+    .find((parts) => parts[1] === archive)?.[0];
+  const actual = execFileSync("shasum", ["-a", "256", archivePath], { encoding: "utf8" }).trim().split(/\s+/)[0];
+  if (!expected || expected !== actual) throw new Error(`Node ${arch} 下载校验失败：${archive}`);
+  await run("tar", ["-xzf", archivePath, "-C", destination], { cwd: destination });
+  return join(destination, prefix);
+}
+
+async function runSmokeTests(stageDir, buildNodePath, mode) {
   const bundledNode = join(stageDir, "runtime", "bin", "node");
   const node = existsSync(bundledNode) ? bundledNode : resolve(buildNodePath);
   const app = join(stageDir, "app");
@@ -306,7 +468,9 @@ async function runSmokeTests(stageDir, buildNodePath) {
       'sqlite.prepare("INSERT INTO smoke (value) VALUES (?)").run("ok");',
       'if (sqlite.prepare("SELECT value FROM smoke").get().value !== "ok") throw new Error("node:sqlite smoke test failed");',
       'sqlite.close();',
-      'await import("./dist/aamp-task-agent.js");',
+      mode === "direct"
+        ? 'await import("./dist/direct-feishu-setup.js");'
+        : 'await import("./dist/aamp-task-agent.js");',
       'console.log("portable runtime smoke test passed");',
     ].join("\n")],
     { cwd: app, env },
@@ -317,13 +481,19 @@ async function writePortableReadme(stageDir, packageName) {
   const content = `# Feishu Codex Bridge Portable Runtime Lite\n\n` 
     + `目标平台：${packageName}\n\n`
     + "## 使用\n\n"
-    + "1. 确认本机已安装并登录 Codex CLI。\n"
-    + "2. 确认要处理的 Git 仓库路径可访问。\n"
-    + "3. 执行 `./feishu-codex-bridge install`，按提示填写 Feishu 凭据。\n\n"
+    + (packageName.includes("-direct-")
+      ? "1. 双击 `install.command`，安装器会通过飞书二维码创建直连 Bot，并写入 lark-cli profile。\n"
+      : "1. 双击 `install.command`，或在终端执行 `./feishu-codex-bridge install`。\n")
+    + (packageName.includes("-direct-")
+      ? "2. 直连包自带双架构 Node、lark-cli 和直连运行依赖，不启动 AAMP 服务。\n"
+      : "2. 安装器会自动查找 ChatGPT App 内置的 Codex；如果电脑另有独立 Codex CLI，也会自动使用。\n")
+    + "3. 按提示选择要处理的 Git 仓库并完成 Feishu 授权。\n\n"
     + "启动器会优先使用系统 Node >=22.13.1；如果找不到，会从 Node 官方发行目录下载固定版本到当前包的 runtime/ 目录。不会修改用户全局 Node、nvm 或 Homebrew。\n"
     + "使用 `--bundle-node` 构建时，也可以完全离线运行。\n"
     + "SQLite 使用 Node 22.13 内置的 node:sqlite，不包含原生 SQLite 扩展。\n"
-    + "Codex CLI 不包含在 Lite 包中；可使用官方独立安装程序安装。\n\n"
+    + (packageName.includes("-direct-")
+      ? "内置 Node 会按当前 CPU 架构从 node-universal.tar.gz 解压使用；不会联网下载 Node。\n\n"
+      : "如果没有找到 ChatGPT App 或独立 Codex CLI，安装器会明确提示原因；不需要手动填写 CLI 路径。\n\n")
     + "已有配置启用 AAMP 时，请使用 `./feishu-codex-bridge aamp:start --config <path>`；`service start` 仅启动原生直连 Codex。\n\n"
     + "## 常用命令\n\n"
     + "```text\n"

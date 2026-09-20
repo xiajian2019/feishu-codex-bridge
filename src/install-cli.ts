@@ -1,14 +1,20 @@
 import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { runCodexCli } from "./codex-cli.js";
-import { parseExecutionMode } from "./config.js";
-import { findExecutableInPath } from "./runtime-env.js";
+import {
+  codexPathSourceLabel,
+  isExecutableCodexPath,
+  resolveCodexCliPath,
+} from "./codex-path.js";
+import { isDirectExecutionMode, loadConfig, parseExecutionMode } from "./config.js";
+import { setupDirectFeishuCredentials } from "./direct-feishu-setup.js";
+import { resolveSharedFeishuCredentials } from "./feishu-credentials.js";
 import type { ExecutionMode } from "./types.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -143,6 +149,7 @@ export async function runInstallCli(argv = process.argv.slice(2)): Promise<void>
   await ensureBuiltRuntime();
   console.log("[1/3] 初始化配置");
   await initializeConfig(args);
+  await ensureDirectFeishuCredentials(args);
   console.log("[2/3] 检查运行环境");
   await runDoctor(args);
   if (args.noService) {
@@ -189,6 +196,7 @@ export function printInstallUsage(): void {
 
 async function initializeConfig(args: InstallCliArguments): Promise<void> {
   if (existsSync(args.configPath) && !args.force) {
+    await repairExistingCodexPath(args.configPath);
     console.log(`保留已有配置：${args.configPath}`);
     return;
   }
@@ -261,14 +269,25 @@ export function buildDirectConfig(values: DirectInitValues): Record<string, unkn
 
 async function collectInitValues(args: InstallCliArguments): Promise<DirectInitValues> {
   const defaultRepo = args.repoPath ?? (isGitRepository(process.cwd()) ? process.cwd() : undefined);
-  const defaultCodex = args.codexPath ?? findCodexPath();
+  const detectedCodex = args.codexPath
+    ? { path: args.codexPath, source: undefined }
+    : resolveCodexCliPath();
+  const defaultCodex = detectedCodex?.path;
   const defaultAppId = args.appId ?? process.env.FEISHU_APP_ID;
   const defaultAppSecret = args.appSecret ?? process.env.FEISHU_APP_SECRET;
   const defaultProxy = args.proxyUrl ?? process.env.HTTPS_PROXY ?? process.env.HTTP_PROXY;
 
+  if (detectedCodex && detectedCodex.source) {
+    console.log(`自动找到 Codex：${detectedCodex.path}（${codexPathSourceLabel(detectedCodex.source)}）`);
+  }
+
   if (args.nonInteractive || !input.isTTY || !output.isTTY) {
     if (!defaultRepo) throw new Error("初始化需要 Git 仓库路径：请使用 --repo path");
-    if (!defaultCodex) throw new Error("找不到 Codex CLI：请使用 --codex path");
+    if (!defaultCodex) {
+      throw new Error(
+        "未找到可用的 Codex。请先安装 ChatGPT App，或使用官方 Codex CLI 安装程序后重试。",
+      );
+    }
     return {
       repoPath: defaultRepo,
       codexPath: defaultCodex,
@@ -286,8 +305,8 @@ async function collectInitValues(args: InstallCliArguments): Promise<DirectInitV
     }
     const codexPath = await ask(readline, "Codex CLI 路径", defaultCodex);
     if (!codexPath) throw new Error("Codex CLI 路径不能为空");
-    const appId = await ask(readline, "Feishu App ID（已有 AAMP binding 可留空）", defaultAppId);
-    const appSecret = await ask(readline, "Feishu App Secret（已有 AAMP binding 可留空）", defaultAppSecret);
+    const appId = await ask(readline, "Feishu App ID（留空则通过飞书授权创建）", defaultAppId);
+    const appSecret = await ask(readline, "Feishu App Secret（留空则通过飞书授权创建）", defaultAppSecret);
     const proxyUrl = await ask(readline, "代理地址（可留空）", defaultProxy);
     return {
       repoPath: resolve(repoPath),
@@ -299,6 +318,55 @@ async function collectInitValues(args: InstallCliArguments): Promise<DirectInitV
   } finally {
     readline.close();
   }
+}
+
+async function ensureDirectFeishuCredentials(args: InstallCliArguments): Promise<void> {
+  if (!isDirectExecutionMode(args.executionMode)) return;
+  const config = loadConfig(args.configPath, { executionMode: args.executionMode });
+  try {
+    resolveSharedFeishuCredentials(config);
+    return;
+  } catch (error) {
+    if (args.nonInteractive || !input.isTTY || !output.isTTY) throw error;
+    console.log("未找到直连 Feishu 凭据，开始独立的飞书 Bot 授权流程…");
+    const setup = await setupDirectFeishuCredentials(args.configPath, {
+      appName: "Feishu Codex Bridge",
+      openUrl: true,
+    });
+    console.log(`授权完成：${setup.appName}（${setup.appId}）`);
+  }
+
+  const refreshed = loadConfig(args.configPath, { executionMode: args.executionMode });
+  try {
+    resolveSharedFeishuCredentials(refreshed);
+  } catch (error) {
+    throw new Error(
+      `飞书授权后仍未找到直连凭据：${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+async function repairExistingCodexPath(configPath: string): Promise<void> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await readFile(configPath, "utf8")) as unknown;
+  } catch {
+    return;
+  }
+  if (!isRecord(raw)) return;
+
+  const codex = isRecord(raw.codex) ? raw.codex : {};
+  const configuredPath = typeof codex.cliPath === "string" ? codex.cliPath : undefined;
+  if (configuredPath && isExecutableCodexPath(configuredPath)) return;
+
+  const detected = resolveCodexCliPath();
+  if (!detected || detected.path === configuredPath) return;
+
+  codex.cliPath = detected.path;
+  raw.codex = codex;
+  await writeFile(configPath, `${JSON.stringify(raw, null, 2)}\n`, { encoding: "utf8" });
+  chmodSync(configPath, 0o600);
+  console.log(`已自动更新 Codex 路径：${detected.path}（${codexPathSourceLabel(detected.source)}）`);
 }
 
 async function ask(
@@ -336,16 +404,6 @@ async function ensureBuiltRuntime(): Promise<void> {
   }
 }
 
-function findCodexPath(): string | undefined {
-  const candidates = [
-    process.env.CODEX_PATH,
-    findExecutableInPath("codex", process.env.PATH),
-    "/opt/homebrew/bin/codex",
-    "/usr/local/bin/codex",
-  ];
-  return candidates.find((candidate) => candidate && existsSync(candidate));
-}
-
 function isGitRepository(path: string): boolean {
   try {
     return execFileSync("git", ["-C", resolve(path), "rev-parse", "--is-inside-work-tree"], {
@@ -355,6 +413,10 @@ function isGitRepository(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function readOption(
