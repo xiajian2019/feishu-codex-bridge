@@ -128,6 +128,8 @@ export interface BridgeConfig {
   localNotifications: {
     /** Emit macOS Notification Center alerts for Codex App/CLI thread completion. */
     enabled: boolean;
+    /** Use the official Codex notify hook instead of thread polling. */
+    mode: "poll" | "hook";
     /** Poll interval for the local notification watcher. */
     intervalSeconds: number;
   };

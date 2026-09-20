@@ -24,6 +24,7 @@ import {
   type CodexThreadStatusType,
 } from "./codex-app-server.js";
 import { DIRECT_RUNTIME_LEASE_NAME } from "./feishu-sqlite-codex.js";
+import { installCodexNotifyHook, runCodexNotifyHook } from "./codex-notify-hook.js";
 import { resolveSharedFeishuCredentials, type FeishuCredentialSource } from "./feishu-credentials.js";
 import { LocalCodexNotificationWatcher } from "./local-codex-notifications.js";
 import { StateDatabase, type OutboxSummary, type RuntimeLeaseRecord } from "./db.js";
@@ -257,7 +258,17 @@ export async function runCodexCli(argv = process.argv.slice(2)): Promise<void> {
       await withDatabase(args.dbPath, (db) => runCodexRecent(db, args, commandArgs));
       return;
     case "notify":
-      await runCodexLocalNotifications(config, commandArgs);
+      await runCodexLocalNotifications(config, args, commandArgs);
+      return;
+    case "notify-install":
+      await installCodexNotifyHook({
+        bridgeConfigPath: args.configPath,
+        dbPath: args.dbPath,
+      });
+      return;
+    case "notify-hook":
+    case "notify-dispatch":
+      await runCodexNotifyHook(config, commandArgs);
       return;
     case "threads":
     case "sessions":
@@ -315,7 +326,9 @@ export function printCodexUsage(): void {
       "",
       "任务与持久化状态：",
       "  recent|list         查看最近任务（--limit N --status STATUS --json）",
-      "  notify              轮询并发送 macOS 系统完成通知（--interval N --once）",
+      "  notify              手动轮询并发送 macOS 系统完成通知（--interval N --once）",
+      "  notify-install      安装官方 Codex notify hook，并保留已有 hook",
+      "  notify-hook         处理 Codex 官方 agent-turn-complete hook",
       "  task|inspect ID     查看任务、事件、附件和 outbox（支持唯一前缀）",
       "  threads|sessions    只读查询 Codex App/CLI threads（支持筛选）",
       "  thread|session ID   只读查看 Codex thread（--turns 展开轮次）",
@@ -1082,11 +1095,12 @@ async function runCodexRecent(
 
 async function runCodexLocalNotifications(
   config: BridgeConfig,
+  args: CodexCliArguments,
   commandArgs: string[],
 ): Promise<void> {
   const intervalSeconds = parsePositiveIntegerOption(commandArgs, "--interval", 60, 10, 3_600);
   const statePath = resolve(
-    optionValue(commandArgs, "--state") || join(PROJECT_ROOT, "runtime", "codex-local-notifications.json"),
+    optionValue(commandArgs, "--state") || join(dirname(resolve(args.dbPath)), "codex-local-notifications.json"),
   );
   const watcher = new LocalCodexNotificationWatcher({
     createClient: () => new CodexAppServerClient({

@@ -15,6 +15,7 @@ import {
 import { isDirectExecutionMode, loadConfig, parseExecutionMode } from "./config.js";
 import { setupDirectFeishuCredentials } from "./direct-feishu-setup.js";
 import { resolveSharedFeishuCredentials } from "./feishu-credentials.js";
+import { installCodexNotifyHook } from "./codex-notify-hook.js";
 import type { ExecutionMode } from "./types.js";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -152,6 +153,10 @@ export async function runInstallCli(argv = process.argv.slice(2)): Promise<void>
   await ensureDirectFeishuCredentials(args);
   console.log("[2/3] 检查运行环境");
   await runDoctor(args);
+  await installCodexNotifyHook({
+    bridgeConfigPath: args.configPath,
+    dbPath: args.dbPath,
+  });
   if (args.noService) {
     console.log("[3/3] 已跳过后台服务安装（--no-service）");
     return;
@@ -210,7 +215,7 @@ async function initializeConfig(args: InstallCliArguments): Promise<void> {
 }
 
 export interface DirectInitValues {
-  repoPath: string;
+  repoPath?: string;
   codexPath: string;
   appId?: string;
   appSecret?: string;
@@ -224,7 +229,7 @@ export function buildDirectConfig(values: DirectInitValues): Record<string, unkn
     aamp: { enabled: false, stopOnShutdown: false },
     relay: { enabled: false },
     direct: {
-      projectKey: "default",
+      ...(values.repoPath ? { projectKey: "default" } : {}),
       mode: "implement",
       feishu: {
         ...(values.appId ? { appId: values.appId } : {}),
@@ -258,9 +263,9 @@ export function buildDirectConfig(values: DirectInitValues): Record<string, unkn
         ...(proxy ? { HTTP_PROXY: proxy, HTTPS_PROXY: proxy } : {}),
       },
     },
-    projects: {
-      default: { optionGuid: "direct-project-option", repo: values.repoPath },
-    },
+    projects: values.repoPath
+      ? { default: { optionGuid: "direct-project-option", repo: values.repoPath } }
+      : {},
     modes: {
       implement: { optionGuid: "direct-mode-option", sandboxMode: "workspace-write" },
     },
@@ -282,7 +287,6 @@ async function collectInitValues(args: InstallCliArguments): Promise<DirectInitV
   }
 
   if (args.nonInteractive || !input.isTTY || !output.isTTY) {
-    if (!defaultRepo) throw new Error("初始化需要 Git 仓库路径：请使用 --repo path");
     if (!defaultCodex) {
       throw new Error(
         "未找到可用的 Codex。请先安装 ChatGPT App，或使用官方 Codex CLI 安装程序后重试。",
@@ -299,9 +303,8 @@ async function collectInitValues(args: InstallCliArguments): Promise<DirectInitV
 
   const readline = createInterface({ input, output });
   try {
-    const repoPath = await ask(readline, "Git 仓库路径", defaultRepo);
-    if (!repoPath || !isGitRepository(repoPath)) {
-      throw new Error(`不是有效的 Git 仓库：${repoPath || "(空)"}`);
+    if (defaultRepo && !isGitRepository(defaultRepo)) {
+      throw new Error(`不是有效的 Git 仓库：${defaultRepo}`);
     }
     const codexPath = await ask(readline, "Codex CLI 路径", defaultCodex);
     if (!codexPath) throw new Error("Codex CLI 路径不能为空");
@@ -309,7 +312,7 @@ async function collectInitValues(args: InstallCliArguments): Promise<DirectInitV
     const appSecret = await ask(readline, "Feishu App Secret（留空则通过飞书授权创建）", defaultAppSecret);
     const proxyUrl = await ask(readline, "代理地址（可留空）", defaultProxy);
     return {
-      repoPath: resolve(repoPath),
+      repoPath: defaultRepo ? resolve(defaultRepo) : undefined,
       codexPath: resolve(codexPath),
       appId: appId || undefined,
       appSecret: appSecret || undefined,

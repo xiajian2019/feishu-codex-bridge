@@ -1,6 +1,6 @@
 {
   "name": "feishu-codex-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "packageManager": "pnpm@10.28.2",
   "description": "Run Codex tasks from Feishu using AAMP or the native direct bridge.",
@@ -46,6 +46,8 @@
     "codex:logs": "tsx src/codex-cli.ts logs",
     "codex:recent": "tsx src/codex-cli.ts recent",
     "codex:notify": "tsx src/codex-cli.ts notify",
+    "codex:notify-install": "tsx src/codex-cli.ts notify-install",
+    "codex:notify-hook": "tsx src/codex-cli.ts notify-hook",
     "codex:list": "tsx src/codex-cli.ts list",
     "codex:threads": "tsx src/codex-cli.ts threads",
     "codex:thread": "tsx src/codex-cli.ts thread",

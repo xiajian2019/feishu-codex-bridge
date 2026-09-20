@@ -6,6 +6,7 @@ import { AampTaskAgentRuntime } from "./aamp-task-agent.js";
 import { AampRelayClient, reconcileRunningAampTasks } from "./aamp-relay.js";
 import { isDirectExecutionMode, loadConfig, parseExecutionMode } from "./config.js";
 import { buildCodexAppServerEnvironment, CodexAppServerClient } from "./codex-app-server.js";
+import { LocalCodexNotificationInbox } from "./codex-notification-inbox.js";
 import { StateDatabase } from "./db.js";
 import { Dispatcher } from "./dispatcher.js";
 import { LarkCliClient } from "./lark.js";
@@ -258,6 +259,7 @@ async function runDirectMode(
     attachmentsDir: join(projectRoot, "runtime", "direct", "attachments"),
   });
   const localNotifications = config.localNotifications.enabled
+    && config.localNotifications.mode === "poll"
     ? new LocalCodexNotificationWatcher({
       createClient: () => new CodexAppServerClient({
         executable: config.codex.cliPath,
@@ -267,8 +269,12 @@ async function runDirectMode(
         clientTitle: "Feishu Codex Bridge Notifications",
       }),
       logger,
-      statePath: join(projectRoot, "runtime", "codex-local-notifications.json"),
+      statePath: join(dirname(dbPath), "codex-local-notifications.json"),
     })
+    : null;
+  const notificationInbox = config.localNotifications.enabled
+    && config.localNotifications.mode === "hook"
+    ? new LocalCodexNotificationInbox({ logger })
     : null;
   let stopping = false;
   const stop = async (): Promise<void> => {
@@ -276,6 +282,7 @@ async function runDirectMode(
     stopping = true;
     try {
       await localNotifications?.stop();
+      await notificationInbox?.stop();
       await runtime.stop();
     } finally {
       db.close();
@@ -290,6 +297,7 @@ async function runDirectMode(
   try {
     await runtime.start();
     await startLocalNotifications(localNotifications, config.localNotifications.intervalSeconds, logger);
+    await startNotificationInbox(notificationInbox, logger);
     if (args.once) {
       await runtime.runOnce();
       await localNotifications?.pollOnce();
@@ -330,6 +338,7 @@ async function runAampMode(
     logger,
   });
   const localNotifications = config.localNotifications.enabled
+    && config.localNotifications.mode === "poll"
     ? new LocalCodexNotificationWatcher({
       createClient: () => new CodexAppServerClient({
         executable: config.codex.cliPath,
@@ -339,8 +348,12 @@ async function runAampMode(
         clientTitle: "Feishu Codex Bridge Notifications",
       }),
       logger,
-      statePath: join(projectRoot, "runtime", "codex-local-notifications.json"),
+      statePath: join(dirname(dbPath), "codex-local-notifications.json"),
     })
+    : null;
+  const notificationInbox = config.localNotifications.enabled
+    && config.localNotifications.mode === "hook"
+    ? new LocalCodexNotificationInbox({ logger })
     : null;
   const dashboard = config.web.enabled
     ? new DashboardServer({
@@ -363,6 +376,7 @@ async function runAampMode(
     stopping = true;
     try {
       await localNotifications?.stop();
+      await notificationInbox?.stop();
       if (runtimeStarted && config.aamp.stopOnShutdown) {
         await runtime.stop();
       } else {
@@ -399,6 +413,7 @@ async function runAampMode(
     await runtime.start();
     runtimeStarted = true;
     await startLocalNotifications(localNotifications, config.localNotifications.intervalSeconds, logger);
+    await startNotificationInbox(notificationInbox, logger);
     logger.info("official AAMP runtime started", {
       profile: config.lark.profile,
       relay: config.relay.aampHost ?? "official-default",
@@ -427,6 +442,21 @@ async function startLocalNotifications(
     logger.info("local Codex system notifications enabled", { intervalSeconds });
   } catch (error) {
     logger.warn("local Codex system notifications disabled after startup failure", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function startNotificationInbox(
+  inbox: LocalCodexNotificationInbox | null,
+  logger: Logger,
+): Promise<void> {
+  if (!inbox) return;
+  try {
+    await inbox.start();
+    logger.info("official Codex notify inbox enabled");
+  } catch (error) {
+    logger.warn("official Codex notify inbox disabled after startup failure", {
       error: error instanceof Error ? error.message : String(error),
     });
   }

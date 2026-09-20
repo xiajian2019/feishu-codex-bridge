@@ -15,8 +15,9 @@ const STATE_VERSION = 2;
 const DEFAULT_STATE_FILE = "runtime/codex-local-notifications.json";
 const MAX_THREADS = 500;
 const MAX_NOTIFICATION_BODY = 600;
+const CHATGPT_APP_BUNDLE_ID = "com.openai.codex";
 const CODEX_SOURCE_KINDS = ["cli", "appServer"] as const;
-const TERMINAL_STATUSES = new Set(["idle", "notLoaded", "systemError"]);
+const TERMINAL_STATUSES = new Set(["idle", "systemError"]);
 
 export interface LocalCodexNotificationOptions {
   createClient: () => CodexAppServerQueryClient;
@@ -25,7 +26,11 @@ export interface LocalCodexNotificationOptions {
   sendNotification?: LocalNotificationSender;
 }
 
-export type LocalNotificationSender = (title: string, body: string) => Promise<void>;
+export type LocalNotificationSender = (
+  title: string,
+  body: string,
+  source?: CodexNotificationSource,
+) => Promise<void>;
 
 export interface LocalCodexNotification {
   threadKey: string;
@@ -34,6 +39,8 @@ export interface LocalCodexNotification {
   title: string;
   body: string;
 }
+
+export type CodexNotificationSource = "cli" | "appServer";
 
 interface WatchedThread {
   key: string;
@@ -60,7 +67,9 @@ interface LocalCodexNotificationState {
 
 /**
  * Poll Codex app-server's local thread index and notify only when a thread
- * observed as active transitions to idle/notLoaded/systemError. Bridge task
+ * observed as active transitions to idle/systemError. `notLoaded` only means
+ * the app-server unloaded the thread from memory, not that the task completed.
+ * Bridge task
  * tables are intentionally not watched here; those already have Feishu cards.
  */
 export class LocalCodexNotificationWatcher {
@@ -87,7 +96,6 @@ export class LocalCodexNotificationWatcher {
       throw new Error("system local Codex notifications currently require macOS");
     }
 
-    await this.pollOnce();
     this.timer = setInterval(() => {
       void this.pollOnce().catch((error) => {
         this.logger?.warn("local Codex notification poll failed", {
@@ -95,6 +103,13 @@ export class LocalCodexNotificationWatcher {
         });
       });
     }, intervalSeconds * 1_000);
+    // Do not make Feishu/Codex service startup depend on app-server readiness.
+    // A slow or temporarily unavailable Codex App is retried on the next tick.
+    void this.pollOnce().catch((error) => {
+      this.logger?.warn("initial local Codex notification poll failed; will retry", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
   }
 
   public async stop(): Promise<void> {
@@ -127,11 +142,16 @@ export class LocalCodexNotificationWatcher {
     for (const thread of threads) {
       const signature = `${thread.status}:${thread.updatedAt}`;
       const prior = previous.threads[thread.key];
+      // Older watcher versions incorrectly notified on notLoaded. Discard
+      // that stale marker so a later active -> idle transition can notify.
+      const priorNotifiedSignature = prior?.status === "notLoaded"
+        ? undefined
+        : prior?.notifiedSignature;
       const next: StoredThreadState = {
         source: thread.source,
         status: thread.status,
         updatedAt: thread.updatedAt,
-        notifiedSignature: prior?.notifiedSignature,
+        notifiedSignature: thread.status === "active" ? undefined : priorNotifiedSignature,
       };
 
       const wasActive = prior?.status === "active";
@@ -140,10 +160,12 @@ export class LocalCodexNotificationWatcher {
         && isTerminal(thread.status)
         && thread.updatedAt !== "unknown"
         && thread.updatedAt >= baselineAt;
-      if ((wasActive || isNewCompletedThread) && isTerminal(thread.status) && prior?.notifiedSignature !== signature) {
+      if ((wasActive || isNewCompletedThread)
+        && isTerminal(thread.status)
+        && !priorNotifiedSignature) {
         const notification = formatLocalCodexNotification(thread);
         try {
-          await this.sendNotification(notification.title, notification.body);
+          await this.sendNotification(notification.title, notification.body, notification.source);
           next.notifiedSignature = signature;
           notifications.push(notification);
         } catch (error) {
@@ -206,16 +228,39 @@ export function formatLocalCodexNotification(thread: WatchedThread): LocalCodexN
 }
 
 export function buildMacNotificationScript(title: string, body: string): string {
-  return `display notification ${appleScriptString(body)} with title ${appleScriptString(title)}`;
+  // Use JXA so AppleScript localization and tell-application terminology do
+  // not affect Notification Center delivery. This runs in the Bridge
+  // LaunchAgent, outside the Codex notify hook's sandbox.
+  return [
+    "const app = Application.currentApplication();",
+    "app.includeStandardAdditions = true;",
+    `app.displayNotification(${JSON.stringify(normalizeNotificationText(body))}, { withTitle: ${JSON.stringify(title)} });`,
+  ].join("\n");
 }
 
-export function sendMacLocalNotification(title: string, body: string): Promise<void> {
+export async function sendMacLocalNotification(
+  title: string,
+  body: string,
+  source: CodexNotificationSource = "cli",
+): Promise<void> {
   if (process.platform !== "darwin") {
     return Promise.reject(new Error("system local Codex notifications currently require macOS"));
   }
-  const script = buildMacNotificationScript(title, body);
+
+  await runMacCommand("/usr/bin/osascript", ["-l", "JavaScript", "-e", buildMacNotificationScript(title, body)]);
+
+  if (source === "appServer") {
+    // The resident LaunchAgent keeps this timer alive. The notification is
+    // already sent; opening ChatGPT is deliberately delayed by ten seconds.
+    setTimeout(() => {
+      void runMacCommand("/usr/bin/open", ["-b", CHATGPT_APP_BUNDLE_ID]).catch(() => undefined);
+    }, 10_000);
+  }
+}
+
+function runMacCommand(command: string, args: string[]): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    execFile("osascript", ["-e", script], (error) => {
+    execFile(command, args, (error) => {
       if (error) reject(error);
       else resolve();
     });
@@ -262,11 +307,8 @@ function trimThreadState(threads: Record<string, StoredThreadState>): void {
     .forEach(([key]) => delete threads[key]);
 }
 
-function appleScriptString(value: string): string {
-  return `"${value
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')
-    .replace(/\r?\n/g, " ")}"`;
+function normalizeNotificationText(value: string): string {
+  return value.replace(/\r?\n/g, " ").trim();
 }
 
 async function readState(path: string): Promise<LocalCodexNotificationState> {

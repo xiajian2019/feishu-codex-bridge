@@ -71,6 +71,7 @@ export async function publishGithubRelease(options = {}, runCommand = run) {
 
   if (!parsed.skipBuild) await runCommand("npm", ["run", "build"], PROJECT_ROOT);
   await runCommand("npm", ["run", "release", "--", "--skip-build", "--json"], PROJECT_ROOT);
+  await runCommand("npm", ["run", "release", "--", "--mode", "core", "--skip-build", "--json"], PROJECT_ROOT);
   await runCommand("npm", ["run", "release", "--", "--mode", "lite", "--skip-build", "--json"], PROJECT_ROOT);
 
   const commands = [

@@ -213,6 +213,7 @@ case "$1" in
       aamp:recent aamp:task aamp:inspect aamp:worktrees \
       codex codex:install codex:setup codex:start codex:stop codex:restart codex:status codex:logs \
       codex:recent codex:list codex:threads codex:thread codex:task codex:inspect codex:attachments codex:outbox \
+      codex:notify-install codex:notify-hook \
       codex:cancel codex:retry codex:recover codex:worktrees codex:doctor codex:update \
       codex:uninstall codex:remove
     exit 0
@@ -228,7 +229,7 @@ case "$1" in
   install|init|doctor)
     command="$1"
     shift
-    run_entry install-cli "$command" "$@"
+    NODE_NO_WARNINGS=1 run_entry install-cli "$command" "$@"
     ;;
   start|start:all)
     shift
@@ -236,9 +237,9 @@ case "$1" in
     ;;
   update)
     shift
-    # Stop the current LaunchAgent before replacing app files. Failure is
-    # tolerated because a package may not have been installed yet.
-    "$SELF_DIR/feishu-codex-bridge" service stop >/dev/null 2>&1 || true
+    # The updater downloads, validates and stages the package before stopping
+    # the current LaunchAgent. It also restarts the service after a successful
+    # swap and restores the old package if the new service cannot start.
     exec "$NODE_BIN" "$APP_DIR/scripts/update-portable-release.mjs" --root "$SELF_DIR" "$@"
     ;;
   bridge:install)

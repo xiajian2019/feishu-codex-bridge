@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
-import { chmod, cp, copyFile, mkdir, mkdtemp, readFile, readlink, readdir, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, cp, copyFile, mkdir, mkdtemp, readFile, readlink, readdir, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -11,7 +11,8 @@ const MIN_NODE_VERSION = [22, 13, 1];
 const DEFAULT_OUTPUT_DIR = join(PROJECT_ROOT, "release");
 const LAUNCHER_SOURCE = join(PROJECT_ROOT, "scripts", "portable-launcher.sh");
 const INSTALL_COMMAND_SOURCE = join(PROJECT_ROOT, "install.command");
-const RELEASE_MODES = ["lite", "direct"];
+const INSTALL_DEFAULTS_SOURCE = join(PROJECT_ROOT, "install.defaults");
+const RELEASE_MODES = ["core", "lite", "direct"];
 const DEFAULT_RELEASE_MODE = "direct";
 
 export function parsePortableReleaseArguments(argv, cwd = process.cwd()) {
@@ -89,25 +90,25 @@ export function targetName(platform = process.platform, arch = process.arch, mod
     x64: "x64",
   }[arch];
   if (!platformName || !archName) {
-    throw new Error(`Portable Runtime Lite 当前只支持 macOS arm64/x64：${platform}/${arch}`);
+    throw new Error(`Portable Runtime 当前只支持 macOS arm64/x64：${platform}/${arch}`);
   }
   if (!RELEASE_MODES.includes(mode)) throw new Error(`未知 portable 发布模式：${mode}`);
-  return mode === "direct"
-    ? `feishu-codex-bridge-direct-${platformName}-${archName}`
-    : `feishu-codex-bridge-${platformName}-${archName}`;
+  if (mode === "direct") return `feishu-codex-bridge-direct-${platformName}-${archName}`;
+  if (mode === "core") return `feishu-codex-bridge-core-${platformName}-${archName}`;
+  return `feishu-codex-bridge-${platformName}-${archName}`;
 }
 
 export function printPortableReleaseUsage() {
   console.log([
     "用法：pnpm run release [选项]",
     "",
-    "构建接收方无需预装 Node/pnpm 的 Portable Runtime Lite 压缩包。",
+    "构建接收方无需预装 Node/pnpm 的 Portable Runtime 压缩包。",
     "",
     "选项：",
     "  --output path          输出目录（默认：./release）",
     "  --node path            要内置的 Node 可执行文件（默认：当前 Node）",
     "  --pnpm path            构建生产依赖使用的 pnpm（默认：pnpm）",
-    "  --mode MODE            发布模式：lite 或 direct（默认：direct）",
+    "  --mode MODE            发布模式：core、lite 或 direct（默认：direct）",
     "  --direct               --mode direct 的别名；内置 lark-cli 和双架构 Node",
     "  --skip-build           复用现有 dist，不重新执行 pnpm run build",
     "  --keep-source-maps     保留 dist 中的 source map",
@@ -117,7 +118,8 @@ export function printPortableReleaseUsage() {
 }
 
 export async function buildPortableRelease(options) {
-  const packageName = targetName(process.platform, process.arch, options.mode || DEFAULT_RELEASE_MODE);
+  const mode = options.mode || DEFAULT_RELEASE_MODE;
+  const packageName = targetName(process.platform, process.arch, mode);
   const outputDir = resolve(options.outputDir);
   const archivePath = join(outputDir, `${packageName}.tar.gz`);
   const packageDir = join(outputDir, packageName);
@@ -137,33 +139,33 @@ export async function buildPortableRelease(options) {
     const appDir = join(stageDir, "app");
     const runtimeDir = join(stageDir, "runtime");
     await mkdir(appDir, { recursive: true, mode: 0o755 });
-    if (options.mode === "direct" || options.bundleNode) {
+    if (mode === "direct" || (mode !== "core" && options.bundleNode)) {
       await mkdir(runtimeDir, { recursive: true, mode: 0o755 });
     }
-    await copyApplication(appDir, options.keepSourceMaps, options.mode || DEFAULT_RELEASE_MODE);
-    await installProductionDependencies(appDir, options.pnpmPath, options.mode || DEFAULT_RELEASE_MODE);
-    if (options.mode === "direct") {
+    await copyApplication(appDir, options.keepSourceMaps, mode, { includePackageJson: mode !== "core" });
+    if (mode !== "core") await installProductionDependencies(appDir, options.pnpmPath, mode);
+    if (mode === "direct") {
       await copyUniversalNodeRuntime(runtimeDir, options.nodePath);
-    } else if (options.bundleNode) {
+    } else if (mode !== "core" && options.bundleNode) {
       await copyNodeRuntime(runtimeDir, options.nodePath);
     }
     await copyFile(LAUNCHER_SOURCE, join(stageDir, "feishu-codex-bridge"));
     await chmod(join(stageDir, "feishu-codex-bridge"), 0o755);
     await copyFile(INSTALL_COMMAND_SOURCE, join(stageDir, "install.command"));
     await chmod(join(stageDir, "install.command"), 0o755);
-    await writeReleaseManifest(stageDir, packageName, options.mode || DEFAULT_RELEASE_MODE);
-    await writePortableReadme(stageDir, packageName);
-    await runSmokeTests(stageDir, options.nodePath, options.mode || DEFAULT_RELEASE_MODE);
+    await copyFile(INSTALL_DEFAULTS_SOURCE, join(stageDir, "install.defaults"));
+    await writeReleaseManifest(stageDir, packageName, mode);
+    await writePortableReadme(stageDir, packageName, mode);
+    await runSmokeTests(stageDir, options.nodePath, mode);
 
     await rm(archivePath, { force: true });
     await run("tar", ["-czf", archivePath, "-C", stageParent, packageName]);
-    await rm(packageDir, { recursive: true, force: true });
-    await cp(stageDir, packageDir, { recursive: true, verbatimSymlinks: true });
+    await installGeneratedPackage(stageDir, packageDir, outputDir, packageName);
     const checksum = await sha256(archivePath);
     await writeFile(`${archivePath}.sha256`, `${checksum}  ${packageName}.tar.gz\n`, "utf8");
     const result = {
       packageName,
-      mode: options.mode || DEFAULT_RELEASE_MODE,
+      mode,
       archivePath,
       packageDir,
       checksum,
@@ -172,10 +174,12 @@ export async function buildPortableRelease(options) {
     };
     if (options.json) console.log(JSON.stringify(result, null, 2));
     else {
-      console.log(`Portable Runtime Lite 已生成：${archivePath}`);
+      console.log(`Portable Runtime ${mode} 已生成：${archivePath}`);
       console.log(`SHA-256：${checksum}`);
       console.log(`校验文件：${archivePath}.sha256`);
-      console.log("接收方解压后执行：./feishu-codex-bridge install");
+      console.log(mode === "core"
+        ? "已安装包执行：./feishu-codex-bridge update --file ./feishu-codex-bridge-core-*.tar.gz"
+        : "接收方解压后执行：./feishu-codex-bridge install");
     }
     return result;
   } finally {
@@ -183,13 +187,13 @@ export async function buildPortableRelease(options) {
   }
 }
 
-async function copyApplication(appDir, keepSourceMaps, mode) {
+async function copyApplication(appDir, keepSourceMaps, mode, { includePackageJson = true } = {}) {
   const distDir = join(PROJECT_ROOT, "dist");
   const scriptsDir = join(PROJECT_ROOT, "scripts");
   await copyFiltered(distDir, join(appDir, "dist"), keepSourceMaps ? undefined : (source) => !source.endsWith(".map"));
   await copyFiltered(scriptsDir, join(appDir, "scripts"), (source) => !source.endsWith(".test.mjs"));
   await writePortableConfigExample(appDir);
-  await copyFile(join(PROJECT_ROOT, "package.json"), join(appDir, "package.json"));
+  if (includePackageJson) await copyFile(join(PROJECT_ROOT, "package.json"), join(appDir, "package.json"));
 }
 
 async function writePortablePackageJson(appDir, mode) {
@@ -451,6 +455,13 @@ async function runSmokeTests(stageDir, buildNodePath, mode) {
   const bundledNode = join(stageDir, "runtime", "bin", "node");
   const node = existsSync(bundledNode) ? bundledNode : resolve(buildNodePath);
   const app = join(stageDir, "app");
+  if (mode === "core") {
+    await run(node, ["--check", join(app, "dist", "main.js")], { cwd: app });
+    await run(node, ["--check", join(app, "scripts", "update-portable-release.mjs")], { cwd: app });
+    await run("sh", ["-n", join(stageDir, "feishu-codex-bridge")], { cwd: stageDir });
+    await run("sh", ["-n", join(stageDir, "install.command")], { cwd: stageDir });
+    return;
+  }
   const env = {
     ...process.env,
     PATH: `${join(stageDir, "runtime", "bin")}:${join(app, "node_modules", ".bin")}:${process.env.PATH || ""}`,
@@ -477,8 +488,22 @@ async function runSmokeTests(stageDir, buildNodePath, mode) {
   );
 }
 
-async function writePortableReadme(stageDir, packageName) {
-  const content = `# Feishu Codex Bridge Portable Runtime Lite\n\n` 
+async function writePortableReadme(stageDir, packageName, mode) {
+  if (mode === "core") {
+    await writeFile(join(stageDir, "README.md"), [
+      "# Feishu Codex Bridge Core Update Package",
+      "",
+      `目标平台：${packageName}`,
+      "",
+      "这是已安装 Portable 包使用的核心更新包，不是独立安装包。",
+      "它只包含 Bridge 编译产物、更新脚本和启动器，不包含 Node、node_modules、lark-cli、config.json 或 runtime 数据。",
+      "",
+      "请在已安装包目录执行 `./feishu-codex-bridge update`，不要直接运行本包中的 install.command。",
+      "",
+    ].join("\n"), "utf8");
+    return;
+  }
+  const content = `# Feishu Codex Bridge Portable Runtime ${mode === "direct" ? "Direct" : "Lite"}\n\n`
     + `目标平台：${packageName}\n\n`
     + "## 使用\n\n"
     + (packageName.includes("-direct-")
@@ -554,6 +579,33 @@ async function removeSourceMaps(root) {
 
 async function mkdirTemp(prefix) {
   return mkdtemp(join(tmpdir(), prefix));
+}
+
+async function installGeneratedPackage(stageDir, packageDir, outputDir, packageName) {
+  const stagingDir = join(outputDir, `.${packageName}.staging-${process.pid}-${Date.now()}`);
+  const backupDir = join(outputDir, `.${packageName}.previous-${process.pid}-${Date.now()}`);
+  let previousMoved = false;
+  let stagedMoved = false;
+  try {
+    await rm(stagingDir, { recursive: true, force: true });
+    await rm(backupDir, { recursive: true, force: true });
+    await cp(stageDir, stagingDir, { recursive: true, verbatimSymlinks: true });
+    if (existsSync(packageDir)) {
+      await rename(packageDir, backupDir);
+      previousMoved = true;
+    }
+    await rename(stagingDir, packageDir);
+    stagedMoved = true;
+    await rm(backupDir, { recursive: true, force: true });
+    previousMoved = false;
+  } catch (error) {
+    if (stagedMoved) await rm(packageDir, { recursive: true, force: true });
+    if (previousMoved && !existsSync(packageDir)) await rename(backupDir, packageDir);
+    throw error;
+  } finally {
+    await rm(stagingDir, { recursive: true, force: true });
+    if (!previousMoved) await rm(backupDir, { recursive: true, force: true });
+  }
 }
 
 async function sha256(path) {

@@ -9,6 +9,8 @@ runtime/*
 runtime/logs/*
 !runtime/logs/
 !runtime/logs/.gitkeep
+.update.lock/
+.update-backup-*/
 config.json
 !package-lock.json
 *.log

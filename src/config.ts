@@ -110,6 +110,7 @@ const localNotificationsSchema = z.object({
   // Disabled by default so existing installations do not change behavior until
   // the user explicitly opts into local system notifications.
   enabled: z.boolean().default(false),
+  mode: z.enum(["poll", "hook"]).default("poll"),
   intervalSeconds: z.number().int().min(10).max(3_600).default(60),
 }).strict();
 

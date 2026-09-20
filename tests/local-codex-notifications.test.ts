@@ -46,6 +46,7 @@ describe("local Codex notifications", () => {
       expect(sendNotification).toHaveBeenCalledWith(
         "Codex CLI任务已完成",
         expect.stringContaining("CLI 任务"),
+        "cli",
       );
       expect(client.close).toHaveBeenCalledTimes(3);
     } finally {
@@ -78,15 +79,55 @@ describe("local Codex notifications", () => {
       expect(sendNotification).toHaveBeenCalledWith(
         "Codex App任务失败",
         expect.stringContaining("App 任务"),
+        "appServer",
       );
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   });
 
-  it("escapes local notification text for AppleScript", () => {
+  it("does not treat notLoaded as complete and notifies after a later idle transition", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "codex-updated-notify-"));
+    const sendNotification = vi.fn(async () => undefined);
+    const updatedAt = Math.floor(Date.now() / 1_000);
+    let threads: CodexThread[] = [{
+      id: "thr-cli-updated",
+      source: "cli",
+      status: { type: "active" },
+      preview: "短任务",
+      updatedAt,
+    }];
+    const watcher = new LocalCodexNotificationWatcher({
+      createClient: () => ({
+        listThreads: async () => ({ data: threads, nextCursor: null, backwardsCursor: null }),
+        close: async () => undefined,
+      }),
+      statePath: join(directory, "state.json"),
+      sendNotification,
+    });
+    try {
+      await watcher.pollOnce();
+      threads = [{ ...threads[0], status: { type: "notLoaded" }, updatedAt: updatedAt + 1 }];
+      await watcher.pollOnce();
+      expect(sendNotification).not.toHaveBeenCalled();
+
+      threads = [{ ...threads[0], status: { type: "active" }, updatedAt: updatedAt + 2 }];
+      await watcher.pollOnce();
+      threads = [{ ...threads[0], status: { type: "idle" }, updatedAt: updatedAt + 3 }];
+      await watcher.pollOnce();
+      threads = [{ ...threads[0], updatedAt: updatedAt + 4 }];
+      await watcher.pollOnce();
+      expect(sendNotification).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("escapes local notification text for JXA", () => {
     expect(buildMacNotificationScript('Codex "完成"', "第一行\n第二行\\路径")).toBe(
-      'display notification "第一行 第二行\\\\路径" with title "Codex \\"完成\\""',
+      'const app = Application.currentApplication();\n'
+        + 'app.includeStandardAdditions = true;\n'
+        + 'app.displayNotification("第一行 第二行\\\\路径", { withTitle: "Codex \\"完成\\"" });',
     );
   });
 });

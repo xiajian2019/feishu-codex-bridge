@@ -37,6 +37,8 @@ jobs:
 
       - name: Build portable release asset
         run: pnpm run release -- --skip-build --json
+      - name: Build core update asset
+        run: pnpm run release -- --mode core --skip-build --json
       - name: Build lite release asset
         run: pnpm run release -- --mode lite --skip-build --json
 
