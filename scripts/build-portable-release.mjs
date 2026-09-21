@@ -12,6 +12,7 @@ const DEFAULT_OUTPUT_DIR = join(PROJECT_ROOT, "release");
 const LAUNCHER_SOURCE = join(PROJECT_ROOT, "scripts", "portable-launcher.sh");
 const INSTALL_COMMAND_SOURCE = join(PROJECT_ROOT, "install.command");
 const INSTALL_DEFAULTS_SOURCE = join(PROJECT_ROOT, "install.defaults");
+const LOCAL_NODE_UNIVERSAL_ARCHIVE = join(PROJECT_ROOT, "runtime", "node", "node-universal.tar.gz");
 const RELEASE_MODES = ["core", "lite", "direct"];
 const DEFAULT_RELEASE_MODE = "direct";
 
@@ -404,6 +405,13 @@ async function copyNodeRuntimeTree(runtimeDir, prefix) {
 }
 
 async function copyUniversalNodeRuntime(runtimeDir, requestedNodePath) {
+  if (existsSync(LOCAL_NODE_UNIVERSAL_ARCHIVE)) {
+    await validateUniversalNodeArchive(LOCAL_NODE_UNIVERSAL_ARCHIVE);
+    console.log(`使用本地 Node universal 包：${LOCAL_NODE_UNIVERSAL_ARCHIVE}`);
+    await copyFile(LOCAL_NODE_UNIVERSAL_ARCHIVE, join(runtimeDir, "node-universal.tar.gz"));
+    return;
+  }
+
   const nodePath = await realpath(requestedNodePath);
   const version = execFileSync(nodePath, ["-p", "process.versions.node"], { encoding: "utf8" }).trim().replace(/^v/, "");
   const currentArch = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : undefined;
@@ -425,6 +433,15 @@ async function copyUniversalNodeRuntime(runtimeDir, requestedNodePath) {
     );
   } finally {
     await rm(stageParent, { recursive: true, force: true });
+  }
+}
+
+async function validateUniversalNodeArchive(archivePath) {
+  const listing = execFileSync("tar", ["-tzf", archivePath], { encoding: "utf8" });
+  for (const arch of ["arm64", "x64"]) {
+    if (!listing.split(/\r?\n/).some((entry) => entry === `node-universal/${arch}/bin/node`)) {
+      throw new Error(`本地 Node universal 包缺少 ${arch}：${archivePath}`);
+    }
   }
 }
 

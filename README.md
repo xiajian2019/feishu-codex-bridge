@@ -65,7 +65,7 @@ pnpm run release:github
 
 Lite 包默认不包含 Node，也不包含独立 Codex CLI；启动器会按需下载并缓存 Node，安装器会优先寻找 ChatGPT App 内置 Codex，再寻找独立 Codex CLI。若两者都不存在，安装器会给出明确提示。若需要完全离线的 Lite 包，可构建时增加 `--bundle-node`。`codex:update` 在便携包中被禁用，升级时使用下面的 Portable 更新命令。
 
-默认 `pnpm run release` 生成自包含 direct 包：不携带 AAMP runtime，但携带 `lark-cli`、直连配置向导和包含 macOS arm64/x64 两套 Node 22.13.1 运行时的 `runtime/node-universal.tar.gz`。Lite/AAMP 包使用 `pnpm run release -- --mode lite`；只更新核心代码的包使用 `pnpm run release -- --mode core`。Core 包不包含 `node_modules`、Node、lark-cli、配置或 runtime 数据，只供已安装包的更新器使用。首次双击 direct 包安装时，直连向导使用官方 Lark SDK 的二维码授权创建 Bot，再写入 lark-cli profile 和 `direct.feishu` 凭据；不会启动 AAMP 服务。构建 direct 包需要联网下载另一种 CPU 的 Node 归档和 lark-cli 原生二进制。
+默认 `pnpm run release` 生成自包含 direct 包：不携带 AAMP runtime，但携带 `lark-cli`、直连配置向导和包含 macOS arm64/x64 两套 Node 22.13.1 运行时的 `runtime/node-universal.tar.gz`。构建时如果项目根目录存在并通过校验的 `runtime/node/node-universal.tar.gz`，会优先复用该本地包，不再下载 Node；否则才联网下载另一种 CPU 的 Node 归档。Lite/AAMP 包使用 `pnpm run release -- --mode lite`；只更新核心代码的包使用 `pnpm run release -- --mode core`。Core 包不包含 `node_modules`、Node、lark-cli、配置或 runtime 数据，只供已安装包的更新器使用。首次双击 direct 包安装时，直连向导使用官方 Lark SDK 的二维码授权创建 Bot，再写入 lark-cli profile 和 `direct.feishu` 凭据；不会启动 AAMP 服务。构建 direct 包仍可能需要联网准备 lark-cli 原生二进制。
 
 已安装的 Portable 包默认从 GitHub 拉取小型 Core 包。更新器会先下载、校验、解压并完成包完整性检查，再在极短窗口内停止当前 LaunchAgent、替换核心文件并自动启动；启动失败会回滚。`config.json`、`runtime/` 和 direct 包中的 Node/lark-cli 不会被 Core 更新覆盖。完整 direct 更新才会替换运行时依赖：
 
@@ -276,7 +276,7 @@ pnpm run start -- --mode feishu-sqlite-codex
 
 状态和时间筛选属于本地二次筛选，因此会分页读取最多 10,000 个匹配来源的线程后再计算结果；默认 `useStateDbOnly=true`，避免查询为了修复 Codex 元数据而扫描并更新 JSONL 日志。App、CLI 和 Bridge 必须使用同一个本地 Codex 状态目录（默认 `~/.codex`，或同一个 `CODEX_HOME`），否则不会出现在同一份查询结果中。
 
-直连服务的容错策略：LaunchAgent 保持 `KeepAlive`，并设置 `ThrottleInterval=10` 防止异常退出时快速重启风暴；`codex:start`/`codex:restart` 对 launchd 的 `Operation already in progress`（exit 37）使用串行锁和指数退避。Feishu WebSocket 初次连接失败会在进程内重试，已连接后的失败状态会由健康检查触发恢复。Codex 的网络断开、连接重置、临时服务不可用、限流和 SQLite busy 等暂时性错误默认最多尝试 3 次，等待 5 秒、10 秒、20 秒并加入少量抖动；认证、权限、配置和明确的业务/执行错误不会自动重跑。可在 `direct.retry` 中调整 `maxAttempts`、`initialDelaySeconds` 和 `maxDelaySeconds`。
+直连服务的容错策略：LaunchAgent 保持 `KeepAlive`，并设置 `ThrottleInterval=10` 防止异常退出时快速重启风暴；`codex:start`/`codex:restart` 对 launchd 的 `Operation already in progress`（exit 37）使用串行锁和指数退避。Feishu WebSocket 的 ping 频率由服务端下发，客户端使用 5 秒的 liveness watchdog；连接长期处于 `reconnecting`/`idle` 或进入 `failed` 时由健康检查重建通道，连续 3 次恢复失败则退出进程交给 LaunchAgent 重启。初次连接失败会在进程内重试。Codex 的网络断开、连接重置、临时服务不可用、限流和 SQLite busy 等暂时性错误默认最多尝试 3 次，等待 5 秒、10 秒、20 秒并加入少量抖动；认证、权限、配置和明确的业务/执行错误不会自动重跑。可在 `direct.retry` 中调整 `maxAttempts`、`initialDelaySeconds` 和 `maxDelaySeconds`。
 
 `codex:update` 默认更新项目中的 `@openai/codex-sdk` 依赖；`codex:update -- --check` 只检查 SDK 和系统 Codex CLI 版本，不会自动升级系统 CLI。LaunchAgent 不会继承当前终端临时 `export` 的飞书凭据；后台运行时优先复用 AAMP binding，也可以在未提交的 `config.json` 中配置凭据，或在用户目录的 plist 中配置环境变量。
 

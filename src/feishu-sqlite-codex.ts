@@ -79,6 +79,8 @@ export interface DirectRuntimeOptions {
   logger: Logger;
   attachmentsDir?: string;
   createCodexAppServerClient?: () => CodexAppServerQueryClient;
+  /** Test hook; production defaults to exiting so LaunchAgent can restart us. */
+  requestProcessRestart?: (reason: string) => void;
 }
 
 export interface DirectPermissionContext {
@@ -139,10 +141,25 @@ const CARD_MAX_FAILURE_ATTEMPTS = 8;
 const CARD_CONTENT_LIMIT = 28_000;
 const CHANNEL_CONNECT_ATTEMPTS = 4;
 const CHANNEL_CONNECT_INITIAL_DELAY_MS = 1_000;
-const CHANNEL_HEALTH_CHECK_MS = 30_000;
+export const DIRECT_CHANNEL_PING_TIMEOUT_SECONDS = 5;
+export const DIRECT_CHANNEL_HEALTH_CHECK_MS = 10_000;
+export const DIRECT_CHANNEL_RECONNECT_STALE_MS = 60_000;
+export const DIRECT_CHANNEL_IDLE_STALE_MS = 15_000;
+const CHANNEL_MAX_RECOVERY_FAILURES = 3;
 const DIRECT_RECEIVED_REACTION = "Get";
 const DIRECT_THINKING_REACTION = "Think";
 const REACTION_MAX_ATTEMPTS = 3;
+
+export function directChannelRecoveryReason(state: string, staleMs: number): string | undefined {
+  if (state === "failed") return "failed";
+  if (state === "reconnecting" && staleMs >= DIRECT_CHANNEL_RECONNECT_STALE_MS) {
+    return "reconnecting_timeout";
+  }
+  if (state === "idle" && staleMs >= DIRECT_CHANNEL_IDLE_STALE_MS) {
+    return "idle_timeout";
+  }
+  return undefined;
+}
 
 /**
  * Small direct runtime for the personal Feishu workflow.
@@ -161,6 +178,7 @@ export class FeishuSqliteCodexRuntime {
   private readonly createCodexAppServerClient: () => CodexAppServerQueryClient;
   private readonly attachmentsDir: string;
   private readonly consultationDirectory: string;
+  private readonly requestProcessRestart: (reason: string) => void;
   private readonly stopped: Promise<void>;
   private readonly activeCardDeliveries = new Map<number, Promise<void>>();
   private resolveStopped: (() => void) | undefined;
@@ -174,6 +192,9 @@ export class FeishuSqliteCodexRuntime {
   private runtimeLeaseTimer: ReturnType<typeof setInterval> | undefined;
   private channelHealthTimer: ReturnType<typeof setInterval> | undefined;
   private channelRecoveryPromise: Promise<void> | undefined;
+  private channelRecoveryFailures = 0;
+  private channelState: string | undefined;
+  private channelStateSince = 0;
   private pumping = false;
   private started = false;
   private stopping = false;
@@ -191,6 +212,18 @@ export class FeishuSqliteCodexRuntime {
     this.config = config;
     this.db = options.db;
     this.logger = options.logger;
+    this.requestProcessRestart = options.requestProcessRestart ?? ((reason) => {
+      this.logger.error("direct Feishu channel recovery exhausted; restarting process", { reason });
+      const stopPromise = this.stop().catch((error) => {
+        this.logger.warn("direct runtime stop before supervisor restart failed", {
+          error: sanitizeError(error instanceof Error ? error.message : String(error)),
+        });
+      });
+      void Promise.race([
+        stopPromise,
+        delay(5_000),
+      ]).finally(() => process.exit(1));
+    });
     this.attachmentsDir = resolve(
       options.attachmentsDir ?? join(process.cwd(), "runtime", "direct", "attachments"),
     );
@@ -260,7 +293,10 @@ export class FeishuSqliteCodexRuntime {
         domain: resolveDirectLarkDomain(this.config.direct.feishu.domain, credentials.tenantBrand),
         source: "feishu-codex-bridge",
         handshakeTimeoutMs: 30_000,
-        wsConfig: { pingTimeout: 90_000 },
+        // The SDK interprets pingTimeout as seconds, not milliseconds. The
+        // server still controls the ping cadence; this is only the watchdog
+        // window after a ping has been sent.
+        wsConfig: { pingTimeout: DIRECT_CHANNEL_PING_TIMEOUT_SECONDS },
         includeRawEvent: true,
       });
       this.channel.on("message", (message) => {
@@ -284,9 +320,12 @@ export class FeishuSqliteCodexRuntime {
         });
       });
       this.channel.on("reconnecting", () => {
+        this.observeChannelState("reconnecting");
         this.logger.warn("Feishu channel reconnecting");
       });
       this.channel.on("reconnected", () => {
+        this.observeChannelState("connected");
+        this.channelRecoveryFailures = 0;
         this.logger.info("Feishu channel reconnected");
         this.scheduleCommandCardDelivery();
         this.schedulePump(0);
@@ -295,7 +334,11 @@ export class FeishuSqliteCodexRuntime {
       await this.connectChannelWithRetry();
       this.started = true;
       this.startedAt = new Date().toISOString();
-      this.channelHealthTimer = setInterval(() => this.checkChannelHealth(), CHANNEL_HEALTH_CHECK_MS);
+      this.observeChannelState("connected");
+      this.channelHealthTimer = setInterval(
+        () => this.checkChannelHealth(),
+        DIRECT_CHANNEL_HEALTH_CHECK_MS,
+      );
       this.logger.info("direct Feishu channel connected", {
         mode: this.config.execution.mode,
         project: this.config.direct.projectKey ?? "按任务选择",
@@ -341,15 +384,39 @@ export class FeishuSqliteCodexRuntime {
   private checkChannelHealth(): void {
     if (this.stopping || !this.started || !this.channel || this.channelRecoveryPromise) return;
     const status = this.channel.getConnectionStatus?.();
-    if (!status || status.state !== "failed") return;
-    this.logger.warn("direct Feishu channel entered failed state; starting recovery", {
+    if (!status) return;
+    const now = Date.now();
+    const state = String(status.state);
+    if (state !== this.channelState) {
+      this.channelState = state;
+      this.channelStateSince = now;
+      if (state === "connected") this.channelRecoveryFailures = 0;
+    }
+    const staleMs = Math.max(0, now - (this.channelStateSince || now));
+    const reason = directChannelRecoveryReason(state, staleMs);
+    if (!reason) return;
+    this.logger.warn("direct Feishu channel watchdog starting recovery", {
+      state,
+      reason,
+      staleMs,
       reconnectAttempts: status.reconnectAttempts,
     });
+    const recoveryAttempt = this.channelRecoveryFailures + 1;
     this.channelRecoveryPromise = this.recoverChannel()
+      .then(() => {
+        this.channelRecoveryFailures = 0;
+        this.observeChannelState("connected");
+      })
       .catch((error) => {
+        this.channelRecoveryFailures = recoveryAttempt;
         this.logger.error("direct Feishu channel recovery failed", {
+          attempt: recoveryAttempt,
+          maxAttempts: CHANNEL_MAX_RECOVERY_FAILURES,
           error: sanitizeError(error instanceof Error ? error.message : String(error)),
         });
+        if (recoveryAttempt >= CHANNEL_MAX_RECOVERY_FAILURES) {
+          this.requestProcessRestart(`channel recovery exhausted after ${recoveryAttempt} attempts`);
+        }
       })
       .finally(() => {
         this.channelRecoveryPromise = undefined;
@@ -366,8 +433,16 @@ export class FeishuSqliteCodexRuntime {
     });
     if (this.stopping) return;
     await this.connectChannelWithRetry();
+    this.observeChannelState("connected");
     this.scheduleCommandCardDelivery();
     this.schedulePump(0);
+  }
+
+  private observeChannelState(state: string): void {
+    const now = Date.now();
+    if (this.channelState === state) return;
+    this.channelState = state;
+    this.channelStateSince = now;
   }
 
   public async waitUntilStopped(): Promise<void> {

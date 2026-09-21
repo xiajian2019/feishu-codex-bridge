@@ -21,6 +21,11 @@ import {
   summarizeCodexEvent,
   isTransientDirectError,
   calculateDirectRetryDelayMs,
+  DIRECT_CHANNEL_HEALTH_CHECK_MS,
+  DIRECT_CHANNEL_IDLE_STALE_MS,
+  DIRECT_CHANNEL_PING_TIMEOUT_SECONDS,
+  DIRECT_CHANNEL_RECONNECT_STALE_MS,
+  directChannelRecoveryReason,
 } from "../src/feishu-sqlite-codex.js";
 import type { StoredBridgeTask } from "../src/types.js";
 
@@ -84,6 +89,15 @@ describe("native Feishu + SQLite + Codex runtime helpers", () => {
     expect(calculateDirectRetryDelayMs(config.direct.retry, 1, 0)).toBe(5_000);
     expect(calculateDirectRetryDelayMs(config.direct.retry, 2, 0)).toBe(10_000);
     expect(calculateDirectRetryDelayMs(config.direct.retry, 20, 1)).toBe(125_000);
+  });
+
+  it("uses seconds for the WebSocket liveness watchdog and recovers stale channel states", () => {
+    expect(DIRECT_CHANNEL_PING_TIMEOUT_SECONDS).toBe(5);
+    expect(DIRECT_CHANNEL_HEALTH_CHECK_MS).toBe(10_000);
+    expect(directChannelRecoveryReason("failed", 0)).toBe("failed");
+    expect(directChannelRecoveryReason("reconnecting", DIRECT_CHANNEL_RECONNECT_STALE_MS - 1)).toBeUndefined();
+    expect(directChannelRecoveryReason("reconnecting", DIRECT_CHANNEL_RECONNECT_STALE_MS)).toBe("reconnecting_timeout");
+    expect(directChannelRecoveryReason("idle", DIRECT_CHANNEL_IDLE_STALE_MS)).toBe("idle_timeout");
   });
 
   it("schedules non-blocking Get and Think message reactions", async () => {

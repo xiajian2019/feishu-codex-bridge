@@ -14,3 +14,4 @@ runtime/logs/*
 config.json
 !package-lock.json
 *.log
+runtime/node

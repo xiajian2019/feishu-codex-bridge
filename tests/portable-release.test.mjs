@@ -61,6 +61,12 @@ describe("portable release", () => {
     expect(source).not.toContain("pnpm run");
   });
 
+  it("prefers the local Node universal archive when building direct releases", async () => {
+    const source = await readFile(new URL("../scripts/build-portable-release.mjs", import.meta.url), "utf8");
+    expect(source).toContain('join(PROJECT_ROOT, "runtime", "node", "node-universal.tar.gz")');
+    expect(source).toContain("validateUniversalNodeArchive");
+  });
+
   it("ships a double-click installer", async () => {
     const source = await readFile(new URL("../install.command", import.meta.url), "utf8");
     expect(source).toContain('"$SELF_DIR/feishu-codex-bridge" install');
