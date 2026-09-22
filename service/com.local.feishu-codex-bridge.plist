@@ -6,7 +6,7 @@
   <string>com.local.feishu-codex-bridge</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/xiajian/.nvm/versions/node/v22.13.1/bin/node</string>
+    <string>/Users/xiajian/.bun/bin/bun</string>
     <string>/Users/xiajian/works/feishu-codex-bridge/dist/main.js</string>
     <string>--config</string>
     <string>/Users/xiajian/works/feishu-codex-bridge/config.json</string>
@@ -32,7 +32,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/Users/xiajian/.nvm/versions/node/v22.13.1/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>/Users/xiajian/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
 </dict>
 </plist>

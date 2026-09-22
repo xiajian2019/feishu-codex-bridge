@@ -487,13 +487,27 @@ export class FeishuSqliteCodexRuntime {
       clearInterval(this.channelHealthTimer);
       this.channelHealthTimer = undefined;
     }
-    this.activeAbortController?.abort();
-    try {
-      await this.pumpPromise;
-    } catch (error) {
-      this.logger.warn("direct runtime pump stopped with an error", {
-        error: sanitizeError(error instanceof Error ? error.message : String(error)),
-      });
+    const pumpPromise = this.pumpPromise;
+    if (pumpPromise) {
+      let drainTimer: ReturnType<typeof setTimeout> | undefined;
+      const drained = await Promise.race([
+        pumpPromise.then(() => true),
+        new Promise<boolean>((resolvePromise) => {
+          drainTimer = setTimeout(() => resolvePromise(false), 30_000);
+        }),
+      ]);
+      if (drainTimer) clearTimeout(drainTimer);
+      if (!drained) {
+        this.logger.warn("direct runtime graceful drain timed out; requeuing active work");
+        this.activeAbortController?.abort();
+      }
+      try {
+        await pumpPromise;
+      } catch (error) {
+        this.logger.warn("direct runtime pump stopped with an error", {
+          error: sanitizeError(error instanceof Error ? error.message : String(error)),
+        });
+      }
     }
     // Card producers observe `stopping` and exit on their next poll. Wait for
     // them before closing SQLite; an in-flight task/card outbox remains

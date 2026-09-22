@@ -20,9 +20,9 @@ export interface ChildWorkerRunnerOptions {
   workerScript: string;
   dbPath: string;
   configPath: string;
-  /** Defaults to the current Node executable. */
+  /** Defaults to the current Bun executable. */
   executable?: string;
-  /** Arguments inserted before workerScript, useful for tsx in development. */
+  /** Arguments inserted before workerScript. */
   executableArgs?: string[];
   logger?: Logger;
   onEvent?: (runId: string, event: WorkerEvent) => void;
@@ -172,7 +172,7 @@ function waitForClose(child: ChildProcess, timeoutMs: number): Promise<void> {
 function workerEnvironment(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value === "string" && !key.startsWith("LARK_") && !key.startsWith("FEISHU_")) {
+    if (typeof value === "string" && (!key.startsWith("LARK_") && !key.startsWith("FEISHU_") || key === "FEISHU_CODEX_BRIDGE_SINGLE_BINARY" || key === "FEISHU_CODEX_BRIDGE_APP_ROOT" || key === "FEISHU_CODEX_BRIDGE_PORTABLE_ROOT" || key === "FEISHU_CODEX_BRIDGE_INSTALL_ROOT")) {
       env[key] = value;
     }
   }

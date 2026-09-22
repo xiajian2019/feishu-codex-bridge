@@ -4,7 +4,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 
 import { isDirectExecutionMode, loadConfig, parseExecutionMode } from "./config.js";
 import {
@@ -24,6 +24,7 @@ import {
   type CodexThreadStatusType,
 } from "./codex-app-server.js";
 import { DIRECT_RUNTIME_LEASE_NAME } from "./feishu-sqlite-codex.js";
+import { isSingleBinaryRuntime, resolveBridgeDataRoot, resolveBridgeProjectRoot } from "./portable-runtime.js";
 import { installCodexNotifyHook, runCodexNotifyHook } from "./codex-notify-hook.js";
 import { resolveSharedFeishuCredentials, type FeishuCredentialSource } from "./feishu-credentials.js";
 import { LocalCodexNotificationWatcher } from "./local-codex-notifications.js";
@@ -39,10 +40,11 @@ import {
   type OutboxEntry,
 } from "./types.js";
 
-const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const PROJECT_ROOT = resolveBridgeProjectRoot(import.meta.url);
+const DATA_ROOT = resolveBridgeDataRoot(import.meta.url);
 const CODEX_SERVICE_LABEL = "com.local.feishu-codex-bridge";
 const CODEX_SERVICE_PLIST_NAME = `${CODEX_SERVICE_LABEL}.plist`;
-const MIN_NODE_VERSION = [22, 13, 1] as const;
+const MIN_BUN_VERSION = [1, 4, 2] as const;
 const DEFAULT_CODEX_EXECUTION_MODE: ExecutionMode = "feishu-sqlite-codex";
 const DEFAULT_LOG_LINE_COUNT = 80;
 const MAX_LOG_BYTES = 8 * 1024 * 1024;
@@ -66,14 +68,17 @@ export interface CodexCliArguments {
   configPath: string;
   dbPath: string;
   executionMode?: ExecutionMode;
-  nodePath?: string;
+  bunPath?: string;
   command: string[];
   help: boolean;
 }
 
 export interface CodexLaunchAgentOptions {
   label?: string;
-  nodePath: string;
+  bunPath?: string;
+  singleBinaryPath?: string;
+  stableSingleBinaryPath?: string;
+  installRoot?: string;
   projectRoot: string;
   configPath: string;
   dbPath: string;
@@ -134,7 +139,7 @@ export function parseCodexCliArguments(
   let configPath = resolve(cwd, "config.json");
   let dbPath = resolve(cwd, "runtime", "bridge.db");
   let executionMode: ExecutionMode | undefined;
-  let nodePath: string | undefined;
+  let bunPath: string | undefined;
   const command: string[] = [];
   let help = false;
 
@@ -176,19 +181,19 @@ export function parseCodexCliArguments(
       if (!inlinePrefix) index += 1;
       continue;
     }
-    if (arg === "--node" || arg === "--node-path" || arg.startsWith("--node=") || arg.startsWith("--node-path=")) {
-      const inlinePrefix = arg.startsWith("--node-path=")
-        ? "--node-path="
-        : arg.startsWith("--node=")
-          ? "--node="
+    if (arg === "--bun" || arg === "--bun-path" || arg.startsWith("--bun=") || arg.startsWith("--bun-path=")) {
+      const inlinePrefix = arg.startsWith("--bun-path=")
+        ? "--bun-path="
+        : arg.startsWith("--bun=")
+          ? "--bun="
           : undefined;
       const value = inlinePrefix
         ? arg.slice(inlinePrefix.length)
         : argv[index + 1];
       if (!value || value.startsWith("--")) {
-        throw new Error(`${inlinePrefix ? inlinePrefix.slice(0, -1) : arg} requires a Node executable path`);
+        throw new Error(`${inlinePrefix ? inlinePrefix.slice(0, -1) : arg} requires a Bun executable path`);
       }
-      nodePath = resolve(cwd, value);
+      bunPath = resolve(cwd, value);
       if (!inlinePrefix) index += 1;
       continue;
     }
@@ -198,7 +203,7 @@ export function parseCodexCliArguments(
     }
     command.push(arg);
   }
-  return { configPath, dbPath, executionMode, nodePath, command, help };
+  return { configPath, dbPath, executionMode, bunPath, command, help };
 }
 
 export async function runCodexCli(argv = process.argv.slice(2)): Promise<void> {
@@ -311,7 +316,7 @@ export async function runCodexCli(argv = process.argv.slice(2)): Promise<void> {
 export function printCodexUsage(): void {
   console.log(
     [
-      "Usage: pnpm run codex -- <command> [options]",
+      "Usage: bun run codex -- <command> [options]",
       "",
       "服务生命周期：",
       "  install|setup       生成当前项目的 LaunchAgent（不自动启动）",
@@ -321,7 +326,7 @@ export function printCodexUsage(): void {
       "  restart             重载 plist 并重启原生后台服务",
       "  status              查看 LaunchAgent、租约、任务和 outbox 状态",
       "  logs                查看桥接 stdout/stderr 日志",
-      "  doctor              检查配置、Node、Codex CLI、凭据和 LaunchAgent",
+      "  doctor              检查配置、Bun、Codex CLI、凭据和 LaunchAgent",
       "  update              更新 @openai/codex-sdk（--check 只检查版本）",
       "",
       "任务与持久化状态：",
@@ -344,25 +349,33 @@ export function printCodexUsage(): void {
       "  --db path           SQLite 文件（默认：./runtime/bridge.db）",
       `  --mode MODE         覆盖 execution.mode（默认：${DEFAULT_CODEX_EXECUTION_MODE}）`,
       "  --execution-mode    --mode 的别名",
-      "  --node path         LaunchAgent 使用的 Node 可执行文件（默认自动选择 Node 22）",
+      "  --bun path         LaunchAgent 使用的 Bun 可执行文件（默认自动选择 Bun >=1.4.2）",
       "",
       "示例：",
-      "  pnpm run codex:status",
-      "  pnpm run codex:recent -- --limit 10",
-      "  pnpm run codex:threads -- --project food --source cli,appServer",
-      "  pnpm run codex:threads -- --search 'fix' --status active --json",
-      "  pnpm run codex:thread -- thr_123 --turns",
-      "  pnpm run codex:task -- bridge_20260910 --json",
-      "  pnpm run codex:cancel -- bridge_20260910 --reason '不再需要'",
-      "  pnpm run codex:restart",
+      "  bun run codex:status",
+      "  bun run codex:recent -- --limit 10",
+      "  bun run codex:threads -- --project food --source cli,appServer",
+      "  bun run codex:threads -- --search 'fix' --status active --json",
+      "  bun run codex:thread -- thr_123 --turns",
+      "  bun run codex:task -- bridge_20260910 --json",
+      "  bun run codex:cancel -- bridge_20260910 --reason '不再需要'",
+      "  bun run codex:restart",
     ].join("\n"),
   );
 }
 
 export function buildCodexLaunchAgentPlist(options: CodexLaunchAgentOptions): string {
   const label = options.label ?? CODEX_SERVICE_LABEL;
+  const singleBinary = Boolean(options.singleBinaryPath);
+  const executablePath = resolve(options.stableSingleBinaryPath || options.singleBinaryPath || options.bunPath || "");
+  const installRoot = options.installRoot ? resolve(options.installRoot) : undefined;
+  const projectRoot = resolve(options.projectRoot);
+  const serviceProjectRoot = installRoot && singleBinary ? join(installRoot, "current", "app") : projectRoot;
+  const portableRoot = installRoot && singleBinary ? join(installRoot, "current") : dirname(projectRoot);
   const pathEntries = uniqueStrings([
-    dirname(options.nodePath),
+    dirname(executablePath),
+    join(serviceProjectRoot, "node_modules", ".bin"),
+    join(serviceProjectRoot, "node_modules", "@larksuite", "cli", "bin"),
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/usr/bin",
@@ -371,8 +384,12 @@ export function buildCodexLaunchAgentPlist(options: CodexLaunchAgentOptions): st
   ]);
   const values = {
     label,
-    nodePath: resolve(options.nodePath),
-    mainPath: join(resolve(options.projectRoot), "dist", "main.js"),
+    executablePath,
+    mainPath: join(serviceProjectRoot, "dist", "main.js"),
+    projectRoot: serviceProjectRoot,
+    portableRoot,
+    installRoot,
+    singleBinary,
     configPath: resolve(options.configPath),
     dbPath: resolve(options.dbPath),
     executionMode: options.executionMode ?? DEFAULT_CODEX_EXECUTION_MODE,
@@ -388,8 +405,8 @@ export function buildCodexLaunchAgentPlist(options: CodexLaunchAgentOptions): st
   <string>${xmlEscape(values.label)}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${xmlEscape(values.nodePath)}</string>
-    <string>${xmlEscape(values.mainPath)}</string>
+    <string>${xmlEscape(values.executablePath)}</string>
+    ${values.singleBinary ? "<string>--bridge-main</string>" : `<string>${xmlEscape(values.mainPath)}</string>`}
     <string>--config</string>
     <string>${xmlEscape(values.configPath)}</string>
     <string>--db</string>
@@ -398,13 +415,15 @@ export function buildCodexLaunchAgentPlist(options: CodexLaunchAgentOptions): st
     <string>${xmlEscape(values.executionMode)}</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>${xmlEscape(resolve(options.projectRoot))}</string>
+  <string>${xmlEscape(values.projectRoot)}</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>ThrottleInterval</key>
   <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
@@ -415,6 +434,14 @@ export function buildCodexLaunchAgentPlist(options: CodexLaunchAgentOptions): st
   <dict>
     <key>PATH</key>
     <string>${xmlEscape(values.path)}</string>
+    ${values.singleBinary ? `<key>FEISHU_CODEX_BRIDGE_SINGLE_BINARY</key>
+    <string>1</string>
+    <key>FEISHU_CODEX_BRIDGE_APP_ROOT</key>
+    <string>${xmlEscape(values.projectRoot)}</string>
+    <key>FEISHU_CODEX_BRIDGE_PORTABLE_ROOT</key>
+    <string>${xmlEscape(values.portableRoot)}</string>
+    ${values.installRoot ? `<key>FEISHU_CODEX_BRIDGE_INSTALL_ROOT</key>
+    <string>${xmlEscape(values.installRoot)}</string>` : ""}` : ""}
   </dict>
 </dict>
 </plist>
@@ -863,7 +890,7 @@ async function installCodexLaunchAgent(
     return;
   }
   console.log(`已生成 Codex LaunchAgent：${paths.plistPath}`);
-  console.log("下一步执行：pnpm run codex:start");
+  console.log("下一步执行：bun run codex:start");
   if (hasFlag(commandArgs, "--start")) {
     const config = loadConfig(args.configPath, {
       executionMode: resolveCodexExecutionMode(args),
@@ -880,8 +907,8 @@ async function writeCodexLaunchAgent(
     throw new Error("codex:install 目前只支持 macOS LaunchAgent；Linux 请使用 systemd 或前台进程管理器。");
   }
   const launchAgentsDir = join(homedir(), "Library", "LaunchAgents");
-  const logDir = join(PROJECT_ROOT, "runtime", "logs");
-  const attachmentsDir = join(PROJECT_ROOT, "runtime", "direct", "attachments");
+  const logDir = join(DATA_ROOT, "runtime", "logs");
+  const attachmentsDir = join(DATA_ROOT, "runtime", "direct", "attachments");
   await mkdir(launchAgentsDir, { recursive: true, mode: 0o700 });
   await mkdir(logDir, { recursive: true, mode: 0o700 });
   await mkdir(attachmentsDir, { recursive: true, mode: 0o700 });
@@ -892,9 +919,17 @@ async function writeCodexLaunchAgent(
     configPath: resolve(args.configPath),
     dbPath: resolve(args.dbPath),
   };
+  const installRoot = process.env.FEISHU_CODEX_BRIDGE_INSTALL_ROOT;
+  const projectRoot = installRoot ? join(resolve(installRoot), "current", "app") : PROJECT_ROOT;
   const plist = buildCodexLaunchAgentPlist({
-    nodePath: resolveLaunchAgentNodePath(args.nodePath),
-    projectRoot: PROJECT_ROOT,
+    ...(isSingleBinaryRuntime()
+      ? {
+          singleBinaryPath: process.execPath,
+          stableSingleBinaryPath: process.env.FEISHU_CODEX_BRIDGE_ENTRYPOINT,
+          installRoot,
+        }
+      : { bunPath: resolveLaunchAgentBunPath(args.bunPath) }),
+    projectRoot,
     configPath: paths.configPath,
     dbPath: paths.dbPath,
     executionMode: resolveCodexExecutionMode(args),
@@ -914,16 +949,21 @@ async function startCodexLaunchAgent(args: CodexCliArguments): Promise<void> {
     const target = launchdTarget();
     const current = await launchctl(["print", target]);
     if (current.exitCode === 0) {
-      const kicked = await kickstartLaunchAgentWithRetry(target);
-      if (kicked.exitCode !== 0) throw launchctlError("启动 Codex LaunchAgent 失败", kicked);
-      console.log(`Codex LaunchAgent 已重启：${target}`);
+      const running = /(?:^|\n)\s*state\s*=\s*running\b/.test(current.stdout);
+      if (!running) {
+        const kicked = await kickstartLaunchAgentWithRetry(target);
+        if (kicked.exitCode !== 0) throw launchctlError("启动 Codex LaunchAgent 失败", kicked);
+      }
+      await waitForCodexRuntimeReady(args.dbPath, target);
+      console.log(`Codex LaunchAgent 已就绪：${target}`);
       return;
     }
     const bootstrapped = await bootstrapLaunchAgentWithRetry(paths.plistPath, target);
     if (bootstrapped.exitCode !== 0) {
       throw launchctlError("加载 Codex LaunchAgent 失败", bootstrapped);
     }
-    console.log(`Codex LaunchAgent 已启动：${target}`);
+    await waitForCodexRuntimeReady(args.dbPath, target);
+    console.log(`Codex LaunchAgent 已启动并就绪：${target}`);
   });
 }
 
@@ -952,11 +992,14 @@ async function stopCodexLaunchAgent(): Promise<void> {
     console.log(`Codex LaunchAgent 未加载：${target}`);
     return;
   }
+  const pid = launchdPid(current.stdout);
   const stopped = await launchctl(["bootout", target]);
   if (stopped.exitCode !== 0 && !isLaunchdNotLoaded(stopped)) {
     throw launchctlError("停止 Codex LaunchAgent 失败", stopped);
   }
-  console.log(`Codex LaunchAgent 已停止：${target}`);
+  await waitForLaunchdUnloaded(target);
+  if (pid) await waitForProcessExit(pid);
+  console.log(`Codex LaunchAgent 已优雅停止：${target}`);
 }
 
 async function restartCodexLaunchAgent(args: CodexCliArguments): Promise<void> {
@@ -967,17 +1010,20 @@ async function restartCodexLaunchAgent(args: CodexCliArguments): Promise<void> {
     const target = launchdTarget();
     const current = await launchctl(["print", target]);
     if (current.exitCode === 0) {
+      const pid = launchdPid(current.stdout);
       const stopped = await launchctl(["bootout", target]);
       if (stopped.exitCode !== 0 && !isLaunchdNotLoaded(stopped)) {
         throw launchctlError("重启前停止 Codex LaunchAgent 失败", stopped);
       }
       await waitForLaunchdUnloaded(target);
+      if (pid) await waitForProcessExit(pid);
     }
     const started = await bootstrapLaunchAgentWithRetry(paths.plistPath, target);
     if (started.exitCode !== 0) throw launchctlError("重载 Codex LaunchAgent 失败", started);
     const kicked = await kickstartLaunchAgentWithRetry(target);
     if (kicked.exitCode !== 0) throw launchctlError("启动 Codex LaunchAgent 失败", kicked);
-    console.log(`Codex LaunchAgent 已重启：${target}`);
+    await waitForCodexRuntimeReady(args.dbPath, target);
+    console.log(`Codex LaunchAgent 已重启并就绪：${target}`);
   });
 }
 
@@ -1292,11 +1338,12 @@ async function runCodexWorktrees(config: BridgeConfig, commandArgs: string[]): P
 
 async function runCodexDoctor(config: BridgeConfig, args: CodexCliArguments, db: StateDatabase): Promise<void> {
   const checks: DoctorCheck[] = [];
-  const [major, minor, patch] = process.versions.node.split(".").map(Number);
+  const bunVersion = String((globalThis as typeof globalThis & { Bun?: { version: string } }).Bun?.version || "0.0.0");
+  const [major, minor, patch] = bunVersion.split(".").map(Number);
   checks.push({
-    name: "Node.js",
-    status: compareVersions([major, minor, patch], MIN_NODE_VERSION) >= 0 ? "ok" : "fail",
-    detail: `${process.versions.node}（要求 >= ${MIN_NODE_VERSION.join(".")}）`,
+    name: "Bun.js",
+    status: compareVersions([major, minor, patch], MIN_BUN_VERSION) >= 0 ? "ok" : "fail",
+    detail: `${bunVersion}（要求 >= ${MIN_BUN_VERSION.join(".")}）`,
   });
   checks.push({
     name: "execution.mode",
@@ -1333,7 +1380,7 @@ async function runCodexDoctor(config: BridgeConfig, args: CodexCliArguments, db:
   });
   checks.push({
     name: "编译产物",
-    ...(await checkPath(join(PROJECT_ROOT, "dist", "main.js"), false)),
+    ...(await checkPath(join(PROJECT_ROOT, isSingleBinaryRuntime() ? "feishu-codex-bridge" : "dist/main.js"), false)),
   });
   checks.push({
     name: "SQLite schema",
@@ -1379,13 +1426,13 @@ async function runCodexUpdate(commandArgs: string[], configPath: string): Promis
     return;
   }
   if (process.env.FEISHU_CODEX_BRIDGE_PORTABLE_ROOT) {
-    throw new Error(
-      "Portable Runtime Lite 不支持在包内更新 @openai/codex-sdk；请下载新版 Portable Runtime Lite 后替换整个目录。",
-    );
+    throw new Error(isSingleBinaryRuntime()
+      ? "Direct 单二进制包不支持包内更新 @openai/codex-sdk；请执行 feishu-codex-bridge update --mode direct。"
+      : "Portable Runtime Lite 不支持在包内更新 @openai/codex-sdk；请下载新版 Portable Runtime Lite 后替换整个目录。");
   }
-  const update = await runInherited(process.env.PNPM_BIN || "pnpm", ["update", "@openai/codex-sdk"], PROJECT_ROOT);
+  const update = await runInherited(process.env.BUN_BIN || "bun", ["update", "@openai/codex-sdk"], PROJECT_ROOT);
   if (update !== 0) throw new Error(`更新 @openai/codex-sdk 失败，退出码：${update}`);
-  console.log("@openai/codex-sdk 已更新；请重新执行 pnpm run build 并重启 codex LaunchAgent。");
+  console.log("@openai/codex-sdk 已更新；请重新执行 bun run build 并重启 codex LaunchAgent。");
   console.log("系统 Codex CLI 未自动更新，请按本机安装方式单独更新。");
 }
 
@@ -1730,7 +1777,7 @@ async function kickstartLaunchAgentWithRetry(target: string): Promise<CapturedPr
     stderr: "kickstart was not attempted",
   };
   for (let attempt = 1; attempt <= LAUNCHD_BOOTSTRAP_ATTEMPTS; attempt += 1) {
-    last = await launchctl(["kickstart", "-k", target]);
+    last = await launchctl(["kickstart", target]);
     if (last.exitCode === 0) return last;
     if (!isLaunchdRetryable(last) || attempt === LAUNCHD_BOOTSTRAP_ATTEMPTS) return last;
     const delayMs = Math.min(
@@ -1809,7 +1856,8 @@ async function isStaleLaunchdOperationLock(): Promise<boolean> {
 }
 
 async function waitForLaunchdUnloaded(target: string): Promise<void> {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
     const result = await launchctl(["print", target]);
     if (result.exitCode !== 0 && isLaunchdNotLoaded(result)) return;
     await delay(250);
@@ -1817,69 +1865,97 @@ async function waitForLaunchdUnloaded(target: string): Promise<void> {
   throw new Error(`等待 LaunchAgent 卸载超时：${target}`);
 }
 
+function launchdPid(output: string): number | undefined {
+  const match = output.match(/(?:^|\n)\s*pid\s*=\s*(\d+)/);
+  return match ? Number(match[1]) : undefined;
+}
+
+async function waitForProcessExit(pid: number): Promise<void> {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+      if (code === "ESRCH") return;
+      if (code !== "EPERM") throw error;
+    }
+    await delay(250);
+  }
+  throw new Error(`LaunchAgent 进程未在 60 秒内完成优雅退出：pid=${pid}`);
+}
+
+async function waitForCodexRuntimeReady(dbPath: string, target: string): Promise<void> {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    const launchd = await launchctl(["print", target]);
+    if (launchd.exitCode === 0 && /(?:^|\n)\s*state\s*=\s*running\b/.test(launchd.stdout)) {
+      let ready = false;
+      try {
+        await withDatabase(dbPath, (db) => {
+          const lease = db.getRuntimeLease(DIRECT_RUNTIME_LEASE_NAME);
+          ready = Boolean(lease && Date.parse(lease.lease_expires_at) > Date.now());
+        });
+      } catch {}
+      if (ready) return;
+    }
+    await delay(250);
+  }
+  throw new Error("LaunchAgent 已启动，但直连运行时未通过就绪检查（SQLite runtime lease）");
+}
+
 async function assertBuiltRuntime(): Promise<void> {
   try {
-    await access(join(PROJECT_ROOT, "dist", "main.js"), fsConstants.F_OK);
+    await access(join(PROJECT_ROOT, isSingleBinaryRuntime() ? "feishu-codex-bridge" : "dist/main.js"), fsConstants.F_OK);
   } catch {
-    throw new Error("尚未找到 dist/main.js，请先执行 pnpm run build");
+    throw new Error(isSingleBinaryRuntime() ? "尚未找到单二进制 Bridge；请重新安装 Direct 包。" : "尚未找到 dist/main.js，请先执行 bun run build");
   }
 }
 
 /**
- * launchd does not source .zshrc or nvm.sh. Resolve an actual Node binary
- * instead of putting the shell's transient PATH choice into the plist.
+ * launchd does not source shell profiles. Resolve and validate a Bun executable
+ * before writing an absolute path into the service plist.
  */
-export function resolveLaunchAgentNodePath(
+export function resolveLaunchAgentBunPath(
   requestedPath?: string,
   environment: NodeJS.ProcessEnv = process.env,
   home = homedir(),
 ): string {
   if (requestedPath) {
     if (!existsSync(requestedPath)) {
-      throw new Error(`指定的 Node 不存在：${requestedPath}`);
+      throw new Error(`指定的 Bun 不存在：${requestedPath}`);
     }
-    if (!isSupportedNodeExecutable(requestedPath)) {
-      throw new Error(`指定的 Node 不满足要求：${requestedPath}（需要 >= ${MIN_NODE_VERSION.join(".")}）`);
+    if (!isSupportedBunExecutable(requestedPath)) {
+      throw new Error(`指定的 Bun 不满足要求：${requestedPath}（需要 >= ${MIN_BUN_VERSION.join(".")}）`);
     }
     return resolve(requestedPath);
   }
-  const nvmDir = environment.NVM_DIR || join(home, ".nvm");
-  const exactNvmNode = join(
-    nvmDir,
-    "versions",
-    "node",
-    `v${MIN_NODE_VERSION.join(".")}`,
-    "bin",
-    "node",
-  );
   const candidates = uniqueStrings([
-    requestedPath,
-    environment.CODEX_NODE_PATH,
-    isSupportedNodeExecutable(process.execPath) ? process.execPath : undefined,
-    exactNvmNode,
-    join(home, ".nvm", "versions", "node", `v${MIN_NODE_VERSION.join(".")}`, "bin", "node"),
-    "/opt/homebrew/bin/node",
-    "/usr/local/bin/node",
+    environment.CODEX_BUN_PATH,
+    environment.BUN_INSTALL ? join(environment.BUN_INSTALL, "bin", "bun") : undefined,
+    isSupportedBunExecutable(process.execPath) ? process.execPath : undefined,
+    join(home, ".bun", "bin", "bun"),
+    "/opt/homebrew/bin/bun",
+    "/usr/local/bin/bun",
   ]);
   for (const candidate of candidates) {
     if (!existsSync(candidate)) continue;
-    if (isSupportedNodeExecutable(candidate)) return resolve(candidate);
+    if (isSupportedBunExecutable(candidate)) return resolve(candidate);
   }
   throw new Error(
-    `找不到满足要求的 Node.js >= ${MIN_NODE_VERSION.join(".")}；`
-      + `请执行 nvm alias default ${MIN_NODE_VERSION.join(".")}，或使用 --node /path/to/node`,
+    `找不到满足要求的 Bun >= ${MIN_BUN_VERSION.join(".")}；请安装 Bun，或使用 --bun /path/to/bun`,
   );
 }
 
-function isSupportedNodeExecutable(path: string): boolean {
+function isSupportedBunExecutable(path: string): boolean {
   try {
-    const version = execFileSync(path, ["-p", "process.versions.node"], {
+    const version = execFileSync(path, ["--version"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
-    const numbers = version.replace(/^v/, "").split(".").slice(0, 3).map(Number);
+    const numbers = version.replace(/[+-].*$/, "").split(".").slice(0, 3).map(Number);
     if (numbers.some((value) => !Number.isInteger(value))) return false;
-    return compareVersions(numbers, MIN_NODE_VERSION) >= 0;
+    return compareVersions(numbers, MIN_BUN_VERSION) >= 0;
   } catch {
     return false;
   }
@@ -2026,7 +2102,7 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
-if (pathToFileURL(resolve(process.argv[1] ?? "")).href === import.meta.url) {
+if (!isSingleBinaryRuntime() && pathToFileURL(resolve(process.argv[1] ?? "")).href === import.meta.url) {
   runCodexCli().catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;

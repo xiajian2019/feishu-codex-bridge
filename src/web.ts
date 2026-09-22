@@ -2,10 +2,10 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { dirname, extname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { extname, join, relative, resolve } from "node:path";
 
 import { StateDatabase } from "./db.js";
+import { resolveBridgeProjectRoot } from "./portable-runtime.js";
 import { parseTaskInput } from "./fingerprint.js";
 import {
   AAMP_TASK_STATUSES,
@@ -307,7 +307,7 @@ export class DashboardServer {
         error: error instanceof Error ? error.message : String(error),
       });
       sendJson(response, 503, {
-        error: "dashboard frontend is not built; run `pnpm run build` first",
+        error: "dashboard frontend is not built; run `bun run build` first",
       });
     }
   }
@@ -515,11 +515,11 @@ function contentTypeFor(filePath: string): string {
 }
 
 function findWebRoot(): string {
-  const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+  const projectRoot = resolveBridgeProjectRoot(import.meta.url);
   const candidates = [
-    resolve(moduleDirectory, "web"),
+    resolve(projectRoot, "dist", "web"),
     resolve(process.cwd(), "dist", "web"),
-    resolve(moduleDirectory, "../web"),
+    resolve(projectRoot, "web"),
   ];
   return candidates.find((candidate) => existsSync(join(candidate, "index.html"))) ?? candidates[0];
 }

@@ -15,6 +15,7 @@ import { Poller } from "./poller.js";
 import type { ExecutionMode, Logger } from "./types.js";
 import { DashboardServer } from "./web.js";
 import { ChildWorkerRunner } from "./worker-runner.js";
+import { isSingleBinaryRuntime, resolveBridgeDataRoot, resolveBridgeProjectRoot } from "./portable-runtime.js";
 
 // The legacy Feishu task-list poller is retained for future rollback work, but
 // it must not be started while the AAMP + Relay path is the active workflow.
@@ -37,9 +38,9 @@ export function parseMainArguments(argv: string[], cwd = process.cwd()): MainArg
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    // pnpm can forward the conventional separator as a literal argument.
-    // Accept it so both `pnpm run start --config ...` and
-    // `pnpm run start -- --config ...` remain usable.
+    // Bun can forward the conventional separator as a literal argument.
+    // Accept it so both `bun run start --config ...` and
+    // `bun run start -- --config ...` remain usable.
     if (arg === "--") {
       continue;
     } else if (arg === "--once") {
@@ -98,8 +99,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
   const logger = createLogger();
   const config = loadConfig(args.configPath, { executionMode: args.executionMode });
-  const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  mkdirSync(join(projectRoot, "runtime", "logs"), { recursive: true });
+  const projectRoot = resolveBridgeProjectRoot(import.meta.url);
+  mkdirSync(join(resolveBridgeDataRoot(import.meta.url), "runtime", "logs"), { recursive: true });
 
   if (config.execution.mode === "aamp-relay") {
     await runAampMode(config, projectRoot, args, logger);
@@ -118,18 +119,19 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   logger.info("bridge state database", { path: resolve(args.dbPath) });
   const db = new StateDatabase(args.dbPath);
   const lark = new LarkCliClient(config, { logger });
-  const workerScript = join(
-    dirname(fileURLToPath(import.meta.url)),
-    existsSync(join(dirname(fileURLToPath(import.meta.url)), "codex-worker.js"))
-      ? "codex-worker.js"
-      : "codex-worker.ts",
-  );
-  const sourceWorker = workerScript.endsWith(".ts");
+  const workerScript = isSingleBinaryRuntime()
+    ? "--bridge-worker"
+    : join(
+      dirname(fileURLToPath(import.meta.url)),
+      existsSync(join(dirname(fileURLToPath(import.meta.url)), "codex-worker.js"))
+        ? "codex-worker.js"
+        : "codex-worker.ts",
+    );
   const runner = new ChildWorkerRunner({
     workerScript,
     dbPath: resolve(args.dbPath),
     configPath: resolve(args.configPath),
-    executable: sourceWorker ? "tsx" : process.execPath,
+    executable: process.execPath,
     onEvent: (runId, event) => {
       if (event.type === "thread.started") {
         db.saveThreadId(runId, event.threadId);
@@ -256,7 +258,7 @@ async function runDirectMode(
   const runtime = new FeishuSqliteCodexRuntime(config, {
     db,
     logger,
-    attachmentsDir: join(projectRoot, "runtime", "direct", "attachments"),
+    attachmentsDir: join(resolveBridgeDataRoot(import.meta.url), "runtime", "direct", "attachments"),
   });
   const localNotifications = config.localNotifications.enabled
     && config.localNotifications.mode === "poll"
@@ -276,20 +278,36 @@ async function runDirectMode(
     && config.localNotifications.mode === "hook"
     ? new LocalCodexNotificationInbox({ logger })
     : null;
-  let stopping = false;
-  const stop = async (): Promise<void> => {
-    if (stopping) return;
-    stopping = true;
-    try {
-      await localNotifications?.stop();
-      await notificationInbox?.stop();
-      await runtime.stop();
-    } finally {
-      db.close();
-    }
+  let stopPromise: Promise<void> | undefined;
+  const stop = (): Promise<void> => {
+    if (stopPromise) return stopPromise;
+    stopPromise = (async () => {
+      try {
+        await localNotifications?.stop();
+      } catch (error) {
+        logger.warn("failed to stop local Codex notifications", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      try {
+        await notificationInbox?.stop();
+      } catch (error) {
+        logger.warn("failed to stop local notification inbox", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      try {
+        await runtime.stop();
+      } finally {
+        db.close();
+      }
+    })();
+    return stopPromise;
   };
   const onSignal = (): void => {
-    void stop();
+    void stop().catch((error) => logger.error("direct runtime graceful shutdown failed", {
+      error: error instanceof Error ? error.message : String(error),
+    }));
   };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
@@ -334,7 +352,7 @@ async function runAampMode(
     projectRoot,
     configPath: args.configPath,
     sqlitePath: dbPath,
-    attachmentsDir: join(projectRoot, "runtime", "aamp", "attachments"),
+    attachmentsDir: join(resolveBridgeDataRoot(import.meta.url), "runtime", "aamp", "attachments"),
     logger,
   });
   const localNotifications = config.localNotifications.enabled
@@ -482,7 +500,7 @@ function createLogger(): Logger {
 function printUsage(): void {
   console.log(
     [
-      "Usage: node dist/main.js [--config path] [--db path] [--once] [--mode execution-mode]",
+      "Usage: bun dist/main.js [--config path] [--db path] [--once] [--mode execution-mode]",
       "  --config  bridge config JSON (default: ./config.json)",
       "  --db      SQLite path (default: ./runtime/bridge.db)",
       "  --once    start the selected runtime once and exit",
@@ -492,7 +510,7 @@ function printUsage(): void {
   );
 }
 
-if (pathToFileURL(resolve(process.argv[1] ?? "")).href === import.meta.url) {
+if (!isSingleBinaryRuntime() && pathToFileURL(resolve(process.argv[1] ?? "")).href === import.meta.url) {
   main().catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     console.error(message);

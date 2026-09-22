@@ -444,7 +444,7 @@ async function queryNativeCodexThreads(runtime, args) {
 
   const entrypoint = join(BRIDGE_ROOT, 'dist', 'codex-cli.js');
   if (!existsSync(entrypoint)) {
-    return { items: [], error: 'Bridge 编译产物不存在，请先执行 npm run build。' };
+    return { items: [], error: 'Bridge 编译产物不存在，请先执行 bun run build。' };
   }
   const configPath = process.env.AAMP_COMMAND_CONFIG_PATH || join(BRIDGE_ROOT, 'config.json');
   const forwardedArgs = (args || []).filter((argument) => argument !== '--json');
@@ -480,7 +480,7 @@ async function queryNativeCodexThread(runtime, threadId) {
 
   const entrypoint = join(BRIDGE_ROOT, 'dist', 'codex-cli.js');
   if (!existsSync(entrypoint)) {
-    return { error: 'Bridge 编译产物不存在，请先执行 npm run build。' };
+    return { error: 'Bridge 编译产物不存在，请先执行 bun run build。' };
   }
   const configPath = process.env.AAMP_COMMAND_CONFIG_PATH || join(BRIDGE_ROOT, 'config.json');
   const result = await runThreadQueryProcess(
@@ -514,7 +514,7 @@ function buildThreadQueryEnvironment() {
   const environment = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (typeof value !== 'string') continue;
-    if (key === 'NODE_OPTIONS' || key.startsWith('LARK_') || key.startsWith('FEISHU_')) continue;
+    if (key === 'NODE_OPTIONS' || key === 'BUN_OPTIONS' || key.startsWith('LARK_') || key.startsWith('FEISHU_')) continue;
     environment[key] = value;
   }
   return environment;

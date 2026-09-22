@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 
 import { AampRelayClient, reconcileRunningAampTasks } from "../src/aamp-relay.js";
 import { StateDatabase } from "../src/db.js";

@@ -168,7 +168,7 @@ function createLogger() {
 
 function printUsage(): void {
   console.log([
-    "Usage: pnpm run tmux:verify -- [options]",
+    "Usage: bun run tmux:verify -- [options]",
     "  --host <host>       loopback host (default: 127.0.0.1)",
     "  --port <port>       HTTP port (default: 7320)",
     "  --db <path>         verifier SQLite path (default: runtime/tmux-verifier.db)",

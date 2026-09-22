@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 
 import { parseConfig } from "../src/config.js";
 import { buildCodexEnvironment } from "../src/codex-worker.js";

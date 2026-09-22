@@ -9,6 +9,7 @@ import {
 } from "./aamp-inspect.js";
 import { AampTaskAgentRuntime } from "./aamp-task-agent.js";
 import { loadConfig } from "./config.js";
+import { resolveBridgeDataRoot, resolveBridgeProjectRoot } from "./portable-runtime.js";
 
 interface AampCliArguments {
   configPath: string;
@@ -49,8 +50,9 @@ export async function runAampCli(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
   const config = loadConfig(args.configPath);
-  const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  if (await runAampInspectionCommand(args.command, config, projectRoot)) return;
+  const projectRoot = resolveBridgeProjectRoot(import.meta.url);
+  const dataRoot = resolveBridgeDataRoot(import.meta.url);
+  if (await runAampInspectionCommand(args.command, config, projectRoot, dataRoot)) return;
   const runtime = new AampTaskAgentRuntime(config, { projectRoot, configPath: args.configPath });
   await runtime.run(args.command);
 }
@@ -58,16 +60,16 @@ export async function runAampCli(argv = process.argv.slice(2)): Promise<void> {
 function printUsage(): void {
   console.log(
     [
-      "Usage: pnpm run aamp -- <install|start|stop|restart|status|logs|list|add|remove|update>",
-      "       pnpm run aamp:restart [-- --hot|--cold]",
-      "       pnpm run aamp:recent -- [--limit N] [--full-message] [--json]",
-      "       pnpm run aamp:task -- <task-id-or-prefix> [--json]",
-      "       pnpm run aamp:inspect -- <task-id-or-prefix> [--json]",
-      "       pnpm run aamp:worktrees [--json]",
+      "Usage: bun run aamp -- <install|start|stop|restart|status|logs|list|add|remove|update>",
+      "       bun run aamp:restart [-- --hot|--cold]",
+      "       bun run aamp:recent -- [--limit N] [--full-message] [--json]",
+      "       bun run aamp:task -- <task-id-or-prefix> [--json]",
+      "       bun run aamp:inspect -- <task-id-or-prefix> [--json]",
+      "       bun run aamp:worktrees [--json]",
       "  --config path  bridge config JSON (default: ./config.json)",
       "",
       "The command is forwarded to the installed official @larktask/aamp-feishu-task-agent package.",
-      "Run `pnpm run aamp:install` once to create the official AAMP binding.",
+      "Run `bun run aamp:install` once to create the official AAMP binding.",
     ].join("\n"),
   );
 }
@@ -76,10 +78,11 @@ async function runAampInspectionCommand(
   command: string[],
   config: Awaited<ReturnType<typeof loadConfig>>,
   projectRoot: string,
+  dataRoot: string,
 ): Promise<boolean> {
   const name = command[0];
   if (!["recent", "task", "inspect", "worktrees"].includes(name)) return false;
-  const inspection = createAampInspection(config, projectRoot);
+  const inspection = createAampInspection(config, projectRoot, dataRoot);
   const json = command.includes("--json");
   const fullMessage = command.includes("--full-message");
   if (name === "recent") {
@@ -104,9 +107,10 @@ async function runAampInspectionCommand(
 function createAampInspection(
   config: Awaited<ReturnType<typeof loadConfig>>,
   projectRoot: string,
+  dataRoot: string,
 ) {
   return {
-    metadataDir: join(projectRoot, "runtime", "aamp", "worktree-tasks"),
+    metadataDir: join(dataRoot, "runtime", "aamp", "worktree-tasks"),
     taskDir: config.aamp.worktree?.taskDir || join(projectRoot, "codex", "tasks"),
     logDir: process.env.AAMP_LOG_DIR,
     stateHome: process.env.AAMP_TASK_STATE_HOME,

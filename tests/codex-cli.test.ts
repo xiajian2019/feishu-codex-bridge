@@ -1,11 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 
 import {
   buildCodexLaunchAgentPlist,
   formatDirectRecent,
   parseCodexCliArguments,
   parseDirectTaskStatuses,
-  resolveLaunchAgentNodePath,
+  resolveLaunchAgentBunPath,
 } from "../src/codex-cli.js";
 import { StateDatabase } from "../src/db.js";
 
@@ -22,21 +22,21 @@ describe("native Codex CLI", () => {
       configPath: "/tmp/bridge/custom.json",
       dbPath: "/tmp/bridge/runtime/custom.db",
       executionMode: undefined,
-      nodePath: undefined,
+      bunPath: undefined,
       command: ["task", "bridge_123", "--json"],
       help: false,
     });
   });
 
-  it("parses a direct execution-mode and LaunchAgent Node override", () => {
+  it("parses a direct execution-mode and LaunchAgent Bun override", () => {
     expect(parseCodexCliArguments([
       "install",
       "--mode=feishu-sqlite-acp",
-      "--node",
-      "/opt/node-22/bin/node",
+      "--bun",
+      "/opt/bun/bin/bun",
     ], "/tmp/bridge")).toMatchObject({
       executionMode: "feishu-sqlite-acp",
-      nodePath: "/opt/node-22/bin/node",
+      bunPath: "/opt/bun/bin/bun",
       command: ["install"],
     });
   });
@@ -52,7 +52,7 @@ describe("native Codex CLI", () => {
 
   it("builds a self-contained background LaunchAgent plist", () => {
     const plist = buildCodexLaunchAgentPlist({
-      nodePath: "/opt/node/bin/node",
+      bunPath: "/opt/bun/bin/bun",
       projectRoot: "/tmp/bridge & direct",
       configPath: "/tmp/bridge/config.json",
       dbPath: "/tmp/bridge/runtime/bridge.db",
@@ -65,12 +65,49 @@ describe("native Codex CLI", () => {
     expect(plist).toContain("<string>feishu-sqlite-codex</string>");
     expect(plist).toContain("<key>KeepAlive</key>");
     expect(plist).toContain("<key>ThrottleInterval</key>");
+    expect(plist).toContain("<key>ExitTimeOut</key>");
+    expect(plist).toContain("<integer>60</integer>");
     expect(plist).toContain("<integer>10</integer>");
     expect(plist).toContain("<string>Background</string>");
   });
 
-  it("rejects an explicitly selected unsupported LaunchAgent Node", () => {
-    expect(() => resolveLaunchAgentNodePath("/usr/bin/false")).toThrow(/Node/);
+  it("builds a Direct single-binary LaunchAgent plist", () => {
+    const plist = buildCodexLaunchAgentPlist({
+      singleBinaryPath: "/tmp/bridge/app/feishu-codex-bridge",
+      projectRoot: "/tmp/bridge/app",
+      configPath: "/tmp/bridge/config.json",
+      dbPath: "/tmp/bridge/runtime/bridge.db",
+      stdoutPath: "/tmp/bridge/runtime/logs/stdout.log",
+      stderrPath: "/tmp/bridge/runtime/logs/stderr.log",
+    });
+    expect(plist).toContain("<string>/tmp/bridge/app/feishu-codex-bridge</string>");
+    expect(plist).toContain("<key>ExitTimeOut</key>");
+    expect(plist).toContain("<string>--bridge-main</string>");
+    expect(plist).toContain("FEISHU_CODEX_BRIDGE_SINGLE_BINARY");
+    expect(plist).toContain("FEISHU_CODEX_BRIDGE_PORTABLE_ROOT");
+    expect(plist.match(/<key>ExitTimeOut<\/key>/g)).toHaveLength(1);
+    expect(plist).not.toContain("/tmp/bridge/app/dist/main.js");
+  });
+
+  it("uses the stable current symlink for managed Direct LaunchAgents", () => {
+    const plist = buildCodexLaunchAgentPlist({
+      singleBinaryPath: "/tmp/bridge/releases/v1/app/feishu-codex-bridge",
+      stableSingleBinaryPath: "/tmp/bridge/current/app/feishu-codex-bridge",
+      installRoot: "/tmp/bridge",
+      projectRoot: "/tmp/bridge/current/app",
+      configPath: "/tmp/bridge/config.json",
+      dbPath: "/tmp/bridge/runtime/bridge.db",
+      stdoutPath: "/tmp/bridge/runtime/logs/stdout.log",
+      stderrPath: "/tmp/bridge/runtime/logs/stderr.log",
+    });
+    expect(plist).toContain("<string>/tmp/bridge/current/app/feishu-codex-bridge</string>");
+    expect(plist).toContain("<string>/tmp/bridge/current/app</string>");
+    expect(plist).toContain("<string>/tmp/bridge/current</string>");
+    expect(plist).toContain("<string>/tmp/bridge</string>");
+  });
+
+  it("rejects an explicitly selected unsupported LaunchAgent Bun", () => {
+    expect(() => resolveLaunchAgentBunPath("/usr/bin/false")).toThrow(/Bun/);
   });
 
   it("formats recent SQLite tasks with bounded messages", () => {

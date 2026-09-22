@@ -13,12 +13,12 @@
 仓库还提供一个独立的本地 CS 验证程序，用来验证“Web Backend → SSH Worker → tmux session → Codex TUI”这条适配器链路；它不接入飞书业务状态机，也不复用 Bridge 业务数据库。
 
 ```bash
-pnpm run build
-pnpm run tmux:verify -- --port 7320
+bun run build
+bun run tmux:verify -- --port 7320
 open http://127.0.0.1:7320
 ```
 
-页面中的 `机器` 填 `local` 或 SSH 配置中的 `user@host`，工作路径从程序读取的 `~/.codex/project-map.yaml`（可用 `TMUX_VERIFY_PROJECT_MAP` 覆盖）中搜索选择。Codex 可执行文件不由页面填写，而是使用 Bridge 进程的 `CODEX_PATH`/自动发现结果。远程执行只使用现有 SSH key/SSH config，不保存或请求密码。默认复用所选机器已有的 tmux 默认 server，本地 Session 会出现在你平时使用的 tmux 会话列表中；只有显式传入 `--socket <name>` 才使用独立 socket。Bridge 看板默认地址为 `http://127.0.0.1:7310`，自定义端口时用 `--bridge-url <url>` 指定。页面通过 `xterm.js → WebSocket → node-pty → tmux attach-session` 查看真实 PTY，页面关闭只会断开 attach 客户端，不会杀掉 tmux/Codex。重新打开页面会先按 SQLite 中的 `after` event cursor 恢复快照，再接入实时 PTY 输出。
+页面中的 `机器` 填 `local` 或 SSH 配置中的 `user@host`，工作路径从程序读取的 `~/.codex/project-map.yaml`（可用 `TMUX_VERIFY_PROJECT_MAP` 覆盖）中搜索选择。Codex 可执行文件不由页面填写，而是使用 Bridge 进程的 `CODEX_PATH`/自动发现结果。远程执行只使用现有 SSH key/SSH config，不保存或请求密码。默认复用所选机器已有的 tmux 默认 server，本地 Session 会出现在你平时使用的 tmux 会话列表中；只有显式传入 `--socket <name>` 才使用独立 socket。Bridge 看板默认地址为 `http://127.0.0.1:7310`，自定义端口时用 `--bridge-url <url>` 指定。页面通过 `xterm.js → WebSocket → Bun.Terminal PTY → tmux attach-session` 查看真实 PTY，页面关闭只会断开 attach 客户端，不会杀掉 tmux/Codex。重新打开页面会先按 SQLite 中的 `after` event cursor 恢复快照，再接入实时 PTY 输出。
 
 Web 追问必须带 `clientMessageId`/`Idempotency-Key`。同一个逻辑请求重试时只会向已经存在的 Codex TUI 注入一次 `tmux send-keys`，不会启动第二个 Codex 进程。原始终端键盘输入仍属于 TUI 的低层输入；若人为在两个界面分别输入完全相同的新句子，后端无法从 tmux 原始字节中推断这是有意重复，因此这不属于当前最小验证范围。
 
@@ -30,41 +30,41 @@ tmux attach-session -t codex-verify-...
 
 ## 安装和配置
 
-研发环境需要 Node.js 22.13.1（项目通过 `.nvmrc` 固定）。给非研发同事使用时，Portable 发布包可以直接双击 `install.command`；安装器会自动寻找 ChatGPT App 内置 Codex 或本机独立 Codex CLI，不要求手动填写 CLI 路径。
+研发环境需要 Bun >=1.4.2（项目通过 `.bun-version` 固定版本）；CI、开发脚本、LaunchAgent 和 Portable Runtime 均使用 Bun，不需要 Node.js。给非研发同事使用时，Portable 发布包可以直接双击 `install.command`；安装器会自动寻找 ChatGPT App 内置 Codex 或本机独立 Codex CLI，不要求手动填写 CLI 路径。
 
 ```bash
-nvm use v22.13.1
-pnpm install
-pnpm link --global
+bun --version # requires >= 1.4.2
+bun install
+bun link --global
 feishu-codex-bridge install
 ```
 
 `feishu-codex-bridge install` 会依次完成：
 
 1. 没有 `config.json` 时交互式初始化；已有配置默认保留，只在原 Codex 路径失效时自动修复 `codex.cliPath`。
-2. 执行 Node、Codex CLI、Feishu 凭据、路由、SQLite 和编译产物检查。
+2. 执行 Bun、Codex CLI、Feishu 凭据、路由、SQLite 和编译产物检查。
 3. 生成并启动 macOS LaunchAgent。
 
 初始化时不再要求输入 Git 仓库；Codex 路径会自动检测，Feishu App ID/Secret 和代理可选。需要预登记项目时再使用高级参数 `--repo /absolute/path/to/repository`；没有项目字段的消息仍可走只读咨询路径。已有 AAMP binding 时，Feishu 凭据可以留空。需要只生成服务而暂不启动时使用 `feishu-codex-bridge install --no-start`；只初始化或排障时仍可使用 `feishu-codex-bridge init` 和 `feishu-codex-bridge doctor`。
 
 ### Portable Runtime 发布包
 
-给没有 Node.js/pnpm 环境的接收方使用时，可以构建按平台划分的便携压缩包。双击 `install.command` 后，安装器默认把发布包复制到 `~/Applications/Feishu Codex Bridge`，不会把 Downloads 目录作为长期运行目录；默认目录可在 `install.defaults` 中修改，也可以在安装时输入其他目录。
+给没有 Bun 环境的接收方使用时，可以构建按 macOS CPU 架构划分的便携压缩包。双击 `install.command` 后，安装器默认把发布包复制到 `~/Applications/Feishu Codex Bridge`，不会把 Downloads 目录作为长期运行目录；默认目录可在 `install.defaults` 中修改，也可以在安装时输入其他目录。
 
 ```bash
-pnpm run release
+bun run release
 ```
 
 默认构建只使用原生直连模式的自包含包：
 
 ```bash
-pnpm run release
+bun run release
 ```
 
 如需一条命令完成重建、使用真实配置/数据库从新 `release/` 包重启直连服务，并校验 LaunchAgent 状态：
 
 ```bash
-pnpm run portable:restart
+bun run portable:restart
 ```
 
 该命令会先完成构建和 smoke test，再执行带有 `--config`、`--db` 和 `--mode feishu-sqlite-codex` 的 `service restart`，最后执行 `service status`；构建失败时不会停止正在运行的服务。可用 `--config <path>`、`--db <path>` 和 `--mode <mode>` 覆盖默认值，`--skip-build` 仅重用现有 `dist` 打包。
@@ -72,22 +72,22 @@ pnpm run portable:restart
 发布 GitHub Release（默认使用 `package.json` 版本生成 `v0.2.0` tag）：
 
 ```bash
-pnpm run release:github
+bun run release:github
 ```
 
 该命令会构建 direct、core、Lite 三类 portable release，提交并推送当前分支和版本 tag；GitHub Actions 会自动生成 macOS arm64 资产并上传到对应 Release。可用 `--tag`、`--message`、`--skip-build` 或 `--dry-run` 覆盖默认行为。
 
-产物默认写入根目录 `release/`，包含已构建的 Bridge 和生产依赖，不包含源码、测试、配置密钥或运行数据。启动器会优先使用系统中满足 `>=22.13.1` 的 Node；如果没有，会从 Node 官方发行目录下载固定版本到当前包的 `runtime/` 目录，不修改用户全局环境。可以用 `--output <path>` 覆盖默认目录。接收方解压后可以直接双击 `install.command`；也可以执行：
+产物默认写入根目录 `release/`，包含已构建的 Bridge 和生产依赖，不包含源码、测试、配置密钥或运行数据。启动器会优先使用包内 Bun，其次使用系统 Bun >=1.4.2；否则会下载固定版本并校验 SHA-256 后缓存到当前包的 `runtime/`，不修改用户全局环境。可以用 `--output <path>` 覆盖默认目录。接收方解压后可以直接双击 `install.command`；也可以执行：
 
 ```bash
 ./feishu-codex-bridge install
 ```
 
-Lite 包默认不包含 Node，也不包含独立 Codex CLI；启动器会按需下载并缓存 Node，安装器会优先寻找 ChatGPT App 内置 Codex，再寻找独立 Codex CLI。若两者都不存在，安装器会给出明确提示。若需要完全离线的 Lite 包，可构建时增加 `--bundle-node`。`codex:update` 在便携包中被禁用，升级时使用下面的 Portable 更新命令。
+Lite 包默认不包含 Bun 和独立 Codex CLI；启动器会按需下载并缓存 Bun，安装器会优先寻找 ChatGPT App 内置 Codex，再寻找独立 Codex CLI。若两者都不存在，安装器会给出明确提示。若需要完全离线的 Lite 包，可构建时增加 `--bundle-bun`。`codex:update` 在便携包中被禁用，升级时使用下面的 Portable 更新命令。
 
-默认 `pnpm run release` 生成自包含 direct 包：不携带 AAMP runtime，但携带 `lark-cli`、直连配置向导和包含 macOS arm64/x64 两套 Node 22.13.1 运行时的 `runtime/node-universal.tar.gz`。构建时如果项目根目录存在并通过校验的 `runtime/node/node-universal.tar.gz`，会优先复用该本地包，不再下载 Node；否则才联网下载另一种 CPU 的 Node 归档。Lite/AAMP 包使用 `pnpm run release -- --mode lite`；只更新核心代码的包使用 `pnpm run release -- --mode core`。Core 包不包含 `node_modules`、Node、lark-cli、配置或 runtime 数据，只供已安装包的更新器使用。首次双击 direct 包安装时，直连向导使用官方 Lark SDK 的二维码授权创建 Bot，再写入 lark-cli profile 和 `direct.feishu` 凭据；不会启动 AAMP 服务。构建 direct 包仍可能需要联网准备 lark-cli 原生二进制。
+默认 `bun run release` 生成自包含 direct 包：不携带 AAMP runtime，但携带 `lark-cli`、直连配置向导和当前 macOS 架构的 Bun 可执行文件（`runtime/bin/bun`）。不会下载或打包 Node，也不再构建 universal Node archive。Lite/AAMP 包使用 `bun run release --mode lite`；只更新核心代码的包使用 `bun run release --mode core`。Core 包不包含 `node_modules`、Bun、lark-cli、配置或 runtime 数据，只供已安装包的更新器使用。首次双击 direct 包安装时，直连向导使用官方 Lark SDK 的二维码授权创建 Bot，再写入 lark-cli profile 和 `direct.feishu` 凭据；不会启动 AAMP 服务。构建 direct 包仍可能需要联网准备 lark-cli 原生二进制。
 
-已安装的 Portable 包默认从 GitHub 拉取小型 Core 包。更新器会先下载、校验、解压并完成包完整性检查，再在极短窗口内停止当前 LaunchAgent、替换核心文件并自动启动；启动失败会回滚。`config.json`、`runtime/` 和 direct 包中的 Node/lark-cli 不会被 Core 更新覆盖。完整 direct 更新才会替换运行时依赖：
+已安装的 Portable 包默认从 GitHub 拉取小型 Core 包。更新器会先下载、校验、解压并完成包完整性检查，再在极短窗口内停止当前 LaunchAgent、替换核心文件并自动启动；启动失败会回滚。`config.json`、`runtime/` 和 direct 包中的 Bun/lark-cli 不会被 Core 更新覆盖。旧 Node 运行时或 Bun 代际不匹配时，检查和自动更新会选择完整 direct/lite 包迁移；Core overlay 仅用于相同 Bun 代际，保留配置和用户 runtime 数据。完整 direct 更新才会替换运行时依赖：
 
 ```bash
 ./feishu-codex-bridge update
@@ -107,10 +107,10 @@ Lite 包默认不包含 Node，也不包含独立 Codex CLI；启动器会按需
 首次在项目目录中执行一次全局链接：
 
 ```bash
-pnpm link --global
+bun link --global
 ```
 
-之后可以在任意目录直接调用项目中的全部 `pnpm run` 脚本，命令会自动回到本项目根目录执行：
+之后可以在任意目录直接调用项目中的全部 `bun run` 脚本，命令会自动回到本项目根目录执行：
 
 ```bash
 feishu-codex-bridge list
@@ -120,23 +120,23 @@ feishu-codex-bridge test
 feishu-codex-bridge install
 ```
 
-也支持显式的 `run` 形式：`feishu-codex-bridge run aamp:restart`。CLI 会从当前 `package.json` 动态读取脚本，因此新增脚本后无需再修改命令行包装器。更新本项目代码后重新执行一次 `pnpm link --global` 即可刷新全局链接。
+也支持显式的 `run` 形式：`feishu-codex-bridge run aamp:restart`。CLI 会从当前 `package.json` 动态读取脚本，因此新增脚本后无需再修改命令行包装器。更新本项目代码后重新执行一次 `bun link --global` 即可刷新全局链接。
 
 项目已经将 `@larktask/aamp-feishu-task-agent` 加入依赖，并由 lockfile 锁定当前 dev 版本，推荐通过项目脚本调用它：
 
 ```bash
-pnpm run aamp:install   # 首次绑定 Agent 和飞书 Bot
-pnpm run aamp:status
-pnpm run aamp:start
+bun run aamp:install   # 首次绑定 Agent 和飞书 Bot
+bun run aamp:status
+bun run aamp:start
 ```
 
-`npx -y --package @larktask/aamp-feishu-task-agent@dev feishu-task-agent install` 中的命令只在本次 `npx` 进程的临时 PATH 中可见；安装完成后，`npx` 不会把包的 bin 永久加入当前 shell，因此不能据此判断包安装失败。需要临时直接调用时可以执行 `pnpm exec feishu-task-agent status`，或者把官方生成的 `~/.aamp/bin` 加入 PATH。项目脚本不依赖全局 PATH。
+上游 AAMP Agent 的部分脚本仍以 `node`、`npm` 和 `npx` 命令名启动子任务。桥接服务为这些入口提供 Bun-backed 兼容 shim，并将全局包、二进制和缓存限定在项目运行目录；实际执行器仍是固定版本的 Bun。
 
-SQLite 使用 Node 22.13.1 内置的 `node:sqlite`，不再需要安装或编译原生数据库扩展。项目要求使用项目固定的 Node 版本，以保证内置 SQLite API 一致：
+SQLite 使用 Bun 内置的 `bun:sqlite`，不需要安装或编译原生数据库扩展。项目通过 `.bun-version` 固定 Bun 1.4.2，以保证运行时 SQLite API 一致：
 
 ```bash
-nvm use v22.13.1
-node -e 'import("node:sqlite").then(() => console.log("node:sqlite available"))'
+bun --version
+bun -e 'import("bun:sqlite").then(() => console.log("bun:sqlite available"))'
 ```
 
 配置中的每个已登记仓库必须是已存在的 Git 仓库。原生直连允许暂不登记项目和模式，等任务派发时再通过路由头选择；默认示例映射为：
@@ -197,14 +197,14 @@ macOS 通知由主服务异步发送，不依赖额外的原生通知组件，�
 
 安装器还会配置 Codex 官方用户级 `notify` hook。它会保留已有的 Computer Use 通知程序，并链式调用 Feishu Bridge；安装后 `localNotifications.mode` 为 `hook`，不再使用 thread 轮询。若需要恢复旧方案，可将该字段改回 `poll`。ChatGPT App、Codex CLI 与 IDE 使用同一个 `CODEX_HOME` 时共享该用户级配置；修改后需要重启 ChatGPT App。
 
-如果已经通过 `pnpm run aamp:install` 绑定过 Codex，直连模式会只读复用
+如果已经通过 `bun run aamp:install` 绑定过 Codex，直连模式会只读复用
 `~/.aamp/feishu-task-agent/bindings-v1.json` 中同一个 Codex Bot 的凭据；不需要再把
 `appId`/`appSecret` 写入 `config.json`，也不需要把 Secret 放进 LaunchAgent 环境变量。
 直连模式不会启动或修改 AAMP 服务。若没有 AAMP binding，仍兼容原来的显式配置和环境变量
 方式：
 
 ```bash
-FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx pnpm run start -- --config ./config.json
+FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx bun run start -- --config ./config.json
 ```
 
 AAMP binding 的选择顺序是当前 AAMP service selection、`lark.profile` 匹配和可用的 Codex
@@ -258,31 +258,31 @@ binding；只使用 `state=ready/pending` 且 `environment=online` 的记录。A
 原生直连提供独立的 `codex:` 命令组，不会调用 AAMP：
 
 ```bash
-pnpm run codex:doctor
-pnpm run codex:install     # 只生成 plist；即使 config.json 仍是 AAMP 模式也可执行
-pnpm run codex:start       # 安装并启动原生直连 LaunchAgent
-pnpm run codex:status
-pnpm run codex:recent -- --limit 10
-pnpm run codex:notify  # 前台运行本机系统通知轮询器
-pnpm run codex:threads -- --project food --source cli,appServer
-pnpm run codex:thread -- thr_123 --turns
-pnpm run codex:task -- bridge_20260910 --json
-pnpm run codex:cancel -- bridge_20260910 --reason "不再需要"
-pnpm run codex:retry -- bridge_20260910
-pnpm run codex:logs -- --follow
-pnpm run codex:stop
-# pnpm run codex:uninstall # 停止并删除 LaunchAgent plist
+bun run codex:doctor
+bun run codex:install     # 只生成 plist；即使 config.json 仍是 AAMP 模式也可执行
+bun run codex:start       # 安装并启动原生直连 LaunchAgent
+bun run codex:status
+bun run codex:recent -- --limit 10
+bun run codex:notify  # 前台运行本机系统通知轮询器
+bun run codex:threads -- --project food --source cli,appServer
+bun run codex:thread -- thr_123 --turns
+bun run codex:task -- bridge_20260910 --json
+bun run codex:cancel -- bridge_20260910 --reason "不再需要"
+bun run codex:retry -- bridge_20260910
+bun run codex:logs -- --follow
+bun run codex:stop
+# bun run codex:uninstall # 停止并删除 LaunchAgent plist
 ```
 
-完整帮助使用 `pnpm run codex -- --help`。`codex:` 命令默认把本次进程的执行模式覆盖为 `feishu-sqlite-codex`，不会修改 `config.json`；也可以显式使用 `--mode feishu-sqlite-acp`（兼容别名）或 `--execution-mode feishu-sqlite-codex`。例如：
+完整帮助使用 `bun run codex -- --help`。`codex:` 命令默认把本次进程的执行模式覆盖为 `feishu-sqlite-codex`，不会修改 `config.json`；也可以显式使用 `--mode feishu-sqlite-acp`（兼容别名）或 `--execution-mode feishu-sqlite-codex`。例如：
 
 ```bash
-pnpm run codex:install -- --mode feishu-sqlite-codex
-pnpm run codex:start -- --execution-mode feishu-sqlite-codex
-pnpm run start -- --mode feishu-sqlite-codex
+bun run codex:install -- --mode feishu-sqlite-codex
+bun run codex:start -- --execution-mode feishu-sqlite-codex
+bun run start -- --mode feishu-sqlite-codex
 ```
 
-`codex:install`/`codex:setup` 只生成用户目录下的 LaunchAgent，不自动启动，且不要求当前 `execution.mode` 已经是直连模式；`codex:start`/`codex:restart` 会把选中的直连模式写入 LaunchAgent 的 `--execution-mode` 参数，再启动服务。实际启动不要求 `direct.projectKey`、`direct.mode`，但首次处理任务时必须能从消息路由头、默认值或唯一注册表项解析出项目和模式；飞书凭据仍必须有效。`--node /path/to/node` 可显式指定 LaunchAgent 使用的 Node；默认会优先寻找满足项目要求的 Node 22，不依赖 launchd 加载 shell 的 nvm 配置。`codex:uninstall`/`codex:remove` 会停止并删除该 plist；`codex:recover` 负责接管已过期任务，`--force` 前必须先停止服务。`codex:task` 会同时显示任务事件、附件和 durable outbox，`codex:worktrees` 只查看配置仓库的 Git worktree，原生直连不会像 AAMP ACP 模式那样为每条消息创建隔离 worktree。
+`codex:install`/`codex:setup` 只生成用户目录下的 LaunchAgent，不自动启动，且不要求当前 `execution.mode` 已经是直连模式；`codex:start`/`codex:restart` 会把选中的直连模式写入 LaunchAgent 的 `--execution-mode` 参数，再启动服务。实际启动不要求 `direct.projectKey`、`direct.mode`，但首次处理任务时必须能从消息路由头、默认值或唯一注册表项解析出项目和模式；飞书凭据仍必须有效。`--bun /path/to/bun` 可显式指定 LaunchAgent 使用的 Bun；默认会优先寻找满足 `>=1.4.2` 的 Bun，不依赖 launchd 加载 shell 配置。`codex:uninstall`/`codex:remove` 会停止并删除该 plist；`codex:recover` 负责接管已过期任务，`--force` 前必须先停止服务。`codex:task` 会同时显示任务事件、附件和 durable outbox，`codex:worktrees` 只查看配置仓库的 Git worktree，原生直连不会像 AAMP ACP 模式那样为每条消息创建隔离 worktree。
 
 `codex:threads`/`codex:thread` 是独立的只读 Codex app-server 查询，不会写入 Bridge SQLite，也不会启动或继续执行任务。默认查询未归档的 `cli` 和 `appServer` 来源；可用以下参数筛选：
 
@@ -333,9 +333,9 @@ LARKSUITE_CLI_CONFIG_DIR="$HOME/.lark-cli-aamp-one-click-v1" \
 
 这里的 `lark-cli` shim 不只放在 PATH 中：适配层会把它作为绝对路径写入官方 Feishu task runtime 的 `feishu.cliBin`，因此 Agent prompt 中即使使用绝对路径，也会进入正确的 AAMP profile/config 目录。macOS launchd 使用项目的绝对 bootstrap 路径，在服务启动前注入运行时补丁与 CLI 环境，保证服务自动拉起时继续生效。官方包本身不被修改，升级依赖后 shim 会在下一次 AAMP 命令时重新生成。
 
-官方 Bridge 重启时会重放历史 mailbox 事件；对于仍处于 `help_needed` 状态的任务，某些版本会再次创建相同的帮助卡。IM 使用 SDK 发送卡片，不能仅依靠 lark-cli shim 去重。项目通过 `NODE_OPTIONS --import` 在加载官方 `FeishuBridgeRuntime` 时安装求助卡补丁：已有卡片且问题相同时跳过重放，问题变化时更新原卡，同一任务的并发事件串行处理。更新失败保留原卡 ID，不回退新增消息。补丁复用官方持久化 state，不修改 node_modules；上游运行时接口变化时会明确报错，升级后需重新验证。
+官方 Bridge 重启时会重放历史 mailbox 事件；对于仍处于 `help_needed` 状态的任务，某些版本会再次创建相同的帮助卡。IM 使用 SDK 发送卡片，不能仅依靠 lark-cli shim 去重。项目通过 `BUN_OPTIONS --preload` 在加载官方 `FeishuBridgeRuntime` 时安装求助卡补丁：已有卡片且问题相同时跳过重放，问题变化时更新原卡，同一任务的并发事件串行处理。更新失败保留原卡 ID，不回退新增消息。补丁复用官方持久化 state，不修改 node_modules；上游运行时接口变化时会明确报错，升级后需重新验证。
 
-AAMP 流式回复卡片和等待补充信息的求助卡会显示“中断执行”按钮。点击后适配层通过官方 `AampClient.sendCancel()` 向任务原目标发送 `task.cancel`，目标 ACP agent 会终止当前 Codex turn；原卡随后更新为“本轮执行已中断”，不会另发一张结果卡。重复点击是幂等的；如果发送失败，原卡会保留“重试中断”按钮。服务级停止仍使用 `pnpm run aamp:stop`。
+AAMP 流式回复卡片和等待补充信息的求助卡会显示“中断执行”按钮。点击后适配层通过官方 `AampClient.sendCancel()` 向任务原目标发送 `task.cancel`，目标 ACP agent 会终止当前 Codex turn；原卡随后更新为“本轮执行已中断”，不会另发一张结果卡。重复点击是幂等的；如果发送失败，原卡会保留“重试中断”按钮。服务级停止仍使用 `bun run aamp:stop`。
 
 AAMP 本地 ACP agent 支持按任务隔离。开启 `aamp.worktree` 后，只有任务正文或 dispatch context 中存在且命中 `project-map.yaml` 的 `项目：<名称>` 才进入隔离流程；每个命中任务会先写成独立 Markdown 文件，再从配置的 `baseRef` 创建唯一分支和 Git worktree，ACP session 使用该 worktree 作为 `--cwd`。没有项目字段的聊天任务继续使用官方 AAMP 路径；项目字段存在但未映射时会报告路由错误，不会猜测目录或在错误项目中执行。这保留了官方 AAMP 的消息、附件、流式卡片和 `task.cancel`，不会在已经运行的 ACP/Codex 会话里再嵌套调用 `codex-worktree`。任务完成或中断后会关闭该任务的 ACP session，但保留任务文件、分支和 worktree 供检查，也不会自动 commit、push、merge、部署或删除。
 
@@ -364,11 +364,11 @@ AAMP 本地 ACP agent 支持按任务隔离。开启 `aamp.worktree` 后，只�
 可以用项目 CLI 查看最近执行情况：
 
 ```bash
-pnpm run aamp:recent -- --limit 10
-pnpm run aamp:recent -- --limit 10 --full-message
-pnpm run aamp:task -- ff96da58       # 支持完整 ID 或唯一前缀
-pnpm run aamp:task -- ff96da58 --json
-pnpm run aamp:worktrees
+bun run aamp:recent -- --limit 10
+bun run aamp:recent -- --limit 10 --full-message
+bun run aamp:task -- ff96da58       # 支持完整 ID 或唯一前缀
+bun run aamp:task -- ff96da58 --json
+bun run aamp:worktrees
 ```
 
 `aamp:recent` 汇总任务状态、项目、worktree、原始消息摘要和最近 AAMP run；默认显示每条消息前 1200 个字符，使用 `--full-message` 展开已保存的完整消息。`aamp:task` 进一步显示任务文件、分支、基线、事件、日志目录、完整用户消息和 worktree 当前 Git 改动；`aamp:worktrees` 只列出已经生成隔离 worktree 的任务。`aamp:inspect` 是 `aamp:task` 的别名。命令只读本地元数据、AAMP 日志和状态文件，不会操作飞书或修改 Git。
@@ -403,7 +403,7 @@ pnpm run aamp:worktrees
 默认读取当前目录的 `config.json`，数据库和日志放在 `runtime/`：
 
 ```bash
-pnpm run start:all
+bun run start:all
 ```
 
 当 `aamp.enabled=true` 时，主入口启动 AAMP + Relay 和 Web 看板；旧任务清单的轮询、Dispatcher 执行链已经禁用。打开 <http://127.0.0.1:7310> 可以查看只读任务看板和 AAMP 状态接口：
@@ -418,27 +418,27 @@ pnpm run start:all
 
 查询接口为 `GET /healthz`、`GET /api/session`、`GET /api/tasks`、`GET /api/tasks/:taskGuid`、`GET /api/aamp/tasks`、`GET /api/aamp/tasks/:id` 和 `GET /api/events`；旧兼容模式的 `POST /api/tasks/:taskGuid` 操作接口当前不会配置 Dispatcher。页面包含 CSP、禁止 iframe 和 `no-store` 响应头。由于内容包含任务描述、仓库路径和 Codex 结果，不应通过端口转发或反向代理对外暴露。
 
-前端源码位于 `web/`，生产构建输出到 `dist/web`，由同一个 Bridge Node 进程静态托管。开发时可另开终端运行 `pnpm run dev:web`（默认 `http://127.0.0.1:5173`，将 `/api` 代理到 `7310`）；发布或 LaunchAgent 启动前必须执行 `pnpm run build`。React 组件使用稳定的任务/run/event ID 合并服务端变化，避免全页面刷新导致操作丢失。
+前端源码位于 `web/`，生产构建输出到 `dist/web`，由同一个 Bridge Bun 进程静态托管。开发时可另开终端运行 `bun run dev:web`（默认 `http://127.0.0.1:5173`，将 `/api` 代理到 `7310`）；发布或 LaunchAgent 启动前必须执行 `bun run build`。React 组件使用稳定的任务/run/event ID 合并服务端变化，避免全页面刷新导致操作丢失。
 
 默认 `runTimeoutSeconds` 为 `3600` 秒（1 小时）；超时会先终止 Worker，必要时再强制结束，并将本轮标记为失败。
 
 也可以显式指定配置和数据库：
 
 ```bash
-pnpm run start:all -- --config ./config.json --db ./runtime/bridge.db
+bun run start:all -- --config ./config.json --db ./runtime/bridge.db
 ```
 
-如果使用 `pnpm run start:all -- --config ...`，程序也会兼容这个额外的参数分隔符。
+如果使用 `bun run start:all -- --config ...`，程序也会兼容这个额外的参数分隔符。
 
 `lark-cli` 调用使用参数数组，不经过 shell。清单的 `tasklist_guid`、分页参数和 `completed: false` 统一通过 `--params` 传入，兼容当前 CLI 的通用参数接口。默认从 PATH 查找 `lark-cli`，也可以在配置中设置绝对路径 `lark.cliPath`，或通过 `LARK_CLI_PATH` 覆盖。
 
-当 `aamp.enabled` 为 `true` 时，`pnpm run start` 或 `pnpm run start:all` 会先打开共享 SQLite 并执行一次 `running` 任务补偿查询，再调用官方 `feishu-task-agent start`，同时启动同一进程内的 SQLite 看板。旧 Poller、Dispatcher 不会启动；AAMP Relay 负责任务触发和流式事件，运行时补丁在 `task.dispatch` 发送前和 `task.update/task.result/task.failed` 生命周期写入 SQLite。
+当 `aamp.enabled` 为 `true` 时，`bun run start` 或 `bun run start:all` 会先打开共享 SQLite 并执行一次 `running` 任务补偿查询，再调用官方 `feishu-task-agent start`，同时启动同一进程内的 SQLite 看板。旧 Poller、Dispatcher 不会启动；AAMP Relay 负责任务触发和流式事件，运行时补丁在 `task.dispatch` 发送前和 `task.update/task.result/task.failed` 生命周期写入 SQLite。
 
 推荐使用：
 
 ```bash
-pnpm run build
-pnpm run start:all -- --config ./config.json --db ./runtime/bridge.db
+bun run build
+bun run start:all -- --config ./config.json --db ./runtime/bridge.db
 ```
 
 `start` 和 `start:all` 当前是同一套 AAMP + Web 入口；`start:all` 只是明确表达“启动完整桥接服务”。如果 `aamp.enabled` 没有打开，程序会直接提示旧轮询模式已禁用，不会启动轮询。
@@ -446,10 +446,10 @@ pnpm run start:all -- --config ./config.json --db ./runtime/bridge.db
 也可以单独使用：
 
 ```bash
-pnpm run aamp:restart
-pnpm run aamp:restart -- --cold  # 强制走官方 bootout/bootstrap 冷重启
-pnpm run aamp:logs
-pnpm run aamp:stop
+bun run aamp:restart
+bun run aamp:restart -- --cold  # 强制走官方 bootout/bootstrap 冷重启
+bun run aamp:logs
+bun run aamp:stop
 ```
 
 `aamp:restart` 在 macOS 上默认使用适配层的快速重启：保留已经加载的
@@ -473,7 +473,7 @@ ACP/Codex 和 Feishu Bridge 进程仍会重新建立；官方包没有提供进�
 
 ready 等待上限可用 `AAMP_RESTART_READY_TIMEOUT_MS` 覆盖，取值范围为 5 秒到 15 分钟。
 
-适配层还把 npm exec 缓存固定到 `~/.aamp/npm-cache`，避免 macOS 清理 `TMPDIR` 后出现
+适配层还把 Bun 的包缓存固定到 `~/.aamp/npm-cache`，避免 macOS 清理 `TMPDIR` 后出现
 `_cacache/... ENOENT` 并触发一次额外的 launchd 重试；可通过 `AAMP_NPM_CACHE_DIR`
 覆盖该目录。
 
@@ -519,8 +519,8 @@ AAMP 和原生直连模式都会在 Feishu 入站消息进入正常任务派发�
 官方包更新后重新启动服务，并检查日志中的 `help-card replay protection and task cancellation active` 和 `per-task ACP worktree isolation active`；运行时补丁依赖官方求助卡、流式卡片、AAMP 发送方法以及 ACP Bridge 的 session/cwd 接口，升级后必须运行回归测试：
 
 ```bash
-pnpm update '@larktask/aamp-feishu-task-agent@dev'
-pnpm run aamp:restart
+bun update '@larktask/aamp-feishu-task-agent@dev'
+bun run aamp:restart
 ```
 
 完成任务和删除任务是两个不同操作：AAMP/飞书桥接默认把任务标记为完成，不会自动删除远端任务；`feishu-task-agent remove` 也只是删除绑定记录。远端删除属于高风险操作，必须在确认目标 GUID 和 profile 后，使用同一 `LARKSUITE_CLI_CONFIG_DIR` 的 `lark-cli task tasks delete ... --yes` 显式执行。
@@ -560,15 +560,15 @@ launchctl kickstart -k gui/$(id -u)/com.local.feishu-codex-bridge
 launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.local.feishu-codex-bridge.plist
 ```
 
-这和 `pnpm run aamp:start` 的 `feishu-task-agent-bootstrap` 服务是两套独立的 LaunchAgent。原生直连只运行一个桥接 Node 进程，并在任务执行时启动 Codex CLI 子进程；不会启动 AAMP、Relay 或 ACP。两个服务不要同时连接同一个飞书机器人。
+这和 `bun run aamp:start` 的 `feishu-task-agent-bootstrap` 服务是两套独立的 LaunchAgent。原生直连只运行一个桥接 Bun 进程，并在任务执行时启动 Codex CLI 子进程；不会启动 AAMP、Relay 或 ACP。两个服务不要同时连接同一个飞书机器人。
 
 如果未来重新启用兼容模式，SIGTERM 处理会停止轮询、终止当前 worker、关闭 Web 监听和 SQLite，并保留 SQLite 状态和 outbox；当前 AAMP 模式的退出行为由 `aamp.stopOnShutdown` 控制。
 
 ## 测试
 
 ```bash
-npm test
-npm run typecheck
+bun run test
+bun run typecheck
 ```
 
 测试使用假的 Lark client/worker，不需要飞书授权、代理或真实 Codex 登录。

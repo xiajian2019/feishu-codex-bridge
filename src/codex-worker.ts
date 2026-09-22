@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { loadConfig } from "./config.js";
+import { isSingleBinaryRuntime } from "./portable-runtime.js";
 import { StateDatabase } from "./db.js";
 import { prependPath, resolveLarkConfigDir } from "./runtime-env.js";
 import type { BridgeConfig, WorkerProgress, WorkerResult } from "./types.js";
@@ -314,13 +315,16 @@ function trimProgress(value: string, maxCharacters = 2000): string {
     : `${sanitized.slice(0, maxCharacters - 1)}…`;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  runWorker(parseArguments(process.argv.slice(2)))
-    .then((result) => {
-      process.exitCode = result.status === "failed" ? 1 : 0;
-    })
-    .catch((error) => {
-      process.stderr.write(`${sanitizeError(error instanceof Error ? error.message : String(error))}\n`);
-      process.exitCode = 1;
-    });
+export async function runWorkerCli(argv = process.argv.slice(2)): Promise<void> {
+  try {
+    const result = await runWorker(parseArguments(argv));
+    process.exitCode = result.status === "failed" ? 1 : 0;
+  } catch (error) {
+    process.stderr.write(`${sanitizeError(error instanceof Error ? error.message : String(error))}\n`);
+    process.exitCode = 1;
+  }
+}
+
+if (!isSingleBinaryRuntime() && import.meta.url === `file://${process.argv[1]}`) {
+  void runWorkerCli();
 }

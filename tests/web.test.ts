@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "bun:test";
 
 import { StateDatabase } from "../src/db.js";
 import { DashboardServer } from "../src/web.js";

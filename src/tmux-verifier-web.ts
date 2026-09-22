@@ -357,7 +357,7 @@ export class TmuxVerifierWebServer {
         webRoot: this.webRoot,
         error: error instanceof Error ? error.message : String(error),
       });
-      sendJson(response, 503, { error: "frontend is not built; run `pnpm run build` first" });
+      sendJson(response, 503, { error: "frontend is not built; run `bun run build` first" });
     }
   }
 
