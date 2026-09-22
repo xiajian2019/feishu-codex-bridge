@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  isCodexCompletionNotifyPayload,
   parseNotifyCommand,
   parseNotifyPayload,
   replaceNotifyCommand,
@@ -39,5 +40,18 @@ describe("Codex official notify hook", () => {
       "/tmp/config.json",
       JSON.stringify({ type: "agent-turn-complete", "thread-id": "thr_1" }),
     ])).toEqual({ type: "agent-turn-complete", "thread-id": "thr_1" });
+  });
+
+  it("accepts only official typed completion events", () => {
+    expect(isCodexCompletionNotifyPayload({
+      type: "agent-turn-complete",
+      "thread-id": "thr_1",
+    })).toBe(true);
+    expect(isCodexCompletionNotifyPayload({
+      type: "turn-ended",
+      "thread-id": "thr_1",
+    })).toBe(false);
+    expect(isCodexCompletionNotifyPayload({ "thread-id": "thr_1" })).toBe(false);
+    expect(isCodexCompletionNotifyPayload({ type: "agent-turn-complete" })).toBe(false);
   });
 });

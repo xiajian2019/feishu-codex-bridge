@@ -16,6 +16,11 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 5173,
     proxy: {
+      "/api/tmux": {
+        target: "http://127.0.0.1:7320",
+        changeOrigin: true,
+        ws: true,
+      },
       "/api": {
         target: "http://127.0.0.1:7310",
         changeOrigin: true,
