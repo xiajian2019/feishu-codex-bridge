@@ -36,15 +36,19 @@ jobs:
         run: pnpm run build
 
       - name: Build portable release asset
-        run: pnpm run portable:release -- --skip-build --json
+        run: pnpm run release -- --skip-build --json
+      - name: Build core update asset
+        run: pnpm run release -- --mode core --skip-build --json
+      - name: Build lite release asset
+        run: pnpm run release -- --mode lite --skip-build --json
 
       - name: Create GitHub release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "$GITHUB_REF_NAME"
-          release/feishu-codex-bridge-darwin-*.tar.gz
-          release/feishu-codex-bridge-darwin-*.sha256
+          release/feishu-codex-bridge-*.tar.gz
+          release/feishu-codex-bridge-*.sha256
           --repo "$GITHUB_REPOSITORY"
           --verify-tag
           --generate-notes

@@ -1,6 +1,6 @@
 {
   "name": "feishu-codex-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "packageManager": "pnpm@10.28.2",
   "description": "Run Codex tasks from Feishu using AAMP or the native direct bridge.",
@@ -14,7 +14,7 @@
   "scripts": {
     "preinstall": "node scripts/check-node-version.mjs",
     "build": "npm run build:web && tsc -p tsconfig.json",
-    "portable:release": "node scripts/build-portable-release.mjs",
+    "release": "node scripts/build-portable-release.mjs",
     "portable:restart": "node scripts/restart-portable-release.mjs",
     "release:github": "node scripts/publish-github-release.mjs",
     "build:web": "vite build --config web/vite.config.ts",
@@ -45,6 +45,9 @@
     "codex:status": "tsx src/codex-cli.ts status",
     "codex:logs": "tsx src/codex-cli.ts logs",
     "codex:recent": "tsx src/codex-cli.ts recent",
+    "codex:notify": "tsx src/codex-cli.ts notify",
+    "codex:notify-install": "tsx src/codex-cli.ts notify-install",
+    "codex:notify-hook": "tsx src/codex-cli.ts notify-hook",
     "codex:list": "tsx src/codex-cli.ts list",
     "codex:threads": "tsx src/codex-cli.ts threads",
     "codex:thread": "tsx src/codex-cli.ts thread",
@@ -65,6 +68,7 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.73.3",
+    "@larksuite/cli": "1.0.94",
     "@larktask/aamp-feishu-task-agent": "0.1.1-dev.8",
     "@openai/codex-sdk": "^0.104.0",
     "react": "^19.2.8",

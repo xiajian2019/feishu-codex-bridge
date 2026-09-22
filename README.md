@@ -10,7 +10,7 @@
 
 ## 安装和配置
 
-需要 Node.js 22.13.1（项目通过 `.nvmrc` 固定）和 Codex CLI。安装时不再需要手动依次执行初始化、doctor 和 LaunchAgent 命令：
+研发环境需要 Node.js 22.13.1（项目通过 `.nvmrc` 固定）。给非研发同事使用时，Portable 发布包可以直接双击 `install.command`；安装器会自动寻找 ChatGPT App 内置 Codex 或本机独立 Codex CLI，不要求手动填写 CLI 路径。
 
 ```bash
 nvm use v22.13.1
@@ -21,18 +21,24 @@ feishu-codex-bridge install
 
 `feishu-codex-bridge install` 会依次完成：
 
-1. 没有 `config.json` 时交互式初始化；已有配置默认保留，不会覆盖。
+1. 没有 `config.json` 时交互式初始化；已有配置默认保留，只在原 Codex 路径失效时自动修复 `codex.cliPath`。
 2. 执行 Node、Codex CLI、Feishu 凭据、路由、SQLite 和编译产物检查。
 3. 生成并启动 macOS LaunchAgent。
 
-初始化时可以直接输入 Git 仓库、Codex CLI、Feishu App ID/Secret 和可选代理。已有 AAMP binding 时，Feishu 凭据可以留空。需要只生成服务而暂不启动时使用 `feishu-codex-bridge install --no-start`；只初始化或排障时仍可使用 `feishu-codex-bridge init` 和 `feishu-codex-bridge doctor`。
+初始化时不再要求输入 Git 仓库；Codex 路径会自动检测，Feishu App ID/Secret 和代理可选。需要预登记项目时再使用高级参数 `--repo /absolute/path/to/repository`；没有项目字段的消息仍可走只读咨询路径。已有 AAMP binding 时，Feishu 凭据可以留空。需要只生成服务而暂不启动时使用 `feishu-codex-bridge install --no-start`；只初始化或排障时仍可使用 `feishu-codex-bridge init` 和 `feishu-codex-bridge doctor`。
 
-### Portable Runtime Lite 发布包
+### Portable Runtime 发布包
 
-给没有 Node.js/pnpm 环境的接收方使用时，可以构建按平台划分的便携压缩包：
+给没有 Node.js/pnpm 环境的接收方使用时，可以构建按平台划分的便携压缩包。双击 `install.command` 后，安装器默认把发布包复制到 `~/Applications/Feishu Codex Bridge`，不会把 Downloads 目录作为长期运行目录；默认目录可在 `install.defaults` 中修改，也可以在安装时输入其他目录。
 
 ```bash
-pnpm run portable:release
+pnpm run release
+```
+
+默认构建只使用原生直连模式的自包含包：
+
+```bash
+pnpm run release
 ```
 
 如需一条命令完成重建、使用真实配置/数据库从新 `release/` 包重启直连服务，并校验 LaunchAgent 状态：
@@ -43,21 +49,36 @@ pnpm run portable:restart
 
 该命令会先完成构建和 smoke test，再执行带有 `--config`、`--db` 和 `--mode feishu-sqlite-codex` 的 `service restart`，最后执行 `service status`；构建失败时不会停止正在运行的服务。可用 `--config <path>`、`--db <path>` 和 `--mode <mode>` 覆盖默认值，`--skip-build` 仅重用现有 `dist` 打包。
 
-发布 GitHub Release（默认使用 `package.json` 版本生成 `v0.1.0` tag）：
+发布 GitHub Release（默认使用 `package.json` 版本生成 `v0.2.0` tag）：
 
 ```bash
 pnpm run release:github
 ```
 
-该命令会构建 portable release、提交并推送当前分支和版本 tag；GitHub Actions 会自动生成 macOS arm64 release asset 并上传到对应 Release。可用 `--tag`、`--message`、`--skip-build` 或 `--dry-run` 覆盖默认行为。
+该命令会构建 direct、core、Lite 三类 portable release，提交并推送当前分支和版本 tag；GitHub Actions 会自动生成 macOS arm64 资产并上传到对应 Release。可用 `--tag`、`--message`、`--skip-build` 或 `--dry-run` 覆盖默认行为。
 
-产物默认写入根目录 `release/`，包含已构建的 Bridge 和生产依赖，不包含源码、测试、配置密钥或运行数据。启动器会优先使用系统中满足 `>=22.13.1` 的 Node；如果没有，会从 Node 官方发行目录下载固定版本到当前包的 `runtime/` 目录，不修改用户全局环境。可以用 `--output <path>` 覆盖默认目录。接收方解压后执行：
+产物默认写入根目录 `release/`，包含已构建的 Bridge 和生产依赖，不包含源码、测试、配置密钥或运行数据。启动器会优先使用系统中满足 `>=22.13.1` 的 Node；如果没有，会从 Node 官方发行目录下载固定版本到当前包的 `runtime/` 目录，不修改用户全局环境。可以用 `--output <path>` 覆盖默认目录。接收方解压后可以直接双击 `install.command`；也可以执行：
 
 ```bash
 ./feishu-codex-bridge install
 ```
 
-Portable Runtime Lite 默认不包含 Node，也不包含 Codex CLI；接收方需要先安装并登录 Codex CLI。若需要完全离线的包，可构建时增加 `--bundle-node`。`codex:update` 在便携包中被禁用，升级时请重新构建并替换整个发布包。生产依赖会按当前机器的 CPU 架构构建，因此 macOS arm64 和 x64 需要分别发布。
+Lite 包默认不包含 Node，也不包含独立 Codex CLI；启动器会按需下载并缓存 Node，安装器会优先寻找 ChatGPT App 内置 Codex，再寻找独立 Codex CLI。若两者都不存在，安装器会给出明确提示。若需要完全离线的 Lite 包，可构建时增加 `--bundle-node`。`codex:update` 在便携包中被禁用，升级时使用下面的 Portable 更新命令。
+
+默认 `pnpm run release` 生成自包含 direct 包：不携带 AAMP runtime，但携带 `lark-cli`、直连配置向导和包含 macOS arm64/x64 两套 Node 22.13.1 运行时的 `runtime/node-universal.tar.gz`。构建时如果项目根目录存在并通过校验的 `runtime/node/node-universal.tar.gz`，会优先复用该本地包，不再下载 Node；否则才联网下载另一种 CPU 的 Node 归档。Lite/AAMP 包使用 `pnpm run release -- --mode lite`；只更新核心代码的包使用 `pnpm run release -- --mode core`。Core 包不包含 `node_modules`、Node、lark-cli、配置或 runtime 数据，只供已安装包的更新器使用。首次双击 direct 包安装时，直连向导使用官方 Lark SDK 的二维码授权创建 Bot，再写入 lark-cli profile 和 `direct.feishu` 凭据；不会启动 AAMP 服务。构建 direct 包仍可能需要联网准备 lark-cli 原生二进制。
+
+已安装的 Portable 包默认从 GitHub 拉取小型 Core 包。更新器会先下载、校验、解压并完成包完整性检查，再在极短窗口内停止当前 LaunchAgent、替换核心文件并自动启动；启动失败会回滚。`config.json`、`runtime/` 和 direct 包中的 Node/lark-cli 不会被 Core 更新覆盖。完整 direct 更新才会替换运行时依赖：
+
+```bash
+./feishu-codex-bridge update
+./feishu-codex-bridge update --check
+./feishu-codex-bridge update --schedule
+./feishu-codex-bridge update --auto
+./feishu-codex-bridge update --file ./feishu-codex-bridge-core-darwin-arm64.tar.gz
+# 如需完整替换为 direct 包：
+./feishu-codex-bridge update --mode direct --file ./feishu-codex-bridge-direct-darwin-arm64.tar.gz
+./feishu-codex-bridge update --unschedule
+```
 
 已有配置启用 AAMP 时，请使用 `./feishu-codex-bridge aamp:start --config <path>`；`service start` 仅启动原生直连 Codex，不会显示 AAMP 的任务统计。
 
@@ -139,6 +160,23 @@ codex login status
 }
 ```
 
+如需在本机收到 Codex 任务完成提醒，可以开启 macOS 系统通知轮询；不发送飞书消息，也不改变任务提交方式：
+
+```json
+{
+  "localNotifications": {
+    "enabled": true,
+    "intervalSeconds": 60
+  }
+}
+```
+
+服务会每 60 秒查询 Codex app-server 中来源为 `cli` 或 `appServer` 的线程，只在观察到线程从运行中进入完成或错误状态时调用 macOS Notification Center。首次启动只建立历史线程基线，不会重复提醒旧任务。通知状态保存在 `runtime/codex-local-notifications.json`；Bridge/AAMP 任务已经有飞书卡片，因此不再由本地通知 watcher 发送。
+
+macOS 通知由主服务异步发送，不依赖额外的原生通知组件，也不会阻塞事件循环。来自 ChatGPT App（`appServer`）的任务会先发送通知，10 秒后执行 `/usr/bin/open -b com.openai.codex`；来自 Codex CLI（`cli`）的任务只发送通知，不打开 ChatGPT App。这个定时器保持引用，因此 `--once` 通常也会等待延迟动作完成；如果进程被强制终止，延迟打开仍会丢失。
+
+安装器还会配置 Codex 官方用户级 `notify` hook。它会保留已有的 Computer Use 通知程序，并链式调用 Feishu Bridge；安装后 `localNotifications.mode` 为 `hook`，不再使用 thread 轮询。若需要恢复旧方案，可将该字段改回 `poll`。ChatGPT App、Codex CLI 与 IDE 使用同一个 `CODEX_HOME` 时共享该用户级配置；修改后需要重启 ChatGPT App。
+
 如果已经通过 `pnpm run aamp:install` 绑定过 Codex，直连模式会只读复用
 `~/.aamp/feishu-task-agent/bindings-v1.json` 中同一个 Codex Bot 的凭据；不需要再把
 `appId`/`appSecret` 写入 `config.json`，也不需要把 Secret 放进 LaunchAgent 环境变量。
@@ -158,7 +196,7 @@ binding；只使用 `state=ready/pending` 且 `environment=online` 的记录。A
 适配层以 AAMP 的 binding store 作为 Bot 凭据来源，以 lark-cli profile 作为辅助选择信息。这与
 官方 AAMP 的存储边界一致，也避免在直连模式中复制一份 Secret 配置。
 
-直接模式仍需要 `codex.cliPath` 指向本机已安装的 Codex CLI：Codex SDK 负责启动和消费 Codex thread，不依赖 ACP/ACPX。`direct.projectKey` 和 `direct.mode` 都是可选默认值，不配置也可以先启动服务；收到任务后，运行时按消息中的路由头选择项目和模式，配置默认值只作为兜底。项目/模式注册表本身也可暂时为空，但没有可解析的任务路由时，该任务会在 SQLite 卡片中明确失败并提示可用配置。
+直接模式会使用安装器自动发现的 Codex 路径：Codex SDK 负责启动和消费 Codex thread，不依赖 ACP/ACPX。`项目` 和 `模式` 都是消息中的可选路由字段。没有填写 `项目` 时，Bridge 将任务视为通用技术咨询，不会假定某个仓库或项目，也不会因为缺少路由而把任务标记为失败；该咨询会在独立的只读非 Git 目录中执行。填写 `项目：<projectKey>` 后，才进入对应仓库的项目任务路径；此时 `模式` 仍可省略并使用默认实现模式。项目/模式注册表本身也可暂时为空，只要当前消息不要求进入具体项目。
 
 任务消息支持以下独立行格式（中文或英文均可）：
 
@@ -205,6 +243,7 @@ pnpm run codex:install     # 只生成 plist；即使 config.json 仍是 AAMP �
 pnpm run codex:start       # 安装并启动原生直连 LaunchAgent
 pnpm run codex:status
 pnpm run codex:recent -- --limit 10
+pnpm run codex:notify  # 前台运行本机系统通知轮询器
 pnpm run codex:threads -- --project food --source cli,appServer
 pnpm run codex:thread -- thr_123 --turns
 pnpm run codex:task -- bridge_20260910 --json
@@ -237,13 +276,13 @@ pnpm run start -- --mode feishu-sqlite-codex
 
 状态和时间筛选属于本地二次筛选，因此会分页读取最多 10,000 个匹配来源的线程后再计算结果；默认 `useStateDbOnly=true`，避免查询为了修复 Codex 元数据而扫描并更新 JSONL 日志。App、CLI 和 Bridge 必须使用同一个本地 Codex 状态目录（默认 `~/.codex`，或同一个 `CODEX_HOME`），否则不会出现在同一份查询结果中。
 
-直连服务的容错策略：LaunchAgent 保持 `KeepAlive`，并设置 `ThrottleInterval=10` 防止异常退出时快速重启风暴；`codex:start`/`codex:restart` 对 launchd 的 `Operation already in progress`（exit 37）使用串行锁和指数退避。Feishu WebSocket 初次连接失败会在进程内重试，已连接后的失败状态会由健康检查触发恢复。Codex 的网络断开、连接重置、临时服务不可用、限流和 SQLite busy 等暂时性错误默认最多尝试 3 次，等待 5 秒、10 秒、20 秒并加入少量抖动；认证、权限、配置和明确的业务/执行错误不会自动重跑。可在 `direct.retry` 中调整 `maxAttempts`、`initialDelaySeconds` 和 `maxDelaySeconds`。
+直连服务的容错策略：LaunchAgent 保持 `KeepAlive`，并设置 `ThrottleInterval=10` 防止异常退出时快速重启风暴；`codex:start`/`codex:restart` 对 launchd 的 `Operation already in progress`（exit 37）使用串行锁和指数退避。Feishu WebSocket 的 ping 频率由服务端下发，客户端使用 5 秒的 liveness watchdog；连接长期处于 `reconnecting`/`idle` 或进入 `failed` 时由健康检查重建通道，连续 3 次恢复失败则退出进程交给 LaunchAgent 重启。初次连接失败会在进程内重试。Codex 的网络断开、连接重置、临时服务不可用、限流和 SQLite busy 等暂时性错误默认最多尝试 3 次，等待 5 秒、10 秒、20 秒并加入少量抖动；认证、权限、配置和明确的业务/执行错误不会自动重跑。可在 `direct.retry` 中调整 `maxAttempts`、`initialDelaySeconds` 和 `maxDelaySeconds`。
 
 `codex:update` 默认更新项目中的 `@openai/codex-sdk` 依赖；`codex:update -- --check` 只检查 SDK 和系统 Codex CLI 版本，不会自动升级系统 CLI。LaunchAgent 不会继承当前终端临时 `export` 的飞书凭据；后台运行时优先复用 AAMP binding，也可以在未提交的 `config.json` 中配置凭据，或在用户目录的 plist 中配置环境变量。
 
 如果要继续使用当前 AAMP 入口，保留 `execution.mode: "aamp-relay"`（或删除 `execution` 并设置 `aamp.enabled: true`）。
 
-`config.json` 中的 `codex.cliPath` 必须指向系统中已安装的 Codex CLI（本机为 `/opt/homebrew/bin/codex`）。桥接通过 SDK 的 `codexPathOverride` 调用该路径，不使用 `node_modules` 中随 SDK 安装的 Codex 二进制。
+`config.json` 中的 `codex.cliPath` 由安装器自动写入。macOS 上会优先使用独立 Codex CLI；找不到时会查找 ChatGPT App 的内置路径，例如 `/Applications/ChatGPT.app/Contents/Resources/codex`。桥接通过 SDK 的 `codexPathOverride` 调用该路径，不使用 `node_modules` 中随 SDK 安装的 Codex 二进制。
 
 如果使用 AAMP 隔离 profile，`lark.profile` 必须填写完整名称，`lark.configDir` 必须指向同一个配置目录；不会在 profile 不存在时静默改用 `work` 或其他 profile。例如：
 

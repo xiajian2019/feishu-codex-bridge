@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { access, mkdir, readdir, rename, unlink, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import { Codex, type Input, type UserInput } from "@openai/codex-sdk";
 import {
@@ -79,6 +79,8 @@ export interface DirectRuntimeOptions {
   logger: Logger;
   attachmentsDir?: string;
   createCodexAppServerClient?: () => CodexAppServerQueryClient;
+  /** Test hook; production defaults to exiting so LaunchAgent can restart us. */
+  requestProcessRestart?: (reason: string) => void;
 }
 
 export interface DirectPermissionContext {
@@ -108,10 +110,19 @@ export interface ParsedDirectTaskRoute {
 export type DirectTaskRouteResult =
   | {
       ok: true;
+      kind: "project";
       projectKey: string;
       modeKey: string;
       project: ProjectConfig;
       mode: ModeConfig;
+    }
+  | {
+      ok: true;
+      kind: "consultation";
+      projectKey?: undefined;
+      modeKey?: undefined;
+      project?: undefined;
+      mode?: undefined;
     }
   | { ok: false; message: string };
 
@@ -130,10 +141,25 @@ const CARD_MAX_FAILURE_ATTEMPTS = 8;
 const CARD_CONTENT_LIMIT = 28_000;
 const CHANNEL_CONNECT_ATTEMPTS = 4;
 const CHANNEL_CONNECT_INITIAL_DELAY_MS = 1_000;
-const CHANNEL_HEALTH_CHECK_MS = 30_000;
+export const DIRECT_CHANNEL_PING_TIMEOUT_SECONDS = 5;
+export const DIRECT_CHANNEL_HEALTH_CHECK_MS = 10_000;
+export const DIRECT_CHANNEL_RECONNECT_STALE_MS = 60_000;
+export const DIRECT_CHANNEL_IDLE_STALE_MS = 15_000;
+const CHANNEL_MAX_RECOVERY_FAILURES = 3;
 const DIRECT_RECEIVED_REACTION = "Get";
 const DIRECT_THINKING_REACTION = "Think";
 const REACTION_MAX_ATTEMPTS = 3;
+
+export function directChannelRecoveryReason(state: string, staleMs: number): string | undefined {
+  if (state === "failed") return "failed";
+  if (state === "reconnecting" && staleMs >= DIRECT_CHANNEL_RECONNECT_STALE_MS) {
+    return "reconnecting_timeout";
+  }
+  if (state === "idle" && staleMs >= DIRECT_CHANNEL_IDLE_STALE_MS) {
+    return "idle_timeout";
+  }
+  return undefined;
+}
 
 /**
  * Small direct runtime for the personal Feishu workflow.
@@ -151,6 +177,8 @@ export class FeishuSqliteCodexRuntime {
   private readonly codex: Codex;
   private readonly createCodexAppServerClient: () => CodexAppServerQueryClient;
   private readonly attachmentsDir: string;
+  private readonly consultationDirectory: string;
+  private readonly requestProcessRestart: (reason: string) => void;
   private readonly stopped: Promise<void>;
   private readonly activeCardDeliveries = new Map<number, Promise<void>>();
   private resolveStopped: (() => void) | undefined;
@@ -164,6 +192,9 @@ export class FeishuSqliteCodexRuntime {
   private runtimeLeaseTimer: ReturnType<typeof setInterval> | undefined;
   private channelHealthTimer: ReturnType<typeof setInterval> | undefined;
   private channelRecoveryPromise: Promise<void> | undefined;
+  private channelRecoveryFailures = 0;
+  private channelState: string | undefined;
+  private channelStateSince = 0;
   private pumping = false;
   private started = false;
   private stopping = false;
@@ -181,9 +212,22 @@ export class FeishuSqliteCodexRuntime {
     this.config = config;
     this.db = options.db;
     this.logger = options.logger;
+    this.requestProcessRestart = options.requestProcessRestart ?? ((reason) => {
+      this.logger.error("direct Feishu channel recovery exhausted; restarting process", { reason });
+      const stopPromise = this.stop().catch((error) => {
+        this.logger.warn("direct runtime stop before supervisor restart failed", {
+          error: sanitizeError(error instanceof Error ? error.message : String(error)),
+        });
+      });
+      void Promise.race([
+        stopPromise,
+        delay(5_000),
+      ]).finally(() => process.exit(1));
+    });
     this.attachmentsDir = resolve(
       options.attachmentsDir ?? join(process.cwd(), "runtime", "direct", "attachments"),
     );
+    this.consultationDirectory = resolve(dirname(this.attachmentsDir), "consultation");
     this.createCodexAppServerClient = options.createCodexAppServerClient
       ?? (() => new CodexAppServerClient({
         executable: config.codex.cliPath,
@@ -249,7 +293,10 @@ export class FeishuSqliteCodexRuntime {
         domain: resolveDirectLarkDomain(this.config.direct.feishu.domain, credentials.tenantBrand),
         source: "feishu-codex-bridge",
         handshakeTimeoutMs: 30_000,
-        wsConfig: { pingTimeout: 90_000 },
+        // The SDK interprets pingTimeout as seconds, not milliseconds. The
+        // server still controls the ping cadence; this is only the watchdog
+        // window after a ping has been sent.
+        wsConfig: { pingTimeout: DIRECT_CHANNEL_PING_TIMEOUT_SECONDS },
         includeRawEvent: true,
       });
       this.channel.on("message", (message) => {
@@ -273,9 +320,12 @@ export class FeishuSqliteCodexRuntime {
         });
       });
       this.channel.on("reconnecting", () => {
+        this.observeChannelState("reconnecting");
         this.logger.warn("Feishu channel reconnecting");
       });
       this.channel.on("reconnected", () => {
+        this.observeChannelState("connected");
+        this.channelRecoveryFailures = 0;
         this.logger.info("Feishu channel reconnected");
         this.scheduleCommandCardDelivery();
         this.schedulePump(0);
@@ -284,7 +334,11 @@ export class FeishuSqliteCodexRuntime {
       await this.connectChannelWithRetry();
       this.started = true;
       this.startedAt = new Date().toISOString();
-      this.channelHealthTimer = setInterval(() => this.checkChannelHealth(), CHANNEL_HEALTH_CHECK_MS);
+      this.observeChannelState("connected");
+      this.channelHealthTimer = setInterval(
+        () => this.checkChannelHealth(),
+        DIRECT_CHANNEL_HEALTH_CHECK_MS,
+      );
       this.logger.info("direct Feishu channel connected", {
         mode: this.config.execution.mode,
         project: this.config.direct.projectKey ?? "按任务选择",
@@ -330,15 +384,39 @@ export class FeishuSqliteCodexRuntime {
   private checkChannelHealth(): void {
     if (this.stopping || !this.started || !this.channel || this.channelRecoveryPromise) return;
     const status = this.channel.getConnectionStatus?.();
-    if (!status || status.state !== "failed") return;
-    this.logger.warn("direct Feishu channel entered failed state; starting recovery", {
+    if (!status) return;
+    const now = Date.now();
+    const state = String(status.state);
+    if (state !== this.channelState) {
+      this.channelState = state;
+      this.channelStateSince = now;
+      if (state === "connected") this.channelRecoveryFailures = 0;
+    }
+    const staleMs = Math.max(0, now - (this.channelStateSince || now));
+    const reason = directChannelRecoveryReason(state, staleMs);
+    if (!reason) return;
+    this.logger.warn("direct Feishu channel watchdog starting recovery", {
+      state,
+      reason,
+      staleMs,
       reconnectAttempts: status.reconnectAttempts,
     });
+    const recoveryAttempt = this.channelRecoveryFailures + 1;
     this.channelRecoveryPromise = this.recoverChannel()
+      .then(() => {
+        this.channelRecoveryFailures = 0;
+        this.observeChannelState("connected");
+      })
       .catch((error) => {
+        this.channelRecoveryFailures = recoveryAttempt;
         this.logger.error("direct Feishu channel recovery failed", {
+          attempt: recoveryAttempt,
+          maxAttempts: CHANNEL_MAX_RECOVERY_FAILURES,
           error: sanitizeError(error instanceof Error ? error.message : String(error)),
         });
+        if (recoveryAttempt >= CHANNEL_MAX_RECOVERY_FAILURES) {
+          this.requestProcessRestart(`channel recovery exhausted after ${recoveryAttempt} attempts`);
+        }
       })
       .finally(() => {
         this.channelRecoveryPromise = undefined;
@@ -355,8 +433,16 @@ export class FeishuSqliteCodexRuntime {
     });
     if (this.stopping) return;
     await this.connectChannelWithRetry();
+    this.observeChannelState("connected");
     this.scheduleCommandCardDelivery();
     this.schedulePump(0);
+  }
+
+  private observeChannelState(state: string): void {
+    const now = Date.now();
+    if (this.channelState === state) return;
+    this.channelState = state;
+    this.channelStateSince = now;
   }
 
   public async waitUntilStopped(): Promise<void> {
@@ -657,8 +743,9 @@ export class FeishuSqliteCodexRuntime {
       const route = task ? resolveDirectTaskRoute(task.text, this.config) : undefined;
       return buildDirectInfoCard(this.globalCardRuntime(), "当前 Codex thread", [
         `Thread ID：${task?.thread_id ?? "暂无"}`,
-        `项目：${route?.ok ? route.projectKey : "暂无"}`,
-        `模式：${route?.ok ? route.modeKey : "暂无"}`,
+        `类型：${route?.ok && route.kind === "consultation" ? "技术咨询" : "项目任务"}`,
+        `项目：${route?.ok && route.kind === "project" ? route.projectKey : "未指定"}`,
+        `模式：${route?.ok && route.kind === "project" ? route.modeKey : "未指定"}`,
         `最近任务：${task?.bridge_task_id ?? "暂无"}`,
       ]);
     }
@@ -674,7 +761,9 @@ export class FeishuSqliteCodexRuntime {
       if (!task.thread_id) return buildDirectInfoCard(this.globalCardRuntime(), "恢复历史 thread", ["该任务没有已保存的 Codex thread ID，无法恢复。"]);
       const route = resolveDirectTaskRoute(task.text, this.config);
       if (!route.ok) return buildDirectInfoCard(this.globalCardRuntime(), "恢复历史 thread", [route.message]);
-      const resumeText = [`项目：${route.projectKey}`, `模式：${route.modeKey}`, "", "请继续处理上一个任务。"].join("\n");
+      const resumeText = route.kind === "project"
+        ? [`项目：${route.projectKey}`, `模式：${route.modeKey}`, "", "请继续处理上一个任务。"].join("\n")
+        : "请继续处理上一个技术咨询任务。";
       const resumed = this.db.ingestDirectMessage({
         ...input,
         sourceEventId: `${input.sourceEventId}:resume:${randomUUID()}`,
@@ -1010,7 +1099,7 @@ export class FeishuSqliteCodexRuntime {
       );
       return;
     }
-    const { projectKey, modeKey, project, mode } = route;
+    const projectRoute = route.kind === "project" ? route : undefined;
 
     this.scheduleMessageReaction(
       followup?.message_id ?? task.message_id,
@@ -1048,12 +1137,21 @@ export class FeishuSqliteCodexRuntime {
       const attachmentDirectory = downloadedAttachments.length > 0
         ? join(this.attachmentsDir, task.bridge_task_id)
         : undefined;
-      const threadOptions = {
-        workingDirectory: project.repo,
-        sandboxMode: mode.sandboxMode,
-        approvalPolicy: "never" as const,
-        ...(attachmentDirectory ? { additionalDirectories: [attachmentDirectory] } : {}),
-      };
+      const threadOptions = projectRoute
+        ? {
+            workingDirectory: projectRoute.project.repo,
+            sandboxMode: projectRoute.mode.sandboxMode,
+            approvalPolicy: "never" as const,
+            ...(attachmentDirectory ? { additionalDirectories: [attachmentDirectory] } : {}),
+          }
+        : {
+            workingDirectory: this.consultationDirectory,
+            skipGitRepoCheck: true,
+            sandboxMode: "read-only" as const,
+            approvalPolicy: "never" as const,
+            ...(attachmentDirectory ? { additionalDirectories: [attachmentDirectory] } : {}),
+          };
+      if (!projectRoute) await mkdir(this.consultationDirectory, { recursive: true });
       const previousTask = this.db.getLatestBridgeTaskForSession(
         task.session_key,
         task.bridge_task_id,
@@ -1061,12 +1159,13 @@ export class FeishuSqliteCodexRuntime {
       const previousRoute = previousTask
         ? resolveDirectTaskRoute(previousTask.text, this.config)
         : undefined;
-      const canResumePreviousThread = Boolean(
-        previousTask?.thread_id
-        && previousRoute?.ok
-        && previousRoute.project.repo === project.repo
-        && previousRoute.mode.sandboxMode === mode.sandboxMode,
-      );
+      const canResumePreviousThread = Boolean(previousTask?.thread_id && previousRoute?.ok && (
+        projectRoute
+          ? previousRoute.kind === "project"
+            && previousRoute.project.repo === projectRoute.project.repo
+            && previousRoute.mode.sandboxMode === projectRoute.mode.sandboxMode
+          : previousRoute.kind === "consultation"
+      ));
       // An explicitly persisted thread belongs to this task and is safe to
       // recover. For a new message, resume only when the previous message was
       // routed to the same repository and sandbox; otherwise start a new
@@ -1080,10 +1179,14 @@ export class FeishuSqliteCodexRuntime {
         ? this.codex.resumeThread(threadId, threadOptions)
         : this.codex.startThread(threadOptions);
       const prompt = buildDirectPrompt({
-        projectKey,
-        modeKey,
-        repo: project.repo,
-        sandboxMode: mode.sandboxMode,
+        ...(projectRoute
+          ? {
+              projectKey: projectRoute.projectKey,
+              modeKey: projectRoute.modeKey,
+              repo: projectRoute.project.repo,
+              sandboxMode: projectRoute.mode.sandboxMode,
+            }
+          : {}),
         text: followup?.text ?? task.text,
         sessionKey: task.session_key,
         attachments: downloadedAttachments.map((attachment) => ({
@@ -1530,10 +1633,10 @@ export function resolveFeishuCredentials(
 }
 
 export interface DirectPromptOptions {
-  projectKey: string;
-  modeKey: string;
-  repo: string;
-  sandboxMode: "read-only" | "workspace-write";
+  projectKey?: string;
+  modeKey?: string;
+  repo?: string;
+  sandboxMode?: "read-only" | "workspace-write";
   text: string;
   sessionKey: string;
   attachments?: DirectPromptAttachment[];
@@ -1559,15 +1662,17 @@ export function parseDirectTaskRoute(text: string): ParsedDirectTaskRoute {
   };
 }
 
-/** Resolve task-level route headers, then configured defaults, then a sole registry entry. */
+/** Resolve explicit project headers; unscoped messages remain consultations. */
 export function resolveDirectTaskRoute(
   text: string,
   config: BridgeConfig,
 ): DirectTaskRouteResult {
   const parsed = parseDirectTaskRoute(text);
-  const projectKey = parsed.projectKey
-    ?? config.direct.projectKey
-    ?? soleKey(config.projects);
+  // No explicit project header means a general technical consultation. Do not
+  // silently bind it to a configured default or the only registered project.
+  if (!parsed.projectKey) return { ok: true, kind: "consultation" };
+
+  const projectKey = parsed.projectKey;
   if (!projectKey) {
     return {
       ok: false,
@@ -1596,7 +1701,7 @@ export function resolveDirectTaskRoute(
       message: `任务指定的执行模式未配置：${modeKey}。可选模式：${formatRouteKeys(config.modes)}。请使用“模式：<modeKey>”指定已登记模式。`,
     };
   }
-  return { ok: true, projectKey, modeKey, project, mode };
+  return { ok: true, kind: "project", projectKey, modeKey, project, mode };
 }
 
 /** Resolve a reply against its parent task, inheriting omitted route fields. */
@@ -1606,8 +1711,13 @@ export function resolveDirectContinuationRoute(
   config: BridgeConfig,
 ): DirectTaskRouteResult {
   const parent = resolveDirectTaskRoute(parentText, config);
-  if (!parent.ok) return parent;
   const parsed = parseDirectTaskRoute(text);
+  if (!parent.ok) return parent;
+  if (parent.kind === "consultation") {
+    return parsed.projectKey
+      ? resolveDirectTaskRoute(text, config)
+      : { ok: true, kind: "consultation" };
+  }
   const projectKey = parsed.projectKey ?? parent.projectKey;
   const modeKey = parsed.modeKey ?? parent.modeKey;
   const project = resolveDirectProject(config, projectKey);
@@ -1630,7 +1740,7 @@ export function resolveDirectContinuationRoute(
       message: `续问不能切换项目或沙箱模式（原任务：${parent.projectKey}/${parent.modeKey}）。请创建新任务处理其他项目或模式。`,
     };
   }
-  return { ok: true, projectKey, modeKey, project, mode };
+  return { ok: true, kind: "project", projectKey, modeKey, project, mode };
 }
 
 function defaultDirectMode(modes: Record<string, ModeConfig>): { key: string; value: ModeConfig } {
@@ -1670,11 +1780,6 @@ function formatDirectProjectKeys(config: BridgeConfig): string {
   return formatRouteKeys(Object.fromEntries([...keys].map((key) => [key, true])));
 }
 
-function soleKey<T>(values: Record<string, T>): string | undefined {
-  const keys = Object.keys(values);
-  return keys.length === 1 ? keys[0] : undefined;
-}
-
 function formatRouteKeys(values: Record<string, unknown>): string {
   const keys = Object.keys(values);
   return keys.length > 0 ? keys.join(", ") : "(未配置)";
@@ -1698,14 +1803,23 @@ export function buildDirectPrompt(options: DirectPromptOptions): string {
           `- ${attachment.type}：${attachment.fileName}，本地路径：${attachment.localPath}`),
       ]
     : [];
+  const projectContext = options.projectKey && options.modeKey && options.repo && options.sandboxMode
+    ? [
+        `项目：${options.projectKey}`,
+        `执行模式：${options.modeKey}`,
+        `仓库：${options.repo}`,
+        `沙箱：${options.sandboxMode}`,
+        "请直接处理下面的用户请求。遵守仓库中的 AGENTS.md 和用户已有工作流；不要自行 commit、push、merge、部署或删除用户数据。",
+      ]
+    : [
+        "当前请求未指定项目或实现模式。",
+        "请将其作为通用技术咨询处理，不要假定用户正在某个具体仓库或项目中工作。",
+        "不要修改文件、运行项目命令或声称已验证本地代码，除非用户在请求中明确提供了对应上下文并要求这样做。",
+      ];
   return [
     "你是一个通过飞书接入的个人 Codex 助手。",
-    `项目：${options.projectKey}`,
-    `执行模式：${options.modeKey}`,
-    `仓库：${options.repo}`,
-    `沙箱：${options.sandboxMode}`,
+    ...projectContext,
     `会话：${options.sessionKey}`,
-    "请直接处理下面的用户请求。遵守仓库中的 AGENTS.md 和用户已有工作流；不要自行 commit、push、merge、部署或删除用户数据。",
     "完成后用简洁中文说明结果、验证情况和仍需用户决定的事项。",
     ...attachmentLines,
     "",

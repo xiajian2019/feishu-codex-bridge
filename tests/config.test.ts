@@ -32,6 +32,7 @@ describe("config validation", () => {
     expect(config.execution.mode).toBe("legacy-polling");
     expect(config.aamp).toEqual({ enabled: false, stopOnShutdown: false });
     expect(config.relay).toEqual({ enabled: false });
+    expect(config.localNotifications).toEqual({ enabled: false, mode: "poll", intervalSeconds: 60 });
     expect(config.direct.retry).toEqual({
       maxAttempts: 3,
       initialDelaySeconds: 5,

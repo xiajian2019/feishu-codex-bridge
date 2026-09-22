@@ -21,6 +21,11 @@ import {
   summarizeCodexEvent,
   isTransientDirectError,
   calculateDirectRetryDelayMs,
+  DIRECT_CHANNEL_HEALTH_CHECK_MS,
+  DIRECT_CHANNEL_IDLE_STALE_MS,
+  DIRECT_CHANNEL_PING_TIMEOUT_SECONDS,
+  DIRECT_CHANNEL_RECONNECT_STALE_MS,
+  directChannelRecoveryReason,
 } from "../src/feishu-sqlite-codex.js";
 import type { StoredBridgeTask } from "../src/types.js";
 
@@ -86,6 +91,15 @@ describe("native Feishu + SQLite + Codex runtime helpers", () => {
     expect(calculateDirectRetryDelayMs(config.direct.retry, 20, 1)).toBe(125_000);
   });
 
+  it("uses seconds for the WebSocket liveness watchdog and recovers stale channel states", () => {
+    expect(DIRECT_CHANNEL_PING_TIMEOUT_SECONDS).toBe(5);
+    expect(DIRECT_CHANNEL_HEALTH_CHECK_MS).toBe(10_000);
+    expect(directChannelRecoveryReason("failed", 0)).toBe("failed");
+    expect(directChannelRecoveryReason("reconnecting", DIRECT_CHANNEL_RECONNECT_STALE_MS - 1)).toBeUndefined();
+    expect(directChannelRecoveryReason("reconnecting", DIRECT_CHANNEL_RECONNECT_STALE_MS)).toBe("reconnecting_timeout");
+    expect(directChannelRecoveryReason("idle", DIRECT_CHANNEL_IDLE_STALE_MS)).toBe("idle_timeout");
+  });
+
   it("schedules non-blocking Get and Think message reactions", async () => {
     const db = new StateDatabase(":memory:");
     const runtime = new FeishuSqliteCodexRuntime(config, {
@@ -108,7 +122,7 @@ describe("native Feishu + SQLite + Codex runtime helpers", () => {
     db.close();
   });
 
-  it("resolves task headers before defaults and supports a single registry entry", () => {
+  it("uses explicit project headers and treats unscoped messages as consultations", () => {
     expect(resolveDirectTaskRoute("项目：food\n模式：implement\n修复问题", {
       ...config,
       direct: { ...config.direct, projectKey: undefined, mode: undefined },
@@ -124,15 +138,14 @@ describe("native Feishu + SQLite + Codex runtime helpers", () => {
       modes: { implement: config.modes.implement },
     })).toMatchObject({
       ok: true,
-      projectKey: "food",
-      modeKey: "implement",
+      kind: "consultation",
     });
     expect(resolveDirectTaskRoute("修复问题", {
       ...config,
       direct: { ...config.direct, projectKey: undefined, mode: undefined },
       projects: {},
       modes: {},
-    })).toMatchObject({ ok: false });
+    })).toMatchObject({ ok: true, kind: "consultation" });
   });
 
   it("defaults direct tasks without a mode header to implement", () => {
@@ -145,6 +158,62 @@ describe("native Feishu + SQLite + Codex runtime helpers", () => {
       modeKey: "implement",
       mode: { sandboxMode: "workspace-write" },
     });
+  });
+
+  it("executes an unscoped message as a read-only consultation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "direct-consultation-"));
+    const db = new StateDatabase(":memory:");
+    const runtime = new FeishuSqliteCodexRuntime({
+      ...config,
+      direct: { ...config.direct, projectKey: "food", mode: "implement" },
+    }, {
+      db,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      attachmentsDir: join(directory, "attachments"),
+    });
+    const threadOptions: Record<string, unknown>[] = [];
+    (runtime as any).codex = {
+      startThread: (options: Record<string, unknown>) => {
+        threadOptions.push(options);
+        return {
+          id: "consultation-thread",
+          runStreamed: async () => ({
+            events: (async function* () {
+              yield { type: "thread.started", thread_id: "consultation-thread" };
+              yield { type: "item.completed", item: { type: "agent_message", text: "这是一个通用技术回答" } };
+            })(),
+          }),
+        };
+      },
+    };
+    try {
+      const task = db.ingestDirectMessage({
+        sourceEventId: "evt-consultation",
+        eventType: "im.message.receive_v1",
+        messageId: "om-consultation",
+        chatId: "oc-consultation",
+        chatType: "p2p",
+        senderId: "ou-consultation",
+        text: "HTTP 429 和指数退避有什么区别？",
+        sessionKey: "chat:oc-consultation",
+      }).task;
+      const workerId = (runtime as any).workerId as string;
+      const claim = db.claimDueBridgeTask(workerId, 60_000);
+      await (runtime as any).processTask(claim);
+
+      expect(db.getBridgeTask(task.bridge_task_id)).toMatchObject({
+        status: "SUCCEEDED",
+        final_response: "这是一个通用技术回答",
+      });
+      expect(threadOptions[0]).toMatchObject({
+        sandboxMode: "read-only",
+        skipGitRepoCheck: true,
+      });
+      expect(threadOptions[0].workingDirectory).toContain("consultation");
+    } finally {
+      db.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("inherits omitted project and mode values for a reply", () => {
@@ -312,6 +381,17 @@ describe("native Feishu + SQLite + Codex runtime helpers", () => {
     expect(prompt).toContain("仓库：/tmp/food");
     expect(prompt).toContain("修复单位换算问题");
     expect(prompt).toContain("不要自行 commit、push、merge、部署或删除用户数据");
+  });
+
+  it("builds a consultation prompt without project assumptions", () => {
+    const prompt = buildDirectPrompt({
+      text: "解释一下 HTTP 429 的常见原因",
+      sessionKey: "chat:oc-consultation",
+    });
+    expect(prompt).toContain("当前请求未指定项目或实现模式");
+    expect(prompt).toContain("通用技术咨询");
+    expect(prompt).not.toContain("项目：undefined");
+    expect(prompt).not.toContain("仓库：undefined");
   });
 
   it("includes durable attachment paths in the Codex prompt", () => {

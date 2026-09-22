@@ -43,4 +43,13 @@ describe("single-command installer", () => {
     expect(config.codex.env).toEqual({});
     expect(config.projects.default.repo).toBe("/tmp/repository");
   });
+
+  it("allows direct-mode initialization without a pre-registered repository", () => {
+    const config = parseConfig(buildDirectConfig({
+      codexPath: "/opt/homebrew/bin/codex",
+    }), { checkRepositories: false });
+    expect(config.execution.mode).toBe("feishu-sqlite-codex");
+    expect(config.projects).toEqual({});
+    expect(config.direct.projectKey).toBeUndefined();
+  });
 });

@@ -10,6 +10,14 @@ NODE_VERSION_DOWNLOAD="22.13.1"
 NODE_BIN=""
 NODE_DOWNLOAD_DIR=""
 
+host_node_arch() {
+  case "$(uname -m)" in
+    arm64|aarch64) printf '%s\n' "arm64" ;;
+    x86_64|amd64) printf '%s\n' "x64" ;;
+    *) return 1 ;;
+  esac
+}
+
 version_at_least() {
   actual="$1"
   awk -v actual="$actual" -v required="$NODE_VERSION_REQUIRED" '
@@ -119,6 +127,24 @@ download_node_runtime() {
 }
 
 resolve_node() {
+  universal_archive="$RUNTIME_DIR/node-universal.tar.gz"
+  universal_arch="$(host_node_arch 2>/dev/null || true)"
+  universal_node="$RUNTIME_DIR/node-universal/$universal_arch/bin/node"
+  if [ -n "$universal_arch" ] && [ -f "$universal_archive" ]; then
+    if ! node_is_supported "$universal_node"; then
+      command -v tar >/dev/null 2>&1 || {
+        echo "找不到 tar，无法解压内置 Node.js 运行时" >&2
+        exit 1
+      }
+      echo "正在解压内置 Node.js ${universal_arch} 运行时…" >&2
+      tar -xzf "$universal_archive" -C "$RUNTIME_DIR"
+    fi
+    if node_is_supported "$universal_node"; then
+      printf '%s\n' "$universal_node"
+      return 0
+    fi
+  fi
+
   bundled_node="$RUNTIME_DIR/bin/node"
   if [ -f "$RUNTIME_DIR/.bundled-node" ] && node_is_supported "$bundled_node"; then
     printf '%s\n' "$bundled_node"
@@ -155,6 +181,7 @@ usage() {
 用法：
   feishu-codex-bridge install|init|doctor [选项]
   feishu-codex-bridge start [选项]
+  feishu-codex-bridge update [选项]
   feishu-codex-bridge service <install|start|stop|restart|status|logs|uninstall>
   feishu-codex-bridge aamp:<命令> [参数...]
   feishu-codex-bridge codex:<命令> [参数...]
@@ -181,11 +208,12 @@ case "$1" in
     ;;
   list|scripts)
     printf '%s\n' \
-      install init doctor start service \
+      install init doctor start update service \
       aamp aamp:install aamp:start aamp:stop aamp:restart aamp:status aamp:logs aamp:update aamp:add aamp:remove \
       aamp:recent aamp:task aamp:inspect aamp:worktrees \
       codex codex:install codex:setup codex:start codex:stop codex:restart codex:status codex:logs \
       codex:recent codex:list codex:threads codex:thread codex:task codex:inspect codex:attachments codex:outbox \
+      codex:notify-install codex:notify-hook \
       codex:cancel codex:retry codex:recover codex:worktrees codex:doctor codex:update \
       codex:uninstall codex:remove
     exit 0
@@ -201,11 +229,18 @@ case "$1" in
   install|init|doctor)
     command="$1"
     shift
-    run_entry install-cli "$command" "$@"
+    NODE_NO_WARNINGS=1 run_entry install-cli "$command" "$@"
     ;;
   start|start:all)
     shift
     run_entry main "$@"
+    ;;
+  update)
+    shift
+    # The updater downloads, validates and stages the package before stopping
+    # the current LaunchAgent. It also restarts the service after a successful
+    # swap and restores the old package if the new service cannot start.
+    exec "$NODE_BIN" "$APP_DIR/scripts/update-portable-release.mjs" --root "$SELF_DIR" "$@"
     ;;
   bridge:install)
     shift

@@ -1,0 +1,3 @@
+# Portable installer defaults. The value may be changed before running
+# install.command; an empty value falls back to ~/Applications/Feishu Codex Bridge.
+INSTALL_DIR="$HOME/Applications/Feishu Codex Bridge"
