@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   CodexAppServerClient,
+  buildCodexAppServerArgs,
   type CodexThread,
 } from "../src/codex-app-server.js";
 import {
@@ -15,6 +16,16 @@ import {
 } from "../src/codex-cli.js";
 
 describe("Codex app-server read-only query", () => {
+  it("disables completion hooks for read-only app-server clients", () => {
+    expect(buildCodexAppServerArgs()).toEqual([
+      "app-server",
+      "-c",
+      "notify=[]",
+      "--listen",
+      "stdio://",
+    ]);
+  });
+
   it("builds source, project, title, status, and time filters", () => {
     const query = parseCodexThreadQuery([
       "--source",

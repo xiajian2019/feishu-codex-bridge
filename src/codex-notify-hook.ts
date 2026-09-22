@@ -18,7 +18,7 @@ const CHAIN_DIRECTORY = "feishu-codex-bridge";
 const CHAIN_STATE_FILE = "notify-chain.json";
 const DELIVERY_STATE_FILE = "notify-delivery.json";
 const CHAIN_VERSION = 1;
-const COMPLETION_EVENT_TYPES = new Set(["agent-turn-complete", "turn-ended"]);
+const COMPLETION_EVENT_TYPE = "agent-turn-complete";
 
 export interface CodexNotifyInstallOptions {
   bridgeConfigPath: string;
@@ -97,14 +97,16 @@ export async function runCodexNotifyHook(
 ): Promise<void> {
   const payload = parseNotifyPayload(commandArgs);
   if (!payload) return;
-  if (payload.type && !COMPLETION_EVENT_TYPES.has(payload.type)) return;
 
   const chain = await readJson<NotifyChainState>(join(resolveCodexHome(), CHAIN_DIRECTORY, CHAIN_STATE_FILE));
   const payloadText = JSON.stringify(payload);
   const legacyPromise = chain?.legacyCommand
     ? runExternalHook(chain.legacyCommand, payloadText, payload.cwd)
     : Promise.resolve();
-  const bridgePromise = config.localNotifications.enabled
+  // Preserve the pre-existing Computer Use hook for every payload. Only the
+  // Bridge's own delivery path is restricted to the official completion event;
+  // otherwise `/threads`/thread lifecycle payloads can become fake alerts.
+  const bridgePromise = config.localNotifications.enabled && isCodexCompletionNotifyPayload(payload)
     ? deliverFeishuNotification(config, payload)
     : Promise.resolve();
   const results = await Promise.allSettled([legacyPromise, bridgePromise]);
@@ -130,6 +132,19 @@ export function parseNotifyPayload(commandArgs: string[]): NotifyPayload | undef
     }
   }
   return undefined;
+}
+
+/**
+ * The bridge owns the official Codex hook, not the legacy `turn-ended`
+ * argument used by older third-party notification commands. Requiring the
+ * typed event also prevents arbitrary JSON passed to the launcher from being
+ * interpreted as a completion.
+ */
+export function isCodexCompletionNotifyPayload(
+  payload: NotifyPayload | undefined,
+): payload is NotifyPayload & { type: typeof COMPLETION_EVENT_TYPE; "thread-id": string } {
+  return payload?.type === COMPLETION_EVENT_TYPE
+    && Boolean(stringValue(payload["thread-id"]));
 }
 
 export function parseNotifyCommand(text: string): string[] | undefined {

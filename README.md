@@ -8,6 +8,26 @@
 
 原生直连模式处理文本和常见图片/文件附件，并使用飞书原生流式卡片展示 Codex 进度；支持 `/cancel`、`取消`、`停止`、`中断` 取消当前任务、细粒度权限、SQLite 任务租约和启动恢复。服务不使用 Dagu、Webhook 或公网 meshmail。Web 看板默认只监听 `127.0.0.1:7310`，不允许通过配置绑定到非 loopback 地址。
 
+## Codex Session SSH + tmux 验证器
+
+仓库还提供一个独立的本地 CS 验证程序，用来验证“Web Backend → SSH Worker → tmux session → Codex TUI”这条适配器链路；它不接入飞书业务状态机，也不复用 Bridge 业务数据库。
+
+```bash
+pnpm run build
+pnpm run tmux:verify -- --port 7320
+open http://127.0.0.1:7320
+```
+
+页面中的 `机器` 填 `local` 或 SSH 配置中的 `user@host`，工作路径从程序读取的 `~/.codex/project-map.yaml`（可用 `TMUX_VERIFY_PROJECT_MAP` 覆盖）中搜索选择。Codex 可执行文件不由页面填写，而是使用 Bridge 进程的 `CODEX_PATH`/自动发现结果。远程执行只使用现有 SSH key/SSH config，不保存或请求密码。默认复用所选机器已有的 tmux 默认 server，本地 Session 会出现在你平时使用的 tmux 会话列表中；只有显式传入 `--socket <name>` 才使用独立 socket。Bridge 看板默认地址为 `http://127.0.0.1:7310`，自定义端口时用 `--bridge-url <url>` 指定。页面通过 `xterm.js → WebSocket → node-pty → tmux attach-session` 查看真实 PTY，页面关闭只会断开 attach 客户端，不会杀掉 tmux/Codex。重新打开页面会先按 SQLite 中的 `after` event cursor 恢复快照，再接入实时 PTY 输出。
+
+Web 追问必须带 `clientMessageId`/`Idempotency-Key`。同一个逻辑请求重试时只会向已经存在的 Codex TUI 注入一次 `tmux send-keys`，不会启动第二个 Codex 进程。原始终端键盘输入仍属于 TUI 的低层输入；若人为在两个界面分别输入完全相同的新句子，后端无法从 tmux 原始字节中推断这是有意重复，因此这不属于当前最小验证范围。
+
+该验证器默认监听 `127.0.0.1:7320`，数据写入 `runtime/tmux-verifier.db`。默认 attach 命令直接连接现有 tmux server：
+
+```bash
+tmux attach-session -t codex-verify-...
+```
+
 ## 安装和配置
 
 研发环境需要 Node.js 22.13.1（项目通过 `.nvmrc` 固定）。给非研发同事使用时，Portable 发布包可以直接双击 `install.command`；安装器会自动寻找 ChatGPT App 内置 Codex 或本机独立 Codex CLI，不要求手动填写 CLI 路径。

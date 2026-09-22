@@ -103,6 +103,15 @@ export interface CodexAppServerQueryClient {
   close(): Promise<void>;
 }
 
+/**
+ * Read-only app-server clients must not inherit the user's completion hook.
+ * Thread hydration/cleanup can otherwise replay completion notifications while
+ * a command such as `/threads` is only listing existing sessions.
+ */
+export function buildCodexAppServerArgs(): string[] {
+  return ["app-server", "-c", "notify=[]", "--listen", "stdio://"];
+}
+
 interface JsonRpcRequest {
   id: number;
   method: string;
@@ -175,7 +184,7 @@ export class CodexAppServerClient implements CodexAppServerQueryClient {
       title: options.clientTitle ?? "Feishu Codex Bridge",
       version: options.clientVersion ?? "0.1.0",
     };
-    this.child = spawn(options.executable, ["app-server", "--listen", "stdio://"], {
+    this.child = spawn(options.executable, buildCodexAppServerArgs(), {
       cwd: options.cwd,
       env: options.env,
       stdio: ["pipe", "pipe", "pipe"],

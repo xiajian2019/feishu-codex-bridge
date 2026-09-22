@@ -20,6 +20,7 @@
     "build:web": "vite build --config web/vite.config.ts",
     "dev": "tsx src/main.ts",
     "dev:web": "vite --config web/vite.config.ts",
+    "tmux:verify": "tsx src/tmux-verifier-cli.ts",
     "start": "node dist/main.js",
     "start:all": "node dist/main.js",
     "aamp": "tsx src/aamp-cli.ts",
@@ -67,18 +68,23 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "1.73.3",
     "@larksuite/cli": "1.0.94",
+    "@larksuiteoapi/node-sdk": "1.73.3",
     "@larktask/aamp-feishu-task-agent": "0.1.1-dev.8",
     "@openai/codex-sdk": "^0.104.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "node-pty": "^1.1.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "ws": "^8.21.3",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.13.1",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^4.7.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
