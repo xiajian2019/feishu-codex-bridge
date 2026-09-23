@@ -1,4 +1,5 @@
-import { Codex } from "@openai/codex-sdk";
+import { Codex, type Input, type UserInput } from "@openai/codex-sdk";
+import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -85,13 +86,28 @@ export async function runWorker(args: WorkerArguments): Promise<WorkerResult> {
     if (!task) {
       throw new Error(`找不到任务记录 ${run.task_guid}`);
     }
-    const mode = config.modes[task.mode];
+    const mode = config.modes[task.mode]
+      ?? (task.origin === "web" && task.mode === "implement"
+        ? { sandboxMode: "workspace-write" as const }
+        : undefined);
     if (!mode) {
       throw new Error(`运行记录中的模式 ${task.mode} 不在配置中`);
     }
-    const project = config.projects[task.project_key];
-    if (!project || project.repo !== task.repo) {
-      throw new Error("运行记录中的仓库路径与项目白名单不一致");
+    if (task.origin === "web") {
+      const project = db.getAvailableProject(task.project_key);
+      if (!project || project.path !== task.repo) {
+        throw new Error("运行记录中的项目路径已不可用或与项目登记不一致");
+      }
+    } else {
+      const project = config.projects[task.project_key];
+      if (!project || project.repo !== task.repo) {
+        throw new Error("运行记录中的仓库路径与项目白名单不一致");
+      }
+    }
+
+    const attachments = db.listWebTaskAttachments(task.task_guid);
+    if (attachments.some((attachment) => !existsSync(attachment.local_path))) {
+      throw new Error("任务的本地附件文件不存在，请重新提交附件后重试。");
     }
 
     const codex = new Codex({
@@ -104,6 +120,7 @@ export async function runWorker(args: WorkerArguments): Promise<WorkerResult> {
       workingDirectory: task.repo,
       sandboxMode: mode.sandboxMode,
       approvalPolicy: "never" as const,
+      ...(attachments.length > 0 ? { additionalDirectories: [dirname(attachments[0]!.local_path)] } : {}),
     };
     const thread = run.thread_id
       ? codex.resumeThread(run.thread_id, threadOptions)
@@ -111,7 +128,13 @@ export async function runWorker(args: WorkerArguments): Promise<WorkerResult> {
 
     let finalResponse = "";
     let usage: unknown;
-    const { events } = await thread.runStreamed(run.prompt_text, {
+    const imageInputs = attachments
+      .filter((attachment) => attachment.mime_type.startsWith("image/"))
+      .map((attachment): UserInput => ({ type: "local_image", path: attachment.local_path }));
+    const codexInput: Input = imageInputs.length > 0
+      ? [{ type: "text", text: run.prompt_text }, ...imageInputs]
+      : run.prompt_text;
+    const { events } = await thread.runStreamed(codexInput, {
       signal: abortController.signal,
     });
 

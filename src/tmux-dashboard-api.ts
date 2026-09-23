@@ -1,11 +1,9 @@
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 
 import { getBunRuntime, type BunSubprocess, type BunTerminal } from "./bun-runtime.js";
-import { getProjectMapPath, parseProjectMap } from "./tmux-dashboard-projects.js";
+import type { StateDatabase } from "./db.js";
 import * as tmux from "./tmux-dashboard.js";
 
 const API_PREFIX = "/tmux-dashboard/api";
@@ -19,20 +17,20 @@ interface TerminalData {
 }
 
 export interface TmuxDashboardApiOptions {
-  projectMapPath?: string;
+  db: StateDatabase;
   operations?: Pick<typeof tmux, "createSession" | "findSession" | "killSession" | "listSessions">;
 }
 
 export class TmuxDashboardApi {
-  private readonly projectMapPath: string;
+  private readonly db: StateDatabase;
   private readonly operations: NonNullable<TmuxDashboardApiOptions["operations"]>;
   private readonly websocketServer = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
   private readonly clients = new Set<WebSocket>();
   private stopped = false;
 
-  constructor(options: TmuxDashboardApiOptions = {}) {
-    this.projectMapPath = options.projectMapPath
-      ?? getProjectMapPath(homedir(), process.env.TMUX_DASHBOARD_PROJECT_MAP);
+  constructor(options: TmuxDashboardApiOptions) {
+    if (!options.db) throw new Error("TmuxDashboardApi requires the Bridge state database.");
+    this.db = options.db;
     this.operations = options.operations ?? tmux;
   }
 
@@ -40,11 +38,9 @@ export class TmuxDashboardApi {
     const url = new URL(request.url ?? "/", "http://localhost");
     const apiPath = url.pathname.slice(API_PREFIX.length);
     if (request.method === "GET" && apiPath === "/projects") {
-      try {
-        sendJson(response, 200, { projects: parseProjectMap(await readFile(this.projectMapPath, "utf8")) });
-      } catch (error) {
-        sendDashboardError(response, error);
-      }
+      sendJson(response, 200, {
+        projects: this.db.listAvailableProjects().map((project) => ({ name: project.name, root: project.path })),
+      });
       return;
     }
     if (request.method === "GET" && apiPath === "/sessions") {
@@ -68,8 +64,10 @@ export class TmuxDashboardApi {
         return;
       }
       try {
-        const cwd = typeof body.cwd === "string" ? body.cwd : undefined;
-        sendJson(response, 201, { session: await this.operations.createSession(body.name.trim(), cwd) });
+        const projectKey = typeof body.projectKey === "string" ? body.projectKey.trim() : "";
+        const project = this.db.getAvailableProject(projectKey);
+        if (!project) throw new Error("所选项目不可用，请刷新项目列表。");
+        sendJson(response, 201, { session: await this.operations.createSession(body.name.trim(), project.path) });
       } catch (error) {
         sendDashboardError(response, error);
       }

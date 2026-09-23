@@ -73,6 +73,8 @@ export interface AampTaskAgentOptions {
   inheritedEnv?: NodeJS.ProcessEnv;
   /** SQLite path shared with the AAMP runtime persistence patch. */
   sqlitePath?: string;
+  /** Snapshot of the active Bridge SQLite project routes for the AAMP adapter. */
+  projectRegistryPath?: string;
   /** Directory where the AAMP runtime stores downloaded image attachments. */
   attachmentsDir?: string;
   logger?: Logger;
@@ -100,6 +102,7 @@ export class AampTaskAgentRuntime {
   private readonly serviceBootstrapPath: string;
   private readonly sqlitePath: string;
   private readonly attachmentsDir: string;
+  private readonly projectRegistryPath: string;
 
   constructor(config: BridgeConfig, options: AampTaskAgentOptions) {
     this.config = config;
@@ -122,6 +125,9 @@ export class AampTaskAgentRuntime {
     this.sqlitePath = resolve(options.sqlitePath ?? join(this.projectRoot, "runtime", "bridge.db"));
     this.attachmentsDir = resolve(
       options.attachmentsDir ?? join(this.projectRoot, "runtime", "aamp", "attachments"),
+    );
+    this.projectRegistryPath = resolve(
+      options.projectRegistryPath ?? join(this.projectRoot, "runtime", "aamp", "project-registry.json"),
     );
   }
 
@@ -420,6 +426,7 @@ export class AampTaskAgentRuntime {
             ...buildAampWorktreeEnvironment(
               this.config,
               join(this.projectRoot, "runtime", "aamp", "worktree-tasks"),
+              this.projectRegistryPath,
             ),
           },
         }),
@@ -826,12 +833,13 @@ export function buildAampPersistenceEnvironment(
 export function buildAampWorktreeEnvironment(
   config: BridgeConfig,
   metadataDir: string,
+  projectRegistryPath = join(metadataDir, "project-registry.json"),
 ): Record<string, string> {
   const worktree = config.aamp.worktree;
   if (!worktree?.enabled) return {};
   return {
     AAMP_CODEX_WORKTREE_ENABLED: "1",
-    AAMP_CODEX_PROJECT_MAP: worktree.projectMapPath,
+    AAMP_CODEX_PROJECTS_FILE: resolve(projectRegistryPath),
     AAMP_CODEX_GLOBAL_AGENTS: worktree.globalAgentsPath,
     AAMP_CODEX_TASK_DIR: worktree.taskDir,
     AAMP_CODEX_WORKTREE_ROOT: worktree.worktreeRoot,

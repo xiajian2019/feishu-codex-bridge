@@ -1,40 +1,53 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { createReadStream, existsSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { extname, join, relative, resolve } from "node:path";
+import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 
 import { StateDatabase } from "./db.js";
+import { writeProjectRegistrySnapshot } from "./project-registry.js";
 import type { TmuxDashboardApi } from "./tmux-dashboard-api.js";
 import { resolveBridgeProjectRoot } from "./portable-runtime.js";
 import { parseTaskInput } from "./fingerprint.js";
-import type { TmuxVerifierWebServer } from "./tmux-verifier-web.js";
 import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import {
   AAMP_TASK_STATUSES,
+  PROJECT_STATUSES,
   TASK_STATES,
   type AampTaskStatus,
   type DatabaseChange,
   type Logger,
+  type ProjectStatus,
   type TaskState,
+  type StoredProject,
+  type StoredWebTaskAttachment,
+  type StoredTask,
+  type WebTaskSubmission,
 } from "./types.js";
+
+const MAX_TASK_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MAX_STAGED_TASK_ATTACHMENTS = 100;
+const MAX_STAGED_TASK_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+const MAX_TASK_ATTACHMENTS = 10;
 
 export interface DashboardServerOptions {
   db: StateDatabase;
   host: string;
   port: number;
-  projects: string[];
   modes: string[];
+  projectRegistrySnapshotPath?: string;
+  taskAttachmentsDirectory?: string;
   webRoot?: string;
   auth?: WebPairingAuth;
-  tmuxVerifier?: TmuxVerifierWebServer;
   tmuxDashboard?: TmuxDashboardApi;
   actions?: DashboardActions;
   logger?: Logger;
 }
 
 export interface DashboardActions {
+  createTask?(input: WebTaskSubmission): Promise<StoredTask>;
   interruptTask(taskGuid: string, reason?: string): Promise<{ ok: boolean; message?: string }>;
   appendFeedback(taskGuid: string, details: string): Promise<{ ok: boolean; state: string }>;
 }
@@ -44,6 +57,7 @@ export class DashboardServer {
   private readonly actionToken = randomUUID();
   private readonly auth: WebPairingAuth;
   private readonly webRoot: string;
+  private readonly taskAttachmentsDirectory: string;
   private readonly eventClients = new Set<ServerResponse>();
   private server: Server | null = null;
   private unsubscribeFromDatabase: (() => void) | null = null;
@@ -54,12 +68,20 @@ export class DashboardServer {
     this.auth = options.auth
       ?? new WebPairingAuth({ db: options.db, allowLocalRequests: true });
     this.webRoot = options.webRoot ?? findWebRoot();
+    this.taskAttachmentsDirectory = resolve(
+      options.taskAttachmentsDirectory ?? join(process.cwd(), "runtime", "task-attachments"),
+    );
   }
 
-  public start(): Promise<string> {
+  public async start(): Promise<string> {
     if (this.server) {
       return Promise.reject(new Error("dashboard server is already running"));
     }
+    await this.cleanupExpiredStagedAttachments().catch((error) => {
+      this.options.logger?.warn("failed to clean expired staged task attachments", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
     const server = createServer((request, response) => {
       void this.handle(request, response).catch((error: unknown) => {
         this.options.logger?.error("dashboard request failed", {
@@ -99,12 +121,11 @@ export class DashboardServer {
     for (const client of this.eventClients) client.end();
     this.eventClients.clear();
     this.options.tmuxDashboard?.stop();
-    const verifierStop = this.options.tmuxVerifier?.stop() ?? Promise.resolve();
-    if (!server) return verifierStop;
-    return verifierStop.then(() => new Promise((resolve, reject) => {
+    if (!server) return Promise.resolve();
+    return new Promise((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
       server.closeIdleConnections();
-    }));
+    });
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -150,11 +171,6 @@ export class DashboardServer {
       sendJson(response, 200, { ok: true });
       return;
     }
-    if (url.pathname.startsWith("/api/tmux/") && this.options.tmuxVerifier) {
-      if (!this.requireAuthorization(request, response)) return;
-      await this.options.tmuxVerifier.handleApiRequest(request, response);
-      return;
-    }
     if (url.pathname.startsWith("/tmux-dashboard/api/") && this.options.tmuxDashboard) {
       if (!this.requireAuthorization(request, response)) return;
       await this.options.tmuxDashboard.handleRequest(request, response);
@@ -183,6 +199,26 @@ export class DashboardServer {
       sendJson(response, 200, { actionToken: this.actionToken });
       return;
     }
+    if (request.method === "GET" && url.pathname === "/api/projects") {
+      sendJson(response, 200, { projects: this.listProjects() });
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/projects") {
+      await this.createProject(request, response);
+      return;
+    }
+    const projectMatch = /^\/api\/projects\/([^/]+)$/.exec(url.pathname);
+    if (projectMatch && request.method === "PATCH") {
+      let name: string;
+      try {
+        name = decodeURIComponent(projectMatch[1]);
+      } catch {
+        sendJson(response, 400, { error: "invalid project name" });
+        return;
+      }
+      await this.updateProject(name, request, response);
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/api/events") {
       this.openEventStream(request, response);
       return;
@@ -193,6 +229,28 @@ export class DashboardServer {
     }
     if (request.method === "GET" && url.pathname === "/api/tasks") {
       this.listTasks(url, response);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/tasks") {
+      await this.createTask(request, response);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/tasks/attachments") {
+      await this.uploadTaskAttachment(request, response);
+      return;
+    }
+    const stagedAttachmentMatch = /^\/api\/tasks\/attachments\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "DELETE" && stagedAttachmentMatch) {
+      await this.deleteStagedTaskAttachment(decodeURIComponent(stagedAttachmentMatch[1]), request, response);
+      return;
+    }
+    const taskAttachmentMatch = /^\/api\/tasks\/([^/]+)\/attachments\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "GET" && taskAttachmentMatch) {
+      await this.getTaskAttachment(
+        decodeURIComponent(taskAttachmentMatch[1]),
+        decodeURIComponent(taskAttachmentMatch[2]),
+        response,
+      );
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/aamp/tasks") {
@@ -220,8 +278,8 @@ export class DashboardServer {
       await this.serveAsset(url.pathname, response);
       return;
     }
-    if (request.method !== "GET" && request.method !== "POST") {
-      response.setHeader("Allow", "GET, POST");
+    if (request.method !== "GET" && request.method !== "POST" && request.method !== "PATCH" && request.method !== "DELETE") {
+      response.setHeader("Allow", "GET, POST, PATCH, DELETE");
       sendJson(response, 405, { error: "method not allowed" });
       return;
     }
@@ -298,10 +356,193 @@ export class DashboardServer {
       offset,
       filters: {
         states: TASK_STATES,
-        projects: this.options.projects,
+        projects: this.options.db.listAvailableProjects().map((project) => project.name),
         modes: this.options.modes,
       },
     });
+  }
+
+  private async createTask(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const create = this.options.actions?.createTask;
+    if (!create) {
+      sendJson(response, 501, { error: "task creation is not configured" });
+      return;
+    }
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(request);
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+      return;
+    }
+    if (typeof body.projectKey !== "string" || typeof body.description !== "string" || !body.description.trim()) {
+      sendJson(response, 400, { error: "projectKey and non-empty description are required" });
+      return;
+    }
+    if (body.summary !== undefined && typeof body.summary !== "string") {
+      sendJson(response, 400, { error: "summary must be a string" });
+      return;
+    }
+    if (body.mode !== undefined && typeof body.mode !== "string") {
+      sendJson(response, 400, { error: "mode must be a string" });
+      return;
+    }
+    if ("executionBackend" in body || "tmuxSessionId" in body) {
+      sendJson(response, 400, { error: "task execution target selection is no longer supported" });
+      return;
+    }
+    const attachmentIds = body.attachmentIds ?? [];
+    if (!Array.isArray(attachmentIds)
+      || attachmentIds.length > MAX_TASK_ATTACHMENTS
+      || attachmentIds.some((attachmentId) => typeof attachmentId !== "string")
+      || new Set(attachmentIds).size !== attachmentIds.length) {
+      sendJson(response, 400, { error: "attachmentIds must contain up to 10 unique ids" });
+      return;
+    }
+    try {
+      const input: WebTaskSubmission = {
+        summary: typeof body.summary === "string" ? body.summary : undefined,
+        description: body.description,
+        projectKey: body.projectKey,
+        mode: typeof body.mode === "string" ? body.mode : undefined,
+        attachmentIds: attachmentIds as string[],
+      };
+      const task = await create(input);
+      sendJson(response, 201, {
+        task: { ...task, input: parseTaskInput(task.input_text) },
+        latest_run: this.options.db.getLatestRun(task.task_guid),
+      });
+    } catch (error) {
+      sendJson(response, 422, { error: error instanceof Error ? error.message : "task creation failed" });
+    }
+  }
+
+  private async uploadTaskAttachment(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    const fileNameHeader = request.headers["x-file-name"];
+    if (typeof fileNameHeader !== "string") {
+      request.resume();
+      sendJson(response, 400, { error: "x-file-name is required" });
+      return;
+    }
+    let decodedFileName: string;
+    try {
+      decodedFileName = decodeURIComponent(fileNameHeader);
+    } catch {
+      request.resume();
+      sendJson(response, 400, { error: "invalid file name" });
+      return;
+    }
+    const fileName = sanitizeAttachmentFileName(decodedFileName);
+    if (!fileName) {
+      request.resume();
+      sendJson(response, 400, { error: "invalid file name" });
+      return;
+    }
+    const contentLength = Number(request.headers["content-length"] ?? 0);
+    if (Number.isFinite(contentLength) && contentLength > MAX_TASK_ATTACHMENT_BYTES) {
+      request.resume();
+      sendJson(response, 413, { error: "单个附件不能超过 25 MiB。" });
+      return;
+    }
+    let data: Buffer;
+    try {
+      data = await readBinaryBody(request, MAX_TASK_ATTACHMENT_BYTES);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(response, message === "attachment exceeds size limit" ? 413 : 400, { error: message });
+      return;
+    }
+    if (data.length === 0) {
+      sendJson(response, 400, { error: "附件不能为空。" });
+      return;
+    }
+
+    await this.cleanupExpiredStagedAttachments();
+    if (this.options.db.countStagedWebTaskAttachments() >= MAX_STAGED_TASK_ATTACHMENTS) {
+      sendJson(response, 429, { error: "待提交附件过多，请先提交或移除旧附件。" });
+      return;
+    }
+    if (this.options.db.stagedWebTaskAttachmentBytes() + data.length > MAX_STAGED_TASK_ATTACHMENT_BYTES) {
+      sendJson(response, 429, { error: "待提交附件总容量超过 100 MiB，请先提交或移除旧附件。" });
+      return;
+    }
+
+    const attachmentId = randomUUID();
+    const mimeType = normalizeAttachmentMimeType(request.headers["content-type"]);
+    const localPath = join(this.taskAttachmentsDirectory, `${attachmentId}${attachmentFileExtension(fileName, mimeType)}`);
+    const temporaryPath = `${localPath}.tmp`;
+    try {
+      await mkdir(this.taskAttachmentsDirectory, { recursive: true, mode: 0o700 });
+      await writeFile(temporaryPath, data, { mode: 0o600, flag: "wx" });
+      await rename(temporaryPath, localPath);
+      const attachment = this.options.db.createStagedWebTaskAttachment({
+        attachmentId,
+        fileName,
+        mimeType,
+        sizeBytes: data.length,
+        localPath,
+      });
+      sendJson(response, 201, { attachment: publicWebTaskAttachment(attachment) });
+    } catch (error) {
+      await unlink(temporaryPath).catch(() => undefined);
+      await unlink(localPath).catch(() => undefined);
+      sendJson(response, 500, { error: error instanceof Error ? error.message : "附件保存失败。" });
+    }
+  }
+
+  private async deleteStagedTaskAttachment(
+    attachmentId: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    const attachment = this.options.db.deleteStagedWebTaskAttachment(attachmentId);
+    if (!attachment) {
+      sendJson(response, 404, { error: "staged attachment not found" });
+      return;
+    }
+    await unlink(attachment.local_path).catch(() => undefined);
+    response.statusCode = 204;
+    response.end();
+  }
+
+  private async getTaskAttachment(
+    taskGuid: string,
+    attachmentId: string,
+    response: ServerResponse,
+  ): Promise<void> {
+    const attachment = this.options.db.getWebTaskAttachment(taskGuid, attachmentId);
+    if (!attachment) {
+      sendJson(response, 404, { error: "task attachment not found" });
+      return;
+    }
+    let fileStat;
+    try {
+      fileStat = await stat(attachment.local_path);
+    } catch {
+      sendJson(response, 410, { error: "attachment file is no longer available" });
+      return;
+    }
+    setSecurityHeaders(response);
+    response.statusCode = 200;
+    response.setHeader("Content-Type", attachment.mime_type);
+    response.setHeader("Content-Length", String(fileStat.size));
+    response.setHeader("Cache-Control", "private, no-store");
+    response.setHeader("Content-Disposition", attachmentDisposition(
+      attachment.file_name,
+      isPreviewableImage(attachment.mime_type),
+    ));
+    const stream = createReadStream(attachment.local_path);
+    stream.on("error", () => response.destroy());
+    stream.pipe(response);
+  }
+
+  private async cleanupExpiredStagedAttachments(): Promise<void> {
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const expired = this.options.db.deleteExpiredStagedWebTaskAttachments(cutoff);
+    await Promise.all(expired.map((attachment) => unlink(attachment.local_path).catch(() => undefined)));
   }
 
   private getTask(taskGuid: string, response: ServerResponse): void {
@@ -316,6 +557,7 @@ export class DashboardServer {
         ...run,
         events: this.options.db.listRunEvents(run.run_id),
       })),
+      attachments: this.options.db.listWebTaskAttachments(taskGuid).map(publicWebTaskAttachment),
       outbox: this.options.db.listOutboxForTask(taskGuid),
     });
   }
@@ -348,6 +590,127 @@ export class DashboardServer {
       offset,
       statuses: AAMP_TASK_STATUSES,
     });
+  }
+
+  private listProjects(): Array<StoredProject & { available: boolean }> {
+    return this.options.db.listProjects().map((project) => ({
+      ...project,
+      available: this.options.db.getAvailableProject(project.name) !== null,
+    }));
+  }
+
+  private requireActionAuthorization(request: IncomingMessage, response: ServerResponse): boolean {
+    const token = request.headers["x-bridge-action-token"];
+    if (!constantTimeTokenMatches(typeof token === "string" ? token : "", this.actionToken)) {
+      sendJson(response, 403, { error: "invalid action token" });
+      return false;
+    }
+    const origin = request.headers.origin;
+    if (origin && !this.isSameOrigin(origin)) {
+      sendJson(response, 403, { error: "cross-origin action rejected" });
+      return false;
+    }
+    return true;
+  }
+
+  private async createProject(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(request);
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+      return;
+    }
+    if (typeof body.name !== "string" || typeof body.path !== "string") {
+      sendJson(response, 400, { error: "name and path are required" });
+      return;
+    }
+    const status = body.status === undefined ? "available" : body.status;
+    if (!isProjectStatus(status)) {
+      sendJson(response, 400, { error: "invalid project status" });
+      return;
+    }
+    const path = normalizeProjectPath(body.path);
+    if (!path) {
+      sendJson(response, 422, { error: "项目路径必须是绝对路径。" });
+      return;
+    }
+    if (status === "available" && !isDirectory(path)) {
+      sendJson(response, 422, { error: "启用的项目路径必须是本机上存在的目录。" });
+      return;
+    }
+    if (this.options.db.getProject(body.name.trim())) {
+      sendJson(response, 409, { error: "项目名称已存在。" });
+      return;
+    }
+    try {
+      const project = this.options.db.createProject({ name: body.name, path, status });
+      this.refreshProjectRegistrySnapshot();
+      sendJson(response, 201, { project: { ...project, available: this.options.db.getAvailableProject(project.name) !== null } });
+    } catch (error) {
+      sendJson(response, 422, { error: error instanceof Error ? error.message : "项目创建失败。" });
+    }
+  }
+
+  private async updateProject(
+    name: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(request);
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+      return;
+    }
+    if (body.path !== undefined && typeof body.path !== "string") {
+      sendJson(response, 400, { error: "path must be a string" });
+      return;
+    }
+    if (body.status !== undefined && !isProjectStatus(body.status)) {
+      sendJson(response, 400, { error: "invalid project status" });
+      return;
+    }
+    const path = typeof body.path === "string" ? normalizeProjectPath(body.path) : undefined;
+    if (body.path !== undefined && !path) {
+      sendJson(response, 422, { error: "项目路径必须是绝对路径。" });
+      return;
+    }
+    const existing = this.options.db.getProject(name);
+    if (!existing) {
+      sendJson(response, 404, { error: "project not found" });
+      return;
+    }
+    const nextStatus = isProjectStatus(body.status) ? body.status : existing.status;
+    if (nextStatus === "available" && !isDirectory(path ?? existing.path)) {
+      sendJson(response, 422, { error: "启用的项目路径必须是本机上存在的目录。" });
+      return;
+    }
+    const project = this.options.db.updateProject(name, {
+      ...(path ? { path } : {}),
+      ...(isProjectStatus(body.status) ? { status: body.status } : {}),
+    });
+    if (!project) {
+      sendJson(response, 404, { error: "project not found" });
+      return;
+    }
+    this.refreshProjectRegistrySnapshot();
+    sendJson(response, 200, { project: { ...project, available: this.options.db.getAvailableProject(name) !== null } });
+  }
+
+  private refreshProjectRegistrySnapshot(): void {
+    const path = this.options.projectRegistrySnapshotPath;
+    if (!path) return;
+    try {
+      writeProjectRegistrySnapshot(this.options.db, path);
+    } catch (error) {
+      this.options.logger?.warn("failed to update AAMP project registry snapshot", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private getAampTask(taskId: string, response: ServerResponse): void {
@@ -466,15 +829,6 @@ export class DashboardServer {
       return;
     }
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
-    if (pathname.startsWith("/api/tmux/sessions/") && this.options.tmuxVerifier) {
-      void this.options.tmuxVerifier.handleApiUpgrade(request, socket, head).catch((error: unknown) => {
-        this.options.logger?.warn("tmux verifier websocket failed", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-        socket.destroy();
-      });
-      return;
-    }
     if (pathname === "/tmux-dashboard/terminal" && this.options.tmuxDashboard) {
       void this.options.tmuxDashboard.handleUpgrade(request, socket, head).catch((error: unknown) => {
         this.options.logger?.warn("tmux dashboard websocket failed", {
@@ -550,8 +904,6 @@ function isSpaRoute(pathname: string): boolean {
   return pathname === "/"
     || pathname === "/index.html"
     || pathname === "/pair-admin"
-    || pathname === "/tmux"
-    || pathname.startsWith("/tmux/")
     || pathname === "/tmux-dashboard"
     || (pathname.startsWith("/tmux-dashboard/")
       && !pathname.startsWith("/tmux-dashboard/api/")
@@ -590,6 +942,25 @@ function constantTimeTokenMatches(value: string, expected: string): boolean {
     && timingSafeEqual(actualBytes, expectedBytes);
 }
 
+function isProjectStatus(value: unknown): value is ProjectStatus {
+  return typeof value === "string" && PROJECT_STATUSES.includes(value as ProjectStatus);
+}
+
+function normalizeProjectPath(value: string): string | undefined {
+  let path = value.trim();
+  if (path === "~") path = homedir();
+  else if (path.startsWith("~/")) path = join(homedir(), path.slice(2));
+  return isAbsolute(path) ? resolve(path) : undefined;
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return existsSync(path) && statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
   const contentLength = request.headers["content-length"];
   if (contentLength && Number(contentLength) > 32 * 1024) {
@@ -608,6 +979,91 @@ async function readJsonBody(request: IncomingMessage): Promise<Record<string, un
     throw new Error("request body must be a JSON object");
   }
   return parsed as Record<string, unknown>;
+}
+
+function readBinaryBody(request: IncomingMessage, maxBytes: number): Promise<Buffer> {
+  return new Promise((resolvePromise, reject) => {
+    const chunks: Buffer[] = [];
+    let sizeBytes = 0;
+    let failed = false;
+    request.on("data", (chunk: Buffer | string) => {
+      if (failed) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      sizeBytes += buffer.length;
+      if (sizeBytes > maxBytes) {
+        failed = true;
+        chunks.length = 0;
+        reject(new Error("attachment exceeds size limit"));
+        request.resume();
+        return;
+      }
+      chunks.push(buffer);
+    });
+    request.once("end", () => {
+      if (!failed) resolvePromise(Buffer.concat(chunks, sizeBytes));
+    });
+    request.once("error", (error) => {
+      if (!failed) reject(error);
+    });
+  });
+}
+
+function sanitizeAttachmentFileName(value: string): string {
+  const basename = value.replaceAll("\\", "/").split("/").pop() ?? "";
+  return basename.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 180);
+}
+
+function normalizeAttachmentMimeType(value: string | string[] | undefined): string {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const mimeType = raw?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  return /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(mimeType)
+    ? mimeType
+    : "application/octet-stream";
+}
+
+function attachmentFileExtension(fileName: string, mimeType: string): string {
+  const knownExtensions: Record<string, string> = {
+    "image/avif": ".avif",
+    "image/gif": ".gif",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+  };
+  const knownExtension = knownExtensions[mimeType];
+  if (knownExtension) return knownExtension;
+  const extension = extname(fileName).toLowerCase();
+  return /^\.[a-z0-9]{1,10}$/.test(extension) ? extension : ".blob";
+}
+
+function isPreviewableImage(mimeType: string): boolean {
+  return [
+    "image/avif",
+    "image/bmp",
+    "image/gif",
+    "image/heic",
+    "image/heif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+  ].includes(mimeType);
+}
+
+function attachmentDisposition(fileName: string, inline: boolean): string {
+  const fallback = fileName.replace(/[^\x20-\x7e]|["\\]/g, "_");
+  return `${inline ? "inline" : "attachment"}; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(fileName)}`;
+}
+
+function publicWebTaskAttachment(attachment: StoredWebTaskAttachment) {
+  return {
+    attachment_id: attachment.attachment_id,
+    file_name: attachment.file_name,
+    mime_type: attachment.mime_type,
+    size_bytes: attachment.size_bytes,
+  };
 }
 
 function setSecurityHeaders(response: ServerResponse): void {

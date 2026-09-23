@@ -81,9 +81,6 @@ function inferDbPathForUrl(rawUrl: string, cwd: string): string {
     if (port === "5173" || port === "17310") {
       return resolve(cwd, "runtime", "dev", "bridge.db");
     }
-    if (port === "7320") {
-      return resolve(cwd, "runtime", "tmux-verifier.db");
-    }
   } catch {
     // buildPairingUrl() reports the useful URL validation error later.
   }
@@ -101,13 +98,10 @@ function renderQr(value: string): Promise<void> {
 
 function printUsage(): void {
   console.log([
-    "Usage: bun run web:pair -- --url http://192.168.1.10:7320/",
+    "Usage: bun run web:pair -- --url http://192.168.1.10:7310/",
     "  --url <url>                 phone-reachable HTTP(S) page URL",
     "  --db <path>                 SQLite database used by the running service",
-    "                              inferred from URL: 5173/17310=runtime/dev, 7320=runtime/tmux-verifier",
-    "",
-    "Standalone tmux verifier example:",
-    "  bun run web:pair -- --db ./runtime/tmux-verifier.db --url http://192.168.1.10:7320/",
+    "                              inferred from URL: 5173/17310=runtime/dev, 7310=runtime/bridge.db",
   ].join("\n"));
 }
 

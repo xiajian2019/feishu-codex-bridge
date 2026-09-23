@@ -54,4 +54,6 @@ describe("Codex official notify hook", () => {
     expect(isCodexCompletionNotifyPayload({ "thread-id": "thr_1" })).toBe(false);
     expect(isCodexCompletionNotifyPayload({ type: "agent-turn-complete" })).toBe(false);
   });
+
+  });
 });

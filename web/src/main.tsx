@@ -8,7 +8,6 @@ import { AuthGate, PairingAdmin } from "./auth.js";
 import { ThemeProvider } from "./theme.js";
 import "./styles.css";
 
-const TmuxApp = lazy(() => import("./TmuxApp.js").then((module) => ({ default: module.TmuxApp })));
 const TmuxDashboard = lazy(() => import("./TmuxDashboard.js").then((module) => ({ default: module.TmuxDashboard })));
 
 createRoot(document.getElementById("root")!).render(
@@ -20,7 +19,6 @@ createRoot(document.getElementById("root")!).render(
           <Suspense fallback={<div className="route-loading">页面加载中…</div>}>
             <Routes>
               <Route path="/" element={<App />} />
-              <Route path="/tmux/*" element={<TmuxApp />} />
               <Route path="/tmux-dashboard/*" element={<TmuxDashboard />} />
               <Route path="/pair-admin" element={<PairingAdmin />} />
               <Route path="*" element={<Navigate to="/" replace />} />

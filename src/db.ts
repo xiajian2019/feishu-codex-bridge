@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { dirname, resolve } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 
 import { DatabaseSync as DatabaseSyncConstructor, type SqliteDatabase } from "./sqlite.js";
@@ -8,6 +9,7 @@ import type { WebAuthPairingRecord, WebAuthSessionRecord } from "./web-auth.js";
 import type {
   DatabaseChange,
   DirectMessageInput,
+  StoredExecutionBackend,
   OutboxEntry,
   RoutedTask,
   StoredRun,
@@ -18,6 +20,10 @@ import type {
   StoredBridgeTaskEvent,
   StoredBridgeTaskFollowup,
   StoredInboundEvent,
+  StoredProject,
+  StoredWebTaskAttachment,
+  ProjectStatus,
+  TaskOrigin,
   AampTaskStatus,
   DirectTaskStatus,
   StoredTask,
@@ -26,8 +32,19 @@ import type {
 } from "./types.js";
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS projects (
+    name TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'disabled')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_projects_status_name ON projects(status, name);
+
 CREATE TABLE IF NOT EXISTS tasks (
     task_guid TEXT PRIMARY KEY,
+    origin TEXT NOT NULL DEFAULT 'feishu',
     project_key TEXT NOT NULL,
     mode TEXT NOT NULL,
     repo TEXT NOT NULL,
@@ -46,6 +63,20 @@ CREATE TABLE IF NOT EXISTS tasks (
     progress_text TEXT,
     progress_updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS web_task_attachments (
+    attachment_id TEXT PRIMARY KEY,
+    task_guid TEXT,
+    file_name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    local_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(task_guid) REFERENCES tasks(task_guid) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_task_attachments_task
+  ON web_task_attachments(task_guid, created_at);
 
 -- AAMP tasks are intentionally separate from the legacy Feishu task-list
 -- state machine. The AAMP task id is the durable cross-process primary key;
@@ -87,6 +118,8 @@ CREATE TABLE IF NOT EXISTS runs (
     previous_input_text TEXT,
     prompt_text TEXT NOT NULL DEFAULT '',
     thread_id TEXT,
+    execution_backend TEXT NOT NULL DEFAULT 'codex-sdk',
+    tmux_session_id TEXT,
     state TEXT NOT NULL,
     final_response TEXT,
     usage_json TEXT,
@@ -271,7 +304,8 @@ export interface ClaimRunArgs {
   task: RoutedTask;
   inputText: string;
   promptText: string;
-  startedComment: string | ((runId: string) => string);
+  startedComment?: string | ((runId: string) => string);
+  attachmentIds?: string[];
 }
 
 export interface AampTaskInit {
@@ -453,6 +487,161 @@ export class StateDatabase {
   public subscribe(listener: (change: DatabaseChange) => void): () => void {
     this.changeListeners.add(listener);
     return () => this.changeListeners.delete(listener);
+  }
+
+  public listProjects(): StoredProject[] {
+    const rows = this.db
+      .prepare("SELECT * FROM projects ORDER BY name COLLATE NOCASE ASC")
+      .all() as Record<string, unknown>[];
+    return rows.map(mapProject);
+  }
+
+  public listAvailableProjects(): StoredProject[] {
+    return this.listProjects().filter((project) =>
+      project.status === "available" && isProjectDirectory(project.path)
+    );
+  }
+
+  public getAvailableProject(name: string): StoredProject | null {
+    const project = this.getProject(name);
+    return project?.status === "available" && isProjectDirectory(project.path) ? project : null;
+  }
+
+  public getProject(name: string): StoredProject | null {
+    const row = this.db.prepare("SELECT * FROM projects WHERE name = ?").get(name) as Record<string, unknown> | undefined;
+    return row ? mapProject(row) : null;
+  }
+
+  public createProject(input: { name: string; path: string; status?: ProjectStatus }): StoredProject {
+    const name = input.name.trim();
+    const path = input.path.trim();
+    if (!name || name.length > 120) throw new Error("项目名称不能为空且不能超过 120 个字符。");
+    if (!isAbsolute(path)) throw new Error("项目路径必须是绝对路径。");
+    const now = this.timestamp();
+    this.db.prepare(
+      "INSERT INTO projects (name, path, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(name, resolve(path), input.status ?? "available", now, now);
+    return this.getProject(name)!;
+  }
+
+  public updateProject(
+    name: string,
+    input: { path?: string; status?: ProjectStatus },
+  ): StoredProject | null {
+    const existing = this.getProject(name);
+    if (!existing) return null;
+    const path = input.path?.trim();
+    if (path !== undefined && !isAbsolute(path)) throw new Error("项目路径必须是绝对路径。");
+    this.db.prepare(
+      "UPDATE projects SET path = ?, status = ?, updated_at = ? WHERE name = ?",
+    ).run(path === undefined ? existing.path : resolve(path), input.status ?? existing.status, this.timestamp(), name);
+    return this.getProject(name);
+  }
+
+  public ensureProject(input: { name: string; path: string; status?: ProjectStatus }): StoredProject {
+    const name = input.name.trim();
+    const path = input.path.trim();
+    if (!name || name.length > 120) throw new Error("项目名称不能为空且不能超过 120 个字符。");
+    if (!isAbsolute(path)) throw new Error("项目路径必须是绝对路径。");
+    const now = this.timestamp();
+    this.db.prepare(
+      "INSERT OR IGNORE INTO projects (name, path, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(name, resolve(path), input.status ?? "available", now, now);
+    return this.getProject(name)!;
+  }
+
+  public createStagedWebTaskAttachment(input: {
+    attachmentId: string;
+    fileName: string;
+    mimeType: string;
+    sizeBytes: number;
+    localPath: string;
+  }): StoredWebTaskAttachment {
+    const now = this.timestamp();
+    this.db.prepare(
+      `INSERT INTO web_task_attachments
+        (attachment_id, task_guid, file_name, mime_type, size_bytes, local_path, created_at)
+       VALUES (?, NULL, ?, ?, ?, ?, ?)`,
+    ).run(input.attachmentId, input.fileName, input.mimeType, input.sizeBytes, input.localPath, now);
+    return this.getStagedWebTaskAttachment(input.attachmentId)!;
+  }
+
+  public getStagedWebTaskAttachment(attachmentId: string): StoredWebTaskAttachment | null {
+    const row = this.db.prepare(
+      "SELECT * FROM web_task_attachments WHERE attachment_id = ? AND task_guid IS NULL",
+    ).get(attachmentId) as Record<string, unknown> | undefined;
+    return row ? mapWebTaskAttachment(row) : null;
+  }
+
+  public getStagedWebTaskAttachments(attachmentIds: string[]): StoredWebTaskAttachment[] {
+    if (attachmentIds.length === 0) return [];
+    const uniqueIds = [...new Set(attachmentIds)];
+    const rows = this.db.prepare(
+      `SELECT * FROM web_task_attachments WHERE task_guid IS NULL
+       AND attachment_id IN (${uniqueIds.map(() => "?").join(", ")})`,
+    ).all(...uniqueIds) as Record<string, unknown>[];
+    const byId = new Map(rows.map((row) => [String(row.attachment_id), mapWebTaskAttachment(row)]));
+    return uniqueIds.flatMap((attachmentId) => {
+      const attachment = byId.get(attachmentId);
+      return attachment ? [attachment] : [];
+    });
+  }
+
+  public countStagedWebTaskAttachments(since?: string): number {
+    const row = since
+      ? this.db.prepare(
+          "SELECT COUNT(*) AS total FROM web_task_attachments WHERE task_guid IS NULL AND created_at >= ?",
+        ).get(since) as { total: number }
+      : this.db.prepare(
+          "SELECT COUNT(*) AS total FROM web_task_attachments WHERE task_guid IS NULL",
+        ).get() as { total: number };
+    return row.total;
+  }
+
+  public stagedWebTaskAttachmentBytes(): number {
+    const row = this.db.prepare(
+      "SELECT COALESCE(SUM(size_bytes), 0) AS total FROM web_task_attachments WHERE task_guid IS NULL",
+    ).get() as { total: number };
+    return row.total;
+  }
+
+  public listWebTaskAttachments(taskGuid: string): StoredWebTaskAttachment[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM web_task_attachments WHERE task_guid = ? ORDER BY created_at ASC",
+    ).all(taskGuid) as Record<string, unknown>[];
+    return rows.map(mapWebTaskAttachment);
+  }
+
+  public getWebTaskAttachment(taskGuid: string, attachmentId: string): StoredWebTaskAttachment | null {
+    const row = this.db.prepare(
+      "SELECT * FROM web_task_attachments WHERE task_guid = ? AND attachment_id = ?",
+    ).get(taskGuid, attachmentId) as Record<string, unknown> | undefined;
+    return row ? mapWebTaskAttachment(row) : null;
+  }
+
+  public deleteStagedWebTaskAttachment(attachmentId: string): StoredWebTaskAttachment | null {
+    return this.transaction(() => {
+      const attachment = this.getStagedWebTaskAttachment(attachmentId);
+      if (!attachment) return null;
+      this.db.prepare(
+        "DELETE FROM web_task_attachments WHERE attachment_id = ? AND task_guid IS NULL",
+      ).run(attachmentId);
+      return attachment;
+    });
+  }
+
+  public deleteExpiredStagedWebTaskAttachments(olderThan: string): StoredWebTaskAttachment[] {
+    return this.transaction(() => {
+      const rows = this.db.prepare(
+        "SELECT * FROM web_task_attachments WHERE task_guid IS NULL AND created_at < ?",
+      ).all(olderThan) as Record<string, unknown>[];
+      if (rows.length > 0) {
+        this.db.prepare(
+          "DELETE FROM web_task_attachments WHERE task_guid IS NULL AND created_at < ?",
+        ).run(olderThan);
+      }
+      return rows.map(mapWebTaskAttachment);
+    });
   }
 
   public getTask(taskGuid: string): StoredTask | null {
@@ -1978,7 +2167,6 @@ export class StateDatabase {
       if (existing && (existing.state === "RUNNING" || existing.state === "QUEUED")) {
         return null;
       }
-
       const now = this.timestamp();
       const runId = makeRunId(now);
       const previousInputText = existing?.input_text ?? null;
@@ -1988,7 +2176,7 @@ export class StateDatabase {
         this.db
           .prepare(
             `UPDATE tasks SET
-              project_key = ?, mode = ?, repo = ?, state = 'QUEUED',
+              origin = ?, project_key = ?, mode = ?, repo = ?, state = 'QUEUED',
               input_text = ?, input_hash = ?, active_run_id = ?,
               completed_at = NULL, last_error = NULL, worker_pid = NULL, service_instance_id = NULL,
               progress_event = NULL, progress_text = NULL, progress_updated_at = NULL,
@@ -1996,6 +2184,7 @@ export class StateDatabase {
              WHERE task_guid = ?`,
           )
           .run(
+            args.task.origin ?? "feishu",
             args.task.projectKey,
             args.task.mode,
             args.task.repo,
@@ -2009,13 +2198,14 @@ export class StateDatabase {
         this.db
           .prepare(
             `INSERT INTO tasks (
-              task_guid, project_key, mode, repo, state, input_text, input_hash,
+              task_guid, origin, project_key, mode, repo, state, input_text, input_hash,
               thread_id, active_run_id, completed_at, last_error, created_at, updated_at,
               worker_pid, service_instance_id
-            ) VALUES (?, ?, ?, ?, 'QUEUED', ?, ?, NULL, ?, NULL, NULL, ?, ?, NULL, NULL)`,
+            ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, NULL, ?, NULL, NULL, ?, ?, NULL, NULL)`,
           )
           .run(
             args.task.taskGuid,
+            args.task.origin ?? "feishu",
             args.task.projectKey,
             args.task.mode,
             args.task.repo,
@@ -2031,9 +2221,9 @@ export class StateDatabase {
         .prepare(
           `INSERT INTO runs (
             run_id, task_guid, input_hash, input_text, previous_input_text, prompt_text,
-            thread_id, state, final_response, usage_json, started_at, finished_at,
+            thread_id, execution_backend, tmux_session_id, state, final_response, usage_json, started_at, finished_at,
             worker_pid, service_instance_id
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', NULL, NULL, ?, NULL, NULL, NULL)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', NULL, NULL, ?, NULL, NULL, NULL)`,
         )
         .run(
           runId,
@@ -2043,19 +2233,42 @@ export class StateDatabase {
           previousInputText,
           args.promptText,
           resumedThreadId,
+          "codex-sdk",
+          null,
           now,
         );
 
-      this.enqueueOutboxInTransaction(
-        args.task.taskGuid,
-        "comment",
-        {
-          content: typeof args.startedComment === "function"
-            ? args.startedComment(runId)
-            : args.startedComment,
-        },
-        now,
-      );
+      const attachmentIds = [...new Set(args.attachmentIds ?? [])];
+      if (attachmentIds.length > 0) {
+        if ((args.task.origin ?? "feishu") !== "web") {
+          throw new Error("only web tasks can attach local task files");
+        }
+        const stagedAttachments = this.getStagedWebTaskAttachments(attachmentIds);
+        if (stagedAttachments.length !== attachmentIds.length) {
+          throw new Error("任务附件已失效或已绑定其他任务，请重新选择附件。");
+        }
+        const attach = this.db.prepare(
+          "UPDATE web_task_attachments SET task_guid = ? WHERE attachment_id = ? AND task_guid IS NULL",
+        );
+        for (const attachmentId of attachmentIds) {
+          if (attach.run(args.task.taskGuid, attachmentId).changes !== 1) {
+            throw new Error("任务附件已被其他请求绑定，请重新选择附件。");
+          }
+        }
+      }
+
+      if (args.startedComment !== undefined) {
+        this.enqueueOutboxInTransaction(
+          args.task.taskGuid,
+          "comment",
+          {
+            content: typeof args.startedComment === "function"
+              ? args.startedComment(runId)
+              : args.startedComment,
+          },
+          now,
+        );
+      }
 
       this.noteChange({
         kind: "task",
@@ -2199,7 +2412,7 @@ export class StateDatabase {
 
   public markRunRunning(
     runId: string,
-    workerPid: number,
+    workerPid: number | null,
     serviceInstanceId: string,
   ): boolean {
     return this.transaction(() => {
@@ -2395,8 +2608,12 @@ export class StateDatabase {
   ): RecoveredRun[] {
     return this.transaction(() => {
       const rows = this.db
-        .prepare("SELECT run_id, task_guid FROM runs WHERE state = 'RUNNING'")
-        .all() as Array<{ run_id: string; task_guid: string }>;
+        .prepare(
+          `SELECT r.run_id, r.task_guid, t.origin FROM runs r
+           INNER JOIN tasks t ON t.task_guid = r.task_guid
+           WHERE r.state = 'RUNNING'`,
+        )
+        .all() as Array<{ run_id: string; task_guid: string; origin: string }>;
       const recovered: RecoveredRun[] = [];
       for (const row of rows) {
         const now = this.timestamp();
@@ -2414,13 +2631,15 @@ export class StateDatabase {
              WHERE task_guid = ? AND active_run_id = ?`,
           )
           .run(error, now, row.task_guid, row.run_id);
-        const comment = commentForTask(row.task_guid, error);
-        this.enqueueOutboxInTransaction(
-          row.task_guid,
-          "comment",
-          { content: comment },
-          now,
-        );
+        const comment = row.origin === "web" ? "" : commentForTask(row.task_guid, error);
+        if (comment) {
+          this.enqueueOutboxInTransaction(
+            row.task_guid,
+            "comment",
+            { content: comment },
+            now,
+          );
+        }
         this.noteChange({
           kind: "task",
           taskGuid: row.task_guid,
@@ -2775,6 +2994,7 @@ export class StateDatabase {
     // These columns were added after the minimal schema in the design document.
     // Keeping the migration additive lets an operator upgrade an existing database.
     addColumnIfMissing(this.db, "tasks", "worker_pid", "INTEGER");
+    addColumnIfMissing(this.db, "tasks", "origin", "TEXT NOT NULL DEFAULT 'feishu'");
     addColumnIfMissing(this.db, "tasks", "service_instance_id", "TEXT");
     addColumnIfMissing(this.db, "tasks", "progress_event", "TEXT");
     addColumnIfMissing(this.db, "tasks", "progress_text", "TEXT");
@@ -2783,10 +3003,13 @@ export class StateDatabase {
     addColumnIfMissing(this.db, "runs", "previous_input_text", "TEXT");
     addColumnIfMissing(this.db, "runs", "prompt_text", "TEXT NOT NULL DEFAULT ''");
     addColumnIfMissing(this.db, "runs", "worker_pid", "INTEGER");
+    addColumnIfMissing(this.db, "runs", "execution_backend", "TEXT NOT NULL DEFAULT 'codex-sdk'");
+    addColumnIfMissing(this.db, "runs", "tmux_session_id", "TEXT");
     addColumnIfMissing(this.db, "runs", "service_instance_id", "TEXT");
     addColumnIfMissing(this.db, "runs", "progress_event", "TEXT");
     addColumnIfMissing(this.db, "runs", "progress_text", "TEXT");
     addColumnIfMissing(this.db, "runs", "progress_updated_at", "TEXT");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_runs_tmux_target_state ON runs(tmux_session_id, state)");
     // The first direct-mode schema only allowed four task states. Add the
     // progress columns before a possible table rebuild so old databases can
     // be copied without losing those fields.
@@ -2804,6 +3027,8 @@ export class StateDatabase {
     addColumnIfMissing(this.db, "bridge_tasks", "last_recovered_at", "TEXT");
     addColumnIfMissing(this.db, "bridge_task_attachments", "followup_id", "TEXT");
   }
+
+
 }
 
 function makeRunId(date: string): string {
@@ -2906,6 +3131,7 @@ function addColumnIfMissing(
 function mapTask(row: Record<string, unknown>): StoredTask {
   return {
     task_guid: String(row.task_guid),
+    origin: String(row.origin ?? "feishu") as TaskOrigin,
     project_key: String(row.project_key),
     mode: String(row.mode),
     repo: String(row.repo),
@@ -2924,6 +3150,36 @@ function mapTask(row: Record<string, unknown>): StoredTask {
     progress_text: nullableString(row.progress_text),
     progress_updated_at: nullableString(row.progress_updated_at),
   };
+}
+
+function mapProject(row: Record<string, unknown>): StoredProject {
+  return {
+    name: String(row.name),
+    path: String(row.path),
+    status: String(row.status) as ProjectStatus,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapWebTaskAttachment(row: Record<string, unknown>): StoredWebTaskAttachment {
+  return {
+    attachment_id: String(row.attachment_id),
+    task_guid: nullableString(row.task_guid),
+    file_name: String(row.file_name),
+    mime_type: String(row.mime_type),
+    size_bytes: Number(row.size_bytes),
+    local_path: String(row.local_path),
+    created_at: String(row.created_at),
+  };
+}
+
+function isProjectDirectory(path: string): boolean {
+  try {
+    return isAbsolute(path) && existsSync(path) && statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function mapAampTask(row: Record<string, unknown>): StoredAampTask {
@@ -3053,6 +3309,8 @@ function mapRun(row: Record<string, unknown>): StoredRun {
     previous_input_text: nullableString(row.previous_input_text),
     prompt_text: String(row.prompt_text ?? ""),
     thread_id: nullableString(row.thread_id),
+    execution_backend: String(row.execution_backend ?? "codex-sdk") as StoredExecutionBackend,
+    tmux_session_id: nullableString(row.tmux_session_id),
     state: String(row.state) as TaskState,
     final_response: nullableString(row.final_response),
     usage_json: nullableString(row.usage_json),

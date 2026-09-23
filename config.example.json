@@ -10,7 +10,6 @@
     "stopOnShutdown": false,
     "worktree": {
       "enabled": true,
-      "projectMapPath": "/Users/xiajian/.codex/project-map.yaml",
       "globalAgentsPath": "/Users/xiajian/.codex/AGENTS.md",
       "taskDir": "/Users/xiajian/works/ai_work/codex/tasks",
       "worktreeRoot": "/Users/xiajian/.codex/worktrees",

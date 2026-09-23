@@ -152,7 +152,6 @@ describe("AAMP runtime environment", () => {
     const config = testConfig();
     config.aamp.worktree = {
       enabled: true,
-      projectMapPath: "/Users/xiajian/.codex/project-map.yaml",
       globalAgentsPath: "/Users/xiajian/.codex/AGENTS.md",
       taskDir: "/Users/xiajian/works/ai_work/codex/tasks",
       worktreeRoot: "/Users/xiajian/.codex/worktrees",
@@ -168,7 +167,7 @@ describe("AAMP runtime environment", () => {
       environment,
     });
 
-    expect(environment.AAMP_CODEX_PROJECT_MAP).toBe("/Users/xiajian/.codex/project-map.yaml");
+    expect(environment.AAMP_CODEX_PROJECTS_FILE).toBe("/tmp/bridge/runtime/aamp/worktree-tasks/project-registry.json");
     expect(serviceShim).toContain("export AAMP_CODEX_WORKTREE_ENABLED='1'");
     expect(serviceShim).toContain("export AAMP_CODEX_WORKTREE_BASE_REF='main'");
   });

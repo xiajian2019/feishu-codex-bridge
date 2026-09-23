@@ -4,7 +4,6 @@ import { isAbsolute } from "node:path";
 import { z, ZodError } from "zod";
 
 import { EXECUTION_MODES, type BridgeConfig, type ExecutionMode, type ModeConfig, type ProjectConfig } from "./types.js";
-import { readProjectMap } from "./project-map.js";
 
 const projectSchema = z.object({
   optionGuid: z.string().min(1),
@@ -26,7 +25,7 @@ const webSchema = z.object({
 
 const aampWorktreeSchema = z.object({
   enabled: z.boolean().default(true),
-  projectMapPath: z.string().trim().min(1),
+  projectMapPath: z.string().trim().min(1).optional(),
   globalAgentsPath: z.string().trim().min(1),
   taskDir: z.string().trim().min(1),
   worktreeRoot: z.string().trim().min(1),
@@ -209,12 +208,12 @@ export function parseConfig(
     );
   }
   if (config.aamp.worktree) {
-    for (const [field, value] of Object.entries({
-      projectMapPath: config.aamp.worktree.projectMapPath,
+    const worktreePaths = {
       globalAgentsPath: config.aamp.worktree.globalAgentsPath,
       taskDir: config.aamp.worktree.taskDir,
       worktreeRoot: config.aamp.worktree.worktreeRoot,
-    })) {
+    };
+    for (const [field, value] of Object.entries(worktreePaths)) {
       if (!isAbsolute(value)) {
         throw new ConfigError(`aamp.worktree.${field} must be an absolute path`);
       }
@@ -240,15 +239,6 @@ export function parseConfig(
   }
 
   if (isDirectExecutionMode(config.execution.mode)) {
-    if (
-      config.direct.projectKey
-      && !config.projects[config.direct.projectKey]
-      && !projectMapHasKey(config, config.direct.projectKey)
-    ) {
-      throw new ConfigError(
-        `direct.projectKey does not reference a configured project: ${config.direct.projectKey}`,
-      );
-    }
     if (config.direct.mode && !config.modes[config.direct.mode]) {
       throw new ConfigError(
         `direct.mode does not reference a configured mode: ${config.direct.mode}`,
@@ -273,16 +263,6 @@ export function parseConfig(
   }
 
   return config;
-}
-
-function projectMapHasKey(config: BridgeConfig, projectKey: string): boolean {
-  const mapPath = config.aamp.worktree?.projectMapPath;
-  if (!mapPath) return false;
-  try {
-    return Object.prototype.hasOwnProperty.call(readProjectMap(mapPath), projectKey);
-  } catch {
-    return false;
-  }
 }
 
 export function isDirectExecutionMode(mode: ExecutionMode): boolean {

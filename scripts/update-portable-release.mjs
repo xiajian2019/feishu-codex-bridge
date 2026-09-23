@@ -169,13 +169,13 @@ export function parsePortableUpdateArguments(argv, cwd = process.cwd()) {
 export function updateAssetName(
   platform = process.platform,
   arch = process.arch,
-  mode = "core",
+  mode = "direct",
   version,
 ) {
   const platformName = platform === "darwin" ? "darwin" : undefined;
   const archName = { arm64: "arm64", x64: "x64" }[arch];
   if (!platformName || !archName) throw new Error(`当前系统不支持 Portable 更新：${platform}/${arch}`);
-  const resolvedMode = mode === "auto" ? "core" : mode;
+  const resolvedMode = mode === "auto" ? "direct" : mode;
   const versionSuffix = version ? "-v" + normalizeVersion(version) : "";
   if (resolvedMode === "direct") {
     return "feishu-codex-bridge-direct-" + platformName + "-" + archName + versionSuffix + ".tar.gz";
@@ -235,17 +235,13 @@ export async function updatePortableRelease(options = {}) {
       if (!options.quiet) printUpdateCheck(check);
       if (options.check || !check.updateAvailable) return check;
       if (options.auto && await hasActivePortableWork(root)) {
-        if (!options.quiet) console.log("检测到活动任务，已延后核心更新。");
+        if (!options.quiet) console.log("检测到活动任务，已延后 Direct 更新。");
         return { ...check, deferred: true };
       }
       return applyPortableRelease({
         ...options,
         root,
-        mode: options.mode && options.mode !== "auto"
-          ? options.mode
-          : check.runtimeMigrationRequired
-            ? check.installedMode
-            : "core",
+        mode: options.mode && options.mode !== "auto" ? options.mode : "direct",
         check: false,
         auto: false,
       });
@@ -274,7 +270,7 @@ export async function checkPortableUpdate({
     installedMode,
     runtimeMigrationRequired,
     updateAvailable: runtimeMigrationRequired || compareVersions(remoteVersion, currentVersion || "0.0.0") > 0,
-    coreAsset: updateAssetName(process.platform, process.arch, "core"),
+    directAsset: updateAssetName(process.platform, process.arch, "direct", release.version),
     releaseUrl: release.html_url,
   };
 }
@@ -292,7 +288,7 @@ export function printPortableUpdateUsage() {
   console.log([
     "用法：feishu-codex-bridge update [选项]",
     "",
-    "默认下载兼容的更新包；Bun 代际不匹配时会执行完整运行时迁移，否则仅替换核心文件。",
+    "默认下载版本化 Bun 单一二进制 Direct 包并完整更新。",
     "下载、校验完成后才会短暂重启已运行的 LaunchAgent；失败时自动恢复旧文件。",
     "",
     "选项：",
@@ -301,9 +297,9 @@ export function printPortableUpdateUsage() {
     "  --repo owner/name     GitHub 仓库（默认：xiajian2019/feishu-codex-bridge）",
     "  --tag TAG             GitHub tag；默认 latest",
     "  --mode auto|core|lite|direct",
-    "                        auto：本地包自动识别；GitHub 默认使用 core",
+    "                        auto：GitHub 使用 Direct；本地包按 manifest 自动识别",
     "  --check               只检查版本，不下载或修改文件",
-    "  --auto                检查新版本并在无活动任务时自动应用 Core 更新",
+    "  --auto                检查新版本并在无活动任务时自动应用 Direct 更新",
     "  --schedule            安装每 6 小时检查一次的用户级 LaunchAgent",
     "  --unschedule          删除自动更新 LaunchAgent",
     "  --interval seconds    自定义自动检查间隔",
@@ -323,7 +319,10 @@ async function applyPortableRelease(options) {
   const currentManifest = await readJsonIfExists(join(currentPackageRoot, "release-manifest.json")) || {};
   const runtimeCompatible = isRuntimeCompatible(currentManifest, currentMode);
   const requestedMode = options.mode || "auto";
-  const remoteMode = requestedMode === "auto" ? (runtimeCompatible ? "core" : currentMode) : requestedMode;
+  const remoteMode = requestedMode === "auto" ? "direct" : requestedMode;
+  if (!options.file && remoteMode !== "direct") {
+    throw new Error("GitHub Release 目前只发布版本化 Direct 包；Core/Lite 包仅支持通过本地文件更新");
+  }
   if (remoteMode === "core" && !runtimeCompatible) {
     throw new Error("当前 Portable 包尚未迁移到 Bun，必须先安装对应的完整 direct/lite 运行时包");
   }

@@ -31,10 +31,11 @@ jobs:
 
       - name: Build portable release asset
         run: bun run release -- --skip-build --json
-      - name: Build core update asset
-        run: bun run release:legacy -- --mode core --skip-build --json
-      - name: Build lite release asset
-        run: bun run release:legacy -- --mode lite --skip-build --json
+      # Temporarily publish only the Bun single-binary package.
+      # - name: Build core update asset
+      #   run: bun run release:legacy -- --mode core --skip-build --json
+      # - name: Build lite release asset
+      #   run: bun run release:legacy -- --mode lite --skip-build --json
 
       - name: Create GitHub release and upload assets
         env:

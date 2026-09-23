@@ -10,6 +10,19 @@ export const TASK_STATES = [
 ] as const;
 
 export type TaskState = (typeof TASK_STATES)[number];
+export type TaskOrigin = "feishu" | "web";
+export type ExecutionBackend = "codex-sdk";
+export type StoredExecutionBackend = ExecutionBackend | "tmux-session";
+export type ProjectStatus = "available" | "disabled";
+
+export interface ProjectRecord {
+  name: string;
+  path: string;
+  status: ProjectStatus;
+  available: boolean;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface TaskInput {
   projectKey: string;
@@ -18,8 +31,27 @@ export interface TaskInput {
   description: string;
 }
 
+export interface CreateTaskInput {
+  description: string;
+  projectKey: string;
+  attachmentIds?: string[];
+}
+
+export interface TaskAttachment {
+  attachment_id: string;
+  file_name: string;
+  mime_type: string;
+  size_bytes: number;
+}
+
+export interface CreateTaskResponse {
+  task: TaskSummary;
+  latest_run: StoredRun | null;
+}
+
 export interface TaskSummary {
   task_guid: string;
+  origin: TaskOrigin;
   project_key: string;
   mode: string;
   repo: string;
@@ -48,6 +80,8 @@ export interface StoredRun {
   previous_input_text: string | null;
   prompt_text: string;
   thread_id: string | null;
+  execution_backend: StoredExecutionBackend;
+  tmux_session_id: string | null;
   state: TaskState;
   final_response: string | null;
   usage_json: string | null;
@@ -98,6 +132,7 @@ export interface TaskListResponse {
 export interface TaskDetailResponse {
   task: TaskSummary;
   runs: StoredRun[];
+  attachments: TaskAttachment[];
   outbox: OutboxEntry[];
 }
 

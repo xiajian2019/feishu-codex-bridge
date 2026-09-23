@@ -8,29 +8,15 @@
 
 原生直连模式处理文本和常见图片/文件附件，并使用飞书原生流式卡片展示 Codex 进度；支持 `/cancel`、`取消`、`停止`、`中断` 取消当前任务、细粒度权限、SQLite 任务租约和启动恢复。服务不使用 Dagu、Webhook 或公网 meshmail。Web 看板默认只监听 `127.0.0.1:7310`，不允许通过配置绑定到非 loopback 地址。
 
-## Codex Session SSH + tmux 验证器
-
-仓库还提供一个独立的本地 CS 验证程序，用来验证“Web Backend → SSH Worker → tmux session → Codex TUI”这条适配器链路；它不接入飞书业务状态机，也不复用 Bridge 业务数据库。页面已并入 Bridge 的 React Router，统一从 `http://127.0.0.1:7310/tmux` 打开。
-
-统一启动 Bridge（`bun run start`）时，tmux 验证器 API 会由同一进程在 `7310` 提供，不需要单独启动服务。若要独立调试验证器后端，可运行：
-
-```bash
-bun run tmux:verify -- --port 7320
-```
-
-页面中的 `机器` 填 `local` 或 SSH 配置中的 `user@host`，工作路径从程序读取的 `~/.codex/project-map.yaml`（可用 `TMUX_VERIFY_PROJECT_MAP` 覆盖）中搜索选择。Codex 可执行文件不由页面填写，而是使用 Bridge 进程的 `CODEX_PATH`/自动发现结果。远程执行只使用现有 SSH key/SSH config，不保存或请求密码。默认复用所选机器已有的 tmux 默认 server，本地 Session 会出现在你平时使用的 tmux 会话列表中；只有显式传入 `--socket <name>` 才使用独立 socket。Bridge 看板默认地址为 `http://127.0.0.1:7310`，自定义端口时用 `--bridge-url <url>` 指定。页面通过 `xterm.js → WebSocket → Bun.Terminal PTY → tmux attach-session` 查看真实 PTY，页面关闭只会断开 attach 客户端，不会杀掉 tmux/Codex。重新打开页面会先按 SQLite 中的 `after` event cursor 恢复快照，再接入实时 PTY 输出。
-
-Web 追问必须带 `clientMessageId`/`Idempotency-Key`。同一个逻辑请求重试时只会向已经存在的 Codex TUI 注入一次 `tmux send-keys`，不会启动第二个 Codex 进程。原始终端键盘输入仍属于 TUI 的低层输入；若人为在两个界面分别输入完全相同的新句子，后端无法从 tmux 原始字节中推断这是有意重复，因此这不属于当前最小验证范围。
-
-`bun run tmux:verify` 独立运行时默认监听 `127.0.0.1:7320`；主服务内嵌运行时接口随 Bridge 使用 `7310`，验证数据仍保存在 `tmux-verifier.db`（默认 `runtime/tmux-verifier.db`）。默认 attach 命令直接连接现有 tmux server：
-
-```bash
-tmux attach-session -t codex-verify-...
-```
-
 ## tmux Dashboard
 
-会话看板已迁入本仓库，并作为 React 页面挂载到 Bridge 的统一入口。统一启动 Bridge 后，从 `http://127.0.0.1:7310/tmux-dashboard` 打开；菜单可在 Bridge、tmux 验证器和 tmux Dashboard 之间用 React Router 切换。Bridge 主进程会直接处理 `/api/tmux/*`、`/tmux-dashboard/api/*` 和两个终端 WebSocket，不再依赖额外后端进程。
+统一启动 Bridge 后，从 http://127.0.0.1:7310/tmux-dashboard 打开 tmux Dashboard。项目名称和目录保存在 Bridge 主库 runtime/bridge.db；看板直接枚举现有 tmux server 中的实时会话，不启动独立 verifier 服务。
+
+旧的 /tmux verifier 页面、/api/tmux 接口和 tmux-session 任务执行模式已移除。旧 tmux-verifier.db 已移回项目 runtime/，作为独立本地历史文件保留；不导入 bridge.db，程序也不再读写它，该文件不纳入 Git 提交。
+
+## Bridge Task Desk
+
+任务面板支持直接新建任务：选择项目后填写描述即可，不要求单独标题或模式。可附加图片及普通文件，单个文件上限 25 MiB、每任务最多 10 个；附件存入本机 Bridge 数据目录，SDK 模式会把图片作为视觉输入，并可在任务详情预览图片或下载文件。标题由描述首行生成，模式沿用服务器配置的默认 sandbox；所有新任务统一由 Codex SDK 执行；tmux Dashboard 用于浏览和操作现有 tmux 会话，不作为任务执行后端。项目管理提供名称/目录搜索、状态筛选、新增和编辑；停用项目不会出现在任务或 tmux 目录选择器中。项目表是运行时唯一来源；旧 project map 仅在 SQLite 项目表为空时迁移一次。
 
 ## 安装和配置
 
@@ -77,7 +63,7 @@ bun run portable:restart
 bun run release:github
 ```
 
-该命令会构建新的 Bun 单一二进制包，以及由 legacy 入口生成的 core、Lite 资产，提交并推送当前分支和版本 tag；GitHub Actions 会自动生成 macOS arm64 资产并上传到对应 Release。可用 `--tag`、`--message`、`--skip-build` 或 `--dry-run` 覆盖默认行为。
+该命令当前只构建新的 Bun 单一二进制包，Core/Lite 打包步骤暂时停用；随后提交并推送当前分支和版本 tag，GitHub Actions 会构建 macOS arm64 包并上传到对应 Release。仍可用 --tag、--message、--skip-build 或 --dry-run 覆盖默认行为。
 
 产物默认写入根目录 `release/`，包含已构建的 Bridge 和生产依赖，不包含源码、测试、配置密钥或运行数据。新的 Bun 单一二进制包由包内编译产物直接启动，不再携带或下载独立 Bun runtime；legacy 包继续使用原有 runtime/launcher 逻辑。可以用 `--output <path>` 覆盖默认目录。接收方解压后可以直接双击 `install.command`；也可以执行：
 
@@ -87,9 +73,9 @@ bun run release:github
 
 Lite 包默认不包含 Bun 和独立 Codex CLI；它属于 legacy 打包路径，启动器会按需下载并缓存 Bun。`codex:update` 在便携包中被禁用，升级时使用下面的 Portable 更新命令。
 
-默认 `bun run release` 生成只包含 Bun 单一二进制运行入口的 direct 包，不构建 Node universal archive，也不携带独立 Bun runtime。旧的 Lite/Core 产物分别使用 `bun run release:legacy -- --mode lite` 和 `bun run release:legacy -- --mode core`；Core 包只供已安装包的更新器使用。单一二进制包首次安装时仍可能需要联网准备 lark-cli 原生二进制。
+新的默认发布入口生成当前架构的 Bun 单一二进制 Direct 包，不携带独立 Bun runtime。Core/Lite legacy 构建器暂时不参与 GitHub Release；Direct 首次安装仍可能需要联网准备 lark-cli 原生二进制。
 
-已安装的 Portable 包默认从 GitHub 拉取小型 Core 包。更新器会先下载、校验、解压并完成包完整性检查，再在极短窗口内停止当前 LaunchAgent、替换核心文件并自动启动；启动失败会回滚。`config.json`、`runtime/` 和 direct 包中的 Bun/lark-cli 不会被 Core 更新覆盖。旧 Node 运行时或 Bun 代际不匹配时，检查和自动更新会选择完整 direct/lite 包迁移；Core overlay 仅用于相同 Bun 代际，保留配置和用户 runtime 数据。完整 direct 更新才会替换运行时依赖：
+已安装 Portable 包的自动更新现在下载版本化 Direct 包，先下载并验证 SHA-256，再执行完整版本替换。固定安装根目录中的 config.json 和 runtime 数据在版本切换时保留；失败会回滚。Core/Lite 包型暂时不再由 GitHub Actions 打包。
 
 ```bash
 ./feishu-codex-bridge update
@@ -339,7 +325,7 @@ LARKSUITE_CLI_CONFIG_DIR="$HOME/.lark-cli-aamp-one-click-v1" \
 
 AAMP 流式回复卡片和等待补充信息的求助卡会显示“中断执行”按钮。点击后适配层通过官方 `AampClient.sendCancel()` 向任务原目标发送 `task.cancel`，目标 ACP agent 会终止当前 Codex turn；原卡随后更新为“本轮执行已中断”，不会另发一张结果卡。重复点击是幂等的；如果发送失败，原卡会保留“重试中断”按钮。服务级停止仍使用 `bun run aamp:stop`。
 
-AAMP 本地 ACP agent 支持按任务隔离。开启 `aamp.worktree` 后，只有任务正文或 dispatch context 中存在且命中 `project-map.yaml` 的 `项目：<名称>` 才进入隔离流程；每个命中任务会先写成独立 Markdown 文件，再从配置的 `baseRef` 创建唯一分支和 Git worktree，ACP session 使用该 worktree 作为 `--cwd`。没有项目字段的聊天任务继续使用官方 AAMP 路径；项目字段存在但未映射时会报告路由错误，不会猜测目录或在错误项目中执行。这保留了官方 AAMP 的消息、附件、流式卡片和 `task.cancel`，不会在已经运行的 ACP/Codex 会话里再嵌套调用 `codex-worktree`。任务完成或中断后会关闭该任务的 ACP session，但保留任务文件、分支和 worktree 供检查，也不会自动 commit、push、merge、部署或删除。
+AAMP 本地 ACP agent 支持按任务隔离。开启 `aamp.worktree` 后，只有任务正文或 dispatch context 中存在且命中 Bridge SQLite 可用项目的 `项目：<名称>` 才进入隔离流程；每个命中任务会先写成独立 Markdown 文件，再从配置的 `baseRef` 创建唯一分支和 Git worktree，ACP session 使用该 worktree 作为 `--cwd`。没有项目字段的聊天任务继续使用官方 AAMP 路径；项目字段存在但未登记或已停用时会报告路由错误，不会猜测目录或在错误项目中执行。这保留了官方 AAMP 的消息、附件、流式卡片和 `task.cancel`，不会在已经运行的 ACP/Codex 会话里再嵌套调用 `codex-worktree`。任务完成或中断后会关闭该任务的 ACP session，但保留任务文件、分支和 worktree 供检查，也不会自动 commit、push、merge、部署或删除。
 
 `worktreeRoot` 是所有项目 worktree 的公共父目录，项目名会由运行时追加一次。例如配置为 `/Users/xiajian/.codex/worktrees` 时，`food` 项目的任务目录为 `/Users/xiajian/.codex/worktrees/food/wt-<前两个任务词>-<任务哈希>`，不会把接收任务的桥接仓库名（如 `ai-work`）放进路径。分支格式为 `<branchPrefix>/<项目名>/<3-4 个有效任务词>-<任务哈希>`。
 
@@ -350,7 +336,6 @@ AAMP 本地 ACP agent 支持按任务隔离。开启 `aamp.worktree` 后，只�
     "stopOnShutdown": false,
     "worktree": {
       "enabled": true,
-      "projectMapPath": "/Users/xiajian/.codex/project-map.yaml",
       "globalAgentsPath": "/Users/xiajian/.codex/AGENTS.md",
       "taskDir": "/Users/xiajian/works/ai_work/codex/tasks",
       "worktreeRoot": "/Users/xiajian/.codex/worktrees",
@@ -420,10 +405,8 @@ bun run start:all
 
 查询接口为 `GET /healthz`、`GET /api/session`、`GET /api/tasks`、`GET /api/tasks/:taskGuid`、`GET /api/aamp/tasks`、`GET /api/aamp/tasks/:id` 和 `GET /api/events`；旧兼容模式的 `POST /api/tasks/:taskGuid` 操作接口当前不会配置 Dispatcher。页面包含 CSP、禁止 iframe 和 `no-store` 响应头。由于内容包含任务描述、仓库路径和 Codex 结果，不应通过端口转发或反向代理对外暴露。
 
-页面现在支持一个轻量的一次性配对层。配对码和二维码只由 Mac 命令行生成，不在网页中生成或显示。独立 tmux verifier 可运行 bun run tmux:pair -- --url http://192.168.1.10:7320/；统一 Bridge 可运行 bun run web:pair -- --url http://192.168.1.10:7310/；开发页面 5173 会自动使用 runtime/dev/bridge.db。手机扫描终端二维码后，网页从 URL fragment 自动 claim，服务端签发一个 30 天 HttpOnly 会话 Cookie，二维码 5 分钟后失效且只能使用一次。任务 API、tmux API、SSE 和终端 WebSocket 都要求已配对会话；未认证网页只显示等待扫码提示。认证后从 /pair-admin 进入设备管理，可查看已配对设备并撤销所有手机；刷新配对码需重新运行对应的 pair 命令。配对成功、设备会话和撤销状态都保存在服务使用的 SQLite 数据库中。配对只解决访问控制，不替代 HTTPS；当前服务默认 HTTP，如果局域网中存在抓包或主动劫持风险，需要另行配置 HTTPS，并确保代理不会绕过配对规则。
-
-前端源码位于 `web/`，生产构建输出到 `dist/web`，由同一个 Bridge Bun 进程静态托管。开发时在两个终端分别运行 `bun run dev:api` 和 `bun run dev:web`，然后打开 `http://127.0.0.1:5173`。开发 API 独立监听 `127.0.0.1:17310`，使用 `runtime/dev/bridge.db` 和 `runtime/dev/tmux-verifier.db`，不触碰 LaunchAgent 的服务、`7310` 生产 API 或 SQLite，也不会启动 Feishu/AAMP/Relay/Codex 消息运行时；Vite 的 Bridge、tmux API 和 WebSocket 默认都代理到这个开发 API。`dev:api` 默认读取 `config.example.json`，需要本地项目配置时可运行 `bun run dev:api -- --config ./config.json`；也可用 `--db`、`--web-port` 覆盖开发数据路径和端口，Vite 目标可用 `BRIDGE_WEB_API_TARGET` 覆盖。tmux API 沿用现有默认 tmux server（或显式设置的 `TMUX_VERIFY_SOCKET`），不会默认额外启动 tmux server。发布或 LaunchAgent 启动前仍须执行 `bun run build`。React 组件使用稳定的任务/run/event ID 合并服务端变化，避免全页面刷新导致操作丢失。
-
+页面支持一次性配对。配对码和二维码只由 Mac 命令行生成；统一 Bridge 使用 bun run web:pair -- --url http://192.168.1.10:7310/，开发页面 5173 使用 runtime/dev/bridge.db。手机扫描二维码后，网页从 URL fragment 自动 claim，服务端签发一个 30 天 HttpOnly 会话 Cookie，二维码 5 分钟后失效且只能使用一次。任务 API、tmux Dashboard API、SSE 和终端 WebSocket 都要求已配对会话；未认证网页只显示等待扫码提示。认证后从 /pair-admin 进入设备管理，可查看已配对设备并撤销所有手机；刷新配对码需重新运行 web:pair。配对状态保存在 Bridge 使用的 SQLite 数据库中。\n
+前端源码位于 web/，生产构建输出到 dist/web，由同一个 Bridge Bun 进程静态托管。开发时运行 bun run dev:api 和 bun run dev:web，然后打开 http://127.0.0.1:5173。开发 API 监听 127.0.0.1:17310，只使用 runtime/dev/bridge.db，不触碰 LaunchAgent 的服务或 7310 生产数据库，也不会启动 Feishu/AAMP/Relay/Codex 消息运行时；Vite 的 Bridge 和 tmux Dashboard API/WebSocket 都代理到这个开发 API。dev:api 默认读取 config.example.json，也可用 --config、--db、--web-port 覆盖配置、数据路径和端口；Vite 目标可用 BRIDGE_WEB_API_TARGET 覆盖。tmux Dashboard 连接现有默认 tmux server。发布或 LaunchAgent 启动前仍须执行 bun run build。\n
 默认 `runTimeoutSeconds` 为 `3600` 秒（1 小时）；超时会先终止 Worker，必要时再强制结束，并将本轮标记为失败。
 
 也可以显式指定配置和数据库：

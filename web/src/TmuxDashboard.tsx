@@ -216,7 +216,7 @@ export function TmuxDashboard(): ReactElement {
     try {
       const result = await requestApi<{ session: TmuxSession }>("/sessions", {
         method: "POST",
-        body: JSON.stringify({ name: newName.trim(), cwd: targetProject.root }),
+        body: JSON.stringify({ name: newName.trim(), projectKey: targetProject.name }),
       });
       setCreateOpen(false);
       if (window.matchMedia("(max-width: 760px)").matches) setMobileView("terminal");

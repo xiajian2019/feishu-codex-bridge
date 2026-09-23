@@ -16,6 +16,7 @@ import {
 
 const envKeys = [
   'AAMP_CODEX_WORKTREE_ENABLED',
+  'AAMP_CODEX_PROJECTS_FILE',
   'AAMP_CODEX_TASK_DIR',
   'AAMP_CODEX_WORKTREE_ROOT',
   'AAMP_CODEX_WORKTREE_BASE_REF',
@@ -41,7 +42,7 @@ function configureIsolation(directory) {
   const taskDir = join(directory, 'tasks');
   const worktreeRoot = join(directory, 'worktrees');
   const metadataDir = join(directory, 'metadata');
-  const projectMap = join(directory, 'project-map.yaml');
+  const projectsFile = join(directory, 'projects.json');
   const globalAgents = join(directory, 'AGENTS.md');
   execFileSync('git', ['init', '-b', 'main', repository]);
   execFileSync('git', ['-C', repository, 'config', 'user.email', 'test@example.com']);
@@ -49,12 +50,12 @@ function configureIsolation(directory) {
   writeFileSync(join(repository, 'README.md'), 'base\n');
   execFileSync('git', ['-C', repository, 'add', 'README.md']);
   execFileSync('git', ['-C', repository, 'commit', '-m', 'base']);
-  writeFileSync(projectMap, `projects:\n  food:\n    root: ${repository}\n`);
+  writeFileSync(projectsFile, JSON.stringify({ food: repository }));
   writeFileSync(globalAgents, '# Global test instructions\n- Run the acceptance checks.\n');
   mkdirSync(taskDir, { recursive: true });
   Object.assign(process.env, {
     AAMP_CODEX_WORKTREE_ENABLED: '1',
-    AAMP_CODEX_PROJECT_MAP: projectMap,
+    AAMP_CODEX_PROJECTS_FILE: projectsFile,
     AAMP_CODEX_GLOBAL_AGENTS: globalAgents,
     AAMP_CODEX_TASK_DIR: taskDir,
     AAMP_CODEX_WORKTREE_ROOT: worktreeRoot,
@@ -221,7 +222,7 @@ describe('AAMP ACP worktree compatibility', () => {
       expect(await prepareTaskIsolation({ taskId: 'no-project', title: 'Chat', bodyText: '请回复我。' }))
         .toBeUndefined();
       await expect(prepareTaskIsolation({ taskId: 'unknown-project', title: 'Task', bodyText: '项目：unknown\n执行。' }))
-        .rejects.toThrow('project "unknown" is not mapped');
+        .rejects.toThrow('project "unknown" is not enabled in the Bridge project registry');
       expect(existsSync(paths.worktreeRoot)).toBe(false);
     } finally {
       rmSync(directory, { recursive: true, force: true });

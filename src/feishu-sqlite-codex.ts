@@ -35,7 +35,6 @@ import {
   type CodexAppServerQueryClient,
 } from "./codex-app-server.js";
 import { isDirectExecutionMode } from "./config.js";
-import { readProjectMap, resolveMappedProject } from "./project-map.js";
 import type { StateDatabase } from "./db.js";
 import {
   resolveSharedFeishuCredentials,
@@ -355,6 +354,10 @@ export class FeishuSqliteCodexRuntime {
       this.db.releaseRuntimeLease(DIRECT_RUNTIME_LEASE_NAME, this.workerId);
       throw error;
     }
+  }
+
+  private projectRoutingConfig(): BridgeConfig {
+    return buildProjectRoutingConfig(this.config, this.db);
   }
 
   private async connectChannelWithRetry(): Promise<void> {
@@ -682,7 +685,7 @@ export class FeishuSqliteCodexRuntime {
     let query: CodexThreadQuery;
     try {
       commandArgs = parseDirectCommandArguments(argument);
-      query = parseCodexThreadQuery(commandArgs, this.config.projects);
+      query = parseCodexThreadQuery(commandArgs, this.projectRoutingConfig().projects);
     } catch (error) {
       return buildDirectInfoCard(this.globalCardRuntime(), "查询 Codex Threads", [
         `参数错误：${sanitizeError(error instanceof Error ? error.message : String(error))}`,
@@ -754,7 +757,7 @@ export class FeishuSqliteCodexRuntime {
     }
     const task = this.resolveDirectCommandTask(input.chatId, argument, command === "thread");
     if (command === "thread") {
-      const route = task ? resolveDirectTaskRoute(task.text, this.config) : undefined;
+      const route = task ? resolveDirectTaskRoute(task.text, this.projectRoutingConfig()) : undefined;
       return buildDirectInfoCard(this.globalCardRuntime(), "当前 Codex thread", [
         `Thread ID：${task?.thread_id ?? "暂无"}`,
         `类型：${route?.ok && route.kind === "consultation" ? "技术咨询" : "项目任务"}`,
@@ -773,7 +776,7 @@ export class FeishuSqliteCodexRuntime {
     if (command === "resume") {
       if (!task) return buildDirectInfoCard(this.globalCardRuntime(), "恢复历史 thread", ["未找到当前会话中的直连任务或 thread ID。"]);
       if (!task.thread_id) return buildDirectInfoCard(this.globalCardRuntime(), "恢复历史 thread", ["该任务没有已保存的 Codex thread ID，无法恢复。"]);
-      const route = resolveDirectTaskRoute(task.text, this.config);
+      const route = resolveDirectTaskRoute(task.text, this.projectRoutingConfig());
       if (!route.ok) return buildDirectInfoCard(this.globalCardRuntime(), "恢复历史 thread", [route.message]);
       const resumeText = route.kind === "project"
         ? [`项目：${route.projectKey}`, `模式：${route.modeKey}`, "", "请继续处理上一个任务。"].join("\n")
@@ -852,7 +855,7 @@ export class FeishuSqliteCodexRuntime {
         lastStartedAt: this.startedAt,
       },
       config: {
-        projects: Object.keys(this.config.projects),
+        projects: Object.keys(this.projectRoutingConfig().projects),
         modes: Object.keys(this.config.modes),
       },
       listGlobalTasks: (chatId) => this.listGlobalCardTasks(chatId),
@@ -1100,8 +1103,8 @@ export class FeishuSqliteCodexRuntime {
       ? this.db.claimBridgeTaskFollowup(followupCandidate.followup_id)
       : null;
     const route = followup
-      ? resolveDirectContinuationRoute(followup.text, current.text, this.config)
-      : resolveDirectTaskRoute(current.text, this.config);
+      ? resolveDirectContinuationRoute(followup.text, current.text, this.projectRoutingConfig())
+      : resolveDirectTaskRoute(current.text, this.projectRoutingConfig());
     if (!route.ok) {
       this.db.finishBridgeTaskTurn(
         task.bridge_task_id,
@@ -1171,7 +1174,7 @@ export class FeishuSqliteCodexRuntime {
         task.bridge_task_id,
       );
       const previousRoute = previousTask
-        ? resolveDirectTaskRoute(previousTask.text, this.config)
+        ? resolveDirectTaskRoute(previousTask.text, this.projectRoutingConfig())
         : undefined;
       const canResumePreviousThread = Boolean(previousTask?.thread_id && previousRoute?.ok && (
         projectRoute
@@ -1718,6 +1721,22 @@ export function resolveDirectTaskRoute(
   return { ok: true, kind: "project", projectKey, modeKey, project, mode };
 }
 
+export function buildProjectRoutingConfig(config: BridgeConfig, db: StateDatabase): BridgeConfig {
+  const registeredProjects = db.listProjects().length > 0
+    ? db.listAvailableProjects()
+    : Object.entries(config.projects).map(([name, project]) => ({ name, path: project.repo }));
+  return {
+    ...config,
+    projects: Object.fromEntries(registeredProjects.map((project) => [
+      project.name,
+      {
+        optionGuid: config.projects[project.name]?.optionGuid ?? project.name,
+        repo: project.path,
+      },
+    ])),
+  };
+}
+
 /** Resolve a reply against its parent task, inheriting omitted route fields. */
 export function resolveDirectContinuationRoute(
   text: string,
@@ -1769,29 +1788,11 @@ function defaultDirectMode(modes: Record<string, ModeConfig>): { key: string; va
 }
 
 function resolveDirectProject(config: BridgeConfig, projectKey: string): ProjectConfig | undefined {
-  const configured = config.projects[projectKey];
-  if (configured) return configured;
-  const mapPath = config.aamp.worktree?.projectMapPath;
-  if (!mapPath) return undefined;
-  const mapped = resolveMappedProject(mapPath, projectKey);
-  if (!mapped) return undefined;
-  // A project-map entry is a repository route, not a Feishu option field;
-  // the key is a stable synthetic option id for the direct-only path.
-  return { optionGuid: projectKey, repo: mapped.root };
+  return config.projects[projectKey];
 }
 
 function formatDirectProjectKeys(config: BridgeConfig): string {
-  const keys = new Set(Object.keys(config.projects));
-  const mapPath = config.aamp.worktree?.projectMapPath;
-  if (mapPath) {
-    try {
-      for (const key of Object.keys(readProjectMap(mapPath))) keys.add(key);
-    } catch {
-      // Keep the configured project list in the user-facing error if the map
-      // is temporarily unavailable; the selected route will report details.
-    }
-  }
-  return formatRouteKeys(Object.fromEntries([...keys].map((key) => [key, true])));
+  return formatRouteKeys(config.projects);
 }
 
 function formatRouteKeys(values: Record<string, unknown>): string {

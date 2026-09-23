@@ -11,6 +11,12 @@ export const TASK_STATES = [
 
 export type TaskState = (typeof TASK_STATES)[number];
 
+export const TASK_ORIGINS = ["feishu", "web"] as const;
+export type TaskOrigin = (typeof TASK_ORIGINS)[number];
+
+export type ExecutionBackend = "codex-sdk";
+export type StoredExecutionBackend = ExecutionBackend | "tmux-session";
+
 export const SANDBOX_MODES = ["read-only", "workspace-write"] as const;
 export type SandboxMode = (typeof SANDBOX_MODES)[number];
 
@@ -59,6 +65,27 @@ export interface ProjectConfig {
   repo: string;
 }
 
+export const PROJECT_STATUSES = ["available", "disabled"] as const;
+export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
+
+export interface StoredProject {
+  name: string;
+  path: string;
+  status: ProjectStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoredWebTaskAttachment {
+  attachment_id: string;
+  task_guid: string | null;
+  file_name: string;
+  mime_type: string;
+  size_bytes: number;
+  local_path: string;
+  created_at: string;
+}
+
 export interface ModeConfig {
   optionGuid: string;
   sandboxMode: SandboxMode;
@@ -79,7 +106,7 @@ export interface BridgeConfig {
     /** Optional per-task Git worktree isolation for local ACP agents. */
     worktree?: {
       enabled: boolean;
-      projectMapPath: string;
+      projectMapPath?: string;
       globalAgentsPath: string;
       taskDir: string;
       worktreeRoot: string;
@@ -168,6 +195,14 @@ export interface TaskInput {
   description: string;
 }
 
+export interface WebTaskSubmission {
+  summary?: string;
+  description: string;
+  projectKey: string;
+  mode?: string;
+  attachmentIds?: string[];
+}
+
 export interface LarkCustomField {
   guid?: string;
   name?: string;
@@ -223,6 +258,7 @@ export interface RoutedTask {
   inputHash: string;
   input: TaskInput;
   completed: boolean;
+  origin?: TaskOrigin;
   url?: string;
 }
 
@@ -241,6 +277,7 @@ export interface ConfigProblem {
 
 export interface StoredTask {
   task_guid: string;
+  origin: TaskOrigin;
   project_key: string;
   mode: string;
   repo: string;
@@ -422,6 +459,8 @@ export interface StoredRun {
   previous_input_text: string | null;
   prompt_text: string;
   thread_id: string | null;
+  execution_backend: StoredExecutionBackend;
+  tmux_session_id: string | null;
   state: TaskState;
   final_response: string | null;
   usage_json: string | null;
@@ -491,7 +530,7 @@ export interface WorkerProgress {
 }
 
 export interface WorkerHandle {
-  pid: number;
+  pid: number | null;
   result: Promise<WorkerResult>;
   terminate(): Promise<void>;
 }

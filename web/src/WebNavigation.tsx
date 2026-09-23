@@ -5,7 +5,6 @@ import { useTheme, type ThemeMode } from "./theme.js";
 
 const PAGES = [
   { to: "/", label: "Bridge", end: true },
-  { to: "/tmux", label: "tmux 验证器", end: false },
   { to: "/tmux-dashboard", label: "tmux Dashboard", end: false },
   { to: "/pair-admin", label: "设备管理", end: true },
 ] as const;

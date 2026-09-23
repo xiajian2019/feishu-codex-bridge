@@ -1,5 +1,10 @@
 import type {
   DashboardChange,
+  CreateTaskInput,
+  CreateTaskResponse,
+  ProjectRecord,
+  ProjectStatus,
+  TaskAttachment,
   TaskDetailResponse,
   TaskListResponse,
 } from "./types.js";
@@ -51,8 +56,80 @@ export function fetchTasks(query: TaskQuery, signal?: AbortSignal): Promise<Task
   return getJson<TaskListResponse>(`/api/tasks?${params.toString()}`, { signal });
 }
 
+export async function fetchProjects(): Promise<ProjectRecord[]> {
+  const result = await getJson<{ projects: ProjectRecord[] }>("/api/projects");
+  return result.projects;
+}
+
+export async function createProject(input: { name: string; path: string; status: ProjectStatus }): Promise<ProjectRecord> {
+  const token = await getActionToken();
+  const result = await getJson<{ project: ProjectRecord }>("/api/projects", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Action-Token": token,
+    },
+    body: JSON.stringify(input),
+  });
+  return result.project;
+}
+
+export async function updateProject(
+  name: string,
+  input: { path?: string; status?: ProjectStatus },
+): Promise<ProjectRecord> {
+  const token = await getActionToken();
+  const result = await getJson<{ project: ProjectRecord }>(`/api/projects/${encodeURIComponent(name)}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Action-Token": token,
+    },
+    body: JSON.stringify(input),
+  });
+  return result.project;
+}
+
 export function fetchTaskDetail(taskGuid: string, signal?: AbortSignal): Promise<TaskDetailResponse> {
   return getJson<TaskDetailResponse>(`/api/tasks/${encodeURIComponent(taskGuid)}`, { signal });
+}
+
+export async function uploadTaskAttachment(file: File): Promise<TaskAttachment> {
+  const token = await getActionToken();
+  const result = await getJson<{ attachment: TaskAttachment }>("/api/tasks/attachments", {
+    method: "POST",
+    headers: {
+      "Content-Type": file.type || "application/octet-stream",
+      "X-Bridge-Action-Token": token,
+      "X-File-Name": encodeURIComponent(file.name),
+    },
+    body: file,
+  });
+  return result.attachment;
+}
+
+export async function deleteTaskAttachment(attachmentId: string): Promise<void> {
+  const token = await getActionToken();
+  await getJson(`/api/tasks/attachments/${encodeURIComponent(attachmentId)}`, {
+    method: "DELETE",
+    headers: { "X-Bridge-Action-Token": token },
+  });
+}
+
+export function taskAttachmentUrl(taskGuid: string, attachmentId: string): string {
+  return `/api/tasks/${encodeURIComponent(taskGuid)}/attachments/${encodeURIComponent(attachmentId)}`;
+}
+
+export async function createTask(input: CreateTaskInput): Promise<CreateTaskResponse> {
+  const token = await getActionToken();
+  return getJson<CreateTaskResponse>("/api/tasks", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Action-Token": token,
+    },
+    body: JSON.stringify(input),
+  });
 }
 
 export async function postTaskAction(

@@ -26,11 +26,6 @@ export default defineConfig({
         target: webSocketTarget,
         ws: true,
       },
-      "/api/tmux": {
-        target: apiTarget,
-        changeOrigin: true,
-        ws: true,
-      },
       "/api": {
         target: apiTarget,
         changeOrigin: true,

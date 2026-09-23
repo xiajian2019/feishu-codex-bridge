@@ -120,6 +120,7 @@ class FakeRunner implements WorkerRunner {
 
 function createHarness() {
   const db = new StateDatabase(":memory:");
+  db.createProject({ name: "food", path: process.cwd() });
   const lark = new FakeLark();
   const runner = new FakeRunner();
   const dispatcher = new Dispatcher({
@@ -152,6 +153,31 @@ describe("Dispatcher", () => {
 
     await dispatcher.observe(task());
     expect(runner.starts).toHaveLength(1);
+    db.close();
+  });
+
+  it("creates a web task on the existing Codex SDK path without Feishu outbox comments", async () => {
+    const { db, lark, runner, dispatcher } = createHarness();
+    const taskRecord = await dispatcher.submitWebTask({
+      summary: "从看板提交的任务",
+      description: "走现有 Codex SDK worker",
+      projectKey: "food",
+      mode: "implement",
+    });
+    const runId = runner.starts[0];
+    expect(taskRecord).toMatchObject({
+      origin: "web",
+      state: "RUNNING",
+      project_key: "food",
+      mode: "implement",
+    });
+    expect(db.getRun(runId)).toMatchObject({ execution_backend: "codex-sdk", tmux_session_id: null });
+    expect(db.listOutboxForTask(taskRecord.task_guid)).toHaveLength(0);
+
+    runner.finish(runId, { status: "succeeded", finalResponse: "task done" });
+    await dispatcher.waitForIdle();
+    expect(db.getTask(taskRecord.task_guid)?.state).toBe("WAITING_REVIEW");
+    expect(lark.comments).toHaveLength(0);
     db.close();
   });
 

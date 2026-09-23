@@ -12,7 +12,7 @@ import {
 } from "../scripts/update-portable-release.mjs";
 
 describe("portable package updater", () => {
-  it("defaults to the current package root and automatic core updates", () => {
+  it("defaults to the current package root and automatic Direct updates", () => {
     expect(parsePortableUpdateArguments([], "/tmp/bridge")).toMatchObject({
       root: "/tmp/bridge",
       repository: "xiajian2019/feishu-codex-bridge",
@@ -47,7 +47,7 @@ describe("portable package updater", () => {
     expect(updateAssetName("darwin", "arm64", "direct", "0.3.0"))
       .toBe("feishu-codex-bridge-direct-darwin-arm64-v0.3.0.tar.gz");
     expect(updateAssetName("darwin", "x64", "lite")).toBe("feishu-codex-bridge-darwin-x64.tar.gz");
-    expect(updateAssetName("darwin", "x64", "auto")).toBe("feishu-codex-bridge-core-darwin-x64.tar.gz");
+    expect(updateAssetName("darwin", "x64", "auto")).toBe("feishu-codex-bridge-direct-darwin-x64.tar.gz");
   });
 
   it("writes a user-level periodic updater plist without shell interpolation", () => {

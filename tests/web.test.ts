@@ -1,26 +1,21 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket } from "ws";
 
 import { StateDatabase } from "../src/db.js";
 import { TmuxDashboardApi } from "../src/tmux-dashboard-api.js";
-import { TmuxVerifier } from "../src/tmux-verifier.js";
-import { TmuxVerifierStore } from "../src/tmux-verifier-store.js";
-import { TmuxVerifierWebServer } from "../src/tmux-verifier-web.js";
 import { DashboardServer } from "../src/web.js";
-import type { RoutedTask } from "../src/types.js";
+import type { RoutedTask, WebTaskSubmission } from "../src/types.js";
 
 const openServers: DashboardServer[] = [];
 const openDatabases: StateDatabase[] = [];
-const openVerifierStores: TmuxVerifierStore[] = [];
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(openServers.splice(0).map((server) => server.stop()));
   openDatabases.splice(0).forEach((db) => db.close());
-  openVerifierStores.splice(0).forEach((store) => store.close());
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
@@ -28,6 +23,8 @@ describe("DashboardServer", () => {
   it("filters tasks and returns run details from the shared database", async () => {
     const db = new StateDatabase(":memory:");
     openDatabases.push(db);
+    const attachmentDirectory = await mkdtemp(join(tmpdir(), "bridge-task-attachments-"));
+    temporaryDirectories.push(attachmentDirectory);
     const task: RoutedTask = {
       taskGuid: "task-dashboard-1",
       summary: "修复导出时区",
@@ -64,9 +61,32 @@ describe("DashboardServer", () => {
       db,
       host: "127.0.0.1",
       port: 0,
-      projects: ["food"],
       modes: ["implement"],
+      taskAttachmentsDirectory: attachmentDirectory,
       actions: {
+        createTask: async (input: WebTaskSubmission) => {
+          const created: RoutedTask = {
+            ...task,
+            taskGuid: "web-task-dashboard-1",
+            summary: input.summary ?? input.description.split(/\r?\n/, 1)[0] ?? "Codex 任务",
+            description: input.description,
+            input: {
+              projectKey: input.projectKey,
+              mode: input.mode ?? "implement",
+              summary: input.summary ?? input.description.split(/\r?\n/, 1)[0] ?? "Codex 任务",
+              description: input.description,
+            },
+            inputHash: "web-task-hash",
+            origin: "web",
+          };
+          db.claimRun({
+            task: created,
+            inputText: JSON.stringify(created.input),
+            promptText: "web task prompt",
+            attachmentIds: input.attachmentIds,
+          });
+          return db.getTask(created.taskGuid)!;
+        },
         interruptTask: async (taskGuid, reason) => ({
           ok: taskGuid === "task-dashboard-1" && reason === "测试中断",
         }),
@@ -116,7 +136,7 @@ describe("DashboardServer", () => {
     const actionToken = /name="bridge-action-token" content="([^"]+)"/.exec(page)?.[1];
     expect(actionToken).toBeTruthy();
 
-    for (const route of ["/tmux", "/tmux-dashboard"]) {
+    for (const route of ["/tmux-dashboard"]) {
       const routedPage = await fetch(url + route);
       expect(routedPage.status).toBe(200);
       expect(await routedPage.text()).toContain('id="root"');
@@ -125,6 +145,91 @@ describe("DashboardServer", () => {
     const sessionResponse = await fetch(`${url}/api/session`);
     expect(sessionResponse.status).toBe(200);
     expect(await sessionResponse.json()).toEqual({ actionToken });
+
+    const imageBytes = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jA3sAAAAASUVORK5CYII=",
+      "base64",
+    );
+    const imageUploadResponse = await fetch(`${url}/api/tasks/attachments`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "image/png",
+        "X-File-Name": encodeURIComponent("任务图片.png"),
+        "X-Bridge-Action-Token": actionToken as string,
+      },
+      body: imageBytes,
+    });
+    expect(imageUploadResponse.status).toBe(201);
+    const imageUpload = await imageUploadResponse.json() as { attachment: { attachment_id: string; file_name: string; size_bytes: number } };
+    expect(imageUpload.attachment).toMatchObject({ file_name: "任务图片.png", size_bytes: imageBytes.length });
+
+    const fileUploadResponse = await fetch(`${url}/api/tasks/attachments`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain",
+        "X-File-Name": encodeURIComponent("说明.txt"),
+        "X-Bridge-Action-Token": actionToken as string,
+      },
+      body: Buffer.from("local attachment content", "utf8"),
+    });
+    expect(fileUploadResponse.status).toBe(201);
+    const fileUpload = await fileUploadResponse.json() as { attachment: { attachment_id: string; file_name: string } };
+    expect(fileUpload.attachment.file_name).toBe("说明.txt");
+
+    const createTaskResponse = await fetch(`${url}/api/tasks`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Bridge-Action-Token": actionToken as string,
+      },
+      body: JSON.stringify({
+        description: "API 创建路径",
+        projectKey: "food",
+        attachmentIds: [imageUpload.attachment.attachment_id, fileUpload.attachment.attachment_id],
+      }),
+    });
+    expect(createTaskResponse.status).toBe(201);
+    expect(await createTaskResponse.json()).toMatchObject({
+      task: { task_guid: "web-task-dashboard-1", origin: "web" },
+      latest_run: { execution_backend: "codex-sdk", state: "QUEUED" },
+    });
+    const createdTaskGuid = "web-task-dashboard-1";
+    const createdTaskDetail = await fetch(`${url}/api/tasks/${createdTaskGuid}`);
+    const createdTaskJson = await createdTaskDetail.json() as { attachments: Array<{ attachment_id: string; file_name: string; local_path?: string }> };
+    expect(createdTaskJson.attachments.map((attachment) => attachment.file_name)).toEqual(["任务图片.png", "说明.txt"]);
+    expect(createdTaskJson.attachments.every((attachment) => !attachment.local_path)).toBe(true);
+
+    const imageViewResponse = await fetch(`${url}/api/tasks/${createdTaskGuid}/attachments/${imageUpload.attachment.attachment_id}`);
+    expect(imageViewResponse.status).toBe(200);
+    expect(imageViewResponse.headers.get("content-type")).toBe("image/png");
+    expect(imageViewResponse.headers.get("content-disposition")).toContain("inline");
+    expect(Buffer.from(await imageViewResponse.arrayBuffer())).toEqual(imageBytes);
+    const fileViewResponse = await fetch(`${url}/api/tasks/${createdTaskGuid}/attachments/${fileUpload.attachment.attachment_id}`);
+    expect(fileViewResponse.headers.get("content-disposition")).toContain("attachment");
+    expect(await fileViewResponse.text()).toBe("local attachment content");
+
+    const createProjectResponse = await fetch(`${url}/api/projects`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Bridge-Action-Token": actionToken as string,
+      },
+      body: JSON.stringify({ name: "bridge-project", path: process.cwd(), status: "available" }),
+    });
+    expect(createProjectResponse.status).toBe(201);
+    expect(await createProjectResponse.json()).toMatchObject({
+      project: { name: "bridge-project", path: process.cwd(), status: "available", available: true },
+    });
+    const disableProjectResponse = await fetch(`${url}/api/projects/bridge-project`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Bridge-Action-Token": actionToken as string,
+      },
+      body: JSON.stringify({ status: "disabled" }),
+    });
+    expect(disableProjectResponse.status).toBe(200);
+    expect(await disableProjectResponse.json()).toMatchObject({ project: { status: "disabled", available: false } });
 
     const eventResponse = await fetch(`${url}/api/events`);
     expect(eventResponse.status).toBe(200);
@@ -173,10 +278,11 @@ describe("DashboardServer", () => {
   });
 
   it("serves Bridge, verifier, and dashboard APIs from one backend listener", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "bridge-unified-tmux-"));
+    const directory = await mkdtemp(join(tmpdir(), "bridge-tmux-dashboard-"));
     temporaryDirectories.push(directory);
-    const projectMapPath = join(directory, "project-map.yaml");
-    await writeFile(projectMapPath, "projects:\n  food:\n    root: /tmp/food\n", "utf8");
+    const db = new StateDatabase(":memory:");
+    openDatabases.push(db);
+    db.createProject({ name: "food", path: directory });
     const sessions = [{
       id: "$42",
       name: "dev",
@@ -185,33 +291,24 @@ describe("DashboardServer", () => {
       cwd: "/tmp/food",
       createdAt: 1,
     }];
+    const createdSessionDirectories: string[] = [];
     const dashboardApi = new TmuxDashboardApi({
-      projectMapPath,
+      db,
       operations: {
-        createSession: async () => sessions[0]!,
+        createSession: async (_name, cwd) => {
+          createdSessionDirectories.push(cwd ?? "");
+          return sessions[0]!;
+        },
         findSession: async () => undefined,
         killSession: async () => undefined,
         listSessions: async () => sessions,
       },
     });
-    const verifierStore = new TmuxVerifierStore(":memory:");
-    openVerifierStores.push(verifierStore);
-    const verifier = new TmuxVerifier({ store: verifierStore });
-    const verifierWeb = new TmuxVerifierWebServer({
-      verifier,
-      host: "127.0.0.1",
-      port: 0,
-      projectMapPath,
-    });
-    const db = new StateDatabase(":memory:");
-    openDatabases.push(db);
     const bridge = new DashboardServer({
       db,
       host: "127.0.0.1",
       port: 0,
-      projects: [],
       modes: [],
-      tmuxVerifier: verifierWeb,
       tmuxDashboard: dashboardApi,
     });
     openServers.push(bridge);
@@ -220,16 +317,20 @@ describe("DashboardServer", () => {
     const dashboardResponse = await fetch(bridgeUrl + "/tmux-dashboard/api/projects");
     expect(dashboardResponse.status).toBe(200);
     expect(await dashboardResponse.json()).toEqual({
-      projects: [{ name: "food", root: "/tmp/food" }],
+      projects: [{ name: "food", root: directory }],
     });
+
+    const createSessionResponse = await fetch(bridgeUrl + "/tmux-dashboard/api/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "db-session", projectKey: "food" }),
+    });
+    expect(createSessionResponse.status).toBe(201);
+    expect(createdSessionDirectories).toEqual([directory]);
 
     const sessionsResponse = await fetch(bridgeUrl + "/tmux-dashboard/api/sessions");
     expect(sessionsResponse.status).toBe(200);
     expect(await sessionsResponse.json()).toEqual({ sessions });
-
-    const verifierResponse = await fetch(bridgeUrl + "/api/tmux/sessions");
-    expect(verifierResponse.status).toBe(200);
-    expect(await verifierResponse.json()).toEqual({ items: [] });
 
     const terminalStatus = await new Promise<number>((resolve, reject) => {
       const terminalSocket = new WebSocket(

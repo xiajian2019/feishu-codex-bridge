@@ -19,7 +19,7 @@ let worktreeQueue = Promise.resolve();
 function isolationConfig(env = process.env) {
   if (env.AAMP_CODEX_WORKTREE_ENABLED !== '1') return undefined;
   const config = {
-    projectMapPath: env.AAMP_CODEX_PROJECT_MAP,
+    projectRegistryPath: env.AAMP_CODEX_PROJECTS_FILE,
     globalAgentsPath: env.AAMP_CODEX_GLOBAL_AGENTS,
     taskDir: env.AAMP_CODEX_TASK_DIR,
     worktreeRoot: env.AAMP_CODEX_WORKTREE_ROOT,
@@ -27,7 +27,7 @@ function isolationConfig(env = process.env) {
     branchPrefix: env.AAMP_CODEX_WORKTREE_BRANCH_PREFIX || 'xiajian/agent',
     metadataDir: env.AAMP_CODEX_WORKTREE_METADATA_DIR,
   };
-  for (const field of ['projectMapPath', 'globalAgentsPath', 'taskDir', 'worktreeRoot', 'metadataDir']) {
+  for (const field of ['projectRegistryPath', 'globalAgentsPath', 'taskDir', 'worktreeRoot', 'metadataDir']) {
     const value = config[field];
     if (!value || !isAbsolute(value)) {
       throw new Error(`AAMP worktree isolation requires an absolute ${field}`);
@@ -131,87 +131,16 @@ function writePrivateFile(filePath, content) {
   renameSync(temporaryPath, filePath);
 }
 
-function stripYamlComment(value) {
-  let quote = null;
-  for (let index = 0; index < value.length; index += 1) {
-    const character = value[index];
-    if ((character === '"' || character === "'") && value[index - 1] !== '\\') {
-      quote = quote === character ? null : quote || character;
+function readProjectRegistry(filePath) {
+  try {
+    const value = JSON.parse(readFileSync(filePath, 'utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('project registry must be an object');
     }
-    if (character === '#' && !quote && (index === 0 || /\s/.test(value[index - 1]))) {
-      return value.slice(0, index).trimEnd();
-    }
+    return Object.fromEntries(Object.entries(value).filter((entry) => typeof entry[1] === 'string'));
+  } catch (error) {
+    throw new Error(`cannot read Bridge project registry ${filePath}: ${error.message}`);
   }
-  return value.trim();
-}
-
-function yamlScalar(value) {
-  const trimmed = stripYamlComment(value).trim();
-  if (!trimmed) return '';
-  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
-    try {
-      return JSON.parse(trimmed);
-    } catch {
-      return trimmed.slice(1, -1);
-    }
-  }
-  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
-    return trimmed.slice(1, -1).replaceAll("''", "'");
-  }
-  return trimmed;
-}
-
-/**
- * Read the deliberately small, stable project-map.yaml contract:
- *
- * projects:
- *   food:
- *     root: /Users/xiajian/works/boohee/food
- *
- * It accepts quoted values, comments, and a scalar project value as a
- * convenience, without adding a YAML runtime dependency to the official
- * AAMP process.
- */
-export function readProjectMap(filePath) {
-  const source = readFileSync(filePath, 'utf8');
-  const lines = source.split(/\r?\n/);
-  const projects = {};
-  let projectsIndent = null;
-  let currentProject = null;
-  let currentProjectIndent = null;
-  for (const rawLine of lines) {
-    if (/^\s*#/.test(rawLine) || /^\s*$/.test(rawLine)) continue;
-    if (/\t/.test(rawLine)) throw new Error(`project map cannot use tabs: ${filePath}`);
-    const content = stripYamlComment(rawLine);
-    if (!content.trim()) continue;
-    const indent = rawLine.length - rawLine.trimStart().length;
-    const projectsMatch = /^projects\s*:\s*(.*)$/.exec(content.trim());
-    if (projectsMatch && indent === 0) {
-      projectsIndent = indent;
-      currentProject = null;
-      currentProjectIndent = null;
-      continue;
-    }
-    if (projectsIndent === null) continue;
-    if (indent <= projectsIndent) {
-      currentProject = null;
-      currentProjectIndent = null;
-      continue;
-    }
-    const entryMatch = /^([^:#][^:]*?):(?:\s*(.*))?$/.exec(content.trim());
-    if (indent === projectsIndent + 2 && entryMatch) {
-      currentProject = yamlScalar(entryMatch[1]);
-      currentProjectIndent = indent;
-      const inlineRoot = yamlScalar(entryMatch[2] || '');
-      if (inlineRoot) projects[currentProject] = inlineRoot;
-      continue;
-    }
-    if (currentProject && indent > currentProjectIndent) {
-      const rootMatch = /^root\s*:\s*(.*)$/.exec(content.trim());
-      if (rootMatch) projects[currentProject] = yamlScalar(rootMatch[1]);
-    }
-  }
-  return projects;
 }
 
 function cleanProjectName(value) {
@@ -252,16 +181,16 @@ function mappedProject(task, config) {
   if (!projectName) return undefined;
   let projects;
   try {
-    projects = readProjectMap(config.projectMapPath);
+    projects = readProjectRegistry(config.projectRegistryPath);
   } catch (error) {
-    throw new Error(`cannot read project map ${config.projectMapPath}: ${error.message}`);
+    throw new Error(`cannot load Bridge project registry: ${error.message}`);
   }
   const mappedRoot = projects[projectName];
   if (!mappedRoot) {
-    throw new Error(`project "${projectName}" is not mapped in ${config.projectMapPath}`);
+    throw new Error(`project "${projectName}" is not enabled in the Bridge project registry`);
   }
   if (!isAbsolute(mappedRoot) || !existsSync(mappedRoot)) {
-    throw new Error(`project "${projectName}" mapping path is invalid or missing: ${mappedRoot}`);
+    throw new Error(`project "${projectName}" registry path is invalid or missing: ${mappedRoot}`);
   }
   let repositoryRoot;
   try {
@@ -386,7 +315,7 @@ function createOrReuseWorktree(task, config, project) {
     taskId: String(task.taskId),
     title: String(task.title || ''),
     projectName: project.projectName,
-    projectMapPath: config.projectMapPath,
+    projectRegistrySource: 'Bridge SQLite',
     globalAgentsPath: config.globalAgentsPath,
     globalAgents: project.globalAgents,
     repositoryRoot: project.repositoryRoot,
@@ -428,7 +357,7 @@ function isolationPromptContext(metadata) {
     'This task has a dedicated Git branch and worktree. Treat this worktree as the only writable repository checkout for this task.',
     `Mapped project: ${metadata.projectName}`,
     `Mapped repository: ${metadata.repositoryRoot}`,
-    `Project map: ${metadata.projectMapPath}`,
+    `Project registry: ${metadata.projectRegistrySource}`,
     `Global Codex instructions: ${metadata.globalAgentsPath}`,
     `Task request file: ${metadata.taskFile}`,
     `Worktree: ${metadata.worktreePath}`,
