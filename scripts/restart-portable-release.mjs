@@ -7,7 +7,7 @@ import {
   buildPortableRelease,
   parsePortableReleaseArguments,
   targetName,
-} from "./build-portable-release.mjs";
+} from "./build-bun-single-binary-release.mjs";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_RELEASE_DIR = join(PROJECT_ROOT, "release");

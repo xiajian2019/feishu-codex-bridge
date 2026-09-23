@@ -1,5 +1,5 @@
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   collectAampTasks,

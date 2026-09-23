@@ -81,7 +81,12 @@ function readOption(argv, index, arg, names) {
   return [name, value, 1];
 }
 
-export function targetName(platform = process.platform, arch = process.arch, mode = DEFAULT_RELEASE_MODE) {
+export function targetName(
+  platform = process.platform,
+  arch = process.arch,
+  mode = DEFAULT_RELEASE_MODE,
+  version,
+) {
   const platformName = platform === "darwin" ? "darwin" : undefined;
   const archName = {
     arm64: "arm64",
@@ -91,14 +96,15 @@ export function targetName(platform = process.platform, arch = process.arch, mod
     throw new Error(`Portable Runtime 当前只支持 macOS arm64/x64：${platform}/${arch}`);
   }
   if (!RELEASE_MODES.includes(mode)) throw new Error(`未知 portable 发布模式：${mode}`);
-  if (mode === "direct") return `feishu-codex-bridge-direct-${platformName}-${archName}`;
-  if (mode === "core") return `feishu-codex-bridge-core-${platformName}-${archName}`;
-  return `feishu-codex-bridge-${platformName}-${archName}`;
+  const suffix = version ? "-v" + String(version).replace(/^v/, "") : "";
+  if (mode === "direct") return "feishu-codex-bridge-direct-" + platformName + "-" + archName + suffix;
+  if (mode === "core") return "feishu-codex-bridge-core-" + platformName + "-" + archName + suffix;
+  return "feishu-codex-bridge-" + platformName + "-" + archName + suffix;
 }
 
 export function printPortableReleaseUsage() {
   console.log([
-    "用法：bun run release [选项]",
+    "用法：bun run release:legacy [选项]",
     "",
     "构建接收方无需预装 Node.js、npm、pnpm 或 Bun 的 Portable Runtime 压缩包。",
     "",
@@ -116,7 +122,13 @@ export function printPortableReleaseUsage() {
 
 export async function buildPortableRelease(options) {
   const mode = options.mode || DEFAULT_RELEASE_MODE;
-  const packageName = targetName(process.platform, process.arch, mode);
+  const packageJson = JSON.parse(await readFile(join(PROJECT_ROOT, "package.json"), "utf8"));
+  const packageName = targetName(
+    process.platform,
+    process.arch,
+    mode,
+    options.versionedNames ? packageJson.version : undefined,
+  );
   const outputDir = resolve(options.outputDir);
   const archivePath = join(outputDir, `${packageName}.tar.gz`);
   const packageDir = join(outputDir, packageName);
@@ -153,6 +165,10 @@ export async function buildPortableRelease(options) {
     await copyFile(INSTALL_COMMAND_SOURCE, join(stageDir, "install.command"));
     await chmod(join(stageDir, "install.command"), 0o755);
     await copyFile(INSTALL_DEFAULTS_SOURCE, join(stageDir, "install.defaults"));
+    const changelogSource = join(PROJECT_ROOT, "CHANGELOG.md");
+    if (existsSync(changelogSource)) {
+      await copyFile(changelogSource, join(stageDir, "CHANGELOG.md"));
+    }
     await writeReleaseManifest(stageDir, packageName, mode, options.bunPath);
     await writePortableReadme(stageDir, packageName, mode);
     await runSmokeTests(stageDir, options.bunPath, mode);

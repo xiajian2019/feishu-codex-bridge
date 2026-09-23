@@ -4,8 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="bridge-action-token" content="__BRIDGE_ACTION_TOKEN__" />
-    <meta name="bridge-app" content="dashboard" />
     <title>Feishu Codex Bridge</title>
+    <script>
+      (() => {
+        const mode = localStorage.getItem("bridge.theme");
+        const isDark = mode === "dark" || (mode !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.theme = isDark ? "dark" : "light";
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -10,23 +10,27 @@
 
 ## Codex Session SSH + tmux 验证器
 
-仓库还提供一个独立的本地 CS 验证程序，用来验证“Web Backend → SSH Worker → tmux session → Codex TUI”这条适配器链路；它不接入飞书业务状态机，也不复用 Bridge 业务数据库。
+仓库还提供一个独立的本地 CS 验证程序，用来验证“Web Backend → SSH Worker → tmux session → Codex TUI”这条适配器链路；它不接入飞书业务状态机，也不复用 Bridge 业务数据库。页面已并入 Bridge 的 React Router，统一从 `http://127.0.0.1:7310/tmux` 打开。
+
+统一启动 Bridge（`bun run start`）时，tmux 验证器 API 会由同一进程在 `7310` 提供，不需要单独启动服务。若要独立调试验证器后端，可运行：
 
 ```bash
-bun run build
 bun run tmux:verify -- --port 7320
-open http://127.0.0.1:7320
 ```
 
 页面中的 `机器` 填 `local` 或 SSH 配置中的 `user@host`，工作路径从程序读取的 `~/.codex/project-map.yaml`（可用 `TMUX_VERIFY_PROJECT_MAP` 覆盖）中搜索选择。Codex 可执行文件不由页面填写，而是使用 Bridge 进程的 `CODEX_PATH`/自动发现结果。远程执行只使用现有 SSH key/SSH config，不保存或请求密码。默认复用所选机器已有的 tmux 默认 server，本地 Session 会出现在你平时使用的 tmux 会话列表中；只有显式传入 `--socket <name>` 才使用独立 socket。Bridge 看板默认地址为 `http://127.0.0.1:7310`，自定义端口时用 `--bridge-url <url>` 指定。页面通过 `xterm.js → WebSocket → Bun.Terminal PTY → tmux attach-session` 查看真实 PTY，页面关闭只会断开 attach 客户端，不会杀掉 tmux/Codex。重新打开页面会先按 SQLite 中的 `after` event cursor 恢复快照，再接入实时 PTY 输出。
 
 Web 追问必须带 `clientMessageId`/`Idempotency-Key`。同一个逻辑请求重试时只会向已经存在的 Codex TUI 注入一次 `tmux send-keys`，不会启动第二个 Codex 进程。原始终端键盘输入仍属于 TUI 的低层输入；若人为在两个界面分别输入完全相同的新句子，后端无法从 tmux 原始字节中推断这是有意重复，因此这不属于当前最小验证范围。
 
-该验证器默认监听 `127.0.0.1:7320`，数据写入 `runtime/tmux-verifier.db`。默认 attach 命令直接连接现有 tmux server：
+`bun run tmux:verify` 独立运行时默认监听 `127.0.0.1:7320`；主服务内嵌运行时接口随 Bridge 使用 `7310`，验证数据仍保存在 `tmux-verifier.db`（默认 `runtime/tmux-verifier.db`）。默认 attach 命令直接连接现有 tmux server：
 
 ```bash
 tmux attach-session -t codex-verify-...
 ```
+
+## tmux Dashboard
+
+会话看板已迁入本仓库，并作为 React 页面挂载到 Bridge 的统一入口。统一启动 Bridge 后，从 `http://127.0.0.1:7310/tmux-dashboard` 打开；菜单可在 Bridge、tmux 验证器和 tmux Dashboard 之间用 React Router 切换。Bridge 主进程会直接处理 `/api/tmux/*`、`/tmux-dashboard/api/*` 和两个终端 WebSocket，不再依赖额外后端进程。
 
 ## 安装和配置
 
@@ -51,14 +55,12 @@ feishu-codex-bridge install
 
 给没有 Bun 环境的接收方使用时，可以构建按 macOS CPU 架构划分的便携压缩包。双击 `install.command` 后，安装器默认把发布包复制到 `~/Applications/Feishu Codex Bridge`，不会把 Downloads 目录作为长期运行目录；默认目录可在 `install.defaults` 中修改，也可以在安装时输入其他目录。
 
-```bash
-bun run release
-```
-
-默认构建只使用原生直连模式的自包含包：
+新的 release 入口只生成当前 macOS 架构的 Bun 单一二进制包。旧的 core/lite/direct 多模式打包逻辑保留在 legacy 入口：
 
 ```bash
 bun run release
+bun run release:legacy -- --mode lite
+bun run release:legacy -- --mode core
 ```
 
 如需一条命令完成重建、使用真实配置/数据库从新 `release/` 包重启直连服务，并校验 LaunchAgent 状态：
@@ -69,23 +71,23 @@ bun run portable:restart
 
 该命令会先完成构建和 smoke test，再执行带有 `--config`、`--db` 和 `--mode feishu-sqlite-codex` 的 `service restart`，最后执行 `service status`；构建失败时不会停止正在运行的服务。可用 `--config <path>`、`--db <path>` 和 `--mode <mode>` 覆盖默认值，`--skip-build` 仅重用现有 `dist` 打包。
 
-发布 GitHub Release（默认使用 `package.json` 版本生成 `v0.2.0` tag）：
+发布 GitHub Release（默认使用 `package.json` 版本生成 `v0.3.0` tag）：
 
 ```bash
 bun run release:github
 ```
 
-该命令会构建 direct、core、Lite 三类 portable release，提交并推送当前分支和版本 tag；GitHub Actions 会自动生成 macOS arm64 资产并上传到对应 Release。可用 `--tag`、`--message`、`--skip-build` 或 `--dry-run` 覆盖默认行为。
+该命令会构建新的 Bun 单一二进制包，以及由 legacy 入口生成的 core、Lite 资产，提交并推送当前分支和版本 tag；GitHub Actions 会自动生成 macOS arm64 资产并上传到对应 Release。可用 `--tag`、`--message`、`--skip-build` 或 `--dry-run` 覆盖默认行为。
 
-产物默认写入根目录 `release/`，包含已构建的 Bridge 和生产依赖，不包含源码、测试、配置密钥或运行数据。启动器会优先使用包内 Bun，其次使用系统 Bun >=1.4.2；否则会下载固定版本并校验 SHA-256 后缓存到当前包的 `runtime/`，不修改用户全局环境。可以用 `--output <path>` 覆盖默认目录。接收方解压后可以直接双击 `install.command`；也可以执行：
+产物默认写入根目录 `release/`，包含已构建的 Bridge 和生产依赖，不包含源码、测试、配置密钥或运行数据。新的 Bun 单一二进制包由包内编译产物直接启动，不再携带或下载独立 Bun runtime；legacy 包继续使用原有 runtime/launcher 逻辑。可以用 `--output <path>` 覆盖默认目录。接收方解压后可以直接双击 `install.command`；也可以执行：
 
 ```bash
 ./feishu-codex-bridge install
 ```
 
-Lite 包默认不包含 Bun 和独立 Codex CLI；启动器会按需下载并缓存 Bun，安装器会优先寻找 ChatGPT App 内置 Codex，再寻找独立 Codex CLI。若两者都不存在，安装器会给出明确提示。若需要完全离线的 Lite 包，可构建时增加 `--bundle-bun`。`codex:update` 在便携包中被禁用，升级时使用下面的 Portable 更新命令。
+Lite 包默认不包含 Bun 和独立 Codex CLI；它属于 legacy 打包路径，启动器会按需下载并缓存 Bun。`codex:update` 在便携包中被禁用，升级时使用下面的 Portable 更新命令。
 
-默认 `bun run release` 生成自包含 direct 包：不携带 AAMP runtime，但携带 `lark-cli`、直连配置向导和当前 macOS 架构的 Bun 可执行文件（`runtime/bin/bun`）。不会下载或打包 Node，也不再构建 universal Node archive。Lite/AAMP 包使用 `bun run release --mode lite`；只更新核心代码的包使用 `bun run release --mode core`。Core 包不包含 `node_modules`、Bun、lark-cli、配置或 runtime 数据，只供已安装包的更新器使用。首次双击 direct 包安装时，直连向导使用官方 Lark SDK 的二维码授权创建 Bot，再写入 lark-cli profile 和 `direct.feishu` 凭据；不会启动 AAMP 服务。构建 direct 包仍可能需要联网准备 lark-cli 原生二进制。
+默认 `bun run release` 生成只包含 Bun 单一二进制运行入口的 direct 包，不构建 Node universal archive，也不携带独立 Bun runtime。旧的 Lite/Core 产物分别使用 `bun run release:legacy -- --mode lite` 和 `bun run release:legacy -- --mode core`；Core 包只供已安装包的更新器使用。单一二进制包首次安装时仍可能需要联网准备 lark-cli 原生二进制。
 
 已安装的 Portable 包默认从 GitHub 拉取小型 Core 包。更新器会先下载、校验、解压并完成包完整性检查，再在极短窗口内停止当前 LaunchAgent、替换核心文件并自动启动；启动失败会回滚。`config.json`、`runtime/` 和 direct 包中的 Bun/lark-cli 不会被 Core 更新覆盖。旧 Node 运行时或 Bun 代际不匹配时，检查和自动更新会选择完整 direct/lite 包迁移；Core overlay 仅用于相同 Bun 代际，保留配置和用户 runtime 数据。完整 direct 更新才会替换运行时依赖：
 
@@ -96,7 +98,7 @@ Lite 包默认不包含 Bun 和独立 Codex CLI；启动器会按需下载并缓
 ./feishu-codex-bridge update --auto
 ./feishu-codex-bridge update --file ./feishu-codex-bridge-core-darwin-arm64.tar.gz
 # 如需完整替换为 direct 包：
-./feishu-codex-bridge update --mode direct --file ./feishu-codex-bridge-direct-darwin-arm64.tar.gz
+./feishu-codex-bridge update --mode direct --file ./feishu-codex-bridge-direct-darwin-arm64-v0.3.0.tar.gz
 ./feishu-codex-bridge update --unschedule
 ```
 
@@ -418,7 +420,9 @@ bun run start:all
 
 查询接口为 `GET /healthz`、`GET /api/session`、`GET /api/tasks`、`GET /api/tasks/:taskGuid`、`GET /api/aamp/tasks`、`GET /api/aamp/tasks/:id` 和 `GET /api/events`；旧兼容模式的 `POST /api/tasks/:taskGuid` 操作接口当前不会配置 Dispatcher。页面包含 CSP、禁止 iframe 和 `no-store` 响应头。由于内容包含任务描述、仓库路径和 Codex 结果，不应通过端口转发或反向代理对外暴露。
 
-前端源码位于 `web/`，生产构建输出到 `dist/web`，由同一个 Bridge Bun 进程静态托管。开发时可另开终端运行 `bun run dev:web`（默认 `http://127.0.0.1:5173`，将 `/api` 代理到 `7310`）；发布或 LaunchAgent 启动前必须执行 `bun run build`。React 组件使用稳定的任务/run/event ID 合并服务端变化，避免全页面刷新导致操作丢失。
+页面现在支持一个轻量的一次性配对层。配对码和二维码只由 Mac 命令行生成，不在网页中生成或显示。独立 tmux verifier 可运行 bun run tmux:pair -- --url http://192.168.1.10:7320/；统一 Bridge 可运行 bun run web:pair -- --url http://192.168.1.10:7310/；开发页面 5173 会自动使用 runtime/dev/bridge.db。手机扫描终端二维码后，网页从 URL fragment 自动 claim，服务端签发一个 30 天 HttpOnly 会话 Cookie，二维码 5 分钟后失效且只能使用一次。任务 API、tmux API、SSE 和终端 WebSocket 都要求已配对会话；未认证网页只显示等待扫码提示。认证后从 /pair-admin 进入设备管理，可查看已配对设备并撤销所有手机；刷新配对码需重新运行对应的 pair 命令。配对成功、设备会话和撤销状态都保存在服务使用的 SQLite 数据库中。配对只解决访问控制，不替代 HTTPS；当前服务默认 HTTP，如果局域网中存在抓包或主动劫持风险，需要另行配置 HTTPS，并确保代理不会绕过配对规则。
+
+前端源码位于 `web/`，生产构建输出到 `dist/web`，由同一个 Bridge Bun 进程静态托管。开发时在两个终端分别运行 `bun run dev:api` 和 `bun run dev:web`，然后打开 `http://127.0.0.1:5173`。开发 API 独立监听 `127.0.0.1:17310`，使用 `runtime/dev/bridge.db` 和 `runtime/dev/tmux-verifier.db`，不触碰 LaunchAgent 的服务、`7310` 生产 API 或 SQLite，也不会启动 Feishu/AAMP/Relay/Codex 消息运行时；Vite 的 Bridge、tmux API 和 WebSocket 默认都代理到这个开发 API。`dev:api` 默认读取 `config.example.json`，需要本地项目配置时可运行 `bun run dev:api -- --config ./config.json`；也可用 `--db`、`--web-port` 覆盖开发数据路径和端口，Vite 目标可用 `BRIDGE_WEB_API_TARGET` 覆盖。tmux API 沿用现有默认 tmux server（或显式设置的 `TMUX_VERIFY_SOCKET`），不会默认额外启动 tmux server。发布或 LaunchAgent 启动前仍须执行 `bun run build`。React 组件使用稳定的任务/run/event ID 合并服务端变化，避免全页面刷新导致操作丢失。
 
 默认 `runTimeoutSeconds` 为 `3600` 秒（1 小时）；超时会先终止 Worker，必要时再强制结束，并将本轮标记为失败。
 

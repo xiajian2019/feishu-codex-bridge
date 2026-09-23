@@ -40,6 +40,7 @@ const CORE_OVERLAY_PATHS = [
   "install.command",
   "install.defaults",
   "README.md",
+  "CHANGELOG.md",
 ];
 const FULL_PACKAGE_PATHS = [
   "app",
@@ -47,6 +48,7 @@ const FULL_PACKAGE_PATHS = [
   "install.command",
   "install.defaults",
   "README.md",
+  "CHANGELOG.md",
   "release-manifest.json",
 ];
 const PACKAGE_RUNTIME_ENTRIES = [
@@ -164,12 +166,20 @@ export function parsePortableUpdateArguments(argv, cwd = process.cwd()) {
   return options;
 }
 
-export function updateAssetName(platform = process.platform, arch = process.arch, mode = "core") {
+export function updateAssetName(
+  platform = process.platform,
+  arch = process.arch,
+  mode = "core",
+  version,
+) {
   const platformName = platform === "darwin" ? "darwin" : undefined;
   const archName = { arm64: "arm64", x64: "x64" }[arch];
   if (!platformName || !archName) throw new Error(`当前系统不支持 Portable 更新：${platform}/${arch}`);
   const resolvedMode = mode === "auto" ? "core" : mode;
-  if (resolvedMode === "direct") return `feishu-codex-bridge-direct-${platformName}-${archName}.tar.gz`;
+  const versionSuffix = version ? "-v" + normalizeVersion(version) : "";
+  if (resolvedMode === "direct") {
+    return "feishu-codex-bridge-direct-" + platformName + "-" + archName + versionSuffix + ".tar.gz";
+  }
   if (resolvedMode === "lite") return `feishu-codex-bridge-${platformName}-${archName}.tar.gz`;
   if (resolvedMode === "core") return `feishu-codex-bridge-core-${platformName}-${archName}.tar.gz`;
   throw new Error(`未知更新模式：${mode}`);
@@ -324,10 +334,21 @@ async function applyPortableRelease(options) {
     if (options.file) {
       archivePath = resolve(options.file);
     } else {
+      const remoteRelease = remoteMode === "direct"
+        ? await fetchGithubRelease({
+            repository: options.repository || DEFAULT_GITHUB_REPOSITORY,
+            tag: options.tag || "latest",
+          })
+        : undefined;
       downloaded = await downloadGithubAsset({
         repository: options.repository || DEFAULT_GITHUB_REPOSITORY,
         tag: options.tag || "latest",
-        assetName: updateAssetName(process.platform, process.arch, remoteMode),
+        assetName: updateAssetName(
+          process.platform,
+          process.arch,
+          remoteMode,
+          remoteRelease?.version,
+        ),
         quiet: options.quiet,
       });
       archivePath = downloaded.path;

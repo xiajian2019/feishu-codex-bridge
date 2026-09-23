@@ -30,6 +30,7 @@ import type {
   TmuxWebSocketOutputMessage,
   TmuxWebSocketReadyMessage,
 } from "./tmux-types.js";
+import { bindMobileTerminalTouch } from "./terminal-touch.js";
 
 const CURSOR_PREFIX = "tmux-verifier.cursor.";
 
@@ -39,7 +40,6 @@ export function TmuxApp(): ReactElement {
   const [detail, setDetail] = useState<TmuxSessionDetail | null>(null);
   const [events, setEvents] = useState<TmuxEvent[]>([]);
   const [projects, setProjects] = useState<TmuxProjectOption[]>([]);
-  const [bridgeDashboardUrl, setBridgeDashboardUrl] = useState("http://127.0.0.1:7310/");
   const [projectKey, setProjectKey] = useState(() => localStorage.getItem("tmux.verify.project") ?? "");
   const [projectMapError, setProjectMapError] = useState<string | null>(null);
   const [machine, setMachine] = useState("local");
@@ -76,7 +76,6 @@ export function TmuxApp(): ReactElement {
       .then((config) => {
         setProjects(config.projects);
         setProjectMapError(config.projectMapError);
-        setBridgeDashboardUrl(config.bridgeDashboardUrl);
         const savedProject = localStorage.getItem("tmux.verify.project");
         const preferred = config.projects.find((project) => project.key === savedProject && project.available)
           ?? config.projects.find((project) => project.available);
@@ -102,7 +101,7 @@ export function TmuxApp(): ReactElement {
     const terminal = new Terminal({
       convertEol: true,
       cursorBlink: true,
-      scrollback: 5_000,
+      scrollback: 50_000,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
       fontSize: 13,
       theme: {
@@ -117,6 +116,10 @@ export function TmuxApp(): ReactElement {
       terminal.open(terminalHostRef.current);
       fit.fit();
     }
+    const sendInput = (data: string): void => {
+      if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: "input", data }));
+    };
+    const removeTouchScrolling = bindMobileTerminalTouch(terminalHostRef.current!, terminal, sendInput);
     terminalRef.current = terminal;
     fitRef.current = fit;
     const onResize = (): void => fit.fit();
@@ -124,6 +127,7 @@ export function TmuxApp(): ReactElement {
     return () => {
       window.removeEventListener("resize", onResize);
       terminal.dispose();
+      removeTouchScrolling();
       terminalRef.current = null;
       fitRef.current = null;
     };
@@ -227,9 +231,7 @@ export function TmuxApp(): ReactElement {
     });
 
     const inputSubscription = terminal.onData((data) => {
-      if (socket?.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: "input", data }));
-      }
+      if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "input", data }));
     });
     const resizeSubscription = terminal.onResize(({ cols, rows }) => {
       if (socket?.readyState === WebSocket.OPEN) {
@@ -318,7 +320,6 @@ export function TmuxApp(): ReactElement {
           <h1>Codex Session 验证器</h1>
           <p className="subtitle">只验证远程执行适配器的三个最小事实；业务状态仍由后端 SQLite 持有。</p>
         </div>
-        <a className="text-link" href={bridgeDashboardUrl}>返回 Bridge 看板</a>
       </header>
 
       <section className="tmux-layout">

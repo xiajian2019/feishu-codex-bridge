@@ -11,6 +11,7 @@ import { TmuxVerifier, type TmuxStartResult, type TmuxTerminalProcess } from "./
 import { loadTmuxProjectCatalog, resolveTmuxProject } from "./tmux-projects.js";
 import type { TmuxProjectCatalog } from "./tmux-projects.js";
 import type { TmuxEvent, TmuxSessionRecord } from "./tmux-verifier-store.js";
+import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 
 export interface TmuxVerifierWebServerOptions {
   verifier: TmuxVerifier;
@@ -19,6 +20,7 @@ export interface TmuxVerifierWebServerOptions {
   projectMapPath: string;
   bridgeDashboardUrl?: string;
   webRoot?: string;
+  auth?: WebPairingAuth;
   logger?: TmuxVerifierWebLogger;
 }
 
@@ -31,6 +33,7 @@ export interface TmuxVerifierWebLogger {
 export class TmuxVerifierWebServer {
   private readonly options: TmuxVerifierWebServerOptions;
   private readonly actionToken = randomUUID();
+  private readonly auth: WebPairingAuth;
   private readonly webRoot: string;
   private readonly bridgeDashboardUrl: string;
   private readonly websocketServer = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
@@ -39,6 +42,7 @@ export class TmuxVerifierWebServer {
 
   constructor(options: TmuxVerifierWebServerOptions) {
     this.options = options;
+    this.auth = options.auth ?? new WebPairingAuth({ allowLocalRequests: true });
     this.webRoot = options.webRoot ?? findWebRoot();
     this.bridgeDashboardUrl = options.bridgeDashboardUrl ?? "http://127.0.0.1:7310/";
   }
@@ -83,6 +87,7 @@ export class TmuxVerifierWebServer {
     this.server = null;
     for (const client of this.terminalClients) client.close();
     this.terminalClients.clear();
+    this.websocketServer.close();
     if (!server) return Promise.resolve();
     return new Promise((resolvePromise, reject) => {
       server.close((error) => error ? reject(error) : resolvePromise());
@@ -94,10 +99,81 @@ export class TmuxVerifierWebServer {
     return this.actionToken;
   }
 
+  public handleApiRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    return this.handle(request, response);
+  }
+
+  public handleApiUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+    return this.handleUpgrade(request, socket, head);
+  }
+
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", "http://localhost");
-    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/tmux" || url.pathname === "/tmux/")) {
-      await this.serveIndex(response);
+    if (request.method === "GET" && url.pathname === "/api/auth/status") {
+      sendJson(response, 200, this.auth.status(request));
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/auth/devices") {
+      const devices = this.auth.listDevices(request);
+      if (!devices) {
+        sendJson(response, 401, { error: "pairing required" });
+        return;
+      }
+      sendJson(response, 200, { devices });
+      return;
+    }
+    const deviceRevokeMatch = /^\/api\/auth\/devices\/([^/]+)\/revoke$/.exec(url.pathname);
+    if (request.method === "POST" && deviceRevokeMatch) {
+      const sessionId = decodeURIComponent(deviceRevokeMatch[1]);
+      if (!this.auth.revokeDevice(request, sessionId)) {
+        sendJson(response, 404, { error: "device not found" });
+        return;
+      }
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/auth/pairing/claim") {
+      await this.claimPairing(request, response);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/auth/logout") {
+      this.auth.clearSession(request, response);
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/auth/revoke-all") {
+      if (!this.auth.isAuthorized(request)) {
+        sendJson(response, 401, { error: "pairing required" });
+        return;
+      }
+      this.auth.revokeAll();
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (
+      request.method === "GET"
+      && (url.pathname === "/"
+        || url.pathname === "/pair-admin"
+        || url.pathname === "/tmux"
+        || url.pathname === "/tmux/")
+    ) {
+      if (
+        !this.auth.isAuthorized(request)
+        && url.pathname !== "/"
+        && url.pathname !== "/pair-admin"
+      ) {
+        sendJson(response, 401, { error: "pairing required" });
+        return;
+      }
+      await this.serveIndex(request, response);
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/healthz") {
+      sendJson(response, 200, { ok: true, service: "tmux-verifier" });
+      return;
+    }
+    if (!this.auth.isAuthorized(request) && url.pathname.startsWith("/api/")) {
+      sendJson(response, 401, { error: "pairing required" });
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/tmux/session") {
@@ -109,10 +185,6 @@ export class TmuxVerifierWebServer {
         projects: projectCatalog.items,
         projectMapError: projectCatalog.error ?? null,
       });
-      return;
-    }
-    if (request.method === "GET" && url.pathname === "/healthz") {
-      sendJson(response, 200, { ok: true, service: "tmux-verifier" });
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/tmux/sessions") {
@@ -160,6 +232,32 @@ export class TmuxVerifierWebServer {
       return;
     }
     sendJson(response, 404, { error: "not found" });
+  }
+
+  private async claimPairing(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(request);
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request" });
+      return;
+    }
+    if (typeof body.code !== "string" || !body.code.trim()) {
+      sendJson(response, 400, { error: "pairing code is required" });
+      return;
+    }
+    try {
+      const token = this.auth.claimPairing(request, body.code);
+      this.auth.setSessionCookie(request, response, token);
+      sendJson(response, 200, { ok: true });
+    } catch (error) {
+      if (error instanceof PairingRateLimitError) {
+        response.setHeader("Retry-After", String(error.retryAfterSeconds));
+        sendJson(response, 429, { error: "too many pairing attempts" });
+        return;
+      }
+      sendJson(response, 403, { error: error instanceof Error ? error.message : "pairing failed" });
+    }
   }
 
   private async startSession(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -264,6 +362,10 @@ export class TmuxVerifierWebServer {
     socket: Duplex,
     head: Buffer,
   ): Promise<void> {
+    if (!this.auth.isAuthorized(request)) {
+      socket.destroy();
+      return;
+    }
     const url = new URL(request.url ?? "/", "http://localhost");
     const match = /^\/api\/tmux\/sessions\/([^/]+)\/terminal$/.exec(url.pathname);
     const token = url.searchParams.get("token") ?? "";
@@ -343,13 +445,14 @@ export class TmuxVerifierWebServer {
     return loadTmuxProjectCatalog(this.options.projectMapPath);
   }
 
-  private async serveIndex(response: ServerResponse): Promise<void> {
+  private async serveIndex(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const content = await readFile(resolve(this.webRoot, "index.html"), "utf8");
+      const actionToken = this.auth.isAuthorized(request) ? this.actionToken : "";
       sendHtml(
         response,
         content
-          .replace("__BRIDGE_ACTION_TOKEN__", this.actionToken)
+          .replace("__BRIDGE_ACTION_TOKEN__", actionToken)
           .replace('content="dashboard"', 'content="tmux-verifier"'),
       );
     } catch (error) {

@@ -1,5 +1,6 @@
 import { mkdirSync, existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { AampTaskAgentRuntime } from "./aamp-task-agent.js";
@@ -8,12 +9,17 @@ import { isDirectExecutionMode, loadConfig, parseExecutionMode } from "./config.
 import { buildCodexAppServerEnvironment, CodexAppServerClient } from "./codex-app-server.js";
 import { LocalCodexNotificationInbox } from "./codex-notification-inbox.js";
 import { StateDatabase } from "./db.js";
+import { TmuxDashboardApi } from "./tmux-dashboard-api.js";
+import { TmuxVerifier } from "./tmux-verifier.js";
+import { TmuxVerifierStore } from "./tmux-verifier-store.js";
+import { TmuxVerifierWebServer } from "./tmux-verifier-web.js";
 import { Dispatcher } from "./dispatcher.js";
 import { LarkCliClient } from "./lark.js";
 import { LocalCodexNotificationWatcher } from "./local-codex-notifications.js";
 import { Poller } from "./poller.js";
 import type { ExecutionMode, Logger } from "./types.js";
 import { DashboardServer } from "./web.js";
+import { WebPairingAuth } from "./web-auth.js";
 import { ChildWorkerRunner } from "./worker-runner.js";
 import { isSingleBinaryRuntime, resolveBridgeDataRoot, resolveBridgeProjectRoot } from "./portable-runtime.js";
 
@@ -26,15 +32,149 @@ export interface MainArguments {
   dbPath: string;
   once: boolean;
   executionMode?: ExecutionMode;
+  webOnly?: boolean;
+  webPort?: number;
   help?: boolean;
+}
+
+interface UnifiedTmuxBackend {
+  verifier: TmuxVerifier;
+  verifierWeb: TmuxVerifierWebServer;
+  dashboardApi: TmuxDashboardApi;
+  start(): void;
+  stop(): void;
+}
+
+function createUnifiedTmuxBackend(
+  config: ReturnType<typeof loadConfig>,
+  dbPath: string,
+  logger: Logger,
+  webPort = config.web.port,
+  auth?: WebPairingAuth,
+): UnifiedTmuxBackend {
+  const store = new TmuxVerifierStore(join(dirname(resolve(dbPath)), "tmux-verifier.db"));
+  const verifier = new TmuxVerifier({
+    store,
+    defaultCodexPath: resolveTmuxVerifierCodexPath(),
+    tmuxSocket: process.env.TMUX_VERIFY_SOCKET ?? "",
+    pollIntervalMs: 500,
+    adapterOptions: { tmuxPath: process.env.TMUX_VERIFY_TMUX_PATH || resolveTmuxPath() },
+  });
+  const verifierWeb = new TmuxVerifierWebServer({
+    verifier,
+    host: config.web.host,
+    port: webPort,
+    projectMapPath: process.env.TMUX_VERIFY_PROJECT_MAP
+      ?? resolve(homedir(), ".codex", "project-map.yaml"),
+    bridgeDashboardUrl: process.env.TMUX_VERIFY_BRIDGE_DASHBOARD_URL
+      ?? "http://127.0.0.1:" + webPort,
+    auth,
+    logger,
+  });
+  return {
+    verifier,
+    verifierWeb,
+    dashboardApi: new TmuxDashboardApi(),
+    start: () => verifier.start(),
+    stop: () => {
+      verifier.stop();
+      store.close();
+    },
+  };
+}
+
+async function runWebOnlyMode(
+  config: ReturnType<typeof loadConfig>,
+  args: MainArguments,
+  logger: Logger,
+): Promise<void> {
+  const db = new StateDatabase(args.dbPath);
+  const port = args.webPort ?? 17310;
+  const auth = new WebPairingAuth({ db });
+  const tmuxBackend = createUnifiedTmuxBackend(config, args.dbPath, logger, port, auth);
+  const dashboard = new DashboardServer({
+    db,
+    auth,
+    tmuxVerifier: tmuxBackend.verifierWeb,
+    tmuxDashboard: tmuxBackend.dashboardApi,
+    host: config.web.host,
+    port,
+    projects: Object.keys(config.projects),
+    modes: Object.keys(config.modes),
+    logger,
+  });
+  let resolveStopped: () => void = () => {};
+  const stopped = new Promise<void>((resolvePromise) => {
+    resolveStopped = resolvePromise;
+  });
+  let stopPromise: Promise<void> | undefined;
+  const stop = (): Promise<void> => {
+    if (!stopPromise) {
+      stopPromise = (async () => {
+        try {
+          await dashboard.stop();
+        } finally {
+          try {
+            tmuxBackend.stop();
+          } finally {
+            db.close();
+          }
+        }
+      })();
+    }
+    return stopPromise;
+  };
+  const onSignal = (): void => {
+    void stop().then(resolveStopped, (error: unknown) => {
+      logger.error("web-only development API shutdown failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      resolveStopped();
+    });
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+
+  try {
+    tmuxBackend.start();
+    const url = await dashboard.start();
+    logger.info("web-only development API started", {
+      url,
+      database: resolve(args.dbPath),
+      messagingRuntime: "disabled",
+    });
+    await stopped;
+  } finally {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    await stop();
+  }
+}
+
+function resolveTmuxVerifierCodexPath(): string {
+  const candidates = [
+    process.env.CODEX_PATH,
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+    "codex",
+  ].filter((candidate): candidate is string => Boolean(candidate));
+  return candidates.find((candidate) => !candidate.startsWith("/") || existsSync(candidate)) ?? "codex";
+}
+
+function resolveTmuxPath(): string {
+  const candidates = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "tmux"];
+  return candidates.find((candidate) => !candidate.startsWith("/") || existsSync(candidate)) ?? "tmux";
 }
 
 export function parseMainArguments(argv: string[], cwd = process.cwd()): MainArguments {
   const root = resolve(cwd);
   let configPath = join(root, "config.json");
   let dbPath = join(root, "runtime", "bridge.db");
+  let explicitDbPath = false;
   let once = false;
   let executionMode: ExecutionMode | undefined;
+  let webOnly = false;
+  let webPort: number | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -45,6 +185,17 @@ export function parseMainArguments(argv: string[], cwd = process.cwd()): MainArg
       continue;
     } else if (arg === "--once") {
       once = true;
+    } else if (arg === "--web-only") {
+      webOnly = true;
+    } else if (arg === "--web-port" || arg.startsWith("--web-port=")) {
+      const inlinePrefix = arg.startsWith("--web-port=") ? "--web-port=" : undefined;
+      const value = inlinePrefix ? arg.slice(inlinePrefix.length) : argv[index + 1];
+      const port = Number(value);
+      if (!value || value.startsWith("--") || !Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error(`${inlinePrefix ? "--web-port" : arg} requires a port from 1 to 65535`);
+      }
+      webPort = port;
+      if (!inlinePrefix) index += 1;
     } else if (
       arg === "--mode"
       || arg === "--execution-mode"
@@ -80,7 +231,10 @@ export function parseMainArguments(argv: string[], cwd = process.cwd()): MainArg
         throw new Error(`${inlinePrefix ? inlinePrefix.slice(0, -1) : arg} requires a path`);
       }
       if (arg === "--config" || inlinePrefix === "--config=") configPath = resolve(cwd, value);
-      if (arg === "--db" || inlinePrefix === "--db=") dbPath = resolve(cwd, value);
+      if (arg === "--db" || inlinePrefix === "--db=") {
+        dbPath = resolve(cwd, value);
+        explicitDbPath = true;
+      }
       if (!inlinePrefix) index += 1;
     } else if (arg === "--help" || arg === "-h") {
       return { configPath, dbPath, once: false, executionMode, help: true };
@@ -88,7 +242,15 @@ export function parseMainArguments(argv: string[], cwd = process.cwd()): MainArg
       throw new Error(`unknown argument: ${arg}`);
     }
   }
-  return { configPath, dbPath, once, executionMode };
+  if (webOnly && !explicitDbPath) dbPath = join(root, "runtime", "dev", "bridge.db");
+  return {
+    configPath,
+    dbPath,
+    once,
+    executionMode,
+    ...(webOnly ? { webOnly } : {}),
+    ...(webPort !== undefined ? { webPort } : {}),
+  };
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -99,6 +261,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
   const logger = createLogger();
   const config = loadConfig(args.configPath, { executionMode: args.executionMode });
+  if (args.webOnly) {
+    await runWebOnlyMode(config, args, logger);
+    return;
+  }
   const projectRoot = resolveBridgeProjectRoot(import.meta.url);
   mkdirSync(join(resolveBridgeDataRoot(import.meta.url), "runtime", "logs"), { recursive: true });
 
@@ -155,9 +321,18 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     intervalSeconds: config.pollIntervalSeconds,
     logger,
   });
+  const auth = config.web.enabled
+    ? new WebPairingAuth({ db })
+    : null;
+  const tmuxBackend = config.web.enabled
+    ? createUnifiedTmuxBackend(config, args.dbPath, logger, config.web.port, auth!)
+    : null;
   const dashboard = config.web.enabled
     ? new DashboardServer({
         db,
+        auth: auth!,
+        tmuxVerifier: tmuxBackend!.verifierWeb,
+        tmuxDashboard: tmuxBackend!.dashboardApi,
         host: config.web.host,
         port: config.web.port,
         projects: Object.keys(config.projects),
@@ -183,6 +358,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     poller.stop();
     await dispatcher.shutdown();
     await dashboard?.stop();
+    tmuxBackend?.stop();
     db.close();
   };
   const onSignal = (): void => {
@@ -222,6 +398,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   process.on("unhandledRejection", onUnhandledRejection);
 
   try {
+    tmuxBackend?.start();
     if (dashboard) {
       const dashboardUrl = await dashboard.start();
       logger.info("dashboard listening", { url: dashboardUrl });
@@ -373,9 +550,18 @@ async function runAampMode(
     && config.localNotifications.mode === "hook"
     ? new LocalCodexNotificationInbox({ logger })
     : null;
+  const auth = config.web.enabled
+    ? new WebPairingAuth({ db })
+    : null;
+  const tmuxBackend = config.web.enabled
+    ? createUnifiedTmuxBackend(config, dbPath, logger, config.web.port, auth!)
+    : null;
   const dashboard = config.web.enabled
     ? new DashboardServer({
         db,
+        auth: auth!,
+        tmuxVerifier: tmuxBackend!.verifierWeb,
+        tmuxDashboard: tmuxBackend!.dashboardApi,
         host: config.web.host,
         port: config.web.port,
         projects: Object.keys(config.projects),
@@ -414,6 +600,7 @@ async function runAampMode(
           error: error instanceof Error ? error.message : String(error),
         });
       });
+      tmuxBackend?.stop();
       db.close();
       resolveStopped?.();
     }
@@ -424,6 +611,7 @@ async function runAampMode(
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
   try {
+    tmuxBackend?.start();
     if (dashboard) {
       const dashboardUrl = await dashboard.start();
       logger.info("dashboard listening", { url: dashboardUrl, mode: "aamp" });
@@ -503,6 +691,8 @@ function printUsage(): void {
       "Usage: bun dist/main.js [--config path] [--db path] [--once] [--mode execution-mode]",
       "  --config  bridge config JSON (default: ./config.json)",
       "  --db      SQLite path (default: ./runtime/bridge.db)",
+      "  --web-only start only local Web APIs and dashboards (no Feishu/AAMP runtime)",
+      "  --web-port override the Web API port for this process",
       "  --once    start the selected runtime once and exit",
       "  --mode    override execution.mode for this process (alias: --execution-mode)",
       "  execution.mode: aamp-relay | feishu-sqlite-codex | feishu-sqlite-acp (alias) | legacy-polling",

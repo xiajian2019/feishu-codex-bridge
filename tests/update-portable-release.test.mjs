@@ -44,6 +44,8 @@ describe("portable package updater", () => {
   it("maps core, direct and Lite assets by architecture", () => {
     expect(updateAssetName("darwin", "arm64", "core")).toBe("feishu-codex-bridge-core-darwin-arm64.tar.gz");
     expect(updateAssetName("darwin", "arm64", "direct")).toBe("feishu-codex-bridge-direct-darwin-arm64.tar.gz");
+    expect(updateAssetName("darwin", "arm64", "direct", "0.3.0"))
+      .toBe("feishu-codex-bridge-direct-darwin-arm64-v0.3.0.tar.gz");
     expect(updateAssetName("darwin", "x64", "lite")).toBe("feishu-codex-bridge-darwin-x64.tar.gz");
     expect(updateAssetName("darwin", "x64", "auto")).toBe("feishu-codex-bridge-core-darwin-x64.tar.gz");
   });

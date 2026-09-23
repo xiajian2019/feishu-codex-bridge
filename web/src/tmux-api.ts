@@ -9,7 +9,6 @@ import type {
 interface TmuxSessionResponse {
   actionToken: string;
   tmuxSocket: string;
-  bridgeDashboardUrl: string;
   projects: TmuxProjectOption[];
   projectMapError: string | null;
 }
