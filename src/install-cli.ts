@@ -4,9 +4,10 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 
 import { runCodexCli } from "./codex-cli.js";
+import { isSingleBinaryRuntime, resolveBridgeProjectRoot } from "./portable-runtime.js";
 import {
   codexPathSourceLabel,
   isExecutableCodexPath,
@@ -18,7 +19,7 @@ import { resolveSharedFeishuCredentials } from "./feishu-credentials.js";
 import { installCodexNotifyHook } from "./codex-notify-hook.js";
 import type { ExecutionMode } from "./types.js";
 
-const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const PROJECT_ROOT = resolveBridgeProjectRoot(import.meta.url);
 const DEFAULT_EXECUTION_MODE: ExecutionMode = "feishu-sqlite-codex";
 
 export interface InstallCliArguments {
@@ -396,11 +397,17 @@ async function runDoctor(args: InstallCliArguments): Promise<void> {
 }
 
 async function ensureBuiltRuntime(): Promise<void> {
+  if (isSingleBinaryRuntime()) {
+    if (!existsSync(join(PROJECT_ROOT, "feishu-codex-bridge"))) {
+      throw new Error("单二进制 Bridge 不存在；请重新安装 Direct 包。");
+    }
+    return;
+  }
   const mainPath = join(PROJECT_ROOT, "dist", "main.js");
   const sourceEntry = join(PROJECT_ROOT, "src", "main.ts");
   if (existsSync(sourceEntry)) {
     console.log("正在构建 Bridge…");
-    await runCommand(process.env.PNPM_BIN || "pnpm", ["run", "build"]);
+    await runCommand(process.env.BUN_BIN || process.execPath, ["run", "build"]);
   }
   if (!existsSync(mainPath)) {
     throw new Error("构建后仍找不到 dist/main.js；请检查构建日志。发布包应当预先包含 dist/。");
@@ -451,7 +458,7 @@ function runCommand(file: string, args: string[]): Promise<void> {
   });
 }
 
-if (pathToFileURL(resolve(process.argv[1] ?? "")).href === import.meta.url) {
+if (!isSingleBinaryRuntime() && pathToFileURL(resolve(process.argv[1] ?? "")).href === import.meta.url) {
   runInstallCli().catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;

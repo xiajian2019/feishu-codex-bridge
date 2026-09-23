@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi } from 'bun:test';
 import { patchHelpCards } from '../scripts/aamp-runtime-patch.mjs';
 
 function fixture(existing = true, options = {}) {

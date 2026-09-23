@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 
 import { StateDatabase } from "../src/db.js";
 import type { RoutedTask } from "../src/types.js";

@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 
 import {
   buildAampEnvironment,
@@ -10,6 +10,8 @@ import {
   buildAampPersistenceEnvironment,
   buildAampWorktreeEnvironment,
   buildAampXattrShim,
+  buildBunNodeShim,
+  buildBunPackageManagerShim,
   buildLarkCliShim,
   buildOfficialCommandShim,
   buildServiceBootstrapShim,
@@ -73,7 +75,7 @@ describe("AAMP runtime environment", () => {
       configDir: "/tmp/lark-cli-aamp-one-click-v1",
       cardDedupStatePath: "/tmp/bridge/runtime/aamp/lark-card-dedup.json",
       compatScriptPath: "/tmp/bridge/scripts/aamp-lark-cli-compat.mjs",
-      nodePath: "/opt/homebrew/bin/node",
+      bunPath: "/opt/homebrew/bin/bun",
     });
     const serviceShim = buildServiceBootstrapShim({
       target: "/tmp/bridge/runtime/aamp/bin/aamp-task-agent-command",
@@ -91,20 +93,20 @@ describe("AAMP runtime environment", () => {
 
     expect(larkShim).toContain("export LARKSUITE_CLI_CONFIG_DIR='/tmp/lark-cli-aamp-one-click-v1'");
     expect(larkShim).toContain("export AAMP_REAL_LARK_CLI_BIN='/Users/xiajian/.aamp/npm-global/bin/lark-cli'");
-    expect(larkShim).toContain("exec '/opt/homebrew/bin/node' '/tmp/bridge/scripts/aamp-lark-cli-compat.mjs'");
+    expect(larkShim).toContain("exec '/opt/homebrew/bin/bun' '/tmp/bridge/scripts/aamp-lark-cli-compat.mjs'");
     const commandShim = buildOfficialCommandShim({
       target: "/tmp/bridge/node_modules/@larktask/aamp-feishu-task-agent/bootstrap/aamp-feishu-task-agent-bootstrap.sh",
       bootstrapPath: "/tmp/bridge/runtime/aamp/bin/feishu-task-agent-bootstrap",
     });
     expect(commandShim).toContain("export AAMP_TASK_COMMAND_PATH='/tmp/bridge/runtime/aamp/bin/feishu-task-agent-bootstrap'");
     expect(commandShim).toContain("exec /bin/bash -s -- \"$@\" < '/tmp/bridge/node_modules/@larktask/aamp-feishu-task-agent/bootstrap/aamp-feishu-task-agent-bootstrap.sh'");
-    const nodeCommandShim = buildOfficialCommandShim({
+    const bunCommandShim = buildOfficialCommandShim({
       target: "/tmp/bridge/node_modules/@larktask/aamp-feishu-task-agent/bin/aamp-feishu-task-agent.mjs",
       bootstrapPath: "/tmp/bridge/runtime/aamp/bin/feishu-task-agent-cli",
-      nodePath: "/opt/homebrew/bin/node",
+      bunPath: "/opt/homebrew/bin/bun",
     });
-    expect(nodeCommandShim).toContain("exec '/opt/homebrew/bin/node' '/tmp/bridge/node_modules/@larktask/aamp-feishu-task-agent/bin/aamp-feishu-task-agent.mjs' \"$@\"");
-    expect(nodeCommandShim).not.toContain("exec /bin/bash -s");
+    expect(bunCommandShim).toContain("exec '/opt/homebrew/bin/bun' '/tmp/bridge/node_modules/@larktask/aamp-feishu-task-agent/bin/aamp-feishu-task-agent.mjs' \"$@\"");
+    expect(bunCommandShim).not.toContain("exec /bin/bash -s");
     expect(serviceShim).toContain("export AAMP_LARK_CLI_BIN='/tmp/bridge/runtime/aamp/bin/lark-cli'");
     expect(serviceShim).toContain("AAMP_TASK_AGENT_VERSION=\"0.1.1-dev.7\"");
     expect(serviceShim).toContain("export AAMP_TASK_COMMAND_PATH='/tmp/bridge/runtime/aamp/bin/feishu-task-agent-bootstrap'");
@@ -114,6 +116,15 @@ describe("AAMP runtime environment", () => {
     expect(serviceShim).toContain("export AAMP_TASK_SKIP_MACOS_QUARANTINE='1'");
   });
 
+  it("creates Bun-backed node and npm compatibility shims", () => {
+    expect(buildBunNodeShim("/opt/homebrew/bin/bun")).toContain("exec '/opt/homebrew/bin/bun' \"$@\"");
+    expect(buildBunPackageManagerShim(
+      "/opt/homebrew/bin/bun",
+      "/tmp/bridge/scripts/aamp-bun-package-manager.mjs",
+      "npm",
+    )).toContain("exec '/opt/homebrew/bin/bun' '/tmp/bridge/scripts/aamp-bun-package-manager.mjs' npm \"$@\"");
+  });
+
   it("skips macOS quarantine through a scoped xattr shim", () => {
     const shim = buildAampXattrShim();
 
@@ -121,16 +132,20 @@ describe("AAMP runtime environment", () => {
     expect(shim).toContain("exec '/usr/bin/xattr' \"$@\"");
   });
 
-  it("keeps npm exec cache outside macOS temporary directories", () => {
+  it("keeps the Bun package-manager cache and prefix in the runtime environment", () => {
     const serviceShim = buildServiceBootstrapShim({
       target: "/tmp/bridge/runtime/aamp/bin/aamp-task-agent-command",
       larkCliShimPath: "/tmp/bridge/runtime/aamp/bin/lark-cli",
       configDir: "/tmp/lark",
       shimDir: "/tmp/bridge/runtime/aamp/bin",
-      environment: { NPM_CONFIG_CACHE: "/tmp/aamp-npm-cache" },
+      environment: {
+        NPM_CONFIG_CACHE: "/tmp/aamp-npm-cache",
+        NPM_GLOBAL_PREFIX: "/tmp/bridge/runtime/aamp/bun-global",
+      },
     });
 
     expect(serviceShim).toContain("export NPM_CONFIG_CACHE='/tmp/aamp-npm-cache'");
+    expect(serviceShim).toContain("export NPM_GLOBAL_PREFIX='/tmp/bridge/runtime/aamp/bun-global'");
   });
 
   it("passes worktree isolation settings into the launchd-owned ACP bridge", () => {

@@ -1,16 +1,30 @@
 #!/bin/sh
 set -eu
 
+if [ -z "${FEISHU_CODEX_BRIDGE_INSTALL_ROOT:-}" ]; then
+  case "$0" in
+    */current/feishu-codex-bridge)
+      FEISHU_CODEX_BRIDGE_INSTALL_ROOT=${0%/current/feishu-codex-bridge}
+      ;;
+  esac
+fi
 SELF_DIR=$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd -P)
 APP_DIR="$SELF_DIR/app"
 RUNTIME_DIR="$SELF_DIR/runtime"
+if [ -n "${FEISHU_CODEX_BRIDGE_INSTALL_ROOT:-}" ]; then
+  export FEISHU_CODEX_BRIDGE_INSTALL_ROOT
+  export FEISHU_CODEX_BRIDGE_ENTRYPOINT="$FEISHU_CODEX_BRIDGE_INSTALL_ROOT/current/app/feishu-codex-bridge"
+  SHARED_RUNTIME_DIR="$FEISHU_CODEX_BRIDGE_INSTALL_ROOT/runtime"
+else
+  SHARED_RUNTIME_DIR="$RUNTIME_DIR"
+fi
 
-NODE_VERSION_REQUIRED="22.13.1"
-NODE_VERSION_DOWNLOAD="22.13.1"
-NODE_BIN=""
-NODE_DOWNLOAD_DIR=""
+BUN_VERSION_REQUIRED="1.4.2"
+BUN_VERSION_DOWNLOAD="1.4.2"
+BUN_BIN=""
+BUN_DOWNLOAD_DIR=""
 
-host_node_arch() {
+host_bun_arch() {
   case "$(uname -m)" in
     arm64|aarch64) printf '%s\n' "arm64" ;;
     x86_64|amd64) printf '%s\n' "x64" ;;
@@ -20,9 +34,10 @@ host_node_arch() {
 
 version_at_least() {
   actual="$1"
-  awk -v actual="$actual" -v required="$NODE_VERSION_REQUIRED" '
+  awk -v actual="$actual" -v required="$BUN_VERSION_REQUIRED" '
     BEGIN {
-      split(actual, a, ".");
+      split(actual, full, /[-+]/);
+      split(full[1], a, ".");
       split(required, r, ".");
       for (i = 1; i <= 3; i += 1) {
         av = a[i] + 0;
@@ -35,145 +50,156 @@ version_at_least() {
   '
 }
 
-node_is_supported() {
+bun_is_supported() {
   candidate="$1"
   [ -x "$candidate" ] || return 1
-  candidate_version=$("$candidate" -p 'process.versions.node' 2>/dev/null) || return 1
+  candidate_version=$("$candidate" --version 2>/dev/null) || return 1
   version_at_least "$candidate_version" || return 1
-  "$candidate" -e 'require("node:sqlite")' >/dev/null 2>&1
+  "$candidate" -e 'const { Database } = require("bun:sqlite"); const db = new Database(":memory:"); db.exec("CREATE TABLE smoke (value TEXT)"); db.prepare("INSERT INTO smoke VALUES (?)").run("ok"); if (db.prepare("SELECT value FROM smoke").get().value !== "ok") process.exit(1); db.close();' >/dev/null 2>&1
 }
 
-download_node_runtime() {
+download_bun_runtime() {
   case "$(uname -s)" in
-    Darwin) node_platform="darwin" ;;
-    Linux) node_platform="linux" ;;
+    Darwin) bun_platform="darwin" ;;
     *)
-      echo "Portable Runtime Lite 暂不支持此系统：$(uname -s)" >&2
+      echo "Portable Runtime 当前只支持 macOS：$(uname -s)" >&2
       exit 1
       ;;
   esac
   case "$(uname -m)" in
-    arm64|aarch64) node_arch="arm64" ;;
-    x86_64|amd64) node_arch="x64" ;;
+    arm64|aarch64)
+      bun_arch="aarch64"
+      bun_runtime_arch="arm64"
+      bun_asset="bun-darwin-aarch64.zip"
+      bun_checksum="90987a3a16d7db556d886ac3d551e7b6d3edf0a1cf43acaed622e8676be1d12f"
+      ;;
+    x86_64|amd64)
+      bun_arch="x64-baseline"
+      bun_runtime_arch="x64"
+      bun_asset="bun-darwin-x64-baseline.zip"
+      bun_checksum="bad5bbd6cf14d0980d115f5954c9ff904df619d5e994d2da1ffccd3f316300b0"
+      ;;
     *)
-      echo "Portable Runtime Lite 暂不支持此 CPU 架构：$(uname -m)" >&2
+      echo "Portable Runtime 暂不支持此 CPU 架构：$(uname -m)" >&2
       exit 1
       ;;
   esac
 
-  node_prefix="node-v${NODE_VERSION_DOWNLOAD}-${node_platform}-${node_arch}"
-  node_install_dir="$RUNTIME_DIR/$node_prefix"
-  node_install_path="$node_install_dir/bin/node"
-  if node_is_supported "$node_install_path"; then
-    printf '%s\n' "$node_install_path"
+  bun_install_dir="$SHARED_RUNTIME_DIR/bun-v${BUN_VERSION_DOWNLOAD}-darwin-${bun_runtime_arch}"
+  bun_install_path="$bun_install_dir/bun"
+  if bun_is_supported "$bun_install_path"; then
+    printf '%s\n' "$bun_install_path"
     return 0
   fi
 
   command -v curl >/dev/null 2>&1 || {
-    echo "找不到 curl，无法下载 Node.js ${NODE_VERSION_DOWNLOAD}" >&2
+    echo "找不到 curl，无法下载 Bun ${BUN_VERSION_DOWNLOAD}" >&2
     exit 1
   }
-  command -v tar >/dev/null 2>&1 || {
-    echo "找不到 tar，无法解压 Node.js ${NODE_VERSION_DOWNLOAD}" >&2
+  command -v unzip >/dev/null 2>&1 || {
+    echo "找不到 unzip，无法解压 Bun ${BUN_VERSION_DOWNLOAD}" >&2
     exit 1
   }
   command -v shasum >/dev/null 2>&1 || {
-    echo "找不到 shasum，无法校验 Node.js 下载包" >&2
-    exit 1
-  }
-  command -v awk >/dev/null 2>&1 || {
-    echo "找不到 awk，无法读取 Node.js 校验和" >&2
+    echo "找不到 shasum，无法校验 Bun 下载包" >&2
     exit 1
   }
 
-  mkdir -p "$RUNTIME_DIR"
-  NODE_DOWNLOAD_DIR=$(mktemp -d "$RUNTIME_DIR/.node-download.XXXXXX")
-  cleanup_node_download() {
-    if [ -n "$NODE_DOWNLOAD_DIR" ] && [ -d "$NODE_DOWNLOAD_DIR" ]; then
-      rm -rf "$NODE_DOWNLOAD_DIR"
+  mkdir -p "$SHARED_RUNTIME_DIR"
+  BUN_DOWNLOAD_DIR=$(mktemp -d "$SHARED_RUNTIME_DIR/.bun-download.XXXXXX")
+  cleanup_bun_download() {
+    if [ -n "$BUN_DOWNLOAD_DIR" ] && [ -d "$BUN_DOWNLOAD_DIR" ]; then
+      rm -rf "$BUN_DOWNLOAD_DIR"
     fi
   }
-  trap cleanup_node_download EXIT INT TERM
+  trap cleanup_bun_download EXIT INT TERM
 
-  node_archive="$node_prefix.tar.gz"
-  node_base_url="https://nodejs.org/dist/v${NODE_VERSION_DOWNLOAD}"
-  node_archive_path="$NODE_DOWNLOAD_DIR/$node_archive"
-  node_checksums_path="$NODE_DOWNLOAD_DIR/SHASUMS256.txt"
-  echo "未找到可用 Node.js，正在下载 ${NODE_VERSION_DOWNLOAD}（${node_platform}-${node_arch}）…" >&2
-  curl --proto '=https' --tlsv1.2 -fsSL "$node_base_url/$node_archive" -o "$node_archive_path"
-  curl --proto '=https' --tlsv1.2 -fsSL "$node_base_url/SHASUMS256.txt" -o "$node_checksums_path"
-  expected_checksum=$(awk -v name="$node_archive" '$2 == name { print $1; exit }' "$node_checksums_path")
-  actual_checksum=$(shasum -a 256 "$node_archive_path" | awk '{ print $1 }')
-  if [ -z "$expected_checksum" ] || [ "$expected_checksum" != "$actual_checksum" ]; then
-    echo "Node.js 下载校验失败：$node_archive" >&2
+  bun_archive_path="$BUN_DOWNLOAD_DIR/$bun_asset"
+  bun_url="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION_DOWNLOAD}/$bun_asset"
+  echo "未找到可用 Bun，正在下载 ${BUN_VERSION_DOWNLOAD}（darwin-${bun_arch}）…" >&2
+  curl --proto '=https' --tlsv1.2 -fsSL "$bun_url" -o "$bun_archive_path"
+  actual_checksum=$(shasum -a 256 "$bun_archive_path" | awk '{ print $1 }')
+  if [ "$bun_checksum" != "$actual_checksum" ]; then
+    echo "Bun 下载校验失败：$bun_asset" >&2
     exit 1
   fi
-  tar -xzf "$node_archive_path" -C "$NODE_DOWNLOAD_DIR"
-  if [ -e "$node_install_dir" ]; then
-    rm -rf "$node_install_dir"
+  unzip -q "$bun_archive_path" -d "$BUN_DOWNLOAD_DIR/unpacked"
+  bun_source=$(find "$BUN_DOWNLOAD_DIR/unpacked" -type f -name bun -perm -u+x | head -n 1)
+  if [ -z "$bun_source" ]; then
+    echo "Bun 下载包中未找到可执行文件：$bun_asset" >&2
+    exit 1
   fi
-  mv "$NODE_DOWNLOAD_DIR/$node_prefix" "$node_install_dir"
-  # The bridge only needs node/npm/npx at runtime. Drop headers, docs and
-  # Corepack from the downloaded distribution so the local cache stays small;
-  # npm itself remains available for the AAMP bootstrap.
-  rm -rf "$node_install_dir/include" "$node_install_dir/share" "$node_install_dir/lib/node_modules/corepack"
-  if [ -e "$node_install_dir/bin/corepack" ] || [ -L "$node_install_dir/bin/corepack" ]; then
-    rm -f "$node_install_dir/bin/corepack"
+  mkdir -p "$bun_install_dir"
+  rm -f "$bun_install_path"
+  mv "$bun_source" "$bun_install_path"
+  chmod 755 "$bun_install_path"
+  if ! bun_is_supported "$bun_install_path"; then
+    echo "下载的 Bun 运行时无法启动或版本不匹配：$bun_install_path" >&2
+    exit 1
   fi
-  chmod 755 "$node_install_path"
   trap - EXIT INT TERM
-  cleanup_node_download
-  printf '%s\n' "$node_install_path"
+  cleanup_bun_download
+  printf '%s\n' "$bun_install_path"
 }
 
-resolve_node() {
-  universal_archive="$RUNTIME_DIR/node-universal.tar.gz"
-  universal_arch="$(host_node_arch 2>/dev/null || true)"
-  universal_node="$RUNTIME_DIR/node-universal/$universal_arch/bin/node"
-  if [ -n "$universal_arch" ] && [ -f "$universal_archive" ]; then
-    if ! node_is_supported "$universal_node"; then
-      command -v tar >/dev/null 2>&1 || {
-        echo "找不到 tar，无法解压内置 Node.js 运行时" >&2
-        exit 1
-      }
-      echo "正在解压内置 Node.js ${universal_arch} 运行时…" >&2
-      tar -xzf "$universal_archive" -C "$RUNTIME_DIR"
-    fi
-    if node_is_supported "$universal_node"; then
-      printf '%s\n' "$universal_node"
-      return 0
-    fi
-  fi
-
-  bundled_node="$RUNTIME_DIR/bin/node"
-  if [ -f "$RUNTIME_DIR/.bundled-node" ] && node_is_supported "$bundled_node"; then
-    printf '%s\n' "$bundled_node"
+resolve_bun() {
+  bundled_bun="$RUNTIME_DIR/bin/bun"
+  if [ -f "$RUNTIME_DIR/.bundled-bun" ] && bun_is_supported "$bundled_bun"; then
+    printf '%s\n' "$bundled_bun"
     return 0
   fi
-  system_node=$(command -v node 2>/dev/null || true)
-  if [ -n "$system_node" ] && node_is_supported "$system_node"; then
-    printf '%s\n' "$system_node"
+  if bun_is_supported "$bundled_bun"; then
+    printf '%s\n' "$bundled_bun"
     return 0
   fi
-  if node_is_supported "$bundled_node"; then
-    printf '%s\n' "$bundled_node"
+  shared_bun="$SHARED_RUNTIME_DIR/bin/bun"
+  if bun_is_supported "$shared_bun"; then
+    printf '%s\n' "$shared_bun"
     return 0
   fi
-  download_node_runtime
+  system_bun=$(command -v bun 2>/dev/null || true)
+  if [ -n "$system_bun" ] && bun_is_supported "$system_bun"; then
+    printf '%s\n' "$system_bun"
+    return 0
+  fi
+  download_bun_runtime
 }
 
-NODE_BIN=$(resolve_node)
-NODE_BIN_DIR=$(CDPATH= cd -P -- "$(dirname -- "$NODE_BIN")" && pwd -P)
-
-# AAMP's bootstrap and the generated LaunchAgent need node/npm to be
-# discoverable even when the caller has no Node installation on PATH.
-export PATH="$NODE_BIN_DIR:$RUNTIME_DIR/bin:$APP_DIR/node_modules/.bin:${PATH:-}"
-export FEISHU_CODEX_BRIDGE_PORTABLE_ROOT="$SELF_DIR"
+SINGLE_BINARY=0
+runtime_packaging=$(awk -F'"' '/"runtimePackaging"[[:space:]]*:/ { print $4; exit }' "$SELF_DIR/release-manifest.json" 2>/dev/null || true)
+if [ "$runtime_packaging" = "single-binary" ] && [ -x "$APP_DIR/feishu-codex-bridge" ]; then
+  SINGLE_BINARY=1
+  export FEISHU_CODEX_BRIDGE_SINGLE_BINARY=1
+  export FEISHU_CODEX_BRIDGE_APP_ROOT="$APP_DIR"
+  export FEISHU_CODEX_BRIDGE_PORTABLE_ROOT="$SELF_DIR"
+  export PATH="$APP_DIR/node_modules/@larksuite/cli/bin:$APP_DIR/node_modules/.bin:${PATH:-}"
+else
+  BUN_BIN=$(resolve_bun)
+  BUN_BIN_DIR=$(CDPATH= cd -P -- "$(dirname -- "$BUN_BIN")" && pwd -P)
+  export PATH="$BUN_BIN_DIR:$RUNTIME_DIR/bin:$APP_DIR/node_modules/.bin:${PATH:-}"
+  export FEISHU_CODEX_BRIDGE_PORTABLE_ROOT="$SELF_DIR"
+fi
 
 run_entry() {
   entry="$1"
   shift
-  exec "$NODE_BIN" "$APP_DIR/dist/$entry.js" "$@"
+  if [ "$SINGLE_BINARY" -eq 1 ]; then
+    case "$entry" in
+      main) internal_command="--bridge-main" ;;
+      codex-cli) internal_command="--bridge-codex" ;;
+      install-cli) internal_command="--bridge-install" ;;
+      aamp-cli)
+        echo "Direct 单二进制包不提供 AAMP 管理命令。" >&2
+        exit 2
+        ;;
+      *)
+        echo "未知单二进制入口：$entry" >&2
+        exit 2
+        ;;
+    esac
+    exec "$APP_DIR/feishu-codex-bridge" "$internal_command" "$@"
+  fi
+  exec "$BUN_BIN" "$APP_DIR/dist/$entry.js" "$@"
 }
 
 usage() {
@@ -202,9 +228,8 @@ case "$1" in
     exit 0
     ;;
   -v|--version)
-    exec "$NODE_BIN" --input-type=module -e \
-      'import { readFileSync } from "node:fs"; const manifest = JSON.parse(readFileSync(process.argv[1], "utf8")); console.log(manifest.version || "0.0.0");' \
-      "$APP_DIR/package.json"
+    if [ "$SINGLE_BINARY" -eq 1 ]; then exec "$APP_DIR/feishu-codex-bridge" --bridge-version; fi
+    exec "$BUN_BIN" -e 'import { readFileSync } from "node:fs"; const manifest = JSON.parse(readFileSync(process.argv[1], "utf8")); console.log(manifest.version || "0.0.0");' "$APP_DIR/package.json"
     ;;
   list|scripts)
     printf '%s\n' \
@@ -229,7 +254,7 @@ case "$1" in
   install|init|doctor)
     command="$1"
     shift
-    NODE_NO_WARNINGS=1 run_entry install-cli "$command" "$@"
+    run_entry install-cli "$command" "$@"
     ;;
   start|start:all)
     shift
@@ -237,10 +262,9 @@ case "$1" in
     ;;
   update)
     shift
-    # The updater downloads, validates and stages the package before stopping
-    # the current LaunchAgent. It also restarts the service after a successful
-    # swap and restores the old package if the new service cannot start.
-    exec "$NODE_BIN" "$APP_DIR/scripts/update-portable-release.mjs" --root "$SELF_DIR" "$@"
+    update_root=${FEISHU_CODEX_BRIDGE_INSTALL_ROOT:-$SELF_DIR}
+    if [ "$SINGLE_BINARY" -eq 1 ]; then exec "$APP_DIR/feishu-codex-bridge" --bridge-update --root "$update_root" "$@"; fi
+    exec "$BUN_BIN" "$APP_DIR/scripts/update-portable-release.mjs" --root "$update_root" "$@"
     ;;
   bridge:install)
     shift

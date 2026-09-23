@@ -90,7 +90,9 @@ export function codexPathCandidates(
 
 export function isExecutableCodexPath(path: string): boolean {
   try {
-    return statSync(path).isFile() && accessSync(path, fsConstants.X_OK) === undefined;
+    if (!statSync(path).isFile()) return false;
+    accessSync(path, fsConstants.X_OK);
+    return true;
   } catch {
     return false;
   }

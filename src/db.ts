@@ -4,6 +4,7 @@ import { mkdirSync } from "node:fs";
 
 import { DatabaseSync as DatabaseSyncConstructor, type SqliteDatabase } from "./sqlite.js";
 import { DIRECT_FOLLOWUP_STATUSES, DIRECT_TASK_STATUSES } from "./types.js";
+import type { WebAuthPairingRecord, WebAuthSessionRecord } from "./web-auth.js";
 import type {
   DatabaseChange,
   DirectMessageInput,
@@ -243,6 +244,27 @@ CREATE TABLE IF NOT EXISTS bridge_runtime_leases (
     lease_expires_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS web_auth_pairings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    code_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS web_auth_sessions (
+    session_id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    device_name TEXT NOT NULL,
+    user_agent TEXT,
+    remote_address TEXT,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_auth_sessions_active
+  ON web_auth_sessions(revoked_at, expires_at);
 `;
 
 export interface ClaimRunArgs {
@@ -2525,6 +2547,88 @@ export class StateDatabase {
     return attempts;
   }
 
+  public getWebAuthPairing(): WebAuthPairingRecord | null {
+    const row = this.db
+      .prepare("SELECT code_hash, expires_at FROM web_auth_pairings WHERE id = 1")
+      .get() as { code_hash: string; expires_at: string } | undefined;
+    if (!row) return null;
+    const expiresAt = Date.parse(row.expires_at);
+    return Number.isFinite(expiresAt)
+      ? { codeHash: row.code_hash, expiresAt }
+      : null;
+  }
+
+  public saveWebAuthPairing(record: WebAuthPairingRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO web_auth_pairings (id, code_hash, expires_at)
+         VALUES (1, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET code_hash = excluded.code_hash, expires_at = excluded.expires_at`,
+      )
+      .run(record.codeHash, new Date(record.expiresAt).toISOString());
+  }
+
+  public clearWebAuthPairing(): void {
+    this.db.prepare("DELETE FROM web_auth_pairings WHERE id = 1").run();
+  }
+
+  public createWebAuthSession(record: WebAuthSessionRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO web_auth_sessions
+          (session_id, token_hash, device_name, user_agent, remote_address,
+           created_at, last_seen_at, expires_at, revoked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.sessionId,
+        record.tokenHash,
+        record.deviceName,
+        record.userAgent,
+        record.remoteAddress,
+        record.createdAt,
+        record.lastSeenAt,
+        record.expiresAt,
+        record.revokedAt,
+      );
+  }
+
+  public getWebAuthSession(tokenHash: string): WebAuthSessionRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM web_auth_sessions WHERE token_hash = ?")
+      .get(tokenHash) as Record<string, unknown> | undefined;
+    return row ? mapWebAuthSession(row) : null;
+  }
+
+  public touchWebAuthSession(sessionId: string, lastSeenAt: string): void {
+    this.db
+      .prepare(
+        "UPDATE web_auth_sessions SET last_seen_at = ? WHERE session_id = ? AND revoked_at IS NULL",
+      )
+      .run(lastSeenAt, sessionId);
+  }
+
+  public listWebAuthSessions(): WebAuthSessionRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM web_auth_sessions ORDER BY created_at DESC")
+      .all() as Record<string, unknown>[];
+    return rows.map(mapWebAuthSession);
+  }
+
+  public revokeWebAuthSession(sessionId: string, revokedAt: string): void {
+    this.db
+      .prepare(
+        "UPDATE web_auth_sessions SET revoked_at = ? WHERE session_id = ? AND revoked_at IS NULL",
+      )
+      .run(revokedAt, sessionId);
+  }
+
+  public revokeAllWebAuthSessions(revokedAt: string): void {
+    this.db
+      .prepare("UPDATE web_auth_sessions SET revoked_at = ? WHERE revoked_at IS NULL")
+      .run(revokedAt);
+  }
+
   public close(): void {
     try {
       this.db.close();
@@ -2985,6 +3089,20 @@ function mapOutbox(row: Record<string, unknown>): OutboxEntry {
     attempts: Number(row.attempts),
     next_attempt_at: nullableString(row.next_attempt_at),
     completed_at: nullableString(row.completed_at),
+  };
+}
+
+function mapWebAuthSession(row: Record<string, unknown>): WebAuthSessionRecord {
+  return {
+    sessionId: String(row.session_id),
+    tokenHash: String(row.token_hash),
+    deviceName: String(row.device_name),
+    userAgent: nullableString(row.user_agent),
+    remoteAddress: nullableString(row.remote_address),
+    createdAt: String(row.created_at),
+    lastSeenAt: String(row.last_seen_at),
+    expiresAt: String(row.expires_at),
+    revokedAt: nullableString(row.revoked_at),
   };
 }
 

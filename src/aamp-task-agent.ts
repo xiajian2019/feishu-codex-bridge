@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import {
@@ -13,6 +14,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   findExecutableInPath,
@@ -110,7 +112,7 @@ export class AampTaskAgentRuntime {
     this.commandPath = join(this.shimDir, "aamp-task-agent-command");
     // The official bootstrap rewrites AAMP_TASK_COMMAND_PATH during updates.
     // Keep that mutable command separate from the project-owned service wrapper
-    // so NODE_OPTIONS and the runtime patches survive package upgrades.
+    // so BUN_OPTIONS and the runtime patches survive package upgrades.
     this.taskCommandPath = join(this.shimDir, "feishu-task-agent-cli");
     const aampBinDir = resolve(
       this.inheritedEnv.AAMP_BIN_DIR?.trim() || join(homedir(), ".aamp", "bin"),
@@ -342,6 +344,22 @@ export class AampTaskAgentRuntime {
   private prepareEnvironment(): Record<string, string> {
     mkdirSync(this.shimDir, { recursive: true, mode: 0o700 });
 
+    const bunPackageManagerPrefix = join(this.projectRoot, "runtime", "aamp", "bun-global");
+    const bunPackageManagerBin = join(bunPackageManagerPrefix, "bin");
+    mkdirSync(bunPackageManagerBin, { recursive: true, mode: 0o700 });
+    const packageManagerScriptPath = join(this.projectRoot, "scripts", "aamp-bun-package-manager.mjs");
+    for (const directory of [this.shimDir, bunPackageManagerBin]) {
+      writeExecutable(join(directory, "node"), buildBunNodeShim(process.execPath));
+      writeExecutable(
+        join(directory, "npm"),
+        buildBunPackageManagerShim(process.execPath, packageManagerScriptPath, "npm"),
+      );
+      writeExecutable(
+        join(directory, "npx"),
+        buildBunPackageManagerShim(process.execPath, packageManagerScriptPath, "npx"),
+      );
+    }
+
     const larkCliPath = resolveAampLarkCliPath(this.config, this.inheritedEnv);
     const configDir = resolveLarkConfigDir(this.config, this.inheritedEnv, true);
     const larkCliShimPath = join(this.shimDir, "lark-cli");
@@ -377,7 +395,7 @@ export class AampTaskAgentRuntime {
           configDir,
           cardDedupStatePath,
           compatScriptPath: join(this.projectRoot, "scripts", "aamp-lark-cli-compat.mjs"),
-          nodePath: process.execPath,
+          bunPath: process.execPath,
         }),
       );
       writeExecutable(
@@ -387,7 +405,7 @@ export class AampTaskAgentRuntime {
           taskCommandPath: this.taskCommandPath,
           taskAgentName: taskAgentMetadata.name,
           taskAgentVersion: taskAgentMetadata.version,
-          runtimeRegisterPath: join(this.projectRoot, "scripts", "aamp-runtime-register.mjs"),
+          runtimeRegisterPath: resolveBunAampPreloadPath(join(this.projectRoot, "scripts", "aamp-runtime-register.mjs")),
           larkCliShimPath,
           configDir,
           shimDir: this.shimDir,
@@ -397,6 +415,7 @@ export class AampTaskAgentRuntime {
             AAMP_COMMAND_CONFIG_PATH: this.configPath,
             ...(this.inheritedEnv.CODEX_HOME ? { CODEX_HOME: this.inheritedEnv.CODEX_HOME } : {}),
             NPM_CONFIG_CACHE: resolveAampNpmCacheDir(this.inheritedEnv),
+            NPM_GLOBAL_PREFIX: bunPackageManagerPrefix,
             ...buildAampPersistenceEnvironment(this.config, this.sqlitePath, this.attachmentsDir),
             ...buildAampWorktreeEnvironment(
               this.config,
@@ -410,8 +429,8 @@ export class AampTaskAgentRuntime {
         buildOfficialCommandShim({
           target: this.officialCommandPath,
           bootstrapPath: this.taskCommandPath,
-          runtimeRegisterPath: join(this.projectRoot, "scripts", "aamp-runtime-register.mjs"),
-          nodePath: process.execPath,
+          runtimeRegisterPath: resolveBunAampPreloadPath(join(this.projectRoot, "scripts", "aamp-runtime-register.mjs")),
+          bunPath: process.execPath,
         }),
       );
       try {
@@ -433,6 +452,7 @@ export class AampTaskAgentRuntime {
       this.shimDir,
       larkCliPath ? serviceBootstrapShimPath : undefined,
     );
+    env.NPM_GLOBAL_PREFIX = bunPackageManagerPrefix;
     if (larkCliPath) {
       // The official bootstrap persists this value into the Feishu runtime
       // profile and passes it verbatim to the Agent prompt. It must therefore
@@ -719,14 +739,14 @@ export function buildLarkCliShim(options: {
   configDir: string;
   cardDedupStatePath: string;
   compatScriptPath: string;
-  nodePath: string;
+  bunPath: string;
 }): string {
   const lines = ["#!/bin/sh", "set -eu"];
   lines.push(`export LARKSUITE_CLI_CONFIG_DIR=${shellQuote(options.configDir)}`);
   lines.push(`export AAMP_REAL_LARK_CLI_BIN=${shellQuote(options.target)}`);
   lines.push(`export AAMP_LARK_CARD_DEDUP_STATE=${shellQuote(options.cardDedupStatePath)}`);
   lines.push(
-    `exec ${shellQuote(options.nodePath)} ${shellQuote(options.compatScriptPath)} "$@"`,
+    `exec ${shellQuote(options.bunPath)} ${shellQuote(options.compatScriptPath)} "$@"`,
     "",
   );
   return lines.join("\n");
@@ -736,15 +756,15 @@ export function buildOfficialCommandShim(options: {
   target: string;
   bootstrapPath: string;
   runtimeRegisterPath?: string;
-  nodePath?: string;
+  bunPath?: string;
 }): string {
   const lines = ["#!/bin/sh", "set -eu"];
   if (options.runtimeRegisterPath) {
-    lines.push(nodeOptionsAssignment(options.runtimeRegisterPath));
+    lines.push(bunOptionsAssignment(options.runtimeRegisterPath));
   }
   lines.push(`export AAMP_TASK_COMMAND_PATH=${shellQuote(options.bootstrapPath)}`);
   if (isNodeTaskAgentEntry(options.target)) {
-    lines.push(`exec ${shellQuote(options.nodePath || process.execPath)} ${shellQuote(options.target)} "$@"`, "");
+    lines.push(`exec ${shellQuote(options.bunPath || process.execPath)} ${shellQuote(options.target)} "$@"`, "");
   } else {
     lines.push(`exec /bin/bash -s -- "$@" < ${shellQuote(options.target)}`, "");
   }
@@ -772,7 +792,7 @@ export function buildServiceBootstrapShim(options: {
     lines.push(`export AAMP_TASK_COMMAND_PATH=${shellQuote(options.taskCommandPath)}`);
   }
   if (options.runtimeRegisterPath) {
-    lines.push(nodeOptionsAssignment(options.runtimeRegisterPath));
+    lines.push(bunOptionsAssignment(options.runtimeRegisterPath));
   }
   lines.push(`export AAMP_LARK_CLI_BIN=${shellQuote(options.larkCliShimPath)}`);
   lines.push(`export AAMP_LARK_CLI_CONFIG_DIR=${shellQuote(options.configDir)}`);
@@ -904,7 +924,7 @@ function resolveTaskAgentCommand(projectRoot: string): string {
   const localBin = join(projectRoot, "node_modules", ".bin", "feishu-task-agent");
   if (existsSync(localBin)) return localBin;
   throw new Error(
-    `${PACKAGE_NAME} is not installed. Run pnpm install before using the AAMP runtime.`,
+    `${PACKAGE_NAME} is not installed. Run bun install before using the AAMP runtime.`,
   );
 }
 
@@ -1192,6 +1212,27 @@ function buildExecutableShim(options: {
  * service PATH points at this shim first; it is a no-op only when the adapter
  * explicitly enables the skip flag, otherwise it preserves the system call.
  */
+export function buildBunNodeShim(bunPath: string): string {
+  return [
+    "#!/bin/sh",
+    "set -eu",
+    `exec ${shellQuote(bunPath)} "$@"`,
+    "",
+  ].join("\n");
+}
+
+export function buildBunPackageManagerShim(
+  bunPath: string,
+  scriptPath: string,
+  command: "npm" | "npx",
+): string {
+  return [
+    "#!/bin/sh",
+    "set -eu",
+    `exec ${shellQuote(bunPath)} ${shellQuote(scriptPath)} ${command} "$@"`,
+    "",
+  ].join("\n");
+}
 export function buildAampXattrShim(): string {
   return [
     "#!/bin/sh",
@@ -1219,8 +1260,24 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-function nodeOptionsAssignment(runtimeRegisterPath: string): string {
-  return `export NODE_OPTIONS=${shellQuote(`--import=${JSON.stringify(runtimeRegisterPath)} `)}"\${NODE_OPTIONS:-}"`;
+function resolveBunAampPreloadPath(runtimeRegisterPath: string): string {
+  const uid = process.getuid?.() ?? "user";
+  const projectHash = createHash("sha256").update(resolve(runtimeRegisterPath)).digest("hex").slice(0, 12);
+  const preloadDirectory = join("/private/tmp", `feishu-codex-bridge-aamp-${uid}-${projectHash}`);
+  mkdirSync(preloadDirectory, { recursive: true, mode: 0o700 });
+  chmodSync(preloadDirectory, 0o700);
+  const preloadPath = join(preloadDirectory, "runtime-register.mjs");
+  writeFileSync(
+    preloadPath,
+    `import ${JSON.stringify(pathToFileURL(runtimeRegisterPath).href)};\n`,
+    { mode: 0o600 },
+  );
+  chmodSync(preloadPath, 0o600);
+  return preloadPath;
+}
+
+function bunOptionsAssignment(runtimeRegisterPath: string): string {
+  return `export BUN_OPTIONS=${shellQuote(`--preload=${runtimeRegisterPath} `)}"\${BUN_OPTIONS:-}"`;
 }
 
 function doubleQuoteValue(value: string): string {
@@ -1241,7 +1298,8 @@ function isSupportedAampServiceEnvironmentKey(key: string): boolean {
     || key === "AAMP_TASK_HTTPS_PROXY"
     || key === "AAMP_TASK_SKIP_MACOS_QUARANTINE"
     || key === "NPM_CONFIG_CACHE"
-    || key === "npm_config_cache";
+    || key === "npm_config_cache"
+    || key === "NPM_GLOBAL_PREFIX";
 }
 
 function spawnInherited(

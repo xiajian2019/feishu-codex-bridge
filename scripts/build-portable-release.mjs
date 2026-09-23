@@ -7,24 +7,22 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const MIN_NODE_VERSION = [22, 13, 1];
+const MIN_BUN_VERSION = [1, 4, 2];
 const DEFAULT_OUTPUT_DIR = join(PROJECT_ROOT, "release");
 const LAUNCHER_SOURCE = join(PROJECT_ROOT, "scripts", "portable-launcher.sh");
 const INSTALL_COMMAND_SOURCE = join(PROJECT_ROOT, "install.command");
 const INSTALL_DEFAULTS_SOURCE = join(PROJECT_ROOT, "install.defaults");
-const LOCAL_NODE_UNIVERSAL_ARCHIVE = join(PROJECT_ROOT, "runtime", "node", "node-universal.tar.gz");
 const RELEASE_MODES = ["core", "lite", "direct"];
 const DEFAULT_RELEASE_MODE = "direct";
 
 export function parsePortableReleaseArguments(argv, cwd = process.cwd()) {
   const args = {
     outputDir: DEFAULT_OUTPUT_DIR,
-    nodePath: process.execPath,
-    pnpmPath: process.env.PNPM_BIN || "pnpm",
+    bunPath: process.execPath,
     mode: DEFAULT_RELEASE_MODE,
     skipBuild: false,
     keepSourceMaps: false,
-    bundleNode: false,
+    bundleBun: false,
     json: false,
     help: false,
   };
@@ -44,8 +42,8 @@ export function parsePortableReleaseArguments(argv, cwd = process.cwd()) {
       args.keepSourceMaps = true;
       continue;
     }
-    if (arg === "--bundle-node") {
-      args.bundleNode = true;
+    if (arg === "--bundle-bun") {
+      args.bundleBun = true;
       continue;
     }
     if (arg === "--direct") {
@@ -56,12 +54,11 @@ export function parsePortableReleaseArguments(argv, cwd = process.cwd()) {
       args.json = true;
       continue;
     }
-    const option = readOption(argv, index, arg, ["--output", "--node", "--pnpm", "--mode"]);
+    const option = readOption(argv, index, arg, ["--output", "--bun", "--mode"]);
     if (!option) throw new Error(`未知参数：${arg}`);
     const [name, value, consumed] = option;
     if (name === "--output") args.outputDir = resolve(cwd, value);
-    if (name === "--node") args.nodePath = resolve(cwd, value);
-    if (name === "--pnpm") args.pnpmPath = resolve(cwd, value);
+    if (name === "--bun") args.bunPath = resolve(cwd, value);
     if (name === "--mode") {
       if (!RELEASE_MODES.includes(value)) throw new Error(`未知 portable 发布模式：${value}`);
       args.mode = value;
@@ -84,7 +81,12 @@ function readOption(argv, index, arg, names) {
   return [name, value, 1];
 }
 
-export function targetName(platform = process.platform, arch = process.arch, mode = DEFAULT_RELEASE_MODE) {
+export function targetName(
+  platform = process.platform,
+  arch = process.arch,
+  mode = DEFAULT_RELEASE_MODE,
+  version,
+) {
   const platformName = platform === "darwin" ? "darwin" : undefined;
   const archName = {
     arm64: "arm64",
@@ -94,45 +96,51 @@ export function targetName(platform = process.platform, arch = process.arch, mod
     throw new Error(`Portable Runtime 当前只支持 macOS arm64/x64：${platform}/${arch}`);
   }
   if (!RELEASE_MODES.includes(mode)) throw new Error(`未知 portable 发布模式：${mode}`);
-  if (mode === "direct") return `feishu-codex-bridge-direct-${platformName}-${archName}`;
-  if (mode === "core") return `feishu-codex-bridge-core-${platformName}-${archName}`;
-  return `feishu-codex-bridge-${platformName}-${archName}`;
+  const suffix = version ? "-v" + String(version).replace(/^v/, "") : "";
+  if (mode === "direct") return "feishu-codex-bridge-direct-" + platformName + "-" + archName + suffix;
+  if (mode === "core") return "feishu-codex-bridge-core-" + platformName + "-" + archName + suffix;
+  return "feishu-codex-bridge-" + platformName + "-" + archName + suffix;
 }
 
 export function printPortableReleaseUsage() {
   console.log([
-    "用法：pnpm run release [选项]",
+    "用法：bun run release:legacy [选项]",
     "",
-    "构建接收方无需预装 Node/pnpm 的 Portable Runtime 压缩包。",
+    "构建接收方无需预装 Node.js、npm、pnpm 或 Bun 的 Portable Runtime 压缩包。",
     "",
     "选项：",
     "  --output path          输出目录（默认：./release）",
-    "  --node path            要内置的 Node 可执行文件（默认：当前 Node）",
-    "  --pnpm path            构建生产依赖使用的 pnpm（默认：pnpm）",
+    "  --bun path             构建/内置的 Bun 可执行文件（默认：当前 Bun）",
     "  --mode MODE            发布模式：core、lite 或 direct（默认：direct）",
-    "  --direct               --mode direct 的别名；内置 lark-cli 和双架构 Node",
-    "  --skip-build           复用现有 dist，不重新执行 pnpm run build",
+    "  --direct               --mode direct 的别名；内置 lark-cli 和单架构 Bun",
+    "  --skip-build           复用现有 dist，不重新执行 bun run build",
     "  --keep-source-maps     保留 dist 中的 source map",
-    "  --bundle-node          将当前 Node 一并放入发布包（默认按需下载）",
+    "  --bundle-bun           将当前架构的 Bun 一并放入发布包（默认按需下载）",
     "  --json                 以 JSON 输出产物信息",
   ].join("\n"));
 }
 
 export async function buildPortableRelease(options) {
   const mode = options.mode || DEFAULT_RELEASE_MODE;
-  const packageName = targetName(process.platform, process.arch, mode);
+  const packageJson = JSON.parse(await readFile(join(PROJECT_ROOT, "package.json"), "utf8"));
+  const packageName = targetName(
+    process.platform,
+    process.arch,
+    mode,
+    options.versionedNames ? packageJson.version : undefined,
+  );
   const outputDir = resolve(options.outputDir);
   const archivePath = join(outputDir, `${packageName}.tar.gz`);
   const packageDir = join(outputDir, packageName);
   const stageParent = await mkdirTemp("feishu-codex-bridge-portable-");
   const stageDir = join(stageParent, packageName);
 
-  await validateNode(options.nodePath);
+  await validateBun(options.bunPath);
   await mkdir(outputDir, { recursive: true, mode: 0o755 });
 
   try {
     if (!options.skipBuild) {
-      await run(options.pnpmPath, ["run", "build"], { cwd: PROJECT_ROOT });
+      await run(options.bunPath, ["run", "build"], { cwd: PROJECT_ROOT });
     }
     await assertBuildOutput();
     await mkdir(stageDir, { recursive: true, mode: 0o755 });
@@ -140,24 +148,30 @@ export async function buildPortableRelease(options) {
     const appDir = join(stageDir, "app");
     const runtimeDir = join(stageDir, "runtime");
     await mkdir(appDir, { recursive: true, mode: 0o755 });
-    if (mode === "direct" || (mode !== "core" && options.bundleNode)) {
+    if (mode !== "core" && mode !== "direct" && options.bundleBun) {
       await mkdir(runtimeDir, { recursive: true, mode: 0o755 });
     }
     await copyApplication(appDir, options.keepSourceMaps, mode, { includePackageJson: mode !== "core" });
-    if (mode !== "core") await installProductionDependencies(appDir, options.pnpmPath, mode);
-    if (mode === "direct") {
-      await copyUniversalNodeRuntime(runtimeDir, options.nodePath);
-    } else if (mode !== "core" && options.bundleNode) {
-      await copyNodeRuntime(runtimeDir, options.nodePath);
+    if (mode !== "core") await installProductionDependencies(appDir, options.bunPath, mode);
+    if (mode === "direct" || mode === "core") {
+      await compilePortableBinary(join(appDir, "feishu-codex-bridge"));
+    }
+    if (mode === "direct") await trimSingleBinaryDirectPackage(appDir);
+    if (mode !== "core" && mode !== "direct" && options.bundleBun) {
+      await copyBunRuntime(runtimeDir, options.bunPath);
     }
     await copyFile(LAUNCHER_SOURCE, join(stageDir, "feishu-codex-bridge"));
     await chmod(join(stageDir, "feishu-codex-bridge"), 0o755);
     await copyFile(INSTALL_COMMAND_SOURCE, join(stageDir, "install.command"));
     await chmod(join(stageDir, "install.command"), 0o755);
     await copyFile(INSTALL_DEFAULTS_SOURCE, join(stageDir, "install.defaults"));
-    await writeReleaseManifest(stageDir, packageName, mode);
+    const changelogSource = join(PROJECT_ROOT, "CHANGELOG.md");
+    if (existsSync(changelogSource)) {
+      await copyFile(changelogSource, join(stageDir, "CHANGELOG.md"));
+    }
+    await writeReleaseManifest(stageDir, packageName, mode, options.bunPath);
     await writePortableReadme(stageDir, packageName, mode);
-    await runSmokeTests(stageDir, options.nodePath, mode);
+    await runSmokeTests(stageDir, options.bunPath, mode);
 
     await rm(archivePath, { force: true });
     await run("tar", ["-czf", archivePath, "-C", stageParent, packageName]);
@@ -170,7 +184,7 @@ export async function buildPortableRelease(options) {
       archivePath,
       packageDir,
       checksum,
-      nodePath: resolve(options.nodePath),
+      bunPath: resolve(options.bunPath),
       outputDir,
     };
     if (options.json) console.log(JSON.stringify(result, null, 2));
@@ -207,12 +221,22 @@ async function writePortablePackageJson(appDir, mode) {
   await writeFile(join(appDir, "package.json"), `${JSON.stringify(packageJson, null, 2)}\n`, "utf8");
 }
 
-async function writeReleaseManifest(stageDir, packageName, mode) {
+async function writeReleaseManifest(stageDir, packageName, mode, bunPath) {
   const packageJson = JSON.parse(await readFile(join(PROJECT_ROOT, "package.json"), "utf8"));
   await writeFile(join(stageDir, "release-manifest.json"), `${JSON.stringify({
     version: packageJson.version,
     packageName,
     mode,
+    runtimeFamily: "bun",
+    runtimeGeneration: mode === "direct"
+      ? `bun-${MIN_BUN_VERSION.join(".")}-single-binary`
+      : `bun-${MIN_BUN_VERSION.join(".")}`,
+    runtimeVersion: execFileSync(bunPath, ["--version"], { encoding: "utf8" }).trim(),
+    runtimeArchitecture: process.arch,
+    runtimePackaging: mode === "direct" ? "single-binary" : mode === "lite" ? "bun-script" : undefined,
+    compatibleRuntimeGenerations: mode === "core"
+      ? [`bun-${MIN_BUN_VERSION.join(".")}`, `bun-${MIN_BUN_VERSION.join(".")}-single-binary`]
+      : undefined,
     generatedAt: new Date().toISOString(),
   }, null, 2)}\n`, "utf8");
 }
@@ -272,11 +296,11 @@ async function writePortableConfigExample(appDir) {
   await writeFile(join(appDir, "config.example.json"), `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
-async function installProductionDependencies(appDir, pnpmPath, mode) {
-  await copyFile(join(PROJECT_ROOT, "pnpm-lock.yaml"), join(appDir, "pnpm-lock.yaml"));
+async function installProductionDependencies(appDir, bunPath, mode) {
+  await copyFile(join(PROJECT_ROOT, "bun.lock"), join(appDir, "bun.lock"));
   await run(
-    pnpmPath,
-    ["install", "--prod", "--no-optional", "--frozen-lockfile"],
+    bunPath,
+    ["install", "--production", "--no-optional", "--frozen-lockfile"],
     { cwd: appDir },
   );
 
@@ -311,29 +335,18 @@ async function installProductionDependencies(appDir, pnpmPath, mode) {
       }
     }
   }
-  const pnpmRoot = join(nodeModules, ".pnpm");
-  if (existsSync(pnpmRoot)) {
-    for (const entry of await readdir(pnpmRoot)) {
-      if (/^@openai\+codex@.*-(darwin|linux|win32)-/.test(entry)
-        || /^react(?:-dom)?@/.test(entry)
-        || (mode === "direct" && /^@larktask\+aamp-feishu-task-agent@/.test(entry))
-        || (mode !== "direct" && /^@larksuite\+cli@/.test(entry))) {
-        await rm(join(pnpmRoot, entry), { recursive: true, force: true });
-      }
-    }
-  }
-  await rm(join(appDir, "pnpm-lock.yaml"), { force: true });
+  await rm(join(appDir, "bun.lock"), { force: true });
   await removeSourceMaps(nodeModules);
 
   if (!existsSync(join(nodeModules, "@openai", "codex-sdk"))) {
     throw new Error("生产依赖中缺少 @openai/codex-sdk");
   }
   if (mode === "direct") await ensureLarkCliBinary(appDir);
-  await relativizeNodeModuleSymlinks(appDir);
+  await relativizeBunModuleSymlinks(appDir);
   await writePortablePackageJson(appDir, mode);
 }
 
-async function relativizeNodeModuleSymlinks(appDir) {
+async function relativizeBunModuleSymlinks(appDir) {
   const root = resolve(appDir);
   let rewritten = 0;
   async function visit(directory) {
@@ -369,137 +382,131 @@ async function ensureLarkCliBinary(appDir) {
   }
   if (!existsSync(binary)) throw new Error(`lark-cli 二进制未生成：${binary}`);
   const shim = join(appDir, "node_modules", ".bin", "lark-cli");
+  await rm(shim, { force: true });
   await writeFile(
     shim,
-    "#!/bin/sh\nset -eu\nSELF_DIR=$(CDPATH= cd -P -- \"$(dirname -- \"$0\")\" && pwd -P)\nexec node \"$SELF_DIR/../@larksuite/cli/scripts/run.js\" \"$@\"\n",
+    "#!/bin/sh\nset -eu\nSELF_DIR=$(CDPATH= cd -P -- \"$(dirname -- \"$0\")\" && pwd -P)\nexec \"$SELF_DIR/../@larksuite/cli/bin/lark-cli\" \"$@\"\n",
     { encoding: "utf8", mode: 0o755 },
   );
   await chmod(shim, 0o755);
 }
 
-async function copyNodeRuntime(runtimeDir, requestedNodePath) {
-  const nodePath = await realpath(requestedNodePath);
-  const prefix = resolve(dirname(nodePath), "..");
-  await copyNodeRuntimeTree(runtimeDir, prefix);
-  await writeFile(join(runtimeDir, ".bundled-node"), `${nodePath}\n`, "utf8");
+async function compilePortableBinary(outputPath) {
+  const result = await Bun.build({
+    entrypoints: [join(PROJECT_ROOT, "scripts", "portable-entry.mjs")],
+    compile: {
+      target: `bun-${process.platform}-${process.arch}`,
+      outfile: outputPath,
+    },
+    minify: true,
+  });
+  if (!result.success) {
+    throw new Error(`Bun 单二进制编译失败：\n${result.logs.map((log) => log.message).join("\n")}`);
+  }
+  await chmod(outputPath, 0o755);
 }
 
-async function copyNodeRuntimeTree(runtimeDir, prefix) {
-  const npmSource = join(prefix, "lib", "node_modules", "npm");
-  if (!existsSync(npmSource)) {
-    throw new Error(`Node 安装中缺少 npm：${npmSource}`);
+async function trimSingleBinaryDirectPackage(appDir) {
+  const distDir = join(appDir, "dist");
+  for (const entry of await readdir(distDir)) {
+    if (entry !== "web") await rm(join(distDir, entry), { recursive: true, force: true });
+  }
+  await rm(join(appDir, "scripts"), { recursive: true, force: true });
+  const modulesDir = join(appDir, "node_modules");
+  for (const entry of await readdir(modulesDir)) {
+    if (entry !== "@larksuite" && entry !== ".bin") {
+      await rm(join(modulesDir, entry), { recursive: true, force: true });
+    }
+  }
+  const binDir = join(modulesDir, ".bin");
+  for (const entry of await readdir(binDir)) {
+    if (entry !== "lark-cli") await rm(join(binDir, entry), { recursive: true, force: true });
+  }
+}
+
+async function copyBunRuntime(runtimeDir, requestedBunPath) {
+  const bunPath = await realpath(requestedBunPath);
+  const runtime = execFileSync(bunPath, ["-e", "process.stdout.write(`${process.platform}/${process.arch}`)"], { encoding: "utf8" }).trim();
+  if (runtime !== `${process.platform}/${process.arch}`) {
+    throw new Error(`Bun 架构与发布目标不匹配：${runtime} != ${process.platform}/${process.arch}`);
+  }
+  const version = execFileSync(bunPath, ["--version"], { encoding: "utf8" }).trim();
+  const numbers = version.replace(/[+-].*$/, "").split(".").map(Number);
+  if (numbers.some((value) => !Number.isInteger(value)) || compareVersions(numbers, MIN_BUN_VERSION) < 0) {
+    throw new Error(`Bun 版本过低：${version}，需要 >= ${MIN_BUN_VERSION.join(".")}`);
   }
   const binDir = join(runtimeDir, "bin");
   await mkdir(binDir, { recursive: true, mode: 0o755 });
-  await copyFile(join(prefix, "bin", "node"), join(binDir, "node"));
-  await chmod(join(binDir, "node"), 0o755);
-  await mkdir(join(runtimeDir, "lib", "node_modules"), { recursive: true, mode: 0o755 });
-  await cp(npmSource, join(runtimeDir, "lib", "node_modules", "npm"), { recursive: true });
-  await removeSourceMaps(join(runtimeDir, "lib", "node_modules", "npm"));
-  await symlink("../lib/node_modules/npm/bin/npm-cli.js", join(binDir, "npm"));
-  await symlink("../lib/node_modules/npm/bin/npx-cli.js", join(binDir, "npx"));
-
-  for (const file of ["LICENSE", "README.md", "CHANGELOG.md"]) {
-    if (existsSync(join(prefix, file))) await copyFile(join(prefix, file), join(runtimeDir, file));
-  }
+  const bundledBunPath = join(binDir, "bun");
+  await copyFile(bunPath, bundledBunPath);
+  await chmod(bundledBunPath, 0o755);
+  await writeFile(join(runtimeDir, ".bundled-bun"), `${version}\n`, "utf8");
+  const licenseCandidates = [
+    resolve(dirname(bunPath), "..", "LICENSE"),
+    resolve(dirname(bunPath), "..", "..", "LICENSE"),
+  ];
+  const licensePath = licenseCandidates.find((candidate) => existsSync(candidate));
+  if (licensePath) await copyFile(licensePath, join(runtimeDir, "BUN-LICENSE.txt"));
 }
 
-async function copyUniversalNodeRuntime(runtimeDir, requestedNodePath) {
-  if (existsSync(LOCAL_NODE_UNIVERSAL_ARCHIVE)) {
-    await validateUniversalNodeArchive(LOCAL_NODE_UNIVERSAL_ARCHIVE);
-    console.log(`使用本地 Node universal 包：${LOCAL_NODE_UNIVERSAL_ARCHIVE}`);
-    await copyFile(LOCAL_NODE_UNIVERSAL_ARCHIVE, join(runtimeDir, "node-universal.tar.gz"));
-    return;
-  }
-
-  const nodePath = await realpath(requestedNodePath);
-  const version = execFileSync(nodePath, ["-p", "process.versions.node"], { encoding: "utf8" }).trim().replace(/^v/, "");
-  const currentArch = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : undefined;
-  if (!currentArch) throw new Error(`direct Portable 暂不支持当前 CPU：${process.arch}`);
-
-  const stageParent = await mkdirTemp("feishu-codex-node-universal-");
-  const universalRoot = join(stageParent, "node-universal");
-  try {
-    for (const arch of ["arm64", "x64"]) {
-      const sourceRoot = arch === currentArch
-        ? resolve(dirname(nodePath), "..")
-        : await downloadNodeDistribution(version, arch, stageParent);
-      await copyNodeRuntimeTree(join(universalRoot, arch), sourceRoot);
-    }
-    await run(
-      "tar",
-      ["-czf", join(runtimeDir, "node-universal.tar.gz"), "-C", stageParent, "node-universal"],
-      { cwd: PROJECT_ROOT },
-    );
-  } finally {
-    await rm(stageParent, { recursive: true, force: true });
-  }
-}
-
-async function validateUniversalNodeArchive(archivePath) {
-  const listing = execFileSync("tar", ["-tzf", archivePath], { encoding: "utf8" });
-  for (const arch of ["arm64", "x64"]) {
-    if (!listing.split(/\r?\n/).some((entry) => entry === `node-universal/${arch}/bin/node`)) {
-      throw new Error(`本地 Node universal 包缺少 ${arch}：${archivePath}`);
-    }
-  }
-}
-
-async function downloadNodeDistribution(version, arch, destination) {
-  const prefix = `node-v${version}-darwin-${arch}`;
-  const archive = `${prefix}.tar.gz`;
-  const archivePath = join(destination, archive);
-  const checksumsPath = join(destination, "SHASUMS256.txt");
-  const baseUrl = `https://nodejs.org/dist/v${version}`;
-  await run("curl", ["--proto", "=https", "--tlsv1.2", "-fsSL", `${baseUrl}/${archive}`, "-o", archivePath], {
-    cwd: destination,
-  });
-  await run("curl", ["--proto", "=https", "--tlsv1.2", "-fsSL", `${baseUrl}/SHASUMS256.txt`, "-o", checksumsPath], {
-    cwd: destination,
-  });
-  const checksums = await readFile(checksumsPath, "utf8");
-  const expected = checksums
-    .split(/\r?\n/)
-    .map((line) => line.trim().split(/\s+/))
-    .find((parts) => parts[1] === archive)?.[0];
-  const actual = execFileSync("shasum", ["-a", "256", archivePath], { encoding: "utf8" }).trim().split(/\s+/)[0];
-  if (!expected || expected !== actual) throw new Error(`Node ${arch} 下载校验失败：${archive}`);
-  await run("tar", ["-xzf", archivePath, "-C", destination], { cwd: destination });
-  return join(destination, prefix);
-}
-
-async function runSmokeTests(stageDir, buildNodePath, mode) {
-  const bundledNode = join(stageDir, "runtime", "bin", "node");
-  const node = existsSync(bundledNode) ? bundledNode : resolve(buildNodePath);
+async function runSmokeTests(stageDir, buildBunPath, mode) {
+  const bundledBun = join(stageDir, "runtime", "bin", "bun");
+  const bun = existsSync(bundledBun) ? bundledBun : resolve(buildBunPath);
   const app = join(stageDir, "app");
   if (mode === "core") {
-    await run(node, ["--check", join(app, "dist", "main.js")], { cwd: app });
-    await run(node, ["--check", join(app, "scripts", "update-portable-release.mjs")], { cwd: app });
     await run("sh", ["-n", join(stageDir, "feishu-codex-bridge")], { cwd: stageDir });
     await run("sh", ["-n", join(stageDir, "install.command")], { cwd: stageDir });
+    await run(join(app, "feishu-codex-bridge"), ["--bridge-version"], {
+      cwd: stageDir,
+      env: {
+        ...process.env,
+        FEISHU_CODEX_BRIDGE_SINGLE_BINARY: "1",
+        FEISHU_CODEX_BRIDGE_APP_ROOT: app,
+        FEISHU_CODEX_BRIDGE_PORTABLE_ROOT: stageDir,
+      },
+    });
+    return;
+  }
+  if (mode === "direct") {
+    await run("sh", ["-n", join(stageDir, "feishu-codex-bridge")], { cwd: stageDir });
+    await run("sh", ["-n", join(stageDir, "install.command")], { cwd: stageDir });
+    const env = {
+      ...process.env,
+      FEISHU_CODEX_BRIDGE_SINGLE_BINARY: "1",
+      FEISHU_CODEX_BRIDGE_APP_ROOT: app,
+      FEISHU_CODEX_BRIDGE_PORTABLE_ROOT: stageDir,
+      PATH: "/usr/bin:/bin",
+    };
+    await run(join(stageDir, "feishu-codex-bridge"), ["--version"], { cwd: stageDir, env });
+    await run(join(app, "feishu-codex-bridge"), ["--bridge-main", "--help"], { cwd: app, env });
+    await run(join(app, "feishu-codex-bridge"), ["--bridge-codex", "--help"], { cwd: app, env });
+    await run(join(app, "feishu-codex-bridge"), ["--bridge-install", "--help"], { cwd: app, env });
+    await run(join(app, "feishu-codex-bridge"), ["--bridge-smoke"], { cwd: stageDir, env });
+    if (existsSync(join(stageDir, "runtime", "bin", "bun"))) throw new Error("Direct 单二进制包不应附带独立 Bun runtime");
+    if (existsSync(join(app, "dist", "main.js"))) throw new Error("Direct 单二进制包不应保留可执行 JS 运行产物");
     return;
   }
   const env = {
     ...process.env,
     PATH: `${join(stageDir, "runtime", "bin")}:${join(app, "node_modules", ".bin")}:${process.env.PATH || ""}`,
   };
-  await run(node, [join(app, "dist", "main.js"), "--help"], { cwd: app, env });
-  await run(node, [join(app, "dist", "codex-cli.js"), "--help"], { cwd: app, env });
+  await run(bun, [join(app, "dist", "main.js"), "--help"], { cwd: app, env });
+  await run(bun, [join(app, "dist", "codex-cli.js"), "--help"], { cwd: app, env });
   await run(
-    node,
-    ["--input-type=module", "-e", [
+    bun,
+    ["-e", [
       'import { Codex } from "@openai/codex-sdk";',
       'new Codex({ codexPathOverride: "codex" });',
-      'const { DatabaseSync } = await import("node:sqlite");',
-      'const sqlite = new DatabaseSync(":memory:");',
+      'import { Database } from "bun:sqlite";',
+      'const sqlite = new Database(":memory:");',
       'sqlite.exec("CREATE TABLE smoke (id INTEGER PRIMARY KEY, value TEXT)");',
       'sqlite.prepare("INSERT INTO smoke (value) VALUES (?)").run("ok");',
-      'if (sqlite.prepare("SELECT value FROM smoke").get().value !== "ok") throw new Error("node:sqlite smoke test failed");',
+      'if (sqlite.prepare("SELECT value FROM smoke").get().value !== "ok") throw new Error("bun:sqlite smoke test failed");',
       'sqlite.close();',
       mode === "direct"
         ? 'await import("./dist/direct-feishu-setup.js");'
         : 'await import("./dist/aamp-task-agent.js");',
-      'console.log("portable runtime smoke test passed");',
+      'console.log("portable Bun runtime smoke test passed");',
     ].join("\n")],
     { cwd: app, env },
   );
@@ -513,30 +520,32 @@ async function writePortableReadme(stageDir, packageName, mode) {
       `目标平台：${packageName}`,
       "",
       "这是已安装 Portable 包使用的核心更新包，不是独立安装包。",
-      "它只包含 Bridge 编译产物、更新脚本和启动器，不包含 Node、node_modules、lark-cli、config.json 或 runtime 数据。",
+      "它包含 Bridge 单二进制更新产物、启动器和安装器，不包含 Bun、node_modules、lark-cli、config.json 或 runtime 数据。",
       "",
       "请在已安装包目录执行 `./feishu-codex-bridge update`，不要直接运行本包中的 install.command。",
       "",
     ].join("\n"), "utf8");
     return;
   }
+  const bundled = existsSync(join(stageDir, "runtime", "bin", "bun"));
   const content = `# Feishu Codex Bridge Portable Runtime ${mode === "direct" ? "Direct" : "Lite"}\n\n`
     + `目标平台：${packageName}\n\n`
     + "## 使用\n\n"
-    + (packageName.includes("-direct-")
+    + (mode === "direct"
       ? "1. 双击 `install.command`，安装器会通过飞书二维码创建直连 Bot，并写入 lark-cli profile。\n"
       : "1. 双击 `install.command`，或在终端执行 `./feishu-codex-bridge install`。\n")
-    + (packageName.includes("-direct-")
-      ? "2. 直连包自带双架构 Node、lark-cli 和直连运行依赖，不启动 AAMP 服务。\n"
+    + (mode === "direct"
+      ? "2. 直连包将 Bun runtime 与 Bridge 主程序编译为单一二进制，并附带 lark-cli 原生组件与 Web 静态资源；不启动 AAMP 服务。\n"
       : "2. 安装器会自动查找 ChatGPT App 内置的 Codex；如果电脑另有独立 Codex CLI，也会自动使用。\n")
     + "3. 按提示选择要处理的 Git 仓库并完成 Feishu 授权。\n\n"
-    + "启动器会优先使用系统 Node >=22.13.1；如果找不到，会从 Node 官方发行目录下载固定版本到当前包的 runtime/ 目录。不会修改用户全局 Node、nvm 或 Homebrew。\n"
-    + "使用 `--bundle-node` 构建时，也可以完全离线运行。\n"
-    + "SQLite 使用 Node 22.13 内置的 node:sqlite，不包含原生 SQLite 扩展。\n"
-    + (packageName.includes("-direct-")
-      ? "内置 Node 会按当前 CPU 架构从 node-universal.tar.gz 解压使用；不会联网下载 Node。\n\n"
-      : "如果没有找到 ChatGPT App 或独立 Codex CLI，安装器会明确提示原因；不需要手动填写 CLI 路径。\n\n")
-    + "已有配置启用 AAMP 时，请使用 `./feishu-codex-bridge aamp:start --config <path>`；`service start` 仅启动原生直连 Codex。\n\n"
+    + (mode === "direct"
+      ? "Direct 单二进制启动不依赖系统 Node、Bun 或运行时下载。\n"
+      : `启动器优先使用包内 Bun，其次使用系统 Bun >=${MIN_BUN_VERSION.join(".")}；如果找不到，会从官方发行页下载固定版本并验证 SHA-256 后缓存到 runtime/。${bundled ? "此包内置运行时，可离线启动。" : ""}\n`)
+    + "SQLite 使用 Bun 内置的 bun:sqlite，不包含原生 SQLite 扩展。\n"
+    + "Bun 运行时按发布包标记的 macOS CPU 架构提供，不假设 universal 二进制。\n\n"
+    + (mode === "lite"
+      ? "已有配置启用 AAMP 时，请使用 `./feishu-codex-bridge aamp:start --config <path>`；`service start` 仅启动原生直连 Codex。\n\n"
+      : "Direct 模式不启动 AAMP；`service start` 启动原生直连 Codex。\n\n")
     + "## 常用命令\n\n"
     + "```text\n"
     + "./feishu-codex-bridge install\n"
@@ -560,12 +569,16 @@ async function assertBuildOutput() {
   if (missing.length > 0) throw new Error(`构建产物缺失：${missing.join(", ")}`);
 }
 
-async function validateNode(nodePath) {
-  if (!existsSync(nodePath)) throw new Error(`指定的 Node 不存在：${nodePath}`);
-  const version = execFileSync(nodePath, ["-p", "process.versions.node"], { encoding: "utf8" }).trim();
-  const numbers = version.replace(/^v/, "").split(".").slice(0, 3).map(Number);
-  if (numbers.some((value) => !Number.isInteger(value)) || compareVersions(numbers, MIN_NODE_VERSION) < 0) {
-    throw new Error(`Node 版本过低：${version}，需要 >= ${MIN_NODE_VERSION.join(".")}`);
+async function validateBun(bunPath) {
+  if (!existsSync(bunPath)) throw new Error(`指定的 Bun 不存在：${bunPath}`);
+  const runtime = execFileSync(bunPath, ["-e", "process.stdout.write(`${process.platform}/${process.arch}`)"], { encoding: "utf8" }).trim();
+  if (runtime !== `${process.platform}/${process.arch}`) {
+    throw new Error(`Bun 架构与发布目标不匹配：${runtime} != ${process.platform}/${process.arch}`);
+  }
+  const version = execFileSync(bunPath, ["--version"], { encoding: "utf8" }).trim();
+  const numbers = version.replace(/[+-].*$/, "").split(".").slice(0, 3).map(Number);
+  if (numbers.some((value) => !Number.isInteger(value)) || compareVersions(numbers, MIN_BUN_VERSION) < 0) {
+    throw new Error(`Bun 版本过低：${version}，需要 >= ${MIN_BUN_VERSION.join(".")}`);
   }
 }
 

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 
 import { parseMainArguments } from "../src/main.js";
 
@@ -16,6 +16,23 @@ describe("main execution mode override", () => {
       once: false,
       executionMode: "feishu-sqlite-codex",
     });
+  });
+
+  it("accepts isolated web development options and defaults", () => {
+    expect(parseMainArguments(["--web-only"], "/tmp/bridge")).toEqual({
+      configPath: "/tmp/bridge/config.json",
+      dbPath: "/tmp/bridge/runtime/dev/bridge.db",
+      once: false,
+      executionMode: undefined,
+      webOnly: true,
+    });
+    expect(parseMainArguments(["--web-only", "--web-port=17311", "--db", "./dev.db"], "/tmp/bridge"))
+      .toMatchObject({ dbPath: "/tmp/bridge/dev.db", webOnly: true, webPort: 17311 });
+  });
+
+  it("rejects an invalid web port", () => {
+    expect(() => parseMainArguments(["--web-port", "70000"], "/tmp/bridge"))
+      .toThrow(/port from 1 to 65535/);
   });
 
   it("rejects an unknown execution mode", () => {

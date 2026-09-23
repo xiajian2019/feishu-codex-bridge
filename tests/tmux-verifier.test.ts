@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 
 import type { TmuxAdapter } from "../src/tmux-adapter.js";
 import { TmuxVerifier } from "../src/tmux-verifier.js";

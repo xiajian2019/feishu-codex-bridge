@@ -1,15 +1,27 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { WebSocket } from "ws";
 
 import { StateDatabase } from "../src/db.js";
+import { TmuxDashboardApi } from "../src/tmux-dashboard-api.js";
+import { TmuxVerifier } from "../src/tmux-verifier.js";
+import { TmuxVerifierStore } from "../src/tmux-verifier-store.js";
+import { TmuxVerifierWebServer } from "../src/tmux-verifier-web.js";
 import { DashboardServer } from "../src/web.js";
 import type { RoutedTask } from "../src/types.js";
 
 const openServers: DashboardServer[] = [];
 const openDatabases: StateDatabase[] = [];
+const openVerifierStores: TmuxVerifierStore[] = [];
+const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(openServers.splice(0).map((server) => server.stop()));
   openDatabases.splice(0).forEach((db) => db.close());
+  openVerifierStores.splice(0).forEach((store) => store.close());
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
 describe("DashboardServer", () => {
@@ -104,6 +116,12 @@ describe("DashboardServer", () => {
     const actionToken = /name="bridge-action-token" content="([^"]+)"/.exec(page)?.[1];
     expect(actionToken).toBeTruthy();
 
+    for (const route of ["/tmux", "/tmux-dashboard"]) {
+      const routedPage = await fetch(url + route);
+      expect(routedPage.status).toBe(200);
+      expect(await routedPage.text()).toContain('id="root"');
+    }
+
     const sessionResponse = await fetch(`${url}/api/session`);
     expect(sessionResponse.status).toBe(200);
     expect(await sessionResponse.json()).toEqual({ actionToken });
@@ -153,4 +171,81 @@ describe("DashboardServer", () => {
     });
     expect(feedbackResponse.status).toBe(200);
   });
+
+  it("serves Bridge, verifier, and dashboard APIs from one backend listener", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bridge-unified-tmux-"));
+    temporaryDirectories.push(directory);
+    const projectMapPath = join(directory, "project-map.yaml");
+    await writeFile(projectMapPath, "projects:\n  food:\n    root: /tmp/food\n", "utf8");
+    const sessions = [{
+      id: "$42",
+      name: "dev",
+      windows: 1,
+      attachedClients: 0,
+      cwd: "/tmp/food",
+      createdAt: 1,
+    }];
+    const dashboardApi = new TmuxDashboardApi({
+      projectMapPath,
+      operations: {
+        createSession: async () => sessions[0]!,
+        findSession: async () => undefined,
+        killSession: async () => undefined,
+        listSessions: async () => sessions,
+      },
+    });
+    const verifierStore = new TmuxVerifierStore(":memory:");
+    openVerifierStores.push(verifierStore);
+    const verifier = new TmuxVerifier({ store: verifierStore });
+    const verifierWeb = new TmuxVerifierWebServer({
+      verifier,
+      host: "127.0.0.1",
+      port: 0,
+      projectMapPath,
+    });
+    const db = new StateDatabase(":memory:");
+    openDatabases.push(db);
+    const bridge = new DashboardServer({
+      db,
+      host: "127.0.0.1",
+      port: 0,
+      projects: [],
+      modes: [],
+      tmuxVerifier: verifierWeb,
+      tmuxDashboard: dashboardApi,
+    });
+    openServers.push(bridge);
+
+    const bridgeUrl = await bridge.start();
+    const dashboardResponse = await fetch(bridgeUrl + "/tmux-dashboard/api/projects");
+    expect(dashboardResponse.status).toBe(200);
+    expect(await dashboardResponse.json()).toEqual({
+      projects: [{ name: "food", root: "/tmp/food" }],
+    });
+
+    const sessionsResponse = await fetch(bridgeUrl + "/tmux-dashboard/api/sessions");
+    expect(sessionsResponse.status).toBe(200);
+    expect(await sessionsResponse.json()).toEqual({ sessions });
+
+    const verifierResponse = await fetch(bridgeUrl + "/api/tmux/sessions");
+    expect(verifierResponse.status).toBe(200);
+    expect(await verifierResponse.json()).toEqual({ items: [] });
+
+    const terminalStatus = await new Promise<number>((resolve, reject) => {
+      const terminalSocket = new WebSocket(
+        bridgeUrl.replace(/^http/, "ws") + "/tmux-dashboard/terminal?session=%2442",
+        { headers: { Origin: bridgeUrl } },
+      );
+      terminalSocket.once("unexpected-response", (_request, response) => {
+        resolve(response.statusCode ?? 0);
+        terminalSocket.terminate();
+      });
+      terminalSocket.once("error", reject);
+    });
+    expect(terminalStatus).toBe(404);
+
+    const bridgeResponse = await fetch(bridgeUrl + "/api/session");
+    expect(bridgeResponse.status).toBe(200);
+  });
+
 });

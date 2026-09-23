@@ -1,7 +1,7 @@
 import { mkdtempSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 
 import { patchAampSqlite } from '../scripts/aamp-sqlite-patch.mjs';
 import { StateDatabase } from '../src/db.ts';
@@ -82,7 +82,7 @@ describe('AAMP SQLite runtime patch', () => {
         bodyText: '请查看这张图',
         attachments: [{ filename: 'input.png', contentType: 'image/png', content: Buffer.from('png') }],
       });
-      const dispatchDb = new DatabaseSync(databasePath, { readOnly: true });
+      const dispatchDb = new DatabaseSync(databasePath);
       const dispatchRow = dispatchDb
         .prepare('SELECT last_event_json FROM aamp_tasks WHERE aamp_task_id = ?')
         .get(task.taskId);
@@ -109,7 +109,7 @@ describe('AAMP SQLite runtime patch', () => {
       ]));
       await runtime.stop();
 
-      const db = new DatabaseSync(databasePath, { readOnly: true });
+      const db = new DatabaseSync(databasePath);
       const row = db.prepare('SELECT * FROM aamp_tasks WHERE aamp_task_id = ?').get(task.taskId);
       const hiddenRows = db.prepare('SELECT chat_id, aamp_task_id FROM aamp_hidden_tasks').all();
       db.close();

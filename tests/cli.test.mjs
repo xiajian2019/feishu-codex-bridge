@@ -1,8 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 
 import {
   buildCommand,
-  buildPnpmArguments,
+  buildBunArguments,
   resolveInvocation,
 } from "../bin/feishu-codex-bridge.mjs";
 
@@ -16,12 +16,12 @@ describe("global bridge CLI", () => {
       script: "bridge:install",
       args: ["--", "--config", "./custom.json"],
     });
-    const command = buildCommand(invocation, "pnpm", "/bin/sh");
+    const command = buildCommand(invocation, "bun", "/bin/sh");
     expect(command.file).toBe(process.execPath);
     expect(command.args).toEqual(["/bin/sh", "--", "--config", "./custom.json"]);
   });
 
-  it("resolves direct script calls and preserves pnpm separators", () => {
+  it("resolves direct script calls and preserves Bun argument separators", () => {
     const invocation = resolveInvocation(["aamp:task", "--", "ff96da58"], scripts);
 
     expect(invocation).toEqual({
@@ -29,7 +29,7 @@ describe("global bridge CLI", () => {
       script: "aamp:task",
       args: ["--", "ff96da58"],
     });
-    expect(buildPnpmArguments(invocation)).toEqual([
+    expect(buildBunArguments(invocation)).toEqual([
       "run",
       "aamp:task",
       "--",
@@ -37,10 +37,10 @@ describe("global bridge CLI", () => {
     ]);
   });
 
-  it("supports the explicit run form and adds pnpm's argument separator", () => {
+  it("supports the explicit run form and adds Bun's argument separator", () => {
     const invocation = resolveInvocation(["run", "test", "--coverage"], scripts);
 
-    expect(buildPnpmArguments(invocation)).toEqual([
+    expect(buildBunArguments(invocation)).toEqual([
       "run",
       "test",
       "--",

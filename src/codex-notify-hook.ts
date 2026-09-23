@@ -3,7 +3,6 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import {
   buildCodexAppServerEnvironment,
@@ -11,9 +10,10 @@ import {
   codexThreadSourceLabel,
 } from "./codex-app-server.js";
 import { enqueueCodexNotification } from "./codex-notification-inbox.js";
+import { resolveBridgeProjectRoot } from "./portable-runtime.js";
 import type { BridgeConfig } from "./types.js";
 
-const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const PROJECT_ROOT = resolveBridgeProjectRoot(import.meta.url);
 const CHAIN_DIRECTORY = "feishu-codex-bridge";
 const CHAIN_STATE_FILE = "notify-chain.json";
 const DELIVERY_STATE_FILE = "notify-delivery.json";

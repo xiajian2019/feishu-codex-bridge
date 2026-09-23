@@ -2,11 +2,15 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { dirname, extname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { extname, join, relative, resolve } from "node:path";
+import type { Duplex } from "node:stream";
 
 import { StateDatabase } from "./db.js";
+import type { TmuxDashboardApi } from "./tmux-dashboard-api.js";
+import { resolveBridgeProjectRoot } from "./portable-runtime.js";
 import { parseTaskInput } from "./fingerprint.js";
+import type { TmuxVerifierWebServer } from "./tmux-verifier-web.js";
+import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import {
   AAMP_TASK_STATUSES,
   TASK_STATES,
@@ -23,6 +27,9 @@ export interface DashboardServerOptions {
   projects: string[];
   modes: string[];
   webRoot?: string;
+  auth?: WebPairingAuth;
+  tmuxVerifier?: TmuxVerifierWebServer;
+  tmuxDashboard?: TmuxDashboardApi;
   actions?: DashboardActions;
   logger?: Logger;
 }
@@ -35,6 +42,7 @@ export interface DashboardActions {
 export class DashboardServer {
   private readonly options: DashboardServerOptions;
   private readonly actionToken = randomUUID();
+  private readonly auth: WebPairingAuth;
   private readonly webRoot: string;
   private readonly eventClients = new Set<ServerResponse>();
   private server: Server | null = null;
@@ -43,6 +51,8 @@ export class DashboardServer {
 
   constructor(options: DashboardServerOptions) {
     this.options = options;
+    this.auth = options.auth
+      ?? new WebPairingAuth({ db: options.db, allowLocalRequests: true });
     this.webRoot = options.webRoot ?? findWebRoot();
   }
 
@@ -58,6 +68,9 @@ export class DashboardServer {
         if (!response.headersSent) sendJson(response, 500, { error: "internal server error" });
         else response.destroy();
       });
+    });
+    server.on("upgrade", (request, socket, head) => {
+      this.handleUpgrade(request, socket, head);
     });
     this.server = server;
     this.unsubscribeFromDatabase = this.options.db.subscribe((change) => this.publishChange(change));
@@ -85,19 +98,87 @@ export class DashboardServer {
     this.unsubscribeFromDatabase = null;
     for (const client of this.eventClients) client.end();
     this.eventClients.clear();
-    if (!server) return Promise.resolve();
-    return new Promise((resolve, reject) => {
+    this.options.tmuxDashboard?.stop();
+    const verifierStop = this.options.tmuxVerifier?.stop() ?? Promise.resolve();
+    if (!server) return verifierStop;
+    return verifierStop.then(() => new Promise((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
       server.closeIdleConnections();
-    });
+    }));
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", "http://localhost");
-    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-      await this.serveIndex(response);
+    if (request.method === "GET" && url.pathname === "/api/auth/status") {
+      sendJson(response, 200, this.auth.status(request));
       return;
     }
+    if (request.method === "GET" && url.pathname === "/api/auth/devices") {
+      const devices = this.auth.listDevices(request);
+      if (!devices) {
+        sendJson(response, 401, { error: "pairing required" });
+        return;
+      }
+      sendJson(response, 200, { devices });
+      return;
+    }
+    const deviceRevokeMatch = /^\/api\/auth\/devices\/([^/]+)\/revoke$/.exec(url.pathname);
+    if (request.method === "POST" && deviceRevokeMatch) {
+      const sessionId = decodeURIComponent(deviceRevokeMatch[1]);
+      if (!this.auth.revokeDevice(request, sessionId)) {
+        sendJson(response, 404, { error: "device not found" });
+        return;
+      }
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/auth/pairing/claim") {
+      await this.claimPairing(request, response);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/auth/logout") {
+      this.auth.clearSession(request, response);
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/auth/revoke-all") {
+      if (!this.auth.isAuthorized(request)) {
+        sendJson(response, 401, { error: "pairing required" });
+        return;
+      }
+      this.auth.revokeAll();
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (url.pathname.startsWith("/api/tmux/") && this.options.tmuxVerifier) {
+      if (!this.requireAuthorization(request, response)) return;
+      await this.options.tmuxVerifier.handleApiRequest(request, response);
+      return;
+    }
+    if (url.pathname.startsWith("/tmux-dashboard/api/") && this.options.tmuxDashboard) {
+      if (!this.requireAuthorization(request, response)) return;
+      await this.options.tmuxDashboard.handleRequest(request, response);
+      return;
+    }
+    if (request.method === "GET" && isSpaRoute(url.pathname)) {
+      if (
+        !this.auth.isAuthorized(request)
+        && url.pathname !== "/"
+        && url.pathname !== "/index.html"
+        && url.pathname !== "/pair-admin"
+      ) {
+        sendJson(response, 401, { error: "pairing required" });
+        return;
+      }
+      await this.serveIndex(request, response);
+      return;
+    }
+    const publicWebRequest = request.method === "GET" && !url.pathname.startsWith("/api/");
+    if (!this.requireAuthorization(
+      request,
+      response,
+      publicWebRequest || url.pathname === "/healthz",
+    )) return;
     if (request.method === "GET" && url.pathname === "/api/session") {
       sendJson(response, 200, { actionToken: this.actionToken });
       return;
@@ -145,6 +226,42 @@ export class DashboardServer {
       return;
     }
     sendJson(response, 404, { error: "not found" });
+  }
+
+  private async claimPairing(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(request);
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request" });
+      return;
+    }
+    if (typeof body.code !== "string" || !body.code.trim()) {
+      sendJson(response, 400, { error: "pairing code is required" });
+      return;
+    }
+    try {
+      const token = this.auth.claimPairing(request, body.code);
+      this.auth.setSessionCookie(request, response, token);
+      sendJson(response, 200, { ok: true });
+    } catch (error) {
+      if (error instanceof PairingRateLimitError) {
+        response.setHeader("Retry-After", String(error.retryAfterSeconds));
+        sendJson(response, 429, { error: "too many pairing attempts" });
+        return;
+      }
+      sendJson(response, 403, { error: error instanceof Error ? error.message : "pairing failed" });
+    }
+  }
+
+  private requireAuthorization(
+    request: IncomingMessage,
+    response: ServerResponse,
+    allowUnauthenticated = false,
+  ): boolean {
+    if (allowUnauthenticated || this.auth.isAuthorized(request)) return true;
+    sendJson(response, 401, { error: "pairing required" });
+    return false;
   }
 
   private listTasks(url: URL, response: ServerResponse): void {
@@ -297,17 +414,18 @@ export class DashboardServer {
     sendJson(response, 400, { error: "unknown task action" });
   }
 
-  private async serveIndex(response: ServerResponse): Promise<void> {
+  private async serveIndex(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const content = await readFile(resolve(this.webRoot, "index.html"), "utf8");
-      sendHtml(response, content.replace("__BRIDGE_ACTION_TOKEN__", this.actionToken));
+      const actionToken = this.auth.isAuthorized(request) ? this.actionToken : "";
+      sendHtml(response, content.replace("__BRIDGE_ACTION_TOKEN__", actionToken));
     } catch (error) {
       this.options.logger?.error("dashboard assets are not built", {
         webRoot: this.webRoot,
         error: error instanceof Error ? error.message : String(error),
       });
       sendJson(response, 503, {
-        error: "dashboard frontend is not built; run `pnpm run build` first",
+        error: "dashboard frontend is not built; run `bun run build` first",
       });
     }
   }
@@ -340,6 +458,33 @@ export class DashboardServer {
     } catch {
       sendJson(response, 404, { error: "not found" });
     }
+  }
+
+  private handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+    if (!this.auth.isAuthorized(request)) {
+      socket.destroy();
+      return;
+    }
+    const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+    if (pathname.startsWith("/api/tmux/sessions/") && this.options.tmuxVerifier) {
+      void this.options.tmuxVerifier.handleApiUpgrade(request, socket, head).catch((error: unknown) => {
+        this.options.logger?.warn("tmux verifier websocket failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        socket.destroy();
+      });
+      return;
+    }
+    if (pathname === "/tmux-dashboard/terminal" && this.options.tmuxDashboard) {
+      void this.options.tmuxDashboard.handleUpgrade(request, socket, head).catch((error: unknown) => {
+        this.options.logger?.warn("tmux dashboard websocket failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        socket.destroy();
+      });
+      return;
+    }
+    socket.destroy();
   }
 
   private openEventStream(request: IncomingMessage, response: ServerResponse): void {
@@ -399,6 +544,18 @@ export class DashboardServer {
     const port = typeof address === "object" && address ? address.port : this.options.port;
     return origin === `http://${this.options.host}:${port}`;
   }
+}
+
+function isSpaRoute(pathname: string): boolean {
+  return pathname === "/"
+    || pathname === "/index.html"
+    || pathname === "/pair-admin"
+    || pathname === "/tmux"
+    || pathname.startsWith("/tmux/")
+    || pathname === "/tmux-dashboard"
+    || (pathname.startsWith("/tmux-dashboard/")
+      && !pathname.startsWith("/tmux-dashboard/api/")
+      && pathname !== "/tmux-dashboard/terminal");
 }
 
 function isTaskState(value: string): value is TaskState {
@@ -515,11 +672,11 @@ function contentTypeFor(filePath: string): string {
 }
 
 function findWebRoot(): string {
-  const moduleDirectory = dirname(fileURLToPath(import.meta.url));
+  const projectRoot = resolveBridgeProjectRoot(import.meta.url);
   const candidates = [
-    resolve(moduleDirectory, "web"),
+    resolve(projectRoot, "dist", "web"),
     resolve(process.cwd(), "dist", "web"),
-    resolve(moduleDirectory, "../web"),
+    resolve(projectRoot, "web"),
   ];
   return candidates.find((candidate) => existsSync(join(candidate, "index.html"))) ?? candidates[0];
 }

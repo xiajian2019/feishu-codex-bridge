@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import {
   chmod,
   cp,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
+  readlink,
   readdir,
   rename,
   rm,
+  realpath,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -17,6 +22,9 @@ import { spawn } from "node:child_process";
 
 const DEFAULT_GITHUB_REPOSITORY = "xiajian2019/feishu-codex-bridge";
 const UPDATE_MODES = ["auto", "core", "lite", "direct"];
+const REQUIRED_RUNTIME_FAMILY = "bun";
+const REQUIRED_RUNTIME_GENERATION = "bun-1.4.2";
+const SINGLE_BINARY_RUNTIME_GENERATION = `${REQUIRED_RUNTIME_GENERATION}-single-binary`;
 const SERVICE_LABEL = "com.local.feishu-codex-bridge";
 const UPDATE_AGENT_LABEL = "com.local.feishu-codex-bridge-updater";
 const DEFAULT_UPDATE_INTERVAL_SECONDS = 6 * 60 * 60;
@@ -24,6 +32,7 @@ const UPDATE_LOCK_STALE_MS = 12 * 60 * 60 * 1000;
 const SERVICE_WAIT_TIMEOUT_MS = 30_000;
 const SERVICE_POLL_INTERVAL_MS = 250;
 const CORE_OVERLAY_PATHS = [
+  "app/feishu-codex-bridge",
   "app/dist",
   "app/scripts",
   "app/config.example.json",
@@ -31,6 +40,7 @@ const CORE_OVERLAY_PATHS = [
   "install.command",
   "install.defaults",
   "README.md",
+  "CHANGELOG.md",
 ];
 const FULL_PACKAGE_PATHS = [
   "app",
@@ -38,17 +48,22 @@ const FULL_PACKAGE_PATHS = [
   "install.command",
   "install.defaults",
   "README.md",
+  "CHANGELOG.md",
   "release-manifest.json",
 ];
 const PACKAGE_RUNTIME_ENTRIES = [
+  ".bundled-bun",
+  "bin",
+  "lib",
+  "BUN-LICENSE.txt",
+  "README.md",
+  "CHANGELOG.md",
+];
+const LEGACY_NODE_RUNTIME_ENTRIES = [
   "node-universal.tar.gz",
   "node-universal",
   ".bundled-node",
-  "bin",
   "lib",
-  "LICENSE",
-  "README.md",
-  "CHANGELOG.md",
 ];
 const ACTIVE_TASK_STATUSES = ["QUEUED", "RUNNING", "CANCEL_REQUESTED"];
 
@@ -151,12 +166,20 @@ export function parsePortableUpdateArguments(argv, cwd = process.cwd()) {
   return options;
 }
 
-export function updateAssetName(platform = process.platform, arch = process.arch, mode = "core") {
+export function updateAssetName(
+  platform = process.platform,
+  arch = process.arch,
+  mode = "core",
+  version,
+) {
   const platformName = platform === "darwin" ? "darwin" : undefined;
   const archName = { arm64: "arm64", x64: "x64" }[arch];
   if (!platformName || !archName) throw new Error(`当前系统不支持 Portable 更新：${platform}/${arch}`);
   const resolvedMode = mode === "auto" ? "core" : mode;
-  if (resolvedMode === "direct") return `feishu-codex-bridge-direct-${platformName}-${archName}.tar.gz`;
+  const versionSuffix = version ? "-v" + normalizeVersion(version) : "";
+  if (resolvedMode === "direct") {
+    return "feishu-codex-bridge-direct-" + platformName + "-" + archName + versionSuffix + ".tar.gz";
+  }
   if (resolvedMode === "lite") return `feishu-codex-bridge-${platformName}-${archName}.tar.gz`;
   if (resolvedMode === "core") return `feishu-codex-bridge-core-${platformName}-${archName}.tar.gz`;
   throw new Error(`未知更新模式：${mode}`);
@@ -164,7 +187,8 @@ export function updateAssetName(platform = process.platform, arch = process.arch
 
 export function buildPortableUpdaterPlist({ root, intervalSeconds = DEFAULT_UPDATE_INTERVAL_SECONDS } = {}) {
   const packageRoot = resolve(root || process.cwd());
-  const launcher = join(packageRoot, "feishu-codex-bridge");
+  const stableLauncher = join(packageRoot, "current", "feishu-codex-bridge");
+  const launcher = existsSync(stableLauncher) ? stableLauncher : join(packageRoot, "feishu-codex-bridge");
   const logDir = join(packageRoot, "runtime", "logs");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -217,7 +241,11 @@ export async function updatePortableRelease(options = {}) {
       return applyPortableRelease({
         ...options,
         root,
-        mode: "core",
+        mode: options.mode && options.mode !== "auto"
+          ? options.mode
+          : check.runtimeMigrationRequired
+            ? check.installedMode
+            : "core",
         check: false,
         auto: false,
       });
@@ -231,24 +259,40 @@ export async function checkPortableUpdate({
   repository = DEFAULT_GITHUB_REPOSITORY,
   tag = "latest",
 } = {}) {
-  const currentVersion = await readInstalledVersion(resolve(root || process.cwd()));
+  const installRoot = resolve(root || process.cwd());
+  const packageRoot = await resolveActivePackageRoot(installRoot);
+  const currentVersion = await readInstalledVersion(packageRoot);
+  const installedManifest = await readJsonIfExists(join(packageRoot, "release-manifest.json")) || {};
+  const installedMode = await readInstalledMode(packageRoot);
+  const runtimeMigrationRequired = !isRuntimeCompatible(installedManifest, installedMode);
   const release = await fetchGithubRelease({ repository, tag });
   const remoteVersion = release.version || release.tag;
   return {
     currentVersion: currentVersion || "0.0.0",
     remoteVersion,
     tag: release.tag,
-    updateAvailable: compareVersions(remoteVersion, currentVersion || "0.0.0") > 0,
+    installedMode,
+    runtimeMigrationRequired,
+    updateAvailable: runtimeMigrationRequired || compareVersions(remoteVersion, currentVersion || "0.0.0") > 0,
     coreAsset: updateAssetName(process.platform, process.arch, "core"),
     releaseUrl: release.html_url,
   };
+}
+
+function isRuntimeCompatible(manifest, mode) {
+  if (manifest.runtimeFamily !== REQUIRED_RUNTIME_FAMILY) return false;
+  if (mode === "direct") {
+    return manifest.runtimePackaging === "single-binary"
+      && manifest.runtimeGeneration === SINGLE_BINARY_RUNTIME_GENERATION;
+  }
+  return manifest.runtimeGeneration === REQUIRED_RUNTIME_GENERATION;
 }
 
 export function printPortableUpdateUsage() {
   console.log([
     "用法：feishu-codex-bridge update [选项]",
     "",
-    "默认从 GitHub 最新 Release 下载 Core 包，只替换 Bridge 核心文件，不下载 Node/lark-cli。",
+    "默认下载兼容的更新包；Bun 代际不匹配时会执行完整运行时迁移，否则仅替换核心文件。",
     "下载、校验完成后才会短暂重启已运行的 LaunchAgent；失败时自动恢复旧文件。",
     "",
     "选项：",
@@ -274,9 +318,15 @@ export function printPortableUpdateUsage() {
 
 async function applyPortableRelease(options) {
   const root = resolve(options.root || process.cwd());
-  const currentMode = await readInstalledMode(root);
+  const currentPackageRoot = await resolveActivePackageRoot(root);
+  const currentMode = await readInstalledMode(currentPackageRoot);
+  const currentManifest = await readJsonIfExists(join(currentPackageRoot, "release-manifest.json")) || {};
+  const runtimeCompatible = isRuntimeCompatible(currentManifest, currentMode);
   const requestedMode = options.mode || "auto";
-  const remoteMode = requestedMode === "auto" ? "core" : requestedMode;
+  const remoteMode = requestedMode === "auto" ? (runtimeCompatible ? "core" : currentMode) : requestedMode;
+  if (remoteMode === "core" && !runtimeCompatible) {
+    throw new Error("当前 Portable 包尚未迁移到 Bun，必须先安装对应的完整 direct/lite 运行时包");
+  }
   let downloaded;
   let archivePath;
   let prepared;
@@ -284,10 +334,21 @@ async function applyPortableRelease(options) {
     if (options.file) {
       archivePath = resolve(options.file);
     } else {
+      const remoteRelease = remoteMode === "direct"
+        ? await fetchGithubRelease({
+            repository: options.repository || DEFAULT_GITHUB_REPOSITORY,
+            tag: options.tag || "latest",
+          })
+        : undefined;
       downloaded = await downloadGithubAsset({
         repository: options.repository || DEFAULT_GITHUB_REPOSITORY,
         tag: options.tag || "latest",
-        assetName: updateAssetName(process.platform, process.arch, remoteMode),
+        assetName: updateAssetName(
+          process.platform,
+          process.arch,
+          remoteMode,
+          remoteRelease?.version,
+        ),
         quiet: options.quiet,
       });
       archivePath = downloaded.path;
@@ -296,6 +357,11 @@ async function applyPortableRelease(options) {
     prepared = await preparePackage(archivePath, options.file ? requestedMode : remoteMode);
     const shouldRestart = options.restart !== false && process.platform === "darwin";
     const serviceState = shouldRestart ? await getPortableServiceState() : { loaded: false, running: false };
+    if (await isVersionedInstall(root)) {
+      const result = await deployVersionedPackage(root, prepared, { currentMode, serviceState });
+      if (!options.quiet) console.log(`更新完成并原子激活：${result.mode} ${result.sourcePackage}`);
+      return result;
+    }
     try {
       if (serviceState.loaded) {
         await stopPortableService(root);
@@ -389,8 +455,130 @@ async function preparePackage(archivePath, expectedMode) {
   }
 }
 
+async function resolveActivePackageRoot(root) {
+  const currentPath = join(resolve(root), "current");
+  try {
+    const current = await lstat(currentPath);
+    if (current.isSymbolicLink()) return await realpath(currentPath);
+  } catch {}
+  return resolve(root);
+}
+
+async function isVersionedInstall(root) {
+  try {
+    return (await lstat(join(root, "current"))).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+async function deployVersionedPackage(root, prepared, { currentMode, serviceState }) {
+  const releasesDir = join(root, "releases");
+  await mkdir(releasesDir, { recursive: true, mode: 0o700 });
+  const stageDir = await mkdtemp(join(releasesDir, ".staging-"));
+  const previousTarget = await readlink(join(root, "current"));
+  let promoted = false;
+  let finalDir;
+  try {
+    const activeRoot = await resolveActivePackageRoot(root);
+    if (prepared.sourceMode === "core") {
+      const activeManifest = await readJsonIfExists(join(activeRoot, "release-manifest.json")) || {};
+      const updateManifest = await readJsonIfExists(join(prepared.sourcePackage, "release-manifest.json")) || {};
+      const compatibleGenerations = updateManifest.compatibleRuntimeGenerations || [updateManifest.runtimeGeneration];
+      if (activeManifest.runtimeFamily !== REQUIRED_RUNTIME_FAMILY
+        || updateManifest.runtimeFamily !== REQUIRED_RUNTIME_FAMILY
+        || !compatibleGenerations.includes(activeManifest.runtimeGeneration)) {
+        throw new Error("Core 更新包与当前运行时代际不兼容；请先应用完整运行时更新");
+      }
+      await cp(activeRoot, stageDir, { recursive: true, verbatimSymlinks: true });
+      for (const relativePath of CORE_OVERLAY_PATHS) {
+        const source = join(prepared.sourcePackage, relativePath);
+        if (!(await exists(source))) continue;
+        const destination = join(stageDir, relativePath);
+        await rm(destination, { recursive: true, force: true });
+        await mkdir(dirname(destination), { recursive: true });
+        await cp(source, destination, { recursive: true, verbatimSymlinks: true });
+      }
+      await writeMergedManifest(stageDir, activeRoot, prepared.sourcePackage, currentMode);
+    } else {
+      await cp(prepared.sourcePackage, stageDir, { recursive: true, verbatimSymlinks: true });
+    }
+
+    const manifest = await readJsonIfExists(join(stageDir, "release-manifest.json")) || {};
+    const executable = existsSync(join(stageDir, "app", "feishu-codex-bridge"))
+      ? join(stageDir, "app", "feishu-codex-bridge")
+      : join(stageDir, "feishu-codex-bridge");
+    const identity = createHash("sha256")
+      .update(await readFile(join(stageDir, "release-manifest.json")))
+      .update(await readFile(executable))
+      .digest("hex")
+      .slice(0, 16);
+    const version = String(manifest.version || "0.0.0").replace(/[^A-Za-z0-9._-]/g, "-");
+    const releaseId = version + "-" + identity;
+    finalDir = join(releasesDir, releaseId);
+    if (existsSync(finalDir)) {
+      await rm(stageDir, { recursive: true, force: true });
+    } else {
+      await rename(stageDir, finalDir);
+    }
+
+    if (serviceState.loaded) {
+      await stopPortableService(root);
+      await waitForServiceState(false);
+    }
+    await switchCurrentRelease(root, "releases/" + releaseId);
+    promoted = true;
+    if (serviceState.loaded) {
+      await startPortableService(root);
+      await waitForServiceState(true);
+    }
+    return {
+      mode: prepared.sourceMode === "core" ? currentMode + "-core-overlay" : prepared.sourceMode,
+      sourcePackage: basename(prepared.sourcePackage),
+      releaseDir: finalDir,
+      previousRelease: previousTarget,
+    };
+  } catch (error) {
+    if (promoted) {
+      if (serviceState.loaded) {
+        try {
+          await stopPortableService(root);
+          await waitForServiceState(false);
+        } catch {}
+      }
+      await switchCurrentRelease(root, previousTarget);
+    }
+    if (serviceState.loaded) await restorePortableService(root);
+    throw error;
+  } finally {
+    await rm(stageDir, { recursive: true, force: true });
+  }
+}
+
+async function switchCurrentRelease(root, target) {
+  const currentPath = join(root, "current");
+  const temporaryPath = join(root, ".current-" + process.pid + "-" + Date.now());
+  try {
+    await symlink(target, temporaryPath, "dir");
+    await rename(temporaryPath, currentPath);
+  } catch (error) {
+    await rm(temporaryPath, { force: true });
+    throw error;
+  }
+}
+
 async function replaceInstalledPackage(root, prepared, { currentMode, onApplied }) {
   const { sourcePackage, sourceMode } = prepared;
+  if (sourceMode === "core") {
+    const installedManifest = await readJsonIfExists(join(root, "release-manifest.json")) || {};
+    const updateManifest = await readJsonIfExists(join(sourcePackage, "release-manifest.json")) || {};
+    const compatibleGenerations = updateManifest.compatibleRuntimeGenerations || [updateManifest.runtimeGeneration];
+    if (installedManifest.runtimeFamily !== REQUIRED_RUNTIME_FAMILY
+      || !compatibleGenerations.includes(installedManifest.runtimeGeneration)
+      || updateManifest.runtimeFamily !== REQUIRED_RUNTIME_FAMILY) {
+      throw new Error("Core 更新包与已安装 Bun 运行时代际不兼容；请先应用完整运行时更新");
+    }
+  }
   if (sourceMode === "core" || (currentMode === "direct" && sourceMode === "lite")) {
     return overlayPackage(root, sourcePackage, { currentMode, sourceMode, onApplied });
   }
@@ -435,6 +623,9 @@ async function replaceFullPackage(root, sourcePackage, { sourceMode, onApplied }
       await movePath(source, join(root, relativePath));
     }
 
+    await preserveAppRuntime(root, backup);
+    await removeLegacyNodeRuntime(root, backup, touchedPaths, sourcePackage);
+
     for (const entry of await packageRuntimeEntries(sourcePackage, sourceMode)) {
       const relativePath = join("runtime", entry);
       await backupPath(root, backup, relativePath, touchedPaths);
@@ -465,6 +656,11 @@ async function writeMergedManifest(root, backup, sourcePackage, currentMode) {
     version: source.version || current.version || "0.0.0",
     packageName: current.packageName || source.packageName,
     mode: currentMode,
+    runtimeFamily: source.runtimeFamily || current.runtimeFamily,
+    runtimeGeneration: source.mode === "core"
+      ? current.runtimeGeneration
+      : source.runtimeGeneration || current.runtimeGeneration,
+    runtimeVersion: source.runtimeVersion || current.runtimeVersion,
     coreVersion: source.version || current.coreVersion || current.version || "0.0.0",
     corePackageName: source.packageName || current.corePackageName,
     coreUpdatedAt: source.generatedAt || new Date().toISOString(),
@@ -479,15 +675,47 @@ async function packageRuntimeEntries(sourcePackage, sourceMode) {
   for (const entry of PACKAGE_RUNTIME_ENTRIES) {
     if (await exists(join(sourceRuntime, entry))) entries.push(entry);
   }
-  if (entries.includes("node-universal.tar.gz") && !entries.includes("node-universal")) {
-    entries.push("node-universal");
-  }
-  if (sourceMode === "direct" && entries.includes("node-universal.tar.gz")) {
-    for (const entry of [".bundled-node", "bin", "lib", "LICENSE", "README.md", "CHANGELOG.md"]) {
-      if (!entries.includes(entry)) entries.push(entry);
+  if (sourceMode === "direct" && entries.includes("bin")) {
+    for (const entry of [".bundled-bun", "BUN-LICENSE.txt"]) {
+      if (await exists(join(sourceRuntime, entry)) && !entries.includes(entry)) entries.push(entry);
     }
   }
   return entries;
+}
+
+async function preserveAppRuntime(root, backup) {
+  const previousRuntime = join(backup, "app", "runtime");
+  if (!(await exists(previousRuntime))) return;
+  await cp(previousRuntime, join(root, "app", "runtime"), {
+    recursive: true,
+    force: false,
+    errorOnExist: false,
+    preserveTimestamps: true,
+  });
+}
+
+async function removeLegacyNodeRuntime(root, backup, touchedPaths, sourcePackage) {
+  const runtimeRoot = join(root, "runtime");
+  let entries = [];
+  try {
+    entries = await readdir(runtimeRoot, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const legacyPaths = LEGACY_NODE_RUNTIME_ENTRIES.map((entry) => join("runtime", entry));
+  legacyPaths.push(...entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("node-v"))
+    .map((entry) => join("runtime", entry.name)));
+  if (!(await exists(join(sourcePackage, "runtime", "bin")))) {
+    legacyPaths.push(join("runtime", "bin", "node"));
+  }
+  const sourceManifest = await readJsonIfExists(join(sourcePackage, "release-manifest.json")) || {};
+  if (sourceManifest.runtimePackaging === "single-binary") {
+    legacyPaths.push(join("runtime", ".bundled-bun"), join("runtime", "BUN-LICENSE.txt"), join("runtime", "bin", "bun"));
+  }
+  for (const relativePath of legacyPaths) {
+    await backupPath(root, backup, relativePath, touchedPaths);
+  }
 }
 
 async function backupPath(root, backup, relativePath, touchedPaths) {
@@ -544,11 +772,18 @@ async function findExtractedPackage(staging) {
 }
 
 async function validatePackage(packageRoot, mode) {
+  const manifest = await readJsonIfExists(join(packageRoot, "release-manifest.json")) || {};
+  const directBinary = mode === "direct" && manifest.runtimePackaging === "single-binary";
   const required = mode === "core"
-    ? ["app/dist/main.js", "app/scripts/update-portable-release.mjs", "release-manifest.json", "feishu-codex-bridge"]
-    : ["app/dist/main.js", "app/package.json", "feishu-codex-bridge"];
+    ? ["app/feishu-codex-bridge", "app/dist/main.js", "app/scripts/update-portable-release.mjs", "release-manifest.json", "feishu-codex-bridge"]
+    : directBinary
+      ? ["app/feishu-codex-bridge", "app/package.json", "release-manifest.json", "feishu-codex-bridge"]
+      : ["app/dist/main.js", "app/package.json", "feishu-codex-bridge"];
   for (const requiredPath of required) {
     if (!(await exists(join(packageRoot, requiredPath)))) throw new Error(`更新包不完整，缺少 ${requiredPath}`);
+  }
+  if (mode === "direct" && !directBinary && manifest.runtimePackaging === "single-binary") {
+    throw new Error("Direct 单二进制包清单缺失或与包内容不匹配");
   }
   const expectedArch = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : process.arch;
   if (!basename(packageRoot).includes(`darwin-${expectedArch}`)) {
@@ -587,7 +822,7 @@ async function uninstallPortableUpdateSchedule() {
 async function hasActivePortableWork(root) {
   const state = await getPortableServiceState();
   if (!state.loaded) return false;
-  const launcher = join(root, "feishu-codex-bridge");
+  const launcher = portableLauncherPath(root);
   const result = await runCapture(launcher, ["codex:status", "--json"], { cwd: root });
   if (result.exitCode !== 0) {
     throw new Error(`无法确认活动任务，自动更新已取消：${result.stderr || result.stdout}`.trim());
@@ -622,17 +857,22 @@ async function waitForServiceState(wantRunning) {
   throw new Error(wantRunning ? "更新后 Bridge LaunchAgent 未进入 running 状态" : "Bridge LaunchAgent 停止超时");
 }
 
+function portableLauncherPath(root) {
+  const versionedLauncher = join(root, "current", "feishu-codex-bridge");
+  return existsSync(versionedLauncher) ? versionedLauncher : join(root, "feishu-codex-bridge");
+}
+
 async function stopPortableService(root) {
-  await run(join(root, "feishu-codex-bridge"), ["service", "stop"], { cwd: root });
+  await run(portableLauncherPath(root), ["service", "stop"], { cwd: root });
 }
 
 async function startPortableService(root) {
-  await run(join(root, "feishu-codex-bridge"), ["service", "start"], { cwd: root });
+  await run(portableLauncherPath(root), ["service", "start"], { cwd: root });
 }
 
 async function restorePortableService(root) {
   try {
-    await run(join(root, "feishu-codex-bridge"), ["service", "stop"], { cwd: root });
+    await run(portableLauncherPath(root), ["service", "stop"], { cwd: root });
   } catch {}
   try {
     await startPortableService(root);
@@ -751,6 +991,7 @@ function compareVersions(left, right) {
 function printUpdateCheck(check) {
   if (check.updateAvailable) {
     console.log(`发现更新：${check.currentVersion} -> ${check.remoteVersion}（${check.tag}）`);
+    if (check.runtimeMigrationRequired) console.log("当前 Portable 包需要从旧运行时完整迁移到 Bun。");
     if (check.releaseUrl) console.log(`Release：${check.releaseUrl}`);
   } else {
     console.log(`当前已是最新版本：${check.currentVersion}`);
@@ -758,7 +999,7 @@ function printUpdateCheck(check) {
 }
 
 function currentUid() {
-  if (typeof process.getuid !== "function") throw new Error("当前 Node 不支持读取 macOS 用户 ID");
+  if (typeof process.getuid !== "function") throw new Error("当前运行时不支持读取 macOS 用户 ID");
   return process.getuid();
 }
 
@@ -812,7 +1053,7 @@ function runCapture(file, args, options = {}) {
   });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.env.FEISHU_CODEX_BRIDGE_SINGLE_BINARY !== "1" && import.meta.url === `file://${process.argv[1]}`) {
   const args = parsePortableUpdateArguments(process.argv.slice(2));
   if (args.help) printPortableUpdateUsage();
   else updatePortableRelease(args).catch((error) => {

@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -91,13 +91,13 @@ export function resolveBuiltinInvocation(args, scriptNames) {
   return undefined;
 }
 
-export function buildPnpmArguments(invocation) {
+export function buildBunArguments(invocation) {
   return ["run", invocation.script, ...invocation.args];
 }
 
 export function buildCommand(
   invocation,
-  pnpm = process.env.PNPM_BIN || "pnpm",
+  bun = process.env.BUN_BIN || "bun",
   installRuntimePath = INSTALL_RUNTIME_PATH,
 ) {
   if (invocation.kind === "run"
@@ -108,7 +108,7 @@ export function buildCommand(
       args: [installRuntimePath, ...invocation.args],
     };
   }
-  return { file: pnpm, args: buildPnpmArguments(invocation) };
+  return { file: bun, args: buildBunArguments(invocation) };
 }
 
 export function usage(scriptNames) {

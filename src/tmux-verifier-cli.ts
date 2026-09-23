@@ -7,6 +7,8 @@ import { pathToFileURL } from "node:url";
 import { TmuxVerifier } from "./tmux-verifier.js";
 import { TmuxVerifierStore } from "./tmux-verifier-store.js";
 import { TmuxVerifierWebServer } from "./tmux-verifier-web.js";
+import { WebPairingAuth } from "./web-auth.js";
+import { StateDatabase } from "./db.js";
 
 export interface TmuxVerifierCliArguments {
   host: string;
@@ -79,6 +81,7 @@ export async function runTmuxVerifier(argv = process.argv.slice(2)): Promise<voi
   }
   mkdirSync(resolve(args.databasePath, ".."), { recursive: true });
   const store = new TmuxVerifierStore(args.databasePath);
+  const authDb = new StateDatabase(args.databasePath);
   const verifier = new TmuxVerifier({
     store,
     defaultCodexPath: args.codexPath,
@@ -93,6 +96,7 @@ export async function runTmuxVerifier(argv = process.argv.slice(2)): Promise<voi
     projectMapPath: process.env.TMUX_VERIFY_PROJECT_MAP
       ?? resolve(homedir(), ".codex", "project-map.yaml"),
     bridgeDashboardUrl: args.bridgeDashboardUrl,
+    auth: new WebPairingAuth({ db: authDb }),
     logger: createLogger(),
   });
   verifier.start();
@@ -106,6 +110,7 @@ export async function runTmuxVerifier(argv = process.argv.slice(2)): Promise<voi
     await server.stop();
     verifier.stop();
     store.close();
+    authDb.close();
   };
   const onSignal = (): void => {
     void stop().then(() => process.exit(0));
@@ -168,7 +173,7 @@ function createLogger() {
 
 function printUsage(): void {
   console.log([
-    "Usage: pnpm run tmux:verify -- [options]",
+    "Usage: bun run tmux:verify -- [options]",
     "  --host <host>       loopback host (default: 127.0.0.1)",
     "  --port <port>       HTTP port (default: 7320)",
     "  --db <path>         verifier SQLite path (default: runtime/tmux-verifier.db)",

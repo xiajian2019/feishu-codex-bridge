@@ -69,10 +69,11 @@ export async function publishGithubRelease(options = {}, runCommand = run) {
   const existingTag = await runCommand("git", ["tag", "--list", parsed.tag], PROJECT_ROOT);
   if (existingTag.trim()) throw new Error(`tag 已存在：${parsed.tag}`);
 
-  if (!parsed.skipBuild) await runCommand("npm", ["run", "build"], PROJECT_ROOT);
-  await runCommand("npm", ["run", "release", "--", "--skip-build", "--json"], PROJECT_ROOT);
-  await runCommand("npm", ["run", "release", "--", "--mode", "core", "--skip-build", "--json"], PROJECT_ROOT);
-  await runCommand("npm", ["run", "release", "--", "--mode", "lite", "--skip-build", "--json"], PROJECT_ROOT);
+  const bun = process.env.BUN_BIN || "bun";
+  if (!parsed.skipBuild) await runCommand(bun, ["run", "build"], PROJECT_ROOT);
+  await runCommand(bun, ["run", "release", "--skip-build", "--json"], PROJECT_ROOT);
+  await runCommand(bun, ["run", "release:legacy", "--mode", "core", "--skip-build", "--json"], PROJECT_ROOT);
+  await runCommand(bun, ["run", "release:legacy", "--mode", "lite", "--skip-build", "--json"], PROJECT_ROOT);
 
   const commands = [
     ["git", ["add", "-A"]],
