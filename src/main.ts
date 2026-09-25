@@ -84,6 +84,10 @@ function dashboardTaskActions(dispatcher: Dispatcher) {
   };
 }
 
+function resolveDashboardListenHost(configuredHost: string): string {
+  return process.env.FEISHU_CODEX_BRIDGE_LAN_BIND === "1" ? "0.0.0.0" : configuredHost;
+}
+
 async function runWebOnlyMode(
   config: ReturnType<typeof loadConfig>,
   args: MainArguments,
@@ -99,7 +103,7 @@ async function runWebOnlyMode(
     db,
     auth,
     tmuxDashboard: tmuxDashboardApi,
-    host: config.web.host,
+    host: resolveDashboardListenHost(config.web.host),
     port,
     modes: Object.keys(config.modes),
     taskAttachmentsDirectory: join(dirname(resolve(args.dbPath)), "task-attachments"),
@@ -318,7 +322,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         db,
         auth: auth!,
         tmuxDashboard: tmuxDashboardApi!,
-        host: config.web.host,
+        host: resolveDashboardListenHost(config.web.host),
         port: config.web.port,
         modes: Object.keys(config.modes),
         taskAttachmentsDirectory: join(dirname(resolve(args.dbPath)), "task-attachments"),
@@ -431,7 +435,7 @@ async function runDirectMode(
       db,
       auth,
       tmuxDashboard: tmuxDashboardApi,
-      host: config.web.host,
+      host: resolveDashboardListenHost(config.web.host),
       port: config.web.port,
       modes: Object.keys(config.modes),
       taskAttachmentsDirectory: join(dirname(dbPath), "task-attachments"),
@@ -577,7 +581,7 @@ async function runAampMode(
         db,
         auth: auth!,
         tmuxDashboard: tmuxDashboardApi!,
-        host: config.web.host,
+        host: resolveDashboardListenHost(config.web.host),
         port: config.web.port,
         modes: Object.keys(config.modes),
         projectRegistrySnapshotPath: projectRegistryPath,

@@ -29,6 +29,11 @@ try {
       await runInstallCli(args);
       break;
     }
+    case "--bridge-web-pair": {
+      const { runWebPair } = await import("../dist/web-pair-cli.js");
+      await runWebPair(args);
+      break;
+    }
     case "--bridge-update": {
       const updater = await import("./update-portable-release.mjs");
       const options = updater.parsePortableUpdateArguments(args, portableRoot);

@@ -42,6 +42,7 @@ export interface DashboardServerOptions {
   webRoot?: string;
   auth?: WebPairingAuth;
   tmuxDashboard?: TmuxDashboardApi;
+  cleanupExpiredStagedAttachments?: boolean;
   actions?: DashboardActions;
   logger?: Logger;
 }
@@ -77,11 +78,13 @@ export class DashboardServer {
     if (this.server) {
       return Promise.reject(new Error("dashboard server is already running"));
     }
-    await this.cleanupExpiredStagedAttachments().catch((error) => {
-      this.options.logger?.warn("failed to clean expired staged task attachments", {
-        error: error instanceof Error ? error.message : String(error),
+    if (this.options.cleanupExpiredStagedAttachments !== false) {
+      await this.cleanupExpiredStagedAttachments().catch((error) => {
+        this.options.logger?.warn("failed to clean expired staged task attachments", {
+          error: error instanceof Error ? error.message : String(error),
+        });
       });
-    });
+    }
     const server = createServer((request, response) => {
       void this.handle(request, response).catch((error: unknown) => {
         this.options.logger?.error("dashboard request failed", {

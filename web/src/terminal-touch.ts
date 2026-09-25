@@ -11,21 +11,38 @@ function cellPosition(terminal: Terminal, element: HTMLElement, clientX: number,
 function sendMouseWheel(
   terminal: Terminal,
   element: HTMLElement,
-  sendInput: (data: string) => void,
+  sendViewScroll: (data: string) => boolean,
   direction: -1 | 1,
   clientX: number,
   clientY: number,
-): void {
+): boolean {
   const { col, row } = cellPosition(terminal, element, clientX, clientY);
   const button = direction < 0 ? 64 : 65;
-  sendInput(`\u001b[<${button};${col};${row}M`);
+  return sendViewScroll(`\u001b[<${button};${col};${row}M`);
 }
 
 export function bindMobileTerminalTouch(
   host: HTMLElement,
   terminal: Terminal,
-  sendInput: (data: string) => void,
+  sendViewScroll: (data: string) => boolean,
 ): () => void {
+  terminal.attachCustomWheelEventHandler((event) => {
+    if (terminal.buffer.active.type === "normal") return true;
+    if (terminal.modes.mouseTrackingMode === "none") {
+      terminal.scrollLines(Math.round(event.deltaY / 18));
+      event.preventDefault();
+      return false;
+    }
+    const lines = Math.min(12, Math.max(1, Math.round(Math.abs(event.deltaY) / 18)));
+    const direction = event.deltaY < 0 ? -1 : 1;
+    let delivered = true;
+    for (let index = 0; index < lines; index += 1) {
+      delivered = sendMouseWheel(terminal, host, sendViewScroll, direction, event.clientX, event.clientY) && delivered;
+    }
+    if (!delivered) terminal.scrollLines(direction * lines);
+    event.preventDefault();
+    return false;
+  });
   let previousY: number | null = null;
   const onTouchStart = (event: TouchEvent): void => {
     previousY = event.touches[0]?.clientY ?? null;
@@ -39,10 +56,12 @@ export function bindMobileTerminalTouch(
     const direction = delta > 0 ? 1 : -1;
     if (terminal.buffer.active.type === "normal") {
       terminal.scrollLines(direction * lines);
-    } else {
+    } else if (terminal.modes.mouseTrackingMode !== "none") {
+      let delivered = true;
       for (let index = 0; index < lines; index += 1) {
-        sendMouseWheel(terminal, host, sendInput, direction, touch.clientX, touch.clientY);
+        delivered = sendMouseWheel(terminal, host, sendViewScroll, direction, touch.clientX, touch.clientY) && delivered;
       }
+      if (!delivered) terminal.scrollLines(direction * lines);
     }
     previousY = touch.clientY;
     event.preventDefault();

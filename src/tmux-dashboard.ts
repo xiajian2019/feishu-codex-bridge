@@ -29,7 +29,11 @@ export function isValidSessionName(value: string): boolean {
 
 export function parseSessions(output: string): TmuxSession[] {
   return output.split(/\r?\n/).filter(Boolean).map((line) => {
-    const [id, name, windows, attachedClients, cwd, createdAt] = line.split("\t");
+    const fields = line.split("\t");
+    const legacyComposite = /^(\$\d+)[_\t](.+?)[_\t](\d+)[_\t](\d+)[_\t](.+)[_\t](\d+)$/.exec(line);
+    const [id, name, windows, attachedClients, cwd, createdAt] = fields.length === 6
+      ? fields
+      : legacyComposite?.slice(1) ?? fields;
     return {
       id,
       name,
@@ -100,4 +104,9 @@ export async function killSession(id: string): Promise<void> {
 export async function findSession(id: string): Promise<TmuxSession | undefined> {
   if (!isSessionId(id)) return undefined;
   return (await listSessions()).find((session) => session.id === id);
+}
+
+export async function capturePane(id: string): Promise<string> {
+  if (!isSessionId(id)) throw new ValidationError("Invalid tmux session id.");
+  return runTmux(["capture-pane", "-p", "-t", id, "-S", "-200"]);
 }

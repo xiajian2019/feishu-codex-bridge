@@ -1,9 +1,12 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
+
+import { bindMobileTerminalViewport } from "./mobile-terminal-viewport.js";
 
 import { bindMobileTerminalTouch } from "./terminal-touch.js";
+import { TmuxMessageComposer, type TerminalShortcut } from "./TmuxMessageComposer.js";
 
 type TmuxSession = {
   id: string;
@@ -16,6 +19,7 @@ type TmuxSession = {
 
 type ProjectOption = { name: string; root: string };
 type Toast = { message: string; isError: boolean };
+type SubmissionResult = { ok: boolean; message?: string };
 
 const API_ROOT = "/tmux-dashboard/api";
 
@@ -29,6 +33,69 @@ async function requestApi<T>(path: string, options: RequestInit = {}): Promise<T
   return payload;
 }
 
+async function copyTextToClipboard(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Mobile browsers may block Clipboard API on HTTP LAN pages.
+    }
+  }
+
+  const field = document.createElement("textarea");
+  field.value = value;
+  field.setAttribute("readonly", "");
+  field.style.position = "fixed";
+  field.style.left = "-9999px";
+  field.style.top = "0";
+  field.style.fontSize = "16px";
+  document.body.append(field);
+  field.select();
+  field.setSelectionRange(0, field.value.length);
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } finally {
+    field.remove();
+  }
+  if (!copied) throw new Error("Clipboard access is unavailable in this browser.");
+}
+
+function normalizeTmuxSession(value: unknown): TmuxSession | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  const rawId = record.id ?? record.sessionId ?? record.session_id;
+  const id = typeof rawId === "string" ? rawId : "";
+  const name = record.name ?? record.sessionName ?? record.session_name;
+  const windows = Number(record.windows ?? record.sessionWindows ?? record.session_windows);
+  const attachedClients = Number(record.attachedClients ?? record.attached_clients ?? record.session_attached);
+  const cwd = record.cwd ?? record.sessionPath ?? record.session_path;
+  const createdAt = Number(record.createdAt ?? record.created_at ?? record.session_created);
+
+  if (
+    id
+    && typeof name === "string"
+    && Number.isFinite(windows)
+    && Number.isFinite(attachedClients)
+    && typeof cwd === "string"
+    && Number.isFinite(createdAt)
+  ) {
+    return { id, name, windows, attachedClients, cwd, createdAt };
+  }
+
+  const composite = /^(\$\d+)[_\t](.+?)[_\t](\d+)[_\t](\d+)[_\t](.+)[_\t](\d+)$/.exec(id);
+  if (!composite) return null;
+  return {
+    id: composite[1],
+    name: composite[2],
+    windows: Number(composite[3]),
+    attachedClients: Number(composite[4]),
+    cwd: composite[5],
+    createdAt: Number(composite[6]),
+  };
+}
+
 function createSessionName(): string {
   const stamp = new Date().toISOString();
   return `session-${stamp.slice(5, 10).replace("-", "")}-${stamp.slice(11, 16).replace(":", "")}`;
@@ -38,6 +105,7 @@ export function TmuxDashboard(): ReactElement {
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
   const [mobileView, setMobileView] = useState<"sessions" | "terminal">("sessions");
+  const [mobileNavigationOpen, setMobileNavigationOpen] = useState(true);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [backendStatus, setBackendStatus] = useState<"connecting" | "online" | "offline">("connecting");
@@ -48,20 +116,81 @@ export function TmuxDashboard(): ReactElement {
   const [createBusy, setCreateBusy] = useState(false);
   const [newName, setNewName] = useState("");
   const [newProjectName, setNewProjectName] = useState("");
+  const [sendingMessage, setSendingMessage] = useState(false);
   const terminalHostRef = useRef<HTMLDivElement | null>(null);
+  const terminalSocketRef = useRef<WebSocket | null>(null);
+  const terminalReconnectRef = useRef<(() => void) | null>(null);
+  const submissionWaitersRef = useRef(new Map<string, (result: SubmissionResult) => void>());
+  const sessionApiResponseRef = useRef("");
+  const sessionApiStatusRef = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    if (mobileView === "terminal") return bindMobileTerminalViewport(window);
+  }, [mobileView]);
+
+  useLayoutEffect(() => {
+    const collapsed = mobileView === "terminal"
+      && window.matchMedia("(max-width: 760px)").matches
+      && !mobileNavigationOpen;
+    document.documentElement.classList.toggle("tmux-mobile-nav-collapsed", collapsed);
+    return () => document.documentElement.classList.remove("tmux-mobile-nav-collapsed");
+  }, [mobileNavigationOpen, mobileView]);
 
   const loadSessions = useCallback(async (): Promise<void> => {
     try {
-      const result = await requestApi<{ sessions: TmuxSession[] }>("/sessions");
-      setSessions(result.sessions);
+      const response = await fetch(API_ROOT + "/sessions", { headers: { Accept: "application/json" } });
+      const rawResponse = await response.text();
+      sessionApiResponseRef.current = rawResponse;
+      sessionApiStatusRef.current = response.status;
+      let result: { sessions?: unknown[]; error?: string };
+      try {
+        result = JSON.parse(rawResponse) as typeof result;
+      } catch {
+        throw new Error("The sessions API returned invalid JSON.");
+      }
+      if (!response.ok) throw new Error(result.error || "Request failed (" + response.status + ").");
+      if (!Array.isArray(result.sessions)) throw new Error("The sessions API response has no session list.");
+      const normalizedSessions = result.sessions.map(normalizeTmuxSession);
+      if (normalizedSessions.some((session) => session === null)) {
+        throw new Error("The sessions API returned an unrecognized session record.");
+      }
+      const sessionList = normalizedSessions as TmuxSession[];
+      setSessions(sessionList);
       setBackendStatus("online");
       setError(null);
-      setSelectedId((current) => current && result.sessions.some((session) => session.id === current) ? current : null);
+      setSelectedId((current) => current && sessionList.some((session) => session.id === current) ? current : null);
     } catch (loadError) {
       setBackendStatus("offline");
       setError(loadError instanceof Error ? loadError.message : "Could not load tmux sessions.");
     }
   }, []);
+
+  const copySessionsApiResponse = async (): Promise<void> => {
+    const rawResponse = sessionApiResponseRef.current;
+    if (!rawResponse) {
+      setToast({ message: "No sessions API response has been received yet.", isError: true });
+      return;
+    }
+    let body: unknown = rawResponse;
+    try {
+      body = JSON.parse(rawResponse) as unknown;
+    } catch {
+      // Keep the original response text for non-JSON errors.
+    }
+    const payload = JSON.stringify({
+      request: { method: "GET", url: window.location.origin + API_ROOT + "/sessions" },
+      response: { status: sessionApiStatusRef.current, body },
+    }, null, 2);
+    try {
+      await copyTextToClipboard(payload);
+      setToast({ message: "Copied GET /tmux-dashboard/api/sessions request and response.", isError: false });
+    } catch (copyError) {
+      setToast({
+        message: copyError instanceof Error ? copyError.message : "Could not copy the sessions API response.",
+        isError: true,
+      });
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -82,17 +211,6 @@ export function TmuxDashboard(): ReactElement {
     return () => window.clearInterval(timer);
   }, [loadSessions]);
 
-  useEffect(() => {
-    const shouldLockPage = mobileView === "terminal"
-      && window.matchMedia("(max-width: 760px)").matches;
-    document.documentElement.classList.toggle("tmux-terminal-scroll-lock", shouldLockPage);
-    document.body.classList.toggle("tmux-terminal-scroll-lock", shouldLockPage);
-    return () => {
-      document.documentElement.classList.remove("tmux-terminal-scroll-lock");
-      document.body.classList.remove("tmux-terminal-scroll-lock");
-    };
-  }, [mobileView]);
-
   const filteredSessions = useMemo(() => {
     const query = search.trim().toLowerCase();
     return query
@@ -102,10 +220,22 @@ export function TmuxDashboard(): ReactElement {
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? null;
   const selectSession = (sessionId: string): void => {
     setSelectedId(sessionId);
-    if (window.matchMedia("(max-width: 760px)").matches) setMobileView("terminal");
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      setMobileNavigationOpen(false);
+      setMobileView("terminal");
+    }
   };
 
-  const showSessionsOnMobile = (): void => setMobileView("sessions");
+  const showSessionsOnMobile = (): void => {
+    setMobileNavigationOpen(true);
+    setMobileView("sessions");
+  };
+
+  const refreshSelectedSession = async (): Promise<void> => {
+    setToast({ message: "正在刷新 session 连接…", isError: false });
+    await loadSessions();
+    terminalReconnectRef.current?.();
+  };
 
   useEffect(() => {
     if (selectedId && !sessions.some((session) => session.id === selectedId)) setSelectedId(null);
@@ -119,7 +249,9 @@ export function TmuxDashboard(): ReactElement {
     }
 
     const terminal = new Terminal({
-      cursorBlink: true,
+      cursorBlink: false,
+      cursorInactiveStyle: "none",
+      disableStdin: true,
       convertEol: false,
       fontSize: 13,
       fontFamily: '"SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace',
@@ -134,63 +266,276 @@ export function TmuxDashboard(): ReactElement {
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(host);
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const address = `${protocol}//${window.location.host}/tmux-dashboard/terminal?session=${encodeURIComponent(selectedSession.id)}`;
-    const socket = new WebSocket(address);
-    socket.binaryType = "arraybuffer";
-    const sendInput = (data: string): void => {
-      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "input", data }));
+
+    const fitTerminal = (): void => {
+      fit.fit();
+      if (window.matchMedia("(max-width: 760px)").matches && terminal.element) {
+        // FitAddon reserves 15px even for overlay scrollbars. Use the actual
+        // mobile scrollbar width, keeping the terminal's scrollback enabled.
+        const screen = host.querySelector<HTMLElement>(".xterm-screen");
+        const viewport = host.querySelector<HTMLElement>(".xterm-viewport");
+        const cellWidth = (screen?.getBoundingClientRect().width ?? 0) / terminal.cols;
+        if (viewport && Number.isFinite(cellWidth) && cellWidth > 0) {
+          const style = getComputedStyle(terminal.element);
+          const padding = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+          const scrollbar = Math.max(0, viewport.offsetWidth - viewport.clientWidth);
+          // Leave one pixel for canvas/device-pixel rounding.
+          const cols = Math.max(2, Math.floor((host.clientWidth - padding - scrollbar - 1) / cellWidth));
+          if (cols !== terminal.cols) terminal.resize(cols, terminal.rows);
+        }
+      }
     };
-    const removeTouchScrolling = bindMobileTerminalTouch(host, terminal, sendInput);
+    fitTerminal();
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const terminalAddress = (): string => `${protocol}//${window.location.host}/tmux-dashboard/terminal?session=${encodeURIComponent(selectedSession.id)}&cols=${terminal.cols}&rows=${terminal.rows}`;
+    let socket: WebSocket | null = null;
     let disposed = false;
-    const sendResize = (): void => {
-      if (socket.readyState !== WebSocket.OPEN) return;
+    let reconnectTimer = 0;
+    let reconnectAttempt = 0;
+    let resizeFrame = 0;
+    let forceResize = false;
+    let keyboardResizePending = false;
+    let keyboardCloseTimer = 0;
+    let lastHostWidth = 0;
+    let lastHostHeight = 0;
+    const initialViewportHeight = window.visualViewport?.height ?? window.innerHeight;
+    lastHostWidth = host.clientWidth;
+    lastHostHeight = host.clientHeight;
+
+    const isComposerFocused = (): boolean => {
+      const activeElement = document.activeElement;
+      return activeElement instanceof HTMLTextAreaElement
+        && Boolean(activeElement.closest(".dashboard-composer"));
+    };
+    const isKeyboardOpen = (): boolean => {
+      if (!isComposerFocused()) return false;
+      const visualHeight = window.visualViewport?.height ?? window.innerHeight;
+      return window.innerHeight < initialViewportHeight * 0.82
+        || visualHeight < initialViewportHeight * 0.82;
+    };
+
+    const sendViewScroll = (data: string): boolean => {
+      const activeSocket = socket;
+      if (
+        activeSocket?.readyState === WebSocket.OPEN
+        && /^\u001b\[<6[45];\d{1,3};\d{1,3}M$/.test(data)
+      ) {
+        activeSocket.send(JSON.stringify({ type: "scroll", data }));
+        return true;
+      }
+      return false;
+    };
+    const removeTouchScrolling = bindMobileTerminalTouch(host, terminal, sendViewScroll);
+
+    const writeTerminalOutput = (data: string | Uint8Array): void => terminal.write(data);
+
+    const sendResize = (force = false): void => {
+      const activeSocket = socket;
+      if (activeSocket?.readyState !== WebSocket.OPEN) return;
+      const width = host.clientWidth;
+      const height = host.clientHeight;
+      if (isKeyboardOpen()) {
+        keyboardResizePending = true;
+        return;
+      }
+      if (!force && width === lastHostWidth && height !== lastHostHeight && isComposerFocused()) return;
       try {
-        fit.fit();
-        socket.send(JSON.stringify({ type: "resize", cols: terminal.cols, rows: terminal.rows }));
+        const preserveViewport = terminal.buffer.active.viewportY < terminal.buffer.active.baseY;
+        const previousViewportY = terminal.buffer.active.viewportY;
+        fitTerminal();
+        if (preserveViewport) terminal.scrollToLine(previousViewportY);
+        lastHostWidth = width;
+        lastHostHeight = height;
+        activeSocket.send(JSON.stringify({ type: "resize", cols: terminal.cols, rows: terminal.rows }));
       } catch {
         return;
       }
     };
-    socket.onopen = () => {
-      if (disposed) return;
-      setTerminalStatus("ATTACHED");
-      sendResize();
-      terminal.focus();
+
+    const resolvePendingSubmissions = (): void => {
+      for (const resolve of submissionWaitersRef.current.values()) {
+        resolve({ ok: false, message: "The terminal connection closed before delivery was confirmed." });
+      }
+      submissionWaitersRef.current.clear();
     };
-    socket.onmessage = (event) => {
-      if (disposed) return;
-      if (typeof event.data === "string") {
-        try {
-          const message = JSON.parse(event.data) as { type?: string; message?: string };
-          if (message.type === "error") {
-            setTerminalStatus("ERROR");
-            setToast({ message: message.message || "Could not attach to the selected session.", isError: true });
-          } else if (message.type === "exit") {
-            setTerminalStatus("DETACHED");
-          }
-        } catch {
-          terminal.write(event.data);
+
+    const scheduleResize = (force = false): void => {
+      forceResize ||= force;
+      if (resizeFrame) return;
+      resizeFrame = window.requestAnimationFrame(() => {
+        resizeFrame = 0;
+        const shouldForce = forceResize;
+        forceResize = false;
+        sendResize(shouldForce);
+      });
+    };
+
+    const scheduleReconnect = (): void => {
+      if (disposed || reconnectTimer) return;
+      if (navigator.onLine === false) {
+        setTerminalStatus("OFFLINE");
+        return;
+      }
+      const delay = Math.min(1_000 * 2 ** Math.min(reconnectAttempt, 4), 15_000);
+      reconnectAttempt += 1;
+      setTerminalStatus("RECONNECTING");
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = 0;
+        connect();
+      }, delay);
+    };
+
+    function connect(): void {
+      if (disposed || socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return;
+      if (navigator.onLine === false) {
+        setTerminalStatus("OFFLINE");
+        return;
+      }
+      setTerminalStatus("RECONNECTING");
+      if (!isKeyboardOpen()) {
+        fitTerminal();
+        lastHostWidth = host!.clientWidth;
+        lastHostHeight = host!.clientHeight;
+      }
+      const nextSocket = new WebSocket(terminalAddress());
+      socket = nextSocket;
+      terminalSocketRef.current = nextSocket;
+      nextSocket.binaryType = "arraybuffer";
+      nextSocket.onopen = () => {
+        if (disposed || socket !== nextSocket) {
+          nextSocket.close();
+          return;
         }
-      } else if (event.data instanceof ArrayBuffer) {
-        terminal.write(new Uint8Array(event.data));
-      } else if (event.data instanceof Blob) {
-        void event.data.arrayBuffer().then((output) => terminal.write(new Uint8Array(output)));
+        reconnectAttempt = 0;
+        setTerminalStatus("ATTACHED");
+        if (host!.clientWidth !== lastHostWidth || host!.clientHeight !== lastHostHeight) scheduleResize(true);
+      };
+      nextSocket.onmessage = (event) => {
+        if (disposed || socket !== nextSocket) return;
+        if (typeof event.data === "string") {
+          try {
+            const message = JSON.parse(event.data) as {
+              type?: string;
+              message?: string;
+              requestId?: string;
+              ok?: boolean;
+            };
+            if (message.type === "submission-result" && typeof message.requestId === "string") {
+              const resolve = submissionWaitersRef.current.get(message.requestId);
+              if (resolve) {
+                submissionWaitersRef.current.delete(message.requestId);
+                resolve({
+                  ok: message.ok === true,
+                  ...(typeof message.message === "string" ? { message: message.message } : {}),
+                });
+              }
+              return;
+            }
+            if (message.type === "error") {
+              setTerminalStatus("ERROR");
+              setToast({ message: message.message || "Could not attach to the selected session.", isError: true });
+            } else if (message.type === "exit") {
+              setTerminalStatus("DETACHED");
+            }
+          } catch {
+            writeTerminalOutput(event.data);
+          }
+        } else if (event.data instanceof ArrayBuffer) {
+          writeTerminalOutput(new Uint8Array(event.data));
+        } else if (event.data instanceof Blob) {
+          void event.data.arrayBuffer().then((output) => {
+            if (!disposed && socket === nextSocket) writeTerminalOutput(new Uint8Array(output));
+          });
+        }
+      };
+      nextSocket.onerror = () => {
+        if (!disposed && socket === nextSocket) setTerminalStatus("RECONNECTING");
+      };
+      nextSocket.onclose = () => {
+        if (socket === nextSocket) {
+          socket = null;
+          if (terminalSocketRef.current === nextSocket) terminalSocketRef.current = null;
+        }
+        resolvePendingSubmissions();
+        if (!disposed) scheduleReconnect();
+      };
+    }
+
+    const onWindowResize = (): void => scheduleResize(true);
+    const onViewportResize = (): void => {
+      if (isKeyboardOpen()) {
+        keyboardResizePending = true;
+        return;
+      }
+      keyboardResizePending = false;
+      scheduleResize(true);
+    };
+    const onComposerFocusOut = (event: FocusEvent): void => {
+      if (!(event.target instanceof HTMLTextAreaElement) || !event.target.closest(".dashboard-composer")) return;
+      window.clearTimeout(keyboardCloseTimer);
+      keyboardCloseTimer = window.setTimeout(() => {
+        const shouldResize = keyboardResizePending && !isComposerFocused();
+        keyboardResizePending = false;
+        if (shouldResize) scheduleResize(true);
+      }, 240);
+    };
+    const reconnectNow = (): void => {
+      if (disposed || document.visibilityState === "hidden") return;
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = 0;
+      connect();
+    };
+    const forceReconnect = (): void => {
+      if (disposed) return;
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = 0;
+      if (socket && socket.readyState < WebSocket.CLOSING) {
+        socket.close(1000, "manual refresh");
+      } else {
+        connect();
       }
     };
-    socket.onerror = () => { if (!disposed) setTerminalStatus("ERROR"); };
-    socket.onclose = () => { if (!disposed) setTerminalStatus("DETACHED"); };
-    terminal.onData(sendInput);
-    const resizeObserver = new ResizeObserver(sendResize);
+    const markOffline = (): void => {
+      if (disposed) return;
+      setTerminalStatus("OFFLINE");
+      if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+    };
+    const resizeObserver = new ResizeObserver(() => {
+      if (isKeyboardOpen()) {
+        keyboardResizePending = true;
+        return;
+      }
+      if (host.clientWidth === lastHostWidth) return;
+      scheduleResize();
+    });
     resizeObserver.observe(host);
-    window.addEventListener("resize", sendResize);
-    window.requestAnimationFrame(sendResize);
+    window.addEventListener("resize", onWindowResize);
+    window.addEventListener("focusout", onComposerFocusOut, true);
+    window.addEventListener("online", reconnectNow);
+    window.addEventListener("offline", markOffline);
+    document.addEventListener("visibilitychange", reconnectNow);
+    window.visualViewport?.addEventListener("resize", onViewportResize);
+    terminalReconnectRef.current = forceReconnect;
+    connect();
+    scheduleResize(true);
 
     return () => {
       disposed = true;
-      window.removeEventListener("resize", sendResize);
+      window.clearTimeout(reconnectTimer);
+      window.clearTimeout(keyboardCloseTimer);
+      window.cancelAnimationFrame(resizeFrame);
+      window.removeEventListener("resize", onWindowResize);
+      window.removeEventListener("focusout", onComposerFocusOut, true);
+      window.removeEventListener("online", reconnectNow);
+      window.removeEventListener("offline", markOffline);
+      document.removeEventListener("visibilitychange", reconnectNow);
+      window.visualViewport?.removeEventListener("resize", onViewportResize);
+      if (terminalReconnectRef.current === forceReconnect) terminalReconnectRef.current = null;
       resizeObserver.disconnect();
-      if (socket.readyState < WebSocket.CLOSING) socket.close();
+      resolvePendingSubmissions();
+      if (terminalSocketRef.current === socket) terminalSocketRef.current = null;
+      if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+      socket = null;
       removeTouchScrolling();
       terminal.dispose();
     };
@@ -198,9 +543,134 @@ export function TmuxDashboard(): ReactElement {
 
   useEffect(() => {
     if (!toast) return;
-    const timer = window.setTimeout(() => setToast(null), 3_200);
+    const timer = window.setTimeout(() => setToast(null), toast.isError ? 8_000 : 3_200);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  const sendMessage = async (messageText: string): Promise<SubmissionResult> => {
+    const socket = terminalSocketRef.current;
+    if (!selectedSession) return { ok: false, message: "Select a tmux session first." };
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      const message = "The terminal connection is closed.";
+      setToast({ message, isError: true });
+      return { ok: false, message };
+    }
+    if (sendingMessage) return { ok: false, message: "A message is already being sent." };
+    if (!messageText.trim()) return { ok: false, message: "Enter a message or attach an image." };
+
+    setSendingMessage(true);
+    try {
+      const requestId = ["submit", Date.now(), Math.random()].join("-");
+      const result = await new Promise<SubmissionResult>((resolve) => {
+        const timeout = window.setTimeout(() => {
+          if (!submissionWaitersRef.current.has(requestId)) return;
+          submissionWaitersRef.current.delete(requestId);
+          resolve({ ok: false, message: "The session did not confirm message delivery." });
+        }, 10_000);
+        submissionWaitersRef.current.set(requestId, (response) => {
+          window.clearTimeout(timeout);
+          resolve(response);
+        });
+        try {
+          if (socket.readyState !== WebSocket.OPEN) throw new Error("The terminal connection is closed.");
+          socket.send(JSON.stringify({ type: "submit", requestId, text: messageText.trim() }));
+        } catch (sendError) {
+          submissionWaitersRef.current.delete(requestId);
+          window.clearTimeout(timeout);
+          resolve({
+            ok: false,
+            message: sendError instanceof Error ? sendError.message : "Could not send the message.",
+          });
+        }
+      });
+      if (!result.ok) {
+        setToast({ message: result.message || "Could not send the message to the session.", isError: true });
+        return result;
+      }
+
+      setToast({ message: "Message sent to “" + selectedSession.name + "”.", isError: false });
+      return result;
+    } catch (sendError) {
+      const message = sendError instanceof Error ? sendError.message : "Could not send the message.";
+      setToast({
+        message,
+        isError: true,
+      });
+      return { ok: false, message };
+    } finally {
+      setSendingMessage(false);
+    }
+  };
+
+  const showAttachmentError = useCallback((message: string): void => {
+    setToast({ message, isError: true });
+  }, []);
+
+  const sendTerminalShortcut = async (shortcut: TerminalShortcut): Promise<void> => {
+    const socket = terminalSocketRef.current;
+    if (!selectedSession || !socket || socket.readyState !== WebSocket.OPEN) {
+      setToast({ message: "The terminal connection is closed.", isError: true });
+      return;
+    }
+
+    const requestId = ["shortcut", Date.now(), Math.random()].join("-");
+    const result = await new Promise<SubmissionResult>((resolve) => {
+      const timeout = window.setTimeout(() => {
+        if (!submissionWaitersRef.current.has(requestId)) return;
+        submissionWaitersRef.current.delete(requestId);
+        resolve({ ok: false, message: "The session did not confirm the shortcut." });
+      }, 5_000);
+      submissionWaitersRef.current.set(requestId, (response) => {
+        window.clearTimeout(timeout);
+        resolve(response);
+      });
+      try {
+        if (socket.readyState !== WebSocket.OPEN) throw new Error("The terminal connection is closed.");
+        socket.send(JSON.stringify({ type: "key", requestId, key: shortcut }));
+      } catch (error) {
+        submissionWaitersRef.current.delete(requestId);
+        window.clearTimeout(timeout);
+        resolve({ ok: false, message: error instanceof Error ? error.message : "Could not send the shortcut." });
+      }
+    });
+    if (!result.ok) {
+      setToast({
+        message: result.message || "Could not send the shortcut.",
+        isError: true,
+      });
+    }
+  };
+
+  const sendTerminalSequence = async (sequence: string): Promise<void> => {
+    const socket = terminalSocketRef.current;
+    if (!selectedSession || !socket || socket.readyState !== WebSocket.OPEN) {
+      setToast({ message: "The terminal connection is closed.", isError: true });
+      return;
+    }
+    const requestId = ["sequence", Date.now(), Math.random()].join("-");
+    const result = await new Promise<SubmissionResult>((resolve) => {
+      const timeout = window.setTimeout(() => {
+        if (!submissionWaitersRef.current.has(requestId)) return;
+        submissionWaitersRef.current.delete(requestId);
+        resolve({ ok: false, message: "The session did not confirm the control-key sequence." });
+      }, 5_000);
+      submissionWaitersRef.current.set(requestId, (response) => {
+        window.clearTimeout(timeout);
+        resolve(response);
+      });
+      try {
+        if (socket.readyState !== WebSocket.OPEN) throw new Error("The terminal connection is closed.");
+        socket.send(JSON.stringify({ type: "sequence", requestId, data: sequence }));
+      } catch (error) {
+        submissionWaitersRef.current.delete(requestId);
+        window.clearTimeout(timeout);
+        resolve({ ok: false, message: error instanceof Error ? error.message : "Could not send the control-key sequence." });
+      }
+    });
+    if (!result.ok) {
+      setToast({ message: result.message || "Could not send the control-key sequence.", isError: true });
+    }
+  };
 
   const openCreateDialog = (): void => {
     setNewName(createSessionName());
@@ -219,7 +689,10 @@ export function TmuxDashboard(): ReactElement {
         body: JSON.stringify({ name: newName.trim(), projectKey: targetProject.name }),
       });
       setCreateOpen(false);
-      if (window.matchMedia("(max-width: 760px)").matches) setMobileView("terminal");
+      if (window.matchMedia("(max-width: 760px)").matches) {
+        setMobileNavigationOpen(false);
+        setMobileView("terminal");
+      }
       setSessions((current) => [result.session, ...current.filter((session) => session.id !== result.session.id)]);
       setSelectedId(result.session.id);
       setToast({ message: `Session “${result.session.name}” created.`, isError: false });
@@ -244,6 +717,15 @@ export function TmuxDashboard(): ReactElement {
     }
   };
 
+  const connectionMessage = terminalStatus === "OFFLINE"
+    ? "当前网络不可用，消息不会发送，输入内容会保留。"
+    : terminalStatus === "RECONNECTING"
+      ? "Session 连接中断，正在自动重连；请等待连接恢复。"
+      : terminalStatus === "ERROR"
+        ? "Session 连接发生错误，可以手动刷新连接。"
+        : "Session 已断开，可以手动刷新连接。";
+  const showConnectionBanner = Boolean(selectedSession) && terminalStatus !== "ATTACHED" && terminalStatus !== "IDLE";
+
   return (
     <main className={`dashboard-page${mobileView === "terminal" ? " is-mobile-terminal" : ""}`}>
       {error ? <div className="dashboard-error" role="alert">{error}</div> : null}
@@ -254,6 +736,15 @@ export function TmuxDashboard(): ReactElement {
             <div className="dashboard-session-tools">
               <span className={`dashboard-backend dashboard-backend-${backendStatus}`}>{backendStatus.toUpperCase()}</span>
               <button className="dashboard-action" type="button" onClick={() => void loadSessions()}>Refresh</button>
+              {import.meta.env.DEV ? (
+                <button
+                  className="dashboard-action dashboard-copy-api"
+                  type="button"
+                  onClick={() => void copySessionsApiResponse()}
+                  aria-label="Copy the latest sessions API request and response"
+                  title="Copy the latest sessions API request and response"
+                >⧉</button>
+              ) : null}
               <button className="dashboard-add" type="button" onClick={openCreateDialog} disabled={projects.length === 0} aria-label="Create session">+</button>
             </div>
           </div>
@@ -281,17 +772,43 @@ export function TmuxDashboard(): ReactElement {
           <div className="dashboard-sidebar-footer"><span />Connected to your local tmux</div>
         </aside>
         <section className="dashboard-workspace" aria-label="Session terminal">
+          <button
+            className="dashboard-mobile-menu-toggle"
+            type="button"
+            onClick={() => setMobileNavigationOpen((current) => !current)}
+            aria-label={mobileNavigationOpen ? "收起顶部导航" : "展开顶部导航"}
+            aria-expanded={mobileNavigationOpen}
+          >☰</button>
           <div className="dashboard-workspace-toolbar">
+            <button className="dashboard-mobile-menu-close" type="button" onClick={() => setMobileNavigationOpen(false)} aria-label="收起顶部导航">☰</button>
             <button className="dashboard-mobile-back" type="button" onClick={showSessionsOnMobile} aria-label="Back to sessions">‹</button>
             <div className="dashboard-active-session"><span className="dashboard-terminal-glyph">⌘</span><div><strong>{selectedSession?.name ?? "No session selected"}</strong><span title={selectedSession?.cwd}>{selectedSession?.cwd ?? "Choose a session to open its terminal"}</span></div></div>
-            <div className="dashboard-terminal-actions"><span className={terminalStatus === "ATTACHED" ? "is-connected" : ""}>{selectedSession ? terminalStatus : "IDLE"}</span><button type="button" onClick={() => void endSession()} disabled={!selectedSession}>End session</button></div>
+            <div className="dashboard-terminal-actions"><span className={terminalStatus === "ATTACHED" ? "is-connected" : ""}>{selectedSession ? terminalStatus : "IDLE"}</span><button type="button" onClick={() => void refreshSelectedSession()} disabled={!selectedSession}>Refresh session</button><button type="button" onClick={() => void endSession()} disabled={!selectedSession}>End session</button></div>
           </div>
+          {showConnectionBanner ? (
+            <div className={`dashboard-connection-banner is-${terminalStatus.toLowerCase()}`} role="alert">
+              <span>{connectionMessage}</span>
+              <button type="button" onClick={() => void refreshSelectedSession()} disabled={!selectedSession}>立即刷新</button>
+            </div>
+          ) : null}
           <div className={`dashboard-terminal-frame${selectedSession ? "" : " is-empty"}`}>
             {selectedSession ? <div className="dashboard-terminal-host" ref={terminalHostRef} /> : (
               <div className="dashboard-empty-state"><div>&gt;_</div><h2>No session selected</h2><p>Choose a session from the list to attach its terminal.</p><button type="button" onClick={openCreateDialog} disabled={projects.length === 0}>+ New session</button></div>
             )}
           </div>
-          <footer className="dashboard-workspace-footer"><span>Interactive terminal powered by tmux</span><span>Session changes refresh automatically</span></footer>
+          <TmuxMessageComposer
+            key={selectedSession?.id ?? "no-session"}
+            sessionId={selectedSession?.id ?? null}
+            diagnosticSessionActive={Boolean(selectedSession) && mobileView === "terminal" && terminalStatus === "ATTACHED"}
+            disabled={!selectedSession || terminalStatus !== "ATTACHED"}
+            sending={sendingMessage}
+            placeholder={selectedSession ? "Message the Codex session…" : "Select a session to start messaging"}
+            onSubmit={sendMessage}
+            onAttachmentError={showAttachmentError}
+            onTerminalShortcut={sendTerminalShortcut}
+            onTerminalSequence={sendTerminalSequence}
+          />
+          <footer className="dashboard-workspace-footer"><span>Read-only tmux view</span><span>Messages and images go to the selected Codex session</span></footer>
         </section>
       </section>
       {createOpen ? (

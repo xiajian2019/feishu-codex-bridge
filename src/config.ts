@@ -17,8 +17,8 @@ const modeSchema = z.object({
 
 const webSchema = z.object({
   enabled: z.boolean().default(true),
-  // The dashboard exposes task prompts, errors and Codex responses. Keep it
-  // loopback-only until an authenticated reverse proxy is deliberately added.
+  // Config stays loopback-only by default. The authenticated system service
+  // opts into LAN binding for QR pairing through its LaunchAgent.
   host: z.literal("127.0.0.1").default("127.0.0.1"),
   port: z.number().int().min(1).max(65535).default(7310),
 }).strict();

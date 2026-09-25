@@ -5,7 +5,8 @@ import react from "@vitejs/plugin-react";
 
 const webRoot = fileURLToPath(new URL(".", import.meta.url));
 const apiTarget = process.env.BRIDGE_WEB_API_TARGET ?? "http://127.0.0.1:17310";
-const webSocketTarget = apiTarget.replace(/^http/, "ws");
+const tmuxApiTarget = process.env.BRIDGE_TMUX_API_TARGET ?? apiTarget;
+const tmuxWebSocketTarget = tmuxApiTarget.replace(/^http/, "ws");
 
 export default defineConfig({
   root: webRoot,
@@ -15,15 +16,16 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
-    host: "127.0.0.1",
+    host: "0.0.0.0",
     port: 5173,
+    strictPort: true,
     proxy: {
       "/tmux-dashboard/api": {
-        target: apiTarget,
+        target: tmuxApiTarget,
         changeOrigin: true,
       },
       "/tmux-dashboard/terminal": {
-        target: webSocketTarget,
+        target: tmuxWebSocketTarget,
         ws: true,
       },
       "/api": {

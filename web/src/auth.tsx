@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 
+const PAIRING_COMMAND = "feishu-codex-bridge web:pair";
+
 interface AuthStatus {
   authenticated: boolean;
   local: boolean;
@@ -26,7 +28,7 @@ interface WebAuthDevice {
 export function AuthGate({ children }: { children: ReactNode }): ReactElement {
   const [status, setStatus] = useState<AuthStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const pairingClaimRef = useRef<string | null>(null);
+  const pairingClaimRef = useRef<Promise<AuthStatus> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -49,7 +51,7 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
 }
 
 async function loadAuthStatus(
-  pairingClaimRef?: { current: string | null },
+  pairingClaimRef?: { current: Promise<AuthStatus> | null },
 ): Promise<AuthStatus> {
   const statusResponse = await fetch("/api/auth/status", {
     headers: { Accept: "application/json" },
@@ -63,24 +65,35 @@ async function loadAuthStatus(
 
   const code = readPairingCodeFromHash();
   if (!code) return statusBody;
-  if (pairingClaimRef?.current === code) return statusBody;
-  if (pairingClaimRef) pairingClaimRef.current = code;
-  const claimResponse = await fetch("/api/auth/pairing/claim", {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    credentials: "same-origin",
-    body: JSON.stringify({ code }),
-  });
-  const claimBody = await claimResponse.json() as ApiError;
-  if (!claimResponse.ok) {
-    if (pairingClaimRef?.current === code) pairingClaimRef.current = null;
-    throw new Error(claimBody.error || "二维码配对失败（" + claimResponse.status + "）");
+  if (pairingClaimRef?.current) return pairingClaimRef.current;
+
+  const claimPromise = (async (): Promise<AuthStatus> => {
+    const claimResponse = await fetch("/api/auth/pairing/claim", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      credentials: "same-origin",
+      body: JSON.stringify({ code }),
+    });
+    const claimBody = await claimResponse.json() as ApiError;
+    if (!claimResponse.ok) {
+      throw new Error(claimBody.error || "二维码配对失败（" + claimResponse.status + "）");
+    }
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    return loadAuthStatus();
+  })();
+
+  if (pairingClaimRef) {
+    pairingClaimRef.current = claimPromise;
+    try {
+      return await claimPromise;
+    } finally {
+      if (pairingClaimRef.current === claimPromise) pairingClaimRef.current = null;
+    }
   }
-  window.history.replaceState(null, "", window.location.pathname + window.location.search);
-  return loadAuthStatus();
+  return claimPromise;
 }
 
 function readPairingCodeFromHash(): string | null {
@@ -93,12 +106,35 @@ function readPairingCodeFromHash(): string | null {
   return code || null;
 }
 
+async function copyTextToClipboard(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Fall back for browsers that expose the API but deny access on HTTP pages.
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("浏览器未允许访问剪贴板。");
+}
+
 export function PairingAdmin(): ReactElement {
   const [status, setStatus] = useState<AuthStatus | null>(null);
   const [devices, setDevices] = useState<WebAuthDevice[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [pairingCommandError, setPairingCommandError] = useState<string | null>(null);
+  const [pairingCommandCopied, setPairingCommandCopied] = useState(false);
 
   const loadManagement = async (): Promise<void> => {
     setLoading(true);
@@ -127,6 +163,17 @@ export function PairingAdmin(): ReactElement {
   useEffect(() => {
     void loadManagement();
   }, []);
+
+  const copyPairingCommand = async (): Promise<void> => {
+    setPairingCommandError(null);
+    try {
+      await copyTextToClipboard(PAIRING_COMMAND);
+      setPairingCommandCopied(true);
+    } catch (copyError: unknown) {
+      setPairingCommandCopied(false);
+      setPairingCommandError(copyError instanceof Error ? copyError.message : String(copyError));
+    }
+  };
 
   const revokeAll = async (): Promise<void> => {
     setBusy(true);
@@ -242,8 +289,18 @@ export function PairingAdmin(): ReactElement {
           <section className="device-info-section">
             <p className="device-panel-kicker">PAIRING</p>
             <h2>添加新设备</h2>
-            <p>配对码不会出现在网页中，只会显示在 Mac 的终端二维码里。</p>
-            <code className="device-command">bun run web:pair -- --url http://内网IP:端口/</code>
+            <p>命令会使用正式数据库，并自动检测当前局域网 IP 和服务端口；配对码只会显示在 Mac 终端中。</p>
+            <div className="device-command-row">
+              <code className="device-command">{PAIRING_COMMAND}</code>
+              <button
+                className="secondary device-command-copy"
+                type="button"
+                onClick={() => void copyPairingCommand()}
+              >
+                {pairingCommandCopied ? "已复制" : "复制命令"}
+              </button>
+            </div>
+            {pairingCommandError ? <p className="device-command-error" role="status">{pairingCommandError}</p> : null}
             <p>二维码 5 分钟有效，使用一次后立即失效。过期后重新运行命令即可刷新。</p>
           </section>
           <details className="device-danger-section">

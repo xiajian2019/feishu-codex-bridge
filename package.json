@@ -21,6 +21,7 @@
     "build:web": "bun run --bun vite build --config web/vite.config.ts",
     "dev": "bun --watch src/main.ts",
     "dev:api": "bun --watch src/main.ts --web-only --web-port 17310 --config ./config.example.json --db ./runtime/dev/bridge.db",
+    "dev:tmux-api": "bun --watch src/tmux-dashboard-dev.ts",
     "dev:web": "bun run --bun vite --config web/vite.config.ts",
     "web:pair": "bun src/web-pair-cli.ts",
     "start": "bun dist/main.js",
@@ -70,6 +71,7 @@
     "typecheck": "bun run --bun tsc -p tsconfig.json --noEmit && bun run --bun tsc -p web/tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@assistant-ui/react": "0.15.19",
     "@larksuite/cli": "1.0.94",
     "@larksuiteoapi/node-sdk": "1.73.3",
     "@larktask/aamp-feishu-task-agent": "0.1.1-dev.8",
@@ -91,6 +93,8 @@
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^4.7.0",
     "typescript": "^5.7.3",
+    "vconsole": "3.15.1",
+    "vconsole-outputlog-plugin": "0.3.0",
     "vite": "^6.4.3"
   }
 }

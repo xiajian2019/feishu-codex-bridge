@@ -403,9 +403,9 @@ bun run start:all
 - React 页面通过 SSE 接收任务状态、run 进展和执行事件变化，只更新受影响的任务行和详情区块；连接断开时自动使用快照轮询并重连。
 - 详情弹窗持续显示实时进展，反馈草稿和操作状态由前端组件独立维护，不会被进展更新覆盖；“刷新详情”用于主动校准完整快照。
 
-查询接口为 `GET /healthz`、`GET /api/session`、`GET /api/tasks`、`GET /api/tasks/:taskGuid`、`GET /api/aamp/tasks`、`GET /api/aamp/tasks/:id` 和 `GET /api/events`；旧兼容模式的 `POST /api/tasks/:taskGuid` 操作接口当前不会配置 Dispatcher。页面包含 CSP、禁止 iframe 和 `no-store` 响应头。由于内容包含任务描述、仓库路径和 Codex 结果，不应通过端口转发或反向代理对外暴露。
+查询接口为 `GET /healthz`、`GET /api/session`、`GET /api/tasks`、`GET /api/tasks/:taskGuid`、`GET /api/aamp/tasks`、`GET /api/aamp/tasks/:id` 和 `GET /api/events`；旧兼容模式的 `POST /api/tasks/:taskGuid` 操作接口当前不会配置 Dispatcher。页面包含 CSP、禁止 iframe 和 `no-store` 响应头。系统安装的服务支持局域网配对，任务 API、tmux API、SSE 和终端 WebSocket 都要求已配对会话；不要将服务暴露到公网。
 
-页面支持一次性配对。配对码和二维码只由 Mac 命令行生成；统一 Bridge 使用 bun run web:pair -- --url http://192.168.1.10:7310/，开发页面 5173 使用 runtime/dev/bridge.db。手机扫描二维码后，网页从 URL fragment 自动 claim，服务端签发一个 30 天 HttpOnly 会话 Cookie，二维码 5 分钟后失效且只能使用一次。任务 API、tmux Dashboard API、SSE 和终端 WebSocket 都要求已配对会话；未认证网页只显示等待扫码提示。认证后从 /pair-admin 进入设备管理，可查看已配对设备并撤销所有手机；刷新配对码需重新运行 web:pair。配对状态保存在 Bridge 使用的 SQLite 数据库中。\n
+页面支持一次性配对。系统安装后运行 `feishu-codex-bridge web:pair`，源码目录运行 `bun run web:pair`；CLI 自动选择当前机器的局域网 IPv4 和 `config.json` 中的 `web.port`（默认 7310），并始终写入生产库 `runtime/bridge.db`。可用 `--url`、`--port` 覆盖地址，或用 `--db` 显式指定数据库；URL/端口不会自动切换到开发库。手机扫描二维码后，网页从 URL fragment 自动 claim，服务端签发一个 30 天 HttpOnly 会话 Cookie，二维码 5 分钟后失效且只能使用一次。未认证网页只显示等待扫码提示。认证后从 `/pair-admin` 进入设备管理，可查看已配对设备并撤销所有手机；刷新配对码需重新运行 `web:pair`。配对状态保存在 Bridge 使用的 SQLite 数据库中。\n
 前端源码位于 web/，生产构建输出到 dist/web，由同一个 Bridge Bun 进程静态托管。开发时运行 bun run dev:api 和 bun run dev:web，然后打开 http://127.0.0.1:5173。开发 API 监听 127.0.0.1:17310，只使用 runtime/dev/bridge.db，不触碰 LaunchAgent 的服务或 7310 生产数据库，也不会启动 Feishu/AAMP/Relay/Codex 消息运行时；Vite 的 Bridge 和 tmux Dashboard API/WebSocket 都代理到这个开发 API。dev:api 默认读取 config.example.json，也可用 --config、--db、--web-port 覆盖配置、数据路径和端口；Vite 目标可用 BRIDGE_WEB_API_TARGET 覆盖。tmux Dashboard 连接现有默认 tmux server。发布或 LaunchAgent 启动前仍须执行 bun run build。\n
 默认 `runTimeoutSeconds` 为 `3600` 秒（1 小时）；超时会先终止 Worker，必要时再强制结束，并将本轮标记为失败。
 
