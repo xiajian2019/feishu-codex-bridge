@@ -3,12 +3,13 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 
 import { App } from "./App.js";
-import { WebNavigation } from "./WebNavigation.js";
+import { SystemNavigationProvider, WebNavigation } from "./WebNavigation.js";
 import { AuthGate, PairingAdmin } from "./auth.js";
 import { ThemeProvider } from "./theme.js";
 import "./styles.css";
 
 const TmuxDashboard = lazy(() => import("./TmuxDashboard.js").then((module) => ({ default: module.TmuxDashboard })));
+const CodexHistory = lazy(() => import("./CodexHistory.js").then((module) => ({ default: module.CodexHistory })));
 
 type MobileVConsole = {
   showSwitch: () => void;
@@ -96,15 +97,19 @@ async function mountApp(): Promise<void> {
         <ThemeProvider>
         <BrowserRouter>
           <AuthGate>
-            <WebNavigation />
-            <Suspense fallback={<div className="route-loading">页面加载中…</div>}>
-              <Routes>
-                <Route path="/" element={<App />} />
-                <Route path="/tmux-dashboard/*" element={<TmuxDashboard />} />
-                <Route path="/pair-admin" element={<PairingAdmin />} />
-                <Route path="*" element={<Navigate to="/" replace />} />
-              </Routes>
-            </Suspense>
+            <SystemNavigationProvider>
+              <WebNavigation />
+              <Suspense fallback={<div className="route-loading">页面加载中…</div>}>
+                <Routes>
+                  <Route path="/" element={<App />} />
+                  <Route path="/codex-history" element={<CodexHistory />} />
+                  <Route path="/codex-history/:homeId/:threadId" element={<CodexHistory />} />
+                  <Route path="/tmux-dashboard/*" element={<TmuxDashboard />} />
+                  <Route path="/pair-admin" element={<PairingAdmin />} />
+                  <Route path="*" element={<Navigate to="/" replace />} />
+                </Routes>
+              </Suspense>
+            </SystemNavigationProvider>
           </AuthGate>
         </BrowserRouter>
       </ThemeProvider>

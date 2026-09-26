@@ -2834,6 +2834,12 @@ export class StateDatabase {
     return rows.map(mapWebAuthSession);
   }
 
+  public updateWebAuthSessionDeviceName(sessionId: string, deviceName: string): void {
+    this.db
+      .prepare("UPDATE web_auth_sessions SET device_name = ? WHERE session_id = ? AND revoked_at IS NULL")
+      .run(deviceName, sessionId);
+  }
+
   public revokeWebAuthSession(sessionId: string, revokedAt: string): void {
     this.db
       .prepare(

@@ -7,6 +7,13 @@ import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 
 import { StateDatabase } from "./db.js";
+import {
+  CODEX_HISTORY_DEFAULT_SOURCE_KINDS,
+  CODEX_HISTORY_SOURCE_KINDS,
+  CODEX_HISTORY_STATUS_TYPES,
+  CodexHistoryService,
+  type CodexHistoryArchivedFilter,
+} from "./codex-history.js";
 import { writeProjectRegistrySnapshot } from "./project-registry.js";
 import type { TmuxDashboardApi } from "./tmux-dashboard-api.js";
 import { resolveBridgeProjectRoot } from "./portable-runtime.js";
@@ -42,6 +49,7 @@ export interface DashboardServerOptions {
   webRoot?: string;
   auth?: WebPairingAuth;
   tmuxDashboard?: TmuxDashboardApi;
+  codexHistory?: CodexHistoryService;
   cleanupExpiredStagedAttachments?: boolean;
   actions?: DashboardActions;
   logger?: Logger;
@@ -146,6 +154,31 @@ export class DashboardServer {
       sendJson(response, 200, { devices });
       return;
     }
+    const deviceUpdateMatch = /^\/api\/auth\/devices\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "PATCH" && deviceUpdateMatch) {
+      if (!this.auth.isAuthorized(request)) {
+        sendJson(response, 401, { error: "pairing required" });
+        return;
+      }
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonBody(request);
+      } catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request" });
+        return;
+      }
+      if (typeof body.deviceName !== "string" || !body.deviceName.trim()) {
+        sendJson(response, 400, { error: "device name is required" });
+        return;
+      }
+      const sessionId = decodeURIComponent(deviceUpdateMatch[1]);
+      if (!this.auth.renameDevice(request, sessionId, body.deviceName)) {
+        sendJson(response, 404, { error: "device not found or name is invalid" });
+        return;
+      }
+      sendJson(response, 200, { ok: true });
+      return;
+    }
     const deviceRevokeMatch = /^\/api\/auth\/devices\/([^/]+)\/revoke$/.exec(url.pathname);
     if (request.method === "POST" && deviceRevokeMatch) {
       const sessionId = decodeURIComponent(deviceRevokeMatch[1]);
@@ -154,6 +187,18 @@ export class DashboardServer {
         return;
       }
       sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/auth/pairing/start") {
+      if (!this.auth.isAuthorized(request)) {
+        sendJson(response, 401, { error: "pairing required" });
+        return;
+      }
+      const pairing = this.auth.startPairing();
+      sendJson(response, 200, {
+        pairingUrl: buildPairingUrl(request, pairing.code),
+        expiresAt: pairing.expiresAt,
+      });
       return;
     }
     if (request.method === "POST" && url.pathname === "/api/auth/pairing/claim") {
@@ -204,6 +249,32 @@ export class DashboardServer {
     }
     if (request.method === "GET" && url.pathname === "/api/projects") {
       sendJson(response, 200, { projects: this.listProjects() });
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/codex/homes") {
+      if (!this.options.codexHistory) {
+        sendJson(response, 501, { error: "Codex history is not configured" });
+        return;
+      }
+      sendJson(response, 200, { homes: this.options.codexHistory.listHomes() });
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/codex/threads") {
+      await this.listCodexThreads(url, response);
+      return;
+    }
+    const codexThreadMatch = /^\/api\/codex\/threads\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "GET" && codexThreadMatch) {
+      let homeId: string;
+      let threadId: string;
+      try {
+        homeId = decodeURIComponent(codexThreadMatch[1]);
+        threadId = decodeURIComponent(codexThreadMatch[2]);
+      } catch {
+        sendJson(response, 400, { error: "invalid Codex thread selector" });
+        return;
+      }
+      await this.getCodexThread(homeId, threadId, url, response);
       return;
     }
     if (request.method === "POST" && url.pathname === "/api/projects") {
@@ -363,6 +434,62 @@ export class DashboardServer {
         modes: this.options.modes,
       },
     });
+  }
+
+  private async listCodexThreads(url: URL, response: ServerResponse): Promise<void> {
+    const history = this.options.codexHistory;
+    if (!history) {
+      sendJson(response, 501, { error: "Codex history is not configured" });
+      return;
+    }
+    const limit = parseInteger(url.searchParams.get("limit"), 50, 1, 200);
+    const offset = parseInteger(url.searchParams.get("offset"), 0, 0, 1_000_000);
+    if (limit === null || offset === null) {
+      sendJson(response, 400, { error: "invalid Codex history pagination" });
+      return;
+    }
+    try {
+      const result = await history.listThreads({
+        homeId: cleanParam(url.searchParams.get("home")),
+        searchTerm: cleanParam(url.searchParams.get("q")),
+        statuses: parseCodexHistoryStatuses(url.searchParams.getAll("status")),
+        sourceKinds: parseCodexHistorySources(url.searchParams.getAll("source")),
+        modelProviders: parseCodexHistoryValues(url.searchParams.getAll("provider")),
+        cwd: parseCodexHistoryCwds(url.searchParams.getAll("cwd")),
+        archived: parseCodexHistoryArchived(url.searchParams.get("archived")),
+        sortKey: parseCodexHistorySortKey(url.searchParams.get("sort")),
+        sortDirection: parseCodexHistorySortDirection(url.searchParams.get("direction")),
+        limit,
+        offset,
+      });
+      sendJson(response, 200, {
+        generatedAt: new Date().toISOString(),
+        dataSource: "codex-app-server",
+        ...result,
+      });
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid Codex history query" });
+    }
+  }
+
+  private async getCodexThread(
+    homeId: string,
+    threadId: string,
+    url: URL,
+    response: ServerResponse,
+  ): Promise<void> {
+    const history = this.options.codexHistory;
+    if (!history) {
+      sendJson(response, 501, { error: "Codex history is not configured" });
+      return;
+    }
+    try {
+      const result = await history.readThread(homeId, threadId, url.searchParams.get("turns") !== "0");
+      sendJson(response, 200, result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(response, message.startsWith("找不到 Codex home") ? 404 : 502, { error: message });
+    }
   }
 
   private async createTask(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -907,6 +1034,7 @@ function isSpaRoute(pathname: string): boolean {
   return pathname === "/"
     || pathname === "/index.html"
     || pathname === "/pair-admin"
+    || pathname === "/codex-history"
     || pathname === "/tmux-dashboard"
     || (pathname.startsWith("/tmux-dashboard/")
       && !pathname.startsWith("/tmux-dashboard/api/")
@@ -924,6 +1052,59 @@ function isAampTaskStatus(value: string): value is AampTaskStatus {
 function cleanParam(value: string | null): string | undefined {
   const normalized = value?.trim();
   return normalized ? normalized.slice(0, 200) : undefined;
+}
+
+function parseCodexHistoryValues(values: string[]): string[] | undefined {
+  const parsed = values.flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean);
+  return parsed.length > 0 ? [...new Set(parsed)] : undefined;
+}
+
+function parseCodexHistorySources(values: string[]): typeof CODEX_HISTORY_DEFAULT_SOURCE_KINDS {
+  const parsed = parseCodexHistoryValues(values) ?? [...CODEX_HISTORY_DEFAULT_SOURCE_KINDS];
+  const invalid = parsed.find((value) => !CODEX_HISTORY_SOURCE_KINDS.includes(value as typeof CODEX_HISTORY_SOURCE_KINDS[number]));
+  if (invalid) {
+    throw new Error(`未知 Codex thread 来源：${invalid}；可选值：${CODEX_HISTORY_SOURCE_KINDS.join(", ")}`);
+  }
+  return parsed as typeof CODEX_HISTORY_DEFAULT_SOURCE_KINDS;
+}
+
+function parseCodexHistoryStatuses(values: string[]): string[] | undefined {
+  const parsed = parseCodexHistoryValues(values);
+  if (!parsed) return undefined;
+  const invalid = parsed.find((value) => !CODEX_HISTORY_STATUS_TYPES.includes(value as typeof CODEX_HISTORY_STATUS_TYPES[number]));
+  if (invalid) {
+    throw new Error(`未知 Codex thread 状态：${invalid}；可选值：${CODEX_HISTORY_STATUS_TYPES.join(", ")}`);
+  }
+  return parsed;
+}
+
+function parseCodexHistoryArchived(value: string | null): CodexHistoryArchivedFilter {
+  const normalized = value?.trim() || "active";
+  if (normalized !== "active" && normalized !== "archived" && normalized !== "all") {
+    throw new Error("archived must be active, archived, or all");
+  }
+  return normalized;
+}
+
+function parseCodexHistorySortKey(value: string | null): "created_at" | "updated_at" | "recency_at" {
+  const normalized = value?.trim() || "recency_at";
+  if (normalized !== "created_at" && normalized !== "updated_at" && normalized !== "recency_at") {
+    throw new Error("sort must be created_at, updated_at, or recency_at");
+  }
+  return normalized;
+}
+
+function parseCodexHistorySortDirection(value: string | null): "asc" | "desc" {
+  const normalized = value?.trim() || "desc";
+  if (normalized !== "asc" && normalized !== "desc") {
+    throw new Error("direction must be asc or desc");
+  }
+  return normalized;
+}
+
+function parseCodexHistoryCwds(values: string[]): string[] | undefined {
+  const parsed = parseCodexHistoryValues(values)?.map((value) => resolve(value));
+  return parsed && parsed.length > 0 ? parsed : undefined;
 }
 
 function parseInteger(
@@ -1022,6 +1203,23 @@ function normalizeAttachmentMimeType(value: string | string[] | undefined): stri
   return /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(mimeType)
     ? mimeType
     : "application/octet-stream";
+}
+
+function buildPairingUrl(request: IncomingMessage, code: string): string {
+  const protocolHeader = firstHeaderValue(request.headers["x-forwarded-proto"]);
+  const protocol = protocolHeader?.toLowerCase() === "https" ? "https" : "http";
+  const configuredHost = firstHeaderValue(request.headers["x-forwarded-host"])
+    ?? request.headers.host
+    ?? "localhost";
+  const url = new URL(`${protocol}://${configuredHost}/`);
+  url.hash = "pair=" + encodeURIComponent(code);
+  return url.toString();
+}
+
+function firstHeaderValue(value: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const normalized = raw?.split(",", 1)[0]?.trim();
+  return normalized || undefined;
 }
 
 function attachmentFileExtension(fileName: string, mimeType: string): string {

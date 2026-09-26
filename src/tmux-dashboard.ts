@@ -106,7 +106,16 @@ export async function findSession(id: string): Promise<TmuxSession | undefined> 
   return (await listSessions()).find((session) => session.id === id);
 }
 
-export async function capturePane(id: string): Promise<string> {
+export async function capturePane(
+  id: string,
+  rows = 24,
+  options: { alternateScreen?: boolean; includeEscapeSequences?: boolean } = {},
+): Promise<string> {
   if (!isSessionId(id)) throw new ValidationError("Invalid tmux session id.");
-  return runTmux(["capture-pane", "-p", "-t", id, "-S", "-200"]);
+  const safeRows = Number.isSafeInteger(rows) ? Math.max(1, Math.min(2_000, rows)) : 24;
+  const args = ["capture-pane", "-p"];
+  if (options.alternateScreen) args.push("-a");
+  if (options.includeEscapeSequences) args.push("-e");
+  args.push("-t", id, "-S", "-" + safeRows);
+  return runTmux(args);
 }

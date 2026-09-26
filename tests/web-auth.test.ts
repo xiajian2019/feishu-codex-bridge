@@ -62,6 +62,24 @@ describe("WebPairingAuth", () => {
     expect(() => auth.claimPairing(validRemote, pairing.code)).toThrow("pairing code expired or unavailable");
     db.close();
   });
+
+  it("allows an authenticated admin to rename a device", () => {
+    const db = new StateDatabase(":memory:");
+    const auth = new WebPairingAuth({ db });
+    const remote = fakeRequest("203.0.113.23");
+    const pairing = auth.startPairing();
+    const response = fakeResponse();
+    const token = auth.claimPairing(remote, pairing.code);
+    auth.setSessionCookie(remote, response as unknown as ServerResponse, token);
+
+    const authenticatedRequest = fakeRequest("203.0.113.23", response.headers["set-cookie"]);
+    const device = auth.listDevices(authenticatedRequest)?.[0];
+    expect(device?.deviceName).toBe("Browser device");
+    expect(auth.renameDevice(authenticatedRequest, device!.sessionId, "办公室 iPhone")).toBe(true);
+    expect(auth.listDevices(authenticatedRequest)?.[0]?.deviceName).toBe("办公室 iPhone");
+    expect(auth.renameDevice(authenticatedRequest, device!.sessionId, "")).toBe(false);
+    db.close();
+  });
 });
 
 function fakeRequest(address: string, cookie?: string): IncomingMessage {

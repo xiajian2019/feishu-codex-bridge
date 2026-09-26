@@ -1,5 +1,7 @@
 import type {
   DashboardChange,
+  CodexHistoryDetailResponse,
+  CodexHistoryListResponse,
   CreateTaskInput,
   CreateTaskResponse,
   ProjectRecord,
@@ -14,6 +16,15 @@ export interface TaskQuery {
   state?: string;
   project?: string;
   mode?: string;
+  limit: number;
+  offset: number;
+}
+
+export interface CodexHistoryQuery {
+  home?: string;
+  q?: string;
+  status?: string;
+  archived: "active" | "archived" | "all";
   limit: number;
   offset: number;
 }
@@ -54,6 +65,32 @@ export function fetchTasks(query: TaskQuery, signal?: AbortSignal): Promise<Task
     params.set(key, value);
   }
   return getJson<TaskListResponse>(`/api/tasks?${params.toString()}`, { signal });
+}
+
+export function fetchCodexHistory(
+  query: CodexHistoryQuery,
+  signal?: AbortSignal,
+): Promise<CodexHistoryListResponse> {
+  const params = new URLSearchParams({
+    archived: query.archived,
+    limit: String(query.limit),
+    offset: String(query.offset),
+  });
+  if (query.home) params.set("home", query.home);
+  if (query.q) params.set("q", query.q);
+  if (query.status) params.set("status", query.status);
+  return getJson<CodexHistoryListResponse>(`/api/codex/threads?${params.toString()}`, { signal });
+}
+
+export function fetchCodexThreadDetail(
+  homeId: string,
+  threadId: string,
+  signal?: AbortSignal,
+): Promise<CodexHistoryDetailResponse> {
+  return getJson<CodexHistoryDetailResponse>(
+    `/api/codex/threads/${encodeURIComponent(homeId)}/${encodeURIComponent(threadId)}?turns=1`,
+    { signal },
+  );
 }
 
 export async function fetchProjects(): Promise<ProjectRecord[]> {

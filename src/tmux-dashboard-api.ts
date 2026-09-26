@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
@@ -11,8 +11,12 @@ import type { StateDatabase } from "./db.js";
 import * as tmux from "./tmux-dashboard.js";
 
 const API_PREFIX = "/tmux-dashboard/api";
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const MAX_SUBMISSION_BYTES = 32 * 1024;
+const MAX_SCROLL_DIAGNOSTIC_EXPORT_BYTES = 5 * 1024 * 1024;
+const MAX_SCROLL_DIAGNOSTIC_ENTRIES = 2_000;
+const SUBMIT_FAST_FLUSH_WINDOW_MS = 5_000;
+const SUBMIT_FAST_FLUSH_IDLE_MS = 250;
 const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.freeze({
   "codex-escape": "\u001b",
   "codex-interrupt": "\u0003",
@@ -45,13 +49,7 @@ const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.fre
   "tmux-window-6": "\u00026",
   "tmux-window-7": "\u00027",
 });
-const IMAGE_EXTENSIONS = new Map([
-  ["image/png", ".png"],
-  ["image/jpeg", ".jpg"],
-  ["image/gif", ".gif"],
-  ["image/webp", ".webp"],
-]);
-const IMAGE_DIRECTORY = join(tmpdir(), "feishu-codex-bridge", "tmux-dashboard-images");
+const ATTACHMENT_DIRECTORY = join(tmpdir(), "feishu-codex-bridge", "tmux-dashboard-attachments");
 
 class DashboardBodyError extends Error {
   constructor(message: string, public readonly statusCode: number) {
@@ -88,25 +86,73 @@ export class TmuxDashboardApi {
   public async handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", "http://localhost");
     const apiPath = url.pathname.slice(API_PREFIX.length);
-    if (request.method === "POST" && apiPath === "/attachments") {
+    if (request.method === "POST" && apiPath === "/scroll-diagnostics/export") {
       const contentType = request.headers["content-type"]?.split(";")[0]?.trim().toLowerCase() ?? "";
-      const extension = IMAGE_EXTENSIONS.get(contentType);
-      if (!extension) {
-        sendJson(response, 415, { error: "Choose a PNG, JPEG, GIF, or WebP image." });
+      if (contentType !== "application/x-www-form-urlencoded") {
+        sendJson(response, 415, { error: "Expected a scroll diagnostic form submission." });
         return;
       }
+      let body: Buffer;
       try {
-        const image = await readBinaryBody(request, MAX_IMAGE_BYTES);
-        if (image.length === 0) throw new DashboardBodyError("The selected image is empty.", 400);
-        await mkdir(IMAGE_DIRECTORY, { recursive: true, mode: 0o700 });
-        const imagePath = join(IMAGE_DIRECTORY, randomUUID() + extension);
-        await writeFile(imagePath, image, { flag: "wx", mode: 0o600 });
-        sendJson(response, 201, { path: imagePath });
+        body = await readBinaryBody(request, MAX_SCROLL_DIAGNOSTIC_EXPORT_BYTES, "Scroll diagnostic export must be 5 MB or smaller.");
+      } catch {
+        sendJson(response, 413, { error: "Scroll diagnostic export is too large." });
+        return;
+      }
+      const payloadText = new URLSearchParams(body.toString("utf8")).get("payload");
+      if (!payloadText) {
+        sendJson(response, 400, { error: "Scroll diagnostic payload is missing." });
+        return;
+      }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(payloadText) as unknown;
+      } catch {
+        sendJson(response, 400, { error: "Scroll diagnostic payload is invalid JSON." });
+        return;
+      }
+      if (
+        typeof payload !== "object"
+        || payload === null
+        || !Array.isArray((payload as Record<string, unknown>).entries)
+        || (payload as { entries: unknown[] }).entries.length > MAX_SCROLL_DIAGNOSTIC_ENTRIES
+      ) {
+        sendJson(response, 400, { error: "Scroll diagnostic payload has an invalid entry list." });
+        return;
+      }
+      const now = new Date();
+      const filename = `tmux-scroll-diagnostics-${now.toISOString().replace(/[:.]/g, "-")}.json`;
+      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("X-Content-Type-Options", "nosniff");
+      response.setHeader("Referrer-Policy", "no-referrer");
+      response.setHeader("Content-Type", "application/json; charset=utf-8");
+      response.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      response.end(JSON.stringify(payload, null, 2));
+      return;
+    }
+    if (request.method === "POST" && apiPath === "/attachments") {
+      try {
+        const attachment = await readBinaryBody(request, MAX_ATTACHMENT_BYTES, "Attachment must be 10 MB or smaller.");
+        if (attachment.length === 0) throw new DashboardBodyError("The selected attachment is empty.", 400);
+        const fileNameHeader = request.headers["x-file-name"];
+        const encodedFileName = Array.isArray(fileNameHeader) ? fileNameHeader[0] ?? "" : fileNameHeader ?? "";
+        let fileName = encodedFileName;
+        try {
+          fileName = decodeURIComponent(encodedFileName);
+        } catch {
+          // Fall back to the raw header and still keep only its safe extension.
+        }
+        const requestedExtension = extname(basename(fileName)).toLowerCase();
+        const extension = /^\.[a-z0-9]{1,12}$/.test(requestedExtension) ? requestedExtension : ".bin";
+        await mkdir(ATTACHMENT_DIRECTORY, { recursive: true, mode: 0o700 });
+        const attachmentPath = join(ATTACHMENT_DIRECTORY, randomUUID() + extension);
+        await writeFile(attachmentPath, attachment, { flag: "wx", mode: 0o600 });
+        sendJson(response, 201, { path: attachmentPath });
       } catch (error) {
         if (error instanceof DashboardBodyError) {
           sendJson(response, error.statusCode, { error: error.message });
         } else {
-          sendJson(response, 500, { error: "Could not store the image attachment." });
+          sendJson(response, 500, { error: "Could not store the attachment." });
         }
       }
       return;
@@ -205,12 +251,50 @@ export class TmuxDashboardApi {
     this.websocketServer.close();
   }
 
-  private openTerminal(client: WebSocket, data: TerminalData): void {
+  private async openTerminal(client: WebSocket, data: TerminalData): Promise<void> {
     let cleanedUp = false;
+    let initialScreenReady = false;
+    let outputFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    let outputBytes = 0;
+    let immediateOutputFlushUntil = 0;
+    const outputQueue: Array<string | Uint8Array> = [];
+    const flushOutput = (): void => {
+      if (outputFlushTimer) clearTimeout(outputFlushTimer);
+      outputFlushTimer = null;
+      outputBytes = 0;
+      if (client.readyState !== WebSocket.OPEN || outputQueue.length === 0) {
+        outputQueue.length = 0;
+        return;
+      }
+      const chunks = outputQueue.splice(0);
+      if (chunks.length === 1) {
+        client.send(chunks[0]!);
+        return;
+      }
+      client.send(Buffer.concat(chunks.map((chunk) => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))));
+    };
+    const queueOutput = (output: string | Uint8Array): void => {
+      if (client.readyState !== WebSocket.OPEN) return;
+      outputQueue.push(output);
+      outputBytes += typeof output === "string" ? Buffer.byteLength(output) : output.byteLength;
+      if (Date.now() < immediateOutputFlushUntil) {
+        immediateOutputFlushUntil = Math.max(immediateOutputFlushUntil, Date.now() + SUBMIT_FAST_FLUSH_IDLE_MS);
+        flushOutput();
+        return;
+      }
+      if (outputBytes >= 256 * 1024) {
+        flushOutput();
+        return;
+      }
+      if (!outputFlushTimer) outputFlushTimer = setTimeout(flushOutput, 16);
+    };
     const cleanup = (): void => {
       if (cleanedUp) return;
       cleanedUp = true;
       this.clients.delete(client);
+      if (outputFlushTimer) clearTimeout(outputFlushTimer);
+      outputFlushTimer = null;
+      outputQueue.length = 0;
       if (data.proc && !data.proc.killed) data.proc.kill("SIGTERM");
       data.terminal?.close();
     };
@@ -229,9 +313,9 @@ export class TmuxDashboardApi {
       if (
         control.type === "scroll"
         && typeof control.data === "string"
-        && /^\u001b\[<6[45];\d{1,3};\d{1,3}M$/.test(control.data)
+        && /^(?:\u001b\[<6[45];\d{1,3};\d{1,3}M){1,32}$/.test(control.data)
       ) {
-        data.terminal?.write(control.data);
+          data.terminal?.write(control.data);
         return;
       }
       if (control.type === "submit" || control.type === "key" || control.type === "sequence") {
@@ -309,14 +393,16 @@ export class TmuxDashboardApi {
           reply(false, "The tmux session is not attached.");
           return;
         }
-        const paneBefore = await tmux.capturePane(data.sessionId).catch(() => null);
+        const paneBefore = await tmux.capturePane(data.sessionId, data.rows).catch(() => null);
         if (paneBefore === null) {
           reply(false, "消息未发送：无法读取 session 当前状态，请稍后重试。");
           return;
         }
         try {
+          flushOutput();
+          immediateOutputFlushUntil = Date.now() + SUBMIT_FAST_FLUSH_WINDOW_MS;
           data.terminal.write("\u001b[200~" + text + "\u001b[201~\r");
-          const confirmed = await waitForPaneChange(data.sessionId, paneBefore, text);
+          const confirmed = await waitForPaneChange(data.sessionId, paneBefore, text, data.rows);
           reply(
             confirmed,
             confirmed
@@ -332,6 +418,8 @@ export class TmuxDashboardApi {
         const cols = clampDimension(control.cols, 20, 400);
         const rows = clampDimension(control.rows, 5, 200);
         if (!cols || !rows) return;
+        data.cols = cols;
+        data.rows = rows;
         data.terminal?.resize(cols, rows);
         if (data.proc && !data.proc.killed) {
           try {
@@ -356,14 +444,19 @@ export class TmuxDashboardApi {
           rows: data.rows,
           name: "xterm-256color",
           data: (_terminal, output) => {
-            if (client.readyState === WebSocket.OPEN) client.send(output);
+            if (initialScreenReady) queueOutput(output);
           },
         },
       });
       data.proc = child;
       data.terminal = child.terminal;
+      const initialScreen = await captureInitialScreen(data.sessionId, data.rows);
+      if (cleanedUp || client.readyState !== WebSocket.OPEN) return;
+      client.send(initialScreen);
+      initialScreenReady = true;
       void child.exited.then((exitCode) => {
         if (client.readyState === WebSocket.OPEN) {
+          flushOutput();
           client.send(JSON.stringify({ type: "exit", code: exitCode }));
           client.close();
         }
@@ -378,7 +471,26 @@ export class TmuxDashboardApi {
   }
 }
 
-async function waitForPaneChange(sessionId: string, before: string, submittedText: string): Promise<boolean> {
+async function captureInitialScreen(sessionId: string, rows: number): Promise<string> {
+  // Let tmux finish attaching/resizing before taking the snapshot. PTY output
+  // during this settling window is intentionally not forwarded to the client.
+  await new Promise<void>((resolve) => setTimeout(resolve, 60));
+  const snapshotRows = Math.max(rows, 1_000);
+  let captured: string;
+  try {
+    captured = await tmux.capturePane(sessionId, snapshotRows, {
+      alternateScreen: true,
+      includeEscapeSequences: true,
+    });
+  } catch {
+    captured = await tmux.capturePane(sessionId, snapshotRows, { includeEscapeSequences: true });
+  }
+  const screen = captured.replace(/\r\n?/g, "\n").replace(/\n/g, "\r\n");
+  // Clear xterm's local history and paint only the current server-side screen.
+  return "\u001b[3J\u001b[2J\u001b[H" + screen;
+}
+
+async function waitForPaneChange(sessionId: string, before: string, submittedText: string, rows: number): Promise<boolean> {
   const messageForEcho = submittedText.split(/<image\s+name=/i, 1)[0].trim() || "请打开并查看我附上的图片";
   const expected = normalizePaneText(messageForEcho);
   const expectedCompact = expected.replace(/\s+/g, "");
@@ -387,7 +499,7 @@ async function waitForPaneChange(sessionId: string, before: string, submittedTex
   for (const delay of [120, 280, 560, 1_120, 2_240]) {
     await new Promise<void>((resolve) => setTimeout(resolve, delay));
     try {
-      const after = await tmux.capturePane(sessionId);
+      const after = await tmux.capturePane(sessionId, rows);
       if (
         after !== before
         && (
@@ -434,17 +546,17 @@ async function readJsonBody(request: IncomingMessage): Promise<Record<string, un
   return parsed as Record<string, unknown>;
 }
 
-async function readBinaryBody(request: IncomingMessage, maxBytes: number): Promise<Buffer> {
+async function readBinaryBody(request: IncomingMessage, maxBytes: number, tooLargeMessage: string): Promise<Buffer> {
   const contentLength = request.headers["content-length"];
   if (contentLength && Number(contentLength) > maxBytes) {
-    throw new DashboardBodyError("Image must be 10 MB or smaller.", 413);
+    throw new DashboardBodyError(tooLargeMessage, 413);
   }
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > maxBytes) throw new DashboardBodyError("Image must be 10 MB or smaller.", 413);
+    if (size > maxBytes) throw new DashboardBodyError(tooLargeMessage, 413);
     chunks.push(buffer);
   }
   return Buffer.concat(chunks, size);

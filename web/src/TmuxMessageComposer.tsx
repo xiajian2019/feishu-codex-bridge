@@ -31,9 +31,7 @@ import {
 const TmuxShortcutPalette = lazy(() => import("./TmuxShortcutPalette.js").then((module) => ({ default: module.TmuxShortcutPalette })));
 
 const API_ROOT = "/tmux-dashboard/api";
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-const IMAGE_ACCEPT = "image/png,image/jpeg,image/gif,image/webp";
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
 export type ComposerSubmissionResult = { ok: boolean; message?: string };
 export type { TerminalShortcut };
@@ -48,19 +46,34 @@ type TmuxMessageComposerProps = {
   onAttachmentError: (message: string) => void;
   onTerminalShortcut: (shortcut: TerminalShortcut) => Promise<void>;
   onTerminalSequence: (sequence: string) => Promise<void>;
+  onScrollToTop: () => void;
+  onScrollToBottom: () => void;
+  onExportScrollDiagnostics: () => void;
 };
 
-async function uploadImage(file: File): Promise<string> {
+async function uploadAttachment(file: File): Promise<string> {
   const response = await fetch(API_ROOT + "/attachments", {
     method: "POST",
-    headers: { "content-type": file.type },
+    headers: {
+      "content-type": file.type || "application/octet-stream",
+      "x-file-name": encodeURIComponent(file.name),
+    },
     body: file,
   });
   const payload = await response.json() as { path?: string; error?: string };
   if (!response.ok || typeof payload.path !== "string") {
-    throw new Error(payload.error || "Image upload failed (" + response.status + ").");
+    throw new Error(payload.error || "Attachment upload failed (" + response.status + ").");
   }
   return payload.path;
+}
+
+function escapePromptAttribute(value: string): string {
+  return value
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
 }
 
 function useFileObjectUrl(file: File | null): string {
@@ -119,7 +132,7 @@ type ComposerFieldsProps = TmuxMessageComposerProps & {
   onSendStart: () => void;
 };
 
-function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholder, preparing, onSendStart, onSubmit, onTerminalShortcut, onTerminalSequence }: ComposerFieldsProps): ReactElement {
+function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholder, preparing, onSendStart, onSubmit, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
   const aui = useAui();
   const controlsDisabled = disabled || sending || preparing;
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -330,11 +343,16 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
           onSendStart();
         }}
       >
-        <div className="dashboard-composer-images" aria-label="Images to send">
+        <div className="dashboard-composer-images" aria-label="Attachments to send">
           <ComposerPrimitive.Attachments>
             {({ attachment }) => (
-              <AttachmentPrimitive.Root className="dashboard-composer-image" key={attachment.id}>
-                {attachment.file ? <ImagePreview file={attachment.file} onOpen={setPreviewFile} /> : <span>IMG</span>}
+              <AttachmentPrimitive.Root
+                className={"dashboard-composer-image" + (attachment.file?.type.startsWith("image/") ? "" : " is-file")}
+                key={attachment.id}
+              >
+                {attachment.file?.type.startsWith("image/")
+                  ? <ImagePreview file={attachment.file} onOpen={setPreviewFile} />
+                  : <span className="dashboard-composer-file-name" title={attachment.name}>{attachment.name}</span>}
                 <AttachmentPrimitive.Remove
                   className="dashboard-composer-image-remove"
                   type="button"
@@ -364,16 +382,38 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
             {shortcutsOpen ? (
               <>
                 <button className="dashboard-keybar-button is-close" type="button" title="关闭快捷栏" aria-label="关闭快捷栏" disabled={controlsDisabled} onClick={() => setShortcutsOpen(false)}>×</button>
+                <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to top" disabled={controlsDisabled} onClick={onScrollToTop}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 19V8m0 0-5 5m5-5 5 5" /></svg>
+                </button>
+                <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to bottom" disabled={controlsDisabled} onClick={onScrollToBottom}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19h14M12 5v11m0 0 5-5m-5 5-5-5" /></svg>
+                </button>
+                <button className="dashboard-keybar-button is-icon is-scroll-export" type="button" aria-label="Download scroll diagnostics" disabled={controlsDisabled} onClick={onExportScrollDiagnostics}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10m0 0 4-4m-4 4-4-4M5 15v4h14v-4" /></svg>
+                </button>
                 <button className="dashboard-keybar-button" type="button" title="Escape" aria-label="Escape" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-escape")}>Esc</button>
-                <button className="dashboard-keybar-button" type="button" title="上一条输入" aria-label="上一条输入" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-up")}>↶</button>
-                <button className="dashboard-keybar-button" type="button" title="下一条输入" aria-label="下一条输入" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-down")}>↷</button>
+                <button className="dashboard-keybar-button is-icon" type="button" title="上一条输入" aria-label="上一条输入" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-up")}>↑</button>
+                <button className="dashboard-keybar-button is-icon" type="button" title="下一条输入" aria-label="下一条输入" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-down")}>↓</button>
+                <button className="dashboard-keybar-button is-icon" type="button" title="回车" aria-label="回车" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-enter")}>↵</button>
                 <button className="dashboard-keybar-button" type="button" title="Ctrl 快捷键" aria-label="Ctrl 快捷键" disabled={controlsDisabled} onClick={() => openShortcutPalette("ctrl")}>⌃</button>
               </>
             ) : (
               <>
                 <ComposerPrimitive.AddAttachment className="dashboard-keybar-button is-attachment" type="button" multiple disabled={controlsDisabled}>＋</ComposerPrimitive.AddAttachment>
+                <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to top" disabled={controlsDisabled} onClick={onScrollToTop}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 19V8m0 0-5 5m5-5 5 5" /></svg>
+                </button>
+                <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to bottom" disabled={controlsDisabled} onClick={onScrollToBottom}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19h14M12 5v11m0 0 5-5m-5 5-5-5" /></svg>
+                </button>
+                <button className="dashboard-keybar-button is-icon is-scroll-export" type="button" aria-label="Download scroll diagnostics" disabled={controlsDisabled} onClick={onExportScrollDiagnostics}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10m0 0 4-4m-4 4-4-4M5 15v4h14v-4" /></svg>
+                </button>
                 <button className="dashboard-keybar-button" type="button" title="Escape" aria-label="Escape" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-escape")}>Esc</button>
                 <button className="dashboard-keybar-button" type="button" title="Tab" aria-label="Tab" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-tab")}>Tab</button>
+                <button className="dashboard-keybar-button is-icon" type="button" title="上一条输入" aria-label="上一条输入" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-up")}>↑</button>
+                <button className="dashboard-keybar-button is-icon" type="button" title="下一条输入" aria-label="下一条输入" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-down")}>↓</button>
+                <button className="dashboard-keybar-button is-icon" type="button" title="回车" aria-label="回车" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-enter")}>↵</button>
                 <button className="dashboard-keybar-button is-keyboard" type="button" title="打开键盘面板" aria-label="打开键盘面板" aria-expanded={shortcutsOpen} disabled={controlsDisabled} onClick={() => openShortcutPalette("keyboard")}>⌨</button>
               </>
             )}
@@ -418,24 +458,19 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
   attachmentErrorRef.current = props.onAttachmentError;
 
   const attachmentAdapter = useMemo<AttachmentAdapter>(() => ({
-    accept: IMAGE_ACCEPT,
+    accept: "*",
     async add({ file }) {
-      let message: string | null = null;
-      if (!SUPPORTED_IMAGE_TYPES.has(file.type)) {
-        message = "Images must be PNG, JPEG, GIF, or WebP.";
-      } else if (file.size > MAX_IMAGE_BYTES) {
-        message = "Each image must be 10 MB or smaller.";
-      }
-      if (message) {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        const message = "Each attachment must be 10 MB or smaller.";
         attachmentErrorRef.current(message);
         throw new Error(message);
       }
 
-      const id = ["image", Date.now(), Math.random()].join("-");
+      const id = ["attachment", Date.now(), Math.random()].join("-");
       if (props.sessionId) await saveDraftAttachment(props.sessionId, id, file);
       return {
         id,
-        type: "image",
+        type: file.type.startsWith("image/") ? "image" : "file",
         name: file.name,
         contentType: file.type,
         file,
@@ -445,7 +480,7 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
     async remove() {},
     async send(attachment) {
       try {
-        const path = await uploadImage(attachment.file);
+        const path = await uploadAttachment(attachment.file);
         return {
           ...attachment,
           status: { type: "complete" },
@@ -453,7 +488,7 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
         };
       } catch (error) {
         setPreparing(false);
-        attachmentErrorRef.current(error instanceof Error ? error.message : "Image upload failed.");
+        attachmentErrorRef.current(error instanceof Error ? error.message : "Attachment upload failed.");
         throw error;
       }
     },
@@ -472,17 +507,28 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
         .map((part) => part.text)
         .join("\n")
         .trim();
-      const imagePaths = userMessage.attachments.flatMap((attachment) =>
+      const uploadedAttachments = userMessage.attachments.flatMap((attachment) =>
         (attachment.content ?? [])
           .filter((part) => part.type === "text")
-          .map((part) => part.text),
+          .map((part) => ({
+            path: part.text,
+            name: attachment.name,
+            isImage: (attachment.contentType ?? attachment.file?.type ?? "").startsWith("image/"),
+          })),
       );
-      const imageNote = imagePaths.length > 0
-        ? "请打开并查看我附上的图片，再结合上面的文字处理：\n" + imagePaths
-          .map((path, index) => `<image name=[Image #${index + 1}] path="${path}">`)
+      const imageAttachments = uploadedAttachments.filter((attachment) => attachment.isImage);
+      const fileAttachments = uploadedAttachments.filter((attachment) => !attachment.isImage);
+      const imageNote = imageAttachments.length > 0
+        ? "请打开并查看我附上的图片，再结合上面的文字处理：\n" + imageAttachments
+          .map((attachment, index) => `<image name=[Image #${index + 1}] path="${attachment.path}">`)
           .join("\n")
         : "";
-      const text = [messageText, imageNote].filter(Boolean).join("\n\n");
+      const fileNote = fileAttachments.length > 0
+        ? "请读取我附上的文件，再结合上面的文字处理：\n" + fileAttachments
+          .map((attachment) => `<file name="${escapePromptAttribute(attachment.name)}" path="${attachment.path}">`)
+          .join("\n")
+        : "";
+      const text = [messageText, imageNote, fileNote].filter(Boolean).join("\n\n");
       let result: ComposerSubmissionResult;
       try {
         result = await submitRef.current(text);

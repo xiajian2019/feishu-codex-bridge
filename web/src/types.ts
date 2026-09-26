@@ -24,6 +24,58 @@ export interface ProjectRecord {
   updated_at: string;
 }
 
+export const CODEX_THREAD_STATUS_TYPES = ["notLoaded", "idle", "active", "systemError"] as const;
+export type CodexThreadStatus = (typeof CODEX_THREAD_STATUS_TYPES)[number] | string;
+
+export interface CodexThread {
+  id: string;
+  sessionId?: string;
+  preview?: string;
+  name?: string | null;
+  cwd?: string;
+  path?: string | null;
+  modelProvider?: string;
+  model?: string | null;
+  reasoningEffort?: string | null;
+  createdAt?: number;
+  updatedAt?: number;
+  recencyAt?: number | null;
+  status?: { type?: CodexThreadStatus; [key: string]: unknown };
+  source?: unknown;
+  threadSource?: unknown;
+  cliVersion?: string;
+  turns?: unknown[];
+  [key: string]: unknown;
+}
+
+export interface CodexHistoryHome {
+  id: string;
+  label: string;
+  path: string;
+  available: boolean;
+  error?: string;
+}
+
+export interface CodexHistoryItem {
+  home: CodexHistoryHome;
+  thread: CodexThread;
+}
+
+export interface CodexHistoryListResponse {
+  items: CodexHistoryItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  homes: CodexHistoryHome[];
+  generatedAt?: string;
+  dataSource?: string;
+}
+
+export interface CodexHistoryDetailResponse {
+  home: CodexHistoryHome;
+  thread: CodexThread;
+}
+
 export interface TaskInput {
   projectKey: string;
   mode: string;

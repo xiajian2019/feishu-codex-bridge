@@ -18,6 +18,12 @@
 
 任务面板支持直接新建任务：选择项目后填写描述即可，不要求单独标题或模式。可附加图片及普通文件，单个文件上限 25 MiB、每任务最多 10 个；附件存入本机 Bridge 数据目录，SDK 模式会把图片作为视觉输入，并可在任务详情预览图片或下载文件。标题由描述首行生成，模式沿用服务器配置的默认 sandbox；所有新任务统一由 Codex SDK 执行；tmux Dashboard 用于浏览和操作现有 tmux 会话，不作为任务执行后端。项目管理提供名称/目录搜索、状态筛选、新增和编辑；停用项目不会出现在任务或 tmux 目录选择器中。项目表是运行时唯一来源；旧 project map 仅在 SQLite 项目表为空时迁移一次。
 
+## Codex 历史会话
+
+统一 Bridge 启动后，从 http://127.0.0.1:7310/codex-history 打开本机 Codex 历史页面。页面通过 Codex app-server 的只读 `thread/list` 和 `thread/read` 协议读取会话，不直接解析 `auth.json`、SQLite 或 JSONL，也不会启动任务、继续会话或写入 Bridge 数据库。
+
+默认会读取当前 `CODEX_HOME`（未设置时为 `~/.codex`）以及 `~/.codex/accounts/*` 下的独立 home；每个 home 都会用自己的 `CODEX_HOME` 和状态数据库目录启动一个短生命周期查询客户端，因此两个登录账号的历史不会混在一起。若账号目录不在这个结构中，可用系统环境变量 `FEISHU_CODEX_HISTORY_HOMES`（macOS 用冒号分隔多个绝对路径）补充路径。页面支持按 home、关键词、归档状态和运行状态筛选，并可打开会话轮次与命令执行详情。
+
 ## 安装和配置
 
 研发环境需要 Bun >=1.4.2（项目通过 `.bun-version` 固定版本）；CI、开发脚本、LaunchAgent 和 Portable Runtime 均使用 Bun，不需要 Node.js。给非研发同事使用时，Portable 发布包可以直接双击 `install.command`；安装器会自动寻找 ChatGPT App 内置 Codex 或本机独立 Codex CLI，不要求手动填写 CLI 路径。
@@ -57,7 +63,7 @@ bun run portable:restart
 
 该命令会先完成构建和 smoke test，再执行带有 `--config`、`--db` 和 `--mode feishu-sqlite-codex` 的 `service restart`，最后执行 `service status`；构建失败时不会停止正在运行的服务。可用 `--config <path>`、`--db <path>` 和 `--mode <mode>` 覆盖默认值，`--skip-build` 仅重用现有 `dist` 打包。
 
-发布 GitHub Release（默认使用 `package.json` 版本生成 `v0.3.0` tag）：
+发布 GitHub Release（默认使用 `package.json` 版本生成 `v0.4.0` tag）：
 
 ```bash
 bun run release:github
@@ -84,7 +90,7 @@ Lite 包默认不包含 Bun 和独立 Codex CLI；它属于 legacy 打包路径�
 ./feishu-codex-bridge update --auto
 ./feishu-codex-bridge update --file ./feishu-codex-bridge-core-darwin-arm64.tar.gz
 # 如需完整替换为 direct 包：
-./feishu-codex-bridge update --mode direct --file ./feishu-codex-bridge-direct-darwin-arm64-v0.3.0.tar.gz
+./feishu-codex-bridge update --mode direct --file ./feishu-codex-bridge-direct-darwin-arm64-v0.4.0.tar.gz
 ./feishu-codex-bridge update --unschedule
 ```
 
@@ -403,10 +409,12 @@ bun run start:all
 - React 页面通过 SSE 接收任务状态、run 进展和执行事件变化，只更新受影响的任务行和详情区块；连接断开时自动使用快照轮询并重连。
 - 详情弹窗持续显示实时进展，反馈草稿和操作状态由前端组件独立维护，不会被进展更新覆盖；“刷新详情”用于主动校准完整快照。
 
-查询接口为 `GET /healthz`、`GET /api/session`、`GET /api/tasks`、`GET /api/tasks/:taskGuid`、`GET /api/aamp/tasks`、`GET /api/aamp/tasks/:id` 和 `GET /api/events`；旧兼容模式的 `POST /api/tasks/:taskGuid` 操作接口当前不会配置 Dispatcher。页面包含 CSP、禁止 iframe 和 `no-store` 响应头。系统安装的服务支持局域网配对，任务 API、tmux API、SSE 和终端 WebSocket 都要求已配对会话；不要将服务暴露到公网。
+查询接口为 `GET /healthz`、`GET /api/session`、`GET /api/tasks`、`GET /api/tasks/:taskGuid`、`GET /api/aamp/tasks`、`GET /api/aamp/tasks/:id`、`GET /api/codex/homes`、`GET /api/codex/threads`、`GET /api/codex/threads/:homeId/:threadId` 和 `GET /api/events`；旧兼容模式的 `POST /api/tasks/:taskGuid` 操作接口当前不会配置 Dispatcher。页面包含 CSP、禁止 iframe 和 `no-store` 响应头。系统安装的服务支持局域网配对，任务 API、Codex history API、tmux API、SSE 和终端 WebSocket 都要求已配对会话；不要将服务暴露到公网。
 
 页面支持一次性配对。系统安装后运行 `feishu-codex-bridge web:pair`，源码目录运行 `bun run web:pair`；CLI 自动选择当前机器的局域网 IPv4 和 `config.json` 中的 `web.port`（默认 7310），并始终写入生产库 `runtime/bridge.db`。可用 `--url`、`--port` 覆盖地址，或用 `--db` 显式指定数据库；URL/端口不会自动切换到开发库。手机扫描二维码后，网页从 URL fragment 自动 claim，服务端签发一个 30 天 HttpOnly 会话 Cookie，二维码 5 分钟后失效且只能使用一次。未认证网页只显示等待扫码提示。认证后从 `/pair-admin` 进入设备管理，可查看已配对设备并撤销所有手机；刷新配对码需重新运行 `web:pair`。配对状态保存在 Bridge 使用的 SQLite 数据库中。\n
 前端源码位于 web/，生产构建输出到 dist/web，由同一个 Bridge Bun 进程静态托管。开发时运行 bun run dev:api 和 bun run dev:web，然后打开 http://127.0.0.1:5173。开发 API 监听 127.0.0.1:17310，只使用 runtime/dev/bridge.db，不触碰 LaunchAgent 的服务或 7310 生产数据库，也不会启动 Feishu/AAMP/Relay/Codex 消息运行时；Vite 的 Bridge 和 tmux Dashboard API/WebSocket 都代理到这个开发 API。dev:api 默认读取 config.example.json，也可用 --config、--db、--web-port 覆盖配置、数据路径和端口；Vite 目标可用 BRIDGE_WEB_API_TARGET 覆盖。tmux Dashboard 连接现有默认 tmux server。发布或 LaunchAgent 启动前仍须执行 bun run build。\n
+开发环境中的 `dev:api` 和 `dev:tmux-api` 都启动当前 `src/main.ts --web-only`，监听 17310 并使用 `runtime/dev/bridge.db`；`dev:web` 的 Vite `/api` 代理只指向这个开发 API，不依赖 7310 生产服务。开发模式会自动发现可用的 Codex CLI 路径。
+
 默认 `runTimeoutSeconds` 为 `3600` 秒（1 小时）；超时会先终止 Worker，必要时再强制结束，并将本轮标记为失败。
 
 也可以显式指定配置和数据库：

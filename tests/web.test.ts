@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { WebSocket } from "ws";
 
 import { StateDatabase } from "../src/db.js";
+import { CodexHistoryService } from "../src/codex-history.js";
 import { TmuxDashboardApi } from "../src/tmux-dashboard-api.js";
 import { DashboardServer } from "../src/web.js";
+import { WebPairingAuth } from "../src/web-auth.js";
 import type { RoutedTask, WebTaskSubmission } from "../src/types.js";
 
 const openServers: DashboardServer[] = [];
@@ -349,4 +352,127 @@ describe("DashboardServer", () => {
     expect(bridgeResponse.status).toBe(200);
   });
 
+  it("lets an authenticated admin generate a pairing URL and rename a device", async () => {
+    const db = new StateDatabase(":memory:");
+    openDatabases.push(db);
+    const auth = new WebPairingAuth({ db });
+    const seedPairing = auth.startPairing();
+    const deviceRequest = fakeAuthRequest("203.0.113.40", "iPhone");
+    const cookieResponse = fakeCookieResponse();
+    const token = auth.claimPairing(deviceRequest, seedPairing.code);
+    auth.setSessionCookie(deviceRequest, cookieResponse as unknown as ServerResponse, token);
+    const cookie = cookieResponse.headers["set-cookie"];
+
+    const bridge = new DashboardServer({
+      db,
+      auth,
+      host: "127.0.0.1",
+      port: 0,
+      modes: [],
+    });
+    openServers.push(bridge);
+    const bridgeUrl = await bridge.start();
+
+    const unauthorizedResponse = await fetch(bridgeUrl + "/api/auth/pairing/start", { method: "POST" });
+    expect(unauthorizedResponse.status).toBe(401);
+
+    const pairingResponse = await fetch(bridgeUrl + "/api/auth/pairing/start", {
+      method: "POST",
+      headers: { Cookie: cookie },
+    });
+    expect(pairingResponse.status).toBe(200);
+    const pairing = await pairingResponse.json() as { pairingUrl: string; expiresAt: number };
+    expect(pairing.pairingUrl).toContain("#pair=");
+    expect(pairing.expiresAt).toBeGreaterThan(Date.now());
+
+    const devicesResponse = await fetch(bridgeUrl + "/api/auth/devices", { headers: { Cookie: cookie } });
+    const devices = await devicesResponse.json() as { devices: Array<{ sessionId: string; deviceName: string }> };
+    expect(devices.devices[0]?.deviceName).toBe("iPhone / iPad");
+    const renameResponse = await fetch(
+      bridgeUrl + "/api/auth/devices/" + encodeURIComponent(devices.devices[0]!.sessionId),
+      {
+        method: "PATCH",
+        headers: { Cookie: cookie, "Content-Type": "application/json" },
+        body: JSON.stringify({ deviceName: "值班 iPhone" }),
+      },
+    );
+    expect(renameResponse.status).toBe(200);
+    const renamedDevicesResponse = await fetch(bridgeUrl + "/api/auth/devices", { headers: { Cookie: cookie } });
+    const renamedDevices = await renamedDevicesResponse.json() as { devices: Array<{ deviceName: string }> };
+    expect(renamedDevices.devices[0]?.deviceName).toBe("值班 iPhone");
+  });
+
+  it("lists and reads local Codex history across separate homes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bridge-codex-history-web-"));
+    const secondHome = join(directory, "second");
+    await mkdir(secondHome, { recursive: true });
+    temporaryDirectories.push(directory);
+    const db = new StateDatabase(":memory:");
+    openDatabases.push(db);
+    const history = new CodexHistoryService({
+      executable: "unused-in-test",
+      environment: { CODEX_HOME: directory },
+      homePaths: [directory, secondHome],
+      createClient: (home) => {
+        const id = home.label === "second" ? "thread-second" : "thread-default";
+        return {
+          listThreads: async () => ({
+            data: [{ id, preview: home.label === "second" ? "Second account" : "Default account", updatedAt: home.label === "second" ? 2 : 1, source: "cli", status: { type: "idle" } }],
+            nextCursor: null,
+            backwardsCursor: null,
+          }),
+          readThread: async (threadId) => ({ thread: { id: threadId, preview: "detail", turns: [{ items: [{ type: "userMessage", content: [{ type: "text", text: "hello" }] }] }] } }),
+          close: async () => undefined,
+        };
+      },
+    });
+    const server = new DashboardServer({
+      db,
+      host: "127.0.0.1",
+      port: 0,
+      modes: [],
+      codexHistory: history,
+    });
+    openServers.push(server);
+    const url = await server.start();
+
+    const homesResponse = await fetch(`${url}/api/codex/homes`);
+    expect(homesResponse.status).toBe(200);
+    const homes = await homesResponse.json() as { homes: Array<{ id: string; label: string }> };
+    expect(homes.homes.map((home) => home.label)).toEqual(["默认", "second"]);
+
+    const listResponse = await fetch(`${url}/api/codex/threads?archived=active&status=idle`);
+    expect(listResponse.status).toBe(200);
+    const list = await listResponse.json() as { total: number; items: Array<{ home: { label: string }; thread: { id: string } }> };
+    expect(list.total).toBe(2);
+    expect(list.items.map((item) => item.home.label)).toEqual(["second", "默认"]);
+
+    const secondHomeId = homes.homes.find((home) => home.label === "second")!.id;
+    const detailResponse = await fetch(`${url}/api/codex/threads/${encodeURIComponent(secondHomeId)}/thread-second?turns=1`);
+    expect(detailResponse.status).toBe(200);
+    expect(await detailResponse.json()).toMatchObject({ home: { label: "second" }, thread: { id: "thread-second", turns: [{ items: [{ type: "userMessage" }] }] } });
+
+    const pageResponse = await fetch(`${url}/codex-history`);
+    expect(pageResponse.status).toBe(200);
+    expect(await pageResponse.text()).toContain('id="root"');
+  });
+
 });
+
+function fakeAuthRequest(address: string, userAgent: string): IncomingMessage {
+  return {
+    headers: { "user-agent": userAgent },
+    socket: { remoteAddress: address },
+  } as unknown as IncomingMessage;
+}
+
+function fakeCookieResponse(): { headers: Record<string, string>; setHeader: ServerResponse["setHeader"] } {
+  const headers: Record<string, string> = {};
+  return {
+    headers,
+    setHeader(name: string, value: number | string | readonly string[]): ServerResponse {
+      headers[name.toLowerCase()] = Array.isArray(value) ? value.join("; ") : String(value);
+      return undefined as never;
+    },
+  };
+}

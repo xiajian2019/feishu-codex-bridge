@@ -55,5 +55,4 @@ describe("Codex official notify hook", () => {
     expect(isCodexCompletionNotifyPayload({ type: "agent-turn-complete" })).toBe(false);
   });
 
-  });
 });

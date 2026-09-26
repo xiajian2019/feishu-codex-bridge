@@ -6,6 +6,8 @@ import { AampTaskAgentRuntime } from "./aamp-task-agent.js";
 import { AampRelayClient, reconcileRunningAampTasks } from "./aamp-relay.js";
 import { isDirectExecutionMode, loadConfig, parseExecutionMode } from "./config.js";
 import { buildCodexAppServerEnvironment, CodexAppServerClient } from "./codex-app-server.js";
+import { CodexHistoryService } from "./codex-history.js";
+import { isExecutableCodexPath, resolveCodexCliPath } from "./codex-path.js";
 import { LocalCodexNotificationInbox } from "./codex-notification-inbox.js";
 import { StateDatabase } from "./db.js";
 import { initializeProjectRegistry, writeProjectRegistrySnapshot } from "./project-registry.js";
@@ -88,6 +90,36 @@ function resolveDashboardListenHost(configuredHost: string): string {
   return process.env.FEISHU_CODEX_BRIDGE_LAN_BIND === "1" ? "0.0.0.0" : configuredHost;
 }
 
+function createCodexHistoryService(
+  config: ReturnType<typeof loadConfig>,
+  projectRoot: string,
+  logger: Logger,
+): CodexHistoryService {
+  let executable = config.codex.cliPath;
+  if (!isExecutableCodexPath(executable)) {
+    // Do not let `bun run`'s node_modules/.bin/codex shadow the system Codex
+    // that owns the user's local homes and state database. Keep PATH-based
+    // discovery for the configured path above; fallback discovery prefers the
+    // known user/system/App locations instead.
+    const discovered = resolveCodexCliPath({
+      environment: { ...process.env, CODEX_PATH: undefined, PATH: "" },
+    });
+    if (discovered) {
+      logger.warn("configured Codex path is unavailable; local history will use the discovered executable", {
+        configuredPath: executable,
+        executable: discovered.path,
+      });
+      executable = discovered.path;
+    }
+  }
+  return new CodexHistoryService({
+    executable,
+    cwd: projectRoot,
+    environment: buildCodexAppServerEnvironment(config),
+    logger,
+  });
+}
+
 async function runWebOnlyMode(
   config: ReturnType<typeof loadConfig>,
   args: MainArguments,
@@ -96,13 +128,14 @@ async function runWebOnlyMode(
   const db = new StateDatabase(args.dbPath);
   initializeProjectRegistry(db, config.projects);
   const port = args.webPort ?? 17310;
-  const auth = new WebPairingAuth({ db });
+  const auth = new WebPairingAuth({ db, allowLocalRequests: true });
   const tmuxDashboardApi = new TmuxDashboardApi({ db });
   const dispatcher = createDashboardTaskDispatcher(config, args, db, logger);
   const dashboard = new DashboardServer({
     db,
     auth,
     tmuxDashboard: tmuxDashboardApi,
+    codexHistory: createCodexHistoryService(config, resolveBridgeProjectRoot(import.meta.url), logger),
     host: resolveDashboardListenHost(config.web.host),
     port,
     modes: Object.keys(config.modes),
@@ -318,10 +351,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     : null;
   const tmuxDashboardApi = config.web.enabled ? new TmuxDashboardApi({ db }) : null;
   const dashboard = config.web.enabled
-    ? new DashboardServer({
+      ? new DashboardServer({
         db,
         auth: auth!,
         tmuxDashboard: tmuxDashboardApi!,
+        codexHistory: createCodexHistoryService(config, projectRoot, logger),
         host: resolveDashboardListenHost(config.web.host),
         port: config.web.port,
         modes: Object.keys(config.modes),
@@ -435,6 +469,7 @@ async function runDirectMode(
       db,
       auth,
       tmuxDashboard: tmuxDashboardApi,
+      codexHistory: createCodexHistoryService(config, projectRoot, logger),
       host: resolveDashboardListenHost(config.web.host),
       port: config.web.port,
       modes: Object.keys(config.modes),
@@ -581,6 +616,7 @@ async function runAampMode(
         db,
         auth: auth!,
         tmuxDashboard: tmuxDashboardApi!,
+        codexHistory: createCodexHistoryService(config, projectRoot, logger),
         host: resolveDashboardListenHost(config.web.host),
         port: config.web.port,
         modes: Object.keys(config.modes),

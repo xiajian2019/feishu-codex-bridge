@@ -33,6 +33,7 @@ export interface WebAuthDatabase {
   getWebAuthSession(tokenHash: string): WebAuthSessionRecord | null;
   touchWebAuthSession(sessionId: string, lastSeenAt: string): void;
   listWebAuthSessions(): WebAuthSessionRecord[];
+  updateWebAuthSessionDeviceName(sessionId: string, deviceName: string): void;
   revokeWebAuthSession(sessionId: string, revokedAt: string): void;
   revokeAllWebAuthSessions(revokedAt: string): void;
 }
@@ -237,6 +238,17 @@ export class WebPairingAuth {
     return true;
   }
 
+  public renameDevice(request: IncomingMessage, sessionId: string, deviceName: string): boolean {
+    if (!this.isAuthorized(request)) return false;
+    const normalizedName = deviceName.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+    if (!normalizedName || normalizedName.length > 80) return false;
+    const session = this.listActiveSessions().find((item) => item.sessionId === sessionId);
+    if (!session) return false;
+    session.deviceName = normalizedName;
+    this.updateSessionDeviceName(sessionId, normalizedName);
+    return true;
+  }
+
   private getPairing(): PairingState | null {
     const stored = this.db ? this.db.getWebAuthPairing() : this.memoryPairing;
     if (!stored) return null;
@@ -284,6 +296,13 @@ export class WebPairingAuth {
     const lastSeenAt = new Date(this.now()).toISOString();
     if (this.db) this.db.touchWebAuthSession(session.sessionId, lastSeenAt);
     else session.lastSeenAt = lastSeenAt;
+  }
+
+  private updateSessionDeviceName(sessionId: string, deviceName: string): void {
+    if (this.db) this.db.updateWebAuthSessionDeviceName(sessionId, deviceName);
+    for (const session of this.memorySessions.values()) {
+      if (session.sessionId === sessionId) session.deviceName = deviceName;
+    }
   }
 
   private revokeSession(sessionId: string): void {

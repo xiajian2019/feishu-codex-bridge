@@ -3,7 +3,7 @@ import type VConsole from "vconsole";
 type ExportPlugin = InstanceType<typeof VConsole.VConsolePlugin>;
 type DebugWindow = Window & {
   VConsole?: typeof VConsole;
-  VConsoleOutputLogsPlugin?: new (host: { addPlugin: (plugin: ExportPlugin) => void }) => ExportPlugin;
+  VConsoleOutputLogsPlugin?: new (vConsole: VConsole) => ExportPlugin;
   __tmuxKeyboardLog?: string[];
   __tmuxKeyboardPaused?: boolean;
 };
@@ -18,6 +18,8 @@ export async function installKeyboardLogExport(vConsole: VConsole, constructor: 
   await import("vconsole-outputlog-plugin");
   const OutputPlugin = debugWindow.VConsoleOutputLogsPlugin;
   if (!OutputPlugin) throw new Error("The vConsole log export plugin did not load.");
+  // Keep the package's original exporter for the vConsole Console log panel.
+  new OutputPlugin(vConsole);
 
   const message = (text: string): void => {
     const status = document.getElementById("tmux-log-export-status");
@@ -63,26 +65,21 @@ export async function installKeyboardLogExport(vConsole: VConsole, constructor: 
       message("自动复制未成功，请长按下方文本全选复制，或使用导出日志。");
     }
   };
-  // Override the upstream DOM scraper before registration: virtualized log rows can be missing.
-  new OutputPlugin({
-    addPlugin(plugin) {
-      plugin.name = "键盘日志";
-      plugin.on("ready", () => {});
-      plugin.on("renderTab", (callback) => callback(`<div style="padding:16px">
+  const plugin = new constructor.VConsolePlugin("tmuxKeyboardLog", "键盘日志");
+  plugin.on("ready", () => {});
+  plugin.on("renderTab", (callback) => callback(`<div style="padding:16px">
         <p id="tmux-log-export-status">进入 session 后点击输入框开始记录，复现后在此复制或导出。</p>
         <p>打开 vConsole 自动暂停；关闭面板后，再点击消息输入框继续。同一 session 保留最近 300 条，新 session 首次点击重新记录。</p>
         <textarea id="tmux-log-export-text" readonly hidden style="width:100%;height:160px;font-size:16px" aria-label="键盘日志导出文本"></textarea>
       </div>`));
-      plugin.on("showConsole", () => { debugWindow.__tmuxKeyboardPaused = true; });
-      plugin.on("show", () => {
-        message(`已保存 ${debugWindow.__tmuxKeyboardLog?.length ?? 0} 条键盘日志，采集已暂停。`);
-      });
-      plugin.on("addTool", (callback) => callback([
-        { name: "复制日志", onClick: copyLogs },
-        { name: "导出日志", onClick: exportLogs },
-      ]));
-      vConsole.addPlugin(plugin);
-      installed.add(vConsole);
-    },
+  plugin.on("showConsole", () => { debugWindow.__tmuxKeyboardPaused = true; });
+  plugin.on("show", () => {
+    message(`已保存 ${debugWindow.__tmuxKeyboardLog?.length ?? 0} 条键盘日志，采集已暂停。`);
   });
+  plugin.on("addTool", (callback) => callback([
+    { name: "复制日志", onClick: copyLogs },
+    { name: "导出日志", onClick: exportLogs },
+  ]));
+  vConsole.addPlugin(plugin);
+  installed.add(vConsole);
 }
