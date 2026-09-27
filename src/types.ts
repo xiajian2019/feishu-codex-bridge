@@ -76,6 +76,40 @@ export interface StoredProject {
   updated_at: string;
 }
 
+export const SHORTCUT_KINDS = ["terminal", "insert", "send", "sequence"] as const;
+export type ShortcutKind = (typeof SHORTCUT_KINDS)[number];
+export const SHORTCUT_GROUP_LAYOUTS = ["grid", "keyboard"] as const;
+export type ShortcutGroupLayout = (typeof SHORTCUT_GROUP_LAYOUTS)[number];
+
+export interface StoredShortcutGroup {
+  id: string;
+  title: string;
+  icon: string;
+  description: string;
+  layout: ShortcutGroupLayout;
+  sort_order: number;
+  enabled: boolean;
+  built_in: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoredShortcut {
+  id: string;
+  group_id: string;
+  title: string;
+  detail: string;
+  kind: ShortcutKind;
+  value: string;
+  enabled: boolean;
+  built_in: boolean;
+  dangerous: boolean;
+  sort_order: number;
+  operation_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface StoredWebTaskAttachment {
   attachment_id: string;
   task_guid: string | null;

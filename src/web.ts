@@ -9,6 +9,7 @@ import type { Duplex } from "node:stream";
 import { StateDatabase } from "./db.js";
 import {
   CODEX_HISTORY_DEFAULT_SOURCE_KINDS,
+  CODEX_HISTORY_MAX_ATTACHMENT_BYTES,
   CODEX_HISTORY_SOURCE_KINDS,
   CODEX_HISTORY_STATUS_TYPES,
   CodexHistoryService,
@@ -22,11 +23,17 @@ import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import {
   AAMP_TASK_STATUSES,
   PROJECT_STATUSES,
+  SHORTCUT_GROUP_LAYOUTS,
+  SHORTCUT_KINDS,
   TASK_STATES,
   type AampTaskStatus,
   type DatabaseChange,
   type Logger,
   type ProjectStatus,
+  type ShortcutGroupLayout,
+  type ShortcutKind,
+  type StoredShortcut,
+  type StoredShortcutGroup,
   type TaskState,
   type StoredProject,
   type StoredWebTaskAttachment,
@@ -230,6 +237,9 @@ export class DashboardServer {
         && url.pathname !== "/"
         && url.pathname !== "/index.html"
         && url.pathname !== "/pair-admin"
+        && url.pathname !== "/system-management"
+        && url.pathname !== "/system-management/devices"
+        && url.pathname !== "/system-management/shortcuts"
       ) {
         sendJson(response, 401, { error: "pairing required" });
         return;
@@ -247,6 +257,67 @@ export class DashboardServer {
       sendJson(response, 200, { actionToken: this.actionToken });
       return;
     }
+    if (request.method === "GET" && url.pathname === "/api/shortcut-config") {
+      this.sendShortcutConfig(response);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/shortcut-groups") {
+      await this.createShortcutGroup(request, response);
+      return;
+    }
+    const shortcutGroupMatch = /^\/api\/shortcut-groups\/([^/]+)$/.exec(url.pathname);
+    if (shortcutGroupMatch) {
+      const groupId = decodeURIComponent(shortcutGroupMatch[1]!);
+      if (request.method === "PATCH") {
+        await this.updateShortcutGroup(groupId, request, response);
+        return;
+      }
+      if (request.method === "DELETE") {
+        if (!this.requireActionAuthorization(request, response)) return;
+        try {
+          if (!this.options.db.deleteShortcutGroup(groupId)) {
+            sendJson(response, 404, { error: "shortcut group not found or cannot be deleted" });
+            return;
+          }
+          sendJson(response, 200, { ok: true });
+        } catch (error) {
+          sendJson(response, 409, { error: error instanceof Error ? error.message : "shortcut group cannot be deleted" });
+        }
+        return;
+      }
+    }
+    if (request.method === "POST" && url.pathname === "/api/shortcuts") {
+      await this.createShortcut(request, response);
+      return;
+    }
+    const shortcutMatch = /^\/api\/shortcuts\/([^/]+)$/.exec(url.pathname);
+    if (shortcutMatch) {
+      const shortcutId = decodeURIComponent(shortcutMatch[1]!);
+      if (request.method === "PATCH") {
+        await this.updateShortcut(shortcutId, request, response);
+        return;
+      }
+      if (request.method === "DELETE") {
+        if (!this.requireActionAuthorization(request, response)) return;
+        if (!this.options.db.deleteShortcut(shortcutId)) {
+          sendJson(response, 404, { error: "shortcut not found or cannot be deleted" });
+          return;
+        }
+        sendJson(response, 200, { ok: true });
+        return;
+      }
+    }
+    const shortcutUseMatch = /^\/api\/shortcuts\/([^/]+)\/use$/.exec(url.pathname);
+    if (request.method === "POST" && shortcutUseMatch) {
+      if (!this.requireActionAuthorization(request, response)) return;
+      const shortcut = this.options.db.recordShortcutUse(decodeURIComponent(shortcutUseMatch[1]!));
+      if (!shortcut) {
+        sendJson(response, 404, { error: "shortcut not found" });
+        return;
+      }
+      sendJson(response, 200, { shortcut: publicShortcut(shortcut) });
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/api/projects") {
       sendJson(response, 200, { projects: this.listProjects() });
       return;
@@ -257,6 +328,98 @@ export class DashboardServer {
         return;
       }
       sendJson(response, 200, { homes: this.options.codexHistory.listHomes() });
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/codex/attachments") {
+      await this.uploadCodexHistoryAttachment(request, response);
+      return;
+    }
+    const codexAttachmentMatch = /^\/api\/codex\/attachments\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "DELETE" && codexAttachmentMatch) {
+      let attachmentId: string;
+      try {
+        attachmentId = decodeURIComponent(codexAttachmentMatch[1]);
+      } catch {
+        sendJson(response, 400, { error: "invalid Codex attachment id" });
+        return;
+      }
+      await this.deleteCodexHistoryAttachment(attachmentId, request, response);
+      return;
+    }
+    const codexWriterStatusMatch = /^\/api\/codex\/threads\/([^/]+)\/([^/]+)\/writer-status$/.exec(url.pathname);
+    if (request.method === "GET" && codexWriterStatusMatch) {
+      let homeId: string;
+      let threadId: string;
+      try {
+        homeId = decodeURIComponent(codexWriterStatusMatch[1]);
+        threadId = decodeURIComponent(codexWriterStatusMatch[2]);
+      } catch {
+        sendJson(response, 400, { error: "invalid Codex thread selector" });
+        return;
+      }
+      await this.getCodexThreadWriterStatus(homeId, threadId, response);
+      return;
+    }
+    const codexRunInterruptMatch = /^\/api\/codex\/threads\/([^/]+)\/([^/]+)\/runs\/([^/]+)\/interrupt$/.exec(url.pathname);
+    if (request.method === "POST" && codexRunInterruptMatch) {
+      let selectors: string[];
+      try {
+        selectors = codexRunInterruptMatch.slice(1).map((value) => decodeURIComponent(value));
+      } catch {
+        sendJson(response, 400, { error: "invalid Codex run selector" });
+        return;
+      }
+      await this.interruptCodexThreadMessage(selectors[0]!, selectors[1]!, selectors[2]!, request, response);
+      return;
+    }
+    const codexRunAttachmentMatch = /^\/api\/codex\/threads\/([^/]+)\/([^/]+)\/runs\/([^/]+)\/attachments\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "GET" && codexRunAttachmentMatch) {
+      let selectors: string[];
+      try {
+        selectors = codexRunAttachmentMatch.slice(1).map((value) => decodeURIComponent(value));
+      } catch {
+        sendJson(response, 400, { error: "invalid Codex attachment selector" });
+        return;
+      }
+      await this.getCodexThreadAttachment(selectors[0]!, selectors[1]!, selectors[2]!, selectors[3]!, response);
+      return;
+    }
+    const codexThreadMessagesMatch = /^\/api\/codex\/threads\/([^/]+)\/([^/]+)\/messages$/.exec(url.pathname);
+    if (request.method === "POST" && codexThreadMessagesMatch) {
+      let homeId: string;
+      let threadId: string;
+      try {
+        homeId = decodeURIComponent(codexThreadMessagesMatch[1]);
+        threadId = decodeURIComponent(codexThreadMessagesMatch[2]);
+      } catch {
+        sendJson(response, 400, { error: "invalid Codex thread selector" });
+        return;
+      }
+      await this.sendCodexThreadMessage(
+        homeId,
+        threadId,
+        request,
+        response,
+      );
+      return;
+    }
+    const codexThreadUpdatesMatch = /^\/api\/codex\/threads\/([^/]+)\/([^/]+)\/updates$/.exec(url.pathname);
+    if (request.method === "GET" && codexThreadUpdatesMatch) {
+      let homeId: string;
+      let threadId: string;
+      try {
+        homeId = decodeURIComponent(codexThreadUpdatesMatch[1]);
+        threadId = decodeURIComponent(codexThreadUpdatesMatch[2]);
+      } catch {
+        sendJson(response, 400, { error: "invalid Codex thread selector" });
+        return;
+      }
+      await this.getCodexThreadUpdates(
+        homeId,
+        threadId,
+        url,
+        response,
+      );
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/codex/threads") {
@@ -489,6 +652,223 @@ export class DashboardServer {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       sendJson(response, message.startsWith("找不到 Codex home") ? 404 : 502, { error: message });
+    }
+  }
+
+  private async uploadCodexHistoryAttachment(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const history = this.options.codexHistory;
+    if (!history) {
+      request.resume();
+      sendJson(response, 501, { error: "Codex history is not configured" });
+      return;
+    }
+    if (!this.requireActionAuthorization(request, response)) return;
+    const fileNameHeader = request.headers["x-file-name"];
+    if (typeof fileNameHeader !== "string") {
+      request.resume();
+      sendJson(response, 400, { error: "x-file-name is required" });
+      return;
+    }
+    let fileName: string;
+    try {
+      fileName = decodeURIComponent(fileNameHeader);
+    } catch {
+      request.resume();
+      sendJson(response, 400, { error: "invalid file name" });
+      return;
+    }
+    const contentLength = Number(request.headers["content-length"] ?? 0);
+    if (Number.isFinite(contentLength) && contentLength > CODEX_HISTORY_MAX_ATTACHMENT_BYTES) {
+      request.resume();
+      sendJson(response, 413, { error: "单个附件不能超过 25 MiB。" });
+      return;
+    }
+    let data: Buffer;
+    try {
+      data = await readBinaryBody(request, CODEX_HISTORY_MAX_ATTACHMENT_BYTES);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(response, message === "attachment exceeds size limit" ? 413 : 400, { error: message });
+      return;
+    }
+    try {
+      const attachment = await history.stageAttachment({
+        fileName,
+        mimeType: normalizeAttachmentMimeType(request.headers["content-type"]),
+        data,
+      });
+      sendJson(response, 201, { attachment });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(response, message.includes("25 MiB") ? 413 : 422, { error: message });
+    }
+  }
+
+  private async deleteCodexHistoryAttachment(
+    attachmentId: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const history = this.options.codexHistory;
+    if (!history) {
+      sendJson(response, 501, { error: "Codex history is not configured" });
+      return;
+    }
+    if (!this.requireActionAuthorization(request, response)) return;
+    if (!await history.deleteStagedAttachment(attachmentId)) {
+      sendJson(response, 404, { error: "Codex history attachment not found or already in use" });
+      return;
+    }
+    response.statusCode = 204;
+    response.end();
+  }
+
+  private async getCodexThreadAttachment(
+    homeId: string,
+    threadId: string,
+    runId: string,
+    attachmentId: string,
+    response: ServerResponse,
+  ): Promise<void> {
+    const attachment = this.options.codexHistory?.getRunAttachment(homeId, threadId, runId, attachmentId);
+    if (!attachment) {
+      sendJson(response, 404, { error: "Codex thread attachment not found or expired" });
+      return;
+    }
+    let fileStat;
+    try {
+      fileStat = await stat(attachment.localPath);
+    } catch {
+      sendJson(response, 410, { error: "Codex thread attachment file is no longer available" });
+      return;
+    }
+    setSecurityHeaders(response);
+    response.statusCode = 200;
+    response.setHeader("Content-Type", attachment.mimeType);
+    response.setHeader("Content-Length", String(fileStat.size));
+    response.setHeader("Cache-Control", "private, no-store");
+    response.setHeader("Content-Disposition", attachmentDisposition(
+      attachment.fileName,
+      isPreviewableImage(attachment.mimeType),
+    ));
+    const stream = createReadStream(attachment.localPath);
+    stream.on("error", () => response.destroy());
+    stream.pipe(response);
+  }
+
+  private async getCodexThreadWriterStatus(
+    homeId: string,
+    threadId: string,
+    response: ServerResponse,
+  ): Promise<void> {
+    const history = this.options.codexHistory;
+    if (!history) {
+      sendJson(response, 501, { error: "Codex history is not configured" });
+      return;
+    }
+    try {
+      sendJson(response, 200, await history.getWriterStatus(homeId, threadId));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(response, message.startsWith("找不到 Codex home") ? 404 : 502, { error: message });
+    }
+  }
+
+  private async interruptCodexThreadMessage(
+    homeId: string,
+    threadId: string,
+    runId: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const history = this.options.codexHistory;
+    if (!history) {
+      sendJson(response, 501, { error: "Codex history is not configured" });
+      return;
+    }
+    if (!this.requireActionAuthorization(request, response)) return;
+    const result = history.interruptMessage(homeId, threadId, runId);
+    sendJson(response, result.ok ? 202 : 409, result);
+  }
+
+  private async sendCodexThreadMessage(
+    homeId: string,
+    threadId: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const history = this.options.codexHistory;
+    if (!history) {
+      sendJson(response, 501, { error: "Codex history is not configured" });
+      return;
+    }
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(request);
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+      return;
+    }
+    if (body.text !== undefined && typeof body.text !== "string") {
+      sendJson(response, 400, { error: "text must be a string" });
+      return;
+    }
+    if (body.turnIndex !== undefined && (!Number.isSafeInteger(body.turnIndex) || Number(body.turnIndex) < 0)) {
+      sendJson(response, 400, { error: "turnIndex must be a non-negative integer" });
+      return;
+    }
+    const attachmentIds = body.attachmentIds ?? [];
+    if (!Array.isArray(attachmentIds) || attachmentIds.some((id) => typeof id !== "string")) {
+      sendJson(response, 400, { error: "attachmentIds must be an array of strings" });
+      return;
+    }
+    try {
+      const result = await history.sendMessage(homeId, threadId, {
+        text: typeof body.text === "string" ? body.text : "",
+        attachmentIds: attachmentIds as string[],
+        ...(typeof body.turnIndex === "number" ? { turnIndex: body.turnIndex } : {}),
+      });
+      sendJson(response, 202, result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status = message.startsWith("找不到 Codex home") ? 404
+        : message.includes("正在处理") ? 409
+          : 422;
+      sendJson(response, status, { error: message });
+    }
+  }
+
+  private async getCodexThreadUpdates(
+    homeId: string,
+    threadId: string,
+    url: URL,
+    response: ServerResponse,
+  ): Promise<void> {
+    const history = this.options.codexHistory;
+    if (!history) {
+      sendJson(response, 501, { error: "Codex history is not configured" });
+      return;
+    }
+    const after = parseInteger(url.searchParams.get("after"), 0, 0, 1_000_000_000);
+    if (after === null) {
+      sendJson(response, 400, { error: "invalid Codex update cursor" });
+      return;
+    }
+    try {
+      const result = history.getMessageUpdates(
+        homeId,
+        threadId,
+        cleanParam(url.searchParams.get("runId")),
+        after,
+      );
+      sendJson(response, 200, result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(response, 404, { error: message });
     }
   }
 
@@ -729,6 +1109,106 @@ export class DashboardServer {
     }));
   }
 
+  private sendShortcutConfig(response: ServerResponse): void {
+    const config = this.options.db.getShortcutConfig();
+    sendJson(response, 200, {
+      groups: config.groups.map(publicShortcutGroup),
+      shortcuts: config.shortcuts.map(publicShortcut),
+    });
+  }
+
+  private async createShortcutGroup(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(request);
+      const group = this.options.db.createShortcutGroup({
+        title: requiredText(body.title, "title"),
+        icon: optionalText(body.icon),
+        description: optionalText(body.description),
+        layout: optionalShortcutGroupLayout(body.layout),
+        sortOrder: optionalInteger(body.sortOrder),
+        enabled: optionalBoolean(body.enabled),
+      });
+      sendJson(response, 201, { group: publicShortcutGroup(group) });
+    } catch (error) {
+      sendJson(response, 422, { error: error instanceof Error ? error.message : "shortcut group creation failed" });
+    }
+  }
+
+  private async updateShortcutGroup(
+    groupId: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    try {
+      const body = await readJsonBody(request);
+      const group = this.options.db.updateShortcutGroup(groupId, {
+        ...(body.title !== undefined ? { title: requiredText(body.title, "title") } : {}),
+        ...(body.icon !== undefined ? { icon: requiredText(body.icon, "icon") } : {}),
+        ...(body.description !== undefined ? { description: optionalText(body.description) ?? "" } : {}),
+        ...(body.layout !== undefined ? { layout: requiredShortcutGroupLayout(body.layout) } : {}),
+        ...(body.sortOrder !== undefined ? { sortOrder: requiredInteger(body.sortOrder, "sortOrder") } : {}),
+        ...(body.enabled !== undefined ? { enabled: requiredBoolean(body.enabled, "enabled") } : {}),
+      });
+      if (!group) {
+        sendJson(response, 404, { error: "shortcut group not found" });
+        return;
+      }
+      sendJson(response, 200, { group: publicShortcutGroup(group) });
+    } catch (error) {
+      sendJson(response, 422, { error: error instanceof Error ? error.message : "shortcut group update failed" });
+    }
+  }
+
+  private async createShortcut(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    try {
+      const body = await readJsonBody(request);
+      const shortcut = this.options.db.createShortcut({
+        groupId: requiredText(body.groupId, "groupId"),
+        title: requiredText(body.title, "title"),
+        detail: optionalText(body.detail),
+        kind: requiredShortcutKind(body.kind),
+        value: requiredText(body.value, "value"),
+        enabled: optionalBoolean(body.enabled),
+        dangerous: optionalBoolean(body.dangerous),
+      });
+      sendJson(response, 201, { shortcut: publicShortcut(shortcut) });
+    } catch (error) {
+      sendJson(response, 422, { error: error instanceof Error ? error.message : "shortcut creation failed" });
+    }
+  }
+
+  private async updateShortcut(
+    shortcutId: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    try {
+      const body = await readJsonBody(request);
+      const shortcut = this.options.db.updateShortcut(shortcutId, {
+        ...(body.groupId !== undefined ? { groupId: requiredText(body.groupId, "groupId") } : {}),
+        ...(body.title !== undefined ? { title: requiredText(body.title, "title") } : {}),
+        ...(body.detail !== undefined ? { detail: optionalText(body.detail) ?? "" } : {}),
+        ...(body.kind !== undefined ? { kind: requiredShortcutKind(body.kind) } : {}),
+        ...(body.value !== undefined ? { value: requiredText(body.value, "value") } : {}),
+        ...(body.enabled !== undefined ? { enabled: requiredBoolean(body.enabled, "enabled") } : {}),
+        ...(body.dangerous !== undefined ? { dangerous: requiredBoolean(body.dangerous, "dangerous") } : {}),
+        ...(body.sortOrder !== undefined ? { sortOrder: requiredInteger(body.sortOrder, "sortOrder") } : {}),
+      });
+      if (!shortcut) {
+        sendJson(response, 404, { error: "shortcut not found" });
+        return;
+      }
+      sendJson(response, 200, { shortcut: publicShortcut(shortcut) });
+    } catch (error) {
+      sendJson(response, 422, { error: error instanceof Error ? error.message : "shortcut update failed" });
+    }
+  }
+
   private requireActionAuthorization(request: IncomingMessage, response: ServerResponse): boolean {
     const token = request.headers["x-bridge-action-token"];
     if (!constantTimeTokenMatches(typeof token === "string" ? token : "", this.actionToken)) {
@@ -736,7 +1216,7 @@ export class DashboardServer {
       return false;
     }
     const origin = request.headers.origin;
-    if (origin && !this.isSameOrigin(origin)) {
+    if (origin && !this.isSameOrigin(origin, request)) {
       sendJson(response, 403, { error: "cross-origin action rejected" });
       return false;
     }
@@ -867,7 +1347,7 @@ export class DashboardServer {
       return;
     }
     const origin = request.headers.origin;
-    if (origin && !this.isSameOrigin(origin)) {
+    if (origin && !this.isSameOrigin(origin, request)) {
       sendJson(response, 403, { error: "cross-origin action rejected" });
       return;
     }
@@ -1022,11 +1502,25 @@ export class DashboardServer {
     }
   }
 
-  private isSameOrigin(origin: string): boolean {
+  private isSameOrigin(origin: string, request: IncomingMessage): boolean {
+    let parsedOrigin: URL;
+    try {
+      parsedOrigin = new URL(origin);
+    } catch {
+      return false;
+    }
+    if (parsedOrigin.protocol !== "http:" && parsedOrigin.protocol !== "https:") return false;
+    const forwardedHost = firstHeaderValue(request.headers["x-forwarded-host"]);
+    const requestHost = forwardedHost || firstHeaderValue(request.headers.host);
+    const forwardedProtocol = firstHeaderValue(request.headers["x-forwarded-proto"]);
+    if (requestHost) {
+      const expectedProtocol = forwardedProtocol?.toLowerCase() === "https" ? "https:" : "http:";
+      return parsedOrigin.host === requestHost && parsedOrigin.protocol === expectedProtocol;
+    }
     const server = this.server;
     const address = server?.address();
     const port = typeof address === "object" && address ? address.port : this.options.port;
-    return origin === `http://${this.options.host}:${port}`;
+    return parsedOrigin.origin === `http://${this.options.host}:${port}`;
   }
 }
 
@@ -1034,6 +1528,9 @@ function isSpaRoute(pathname: string): boolean {
   return pathname === "/"
     || pathname === "/index.html"
     || pathname === "/pair-admin"
+    || pathname === "/system-management"
+    || pathname === "/system-management/devices"
+    || pathname === "/system-management/shortcuts"
     || pathname === "/codex-history"
     || pathname === "/tmux-dashboard"
     || (pathname.startsWith("/tmux-dashboard/")
@@ -1128,6 +1625,86 @@ function constantTimeTokenMatches(value: string, expected: string): boolean {
 
 function isProjectStatus(value: unknown): value is ProjectStatus {
   return typeof value === "string" && PROJECT_STATUSES.includes(value as ProjectStatus);
+}
+
+function publicShortcutGroup(group: StoredShortcutGroup): Record<string, unknown> {
+  return {
+    id: group.id,
+    title: group.title,
+    icon: group.icon,
+    description: group.description,
+    layout: group.layout,
+    sortOrder: group.sort_order,
+    enabled: group.enabled,
+    builtIn: group.built_in,
+    createdAt: group.created_at,
+    updatedAt: group.updated_at,
+  };
+}
+
+function publicShortcut(shortcut: StoredShortcut): Record<string, unknown> {
+  return {
+    id: shortcut.id,
+    groupId: shortcut.group_id,
+    title: shortcut.title,
+    detail: shortcut.detail,
+    kind: shortcut.kind,
+    value: shortcut.value,
+    enabled: shortcut.enabled,
+    builtIn: shortcut.built_in,
+    dangerous: shortcut.dangerous,
+    sortOrder: shortcut.sort_order,
+    operationCount: shortcut.operation_count,
+    createdAt: shortcut.created_at,
+    updatedAt: shortcut.updated_at,
+  };
+}
+
+function requiredText(value: unknown, field: string): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${field} is required`);
+  return value;
+}
+
+function optionalText(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw new Error("text value is invalid");
+  return value;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  return value === undefined ? undefined : requiredBoolean(value, "boolean");
+}
+
+function requiredBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`${field} must be a boolean`);
+  return value;
+}
+
+function optionalInteger(value: unknown): number | undefined {
+  return value === undefined ? undefined : requiredInteger(value, "integer");
+}
+
+function requiredInteger(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value)) throw new Error(`${field} must be an integer`);
+  return value as number;
+}
+
+function requiredShortcutKind(value: unknown): ShortcutKind {
+  if (typeof value !== "string" || !SHORTCUT_KINDS.includes(value as ShortcutKind)) {
+    throw new Error("kind is invalid");
+  }
+  return value as ShortcutKind;
+}
+
+function optionalShortcutGroupLayout(value: unknown): ShortcutGroupLayout | undefined {
+  return value === undefined ? undefined : requiredShortcutGroupLayout(value);
+}
+
+function requiredShortcutGroupLayout(value: unknown): ShortcutGroupLayout {
+  if (typeof value !== "string" || !SHORTCUT_GROUP_LAYOUTS.includes(value as ShortcutGroupLayout)) {
+    throw new Error("layout is invalid");
+  }
+  return value as ShortcutGroupLayout;
 }
 
 function normalizeProjectPath(value: string): string | undefined {

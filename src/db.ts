@@ -4,7 +4,13 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 
 import { DatabaseSync as DatabaseSyncConstructor, type SqliteDatabase } from "./sqlite.js";
-import { DIRECT_FOLLOWUP_STATUSES, DIRECT_TASK_STATUSES } from "./types.js";
+import { DEFAULT_SHORTCUT_GROUPS, DEFAULT_SHORTCUTS } from "./tmux-shortcut-defaults.js";
+import {
+  DIRECT_FOLLOWUP_STATUSES,
+  DIRECT_TASK_STATUSES,
+  SHORTCUT_GROUP_LAYOUTS,
+  SHORTCUT_KINDS,
+} from "./types.js";
 import type { WebAuthPairingRecord, WebAuthSessionRecord } from "./web-auth.js";
 import type {
   DatabaseChange,
@@ -29,6 +35,10 @@ import type {
   StoredTask,
   TaskState,
   WorkerProgress,
+  ShortcutGroupLayout,
+  ShortcutKind,
+  StoredShortcut,
+  StoredShortcutGroup,
 } from "./types.js";
 
 const SCHEMA = `
@@ -278,6 +288,41 @@ CREATE TABLE IF NOT EXISTS bridge_runtime_leases (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS shortcut_groups (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    icon TEXT NOT NULL DEFAULT '⌘',
+    description TEXT NOT NULL DEFAULT '',
+    layout TEXT NOT NULL DEFAULT 'grid' CHECK (layout IN ('grid', 'keyboard')),
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    built_in INTEGER NOT NULL DEFAULT 0 CHECK (built_in IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shortcuts (
+    id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL CHECK (kind IN ('terminal', 'insert', 'send', 'sequence')),
+    value TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    built_in INTEGER NOT NULL DEFAULT 0 CHECK (built_in IN (0, 1)),
+    dangerous INTEGER NOT NULL DEFAULT 0 CHECK (dangerous IN (0, 1)),
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    operation_count INTEGER NOT NULL DEFAULT 0 CHECK (operation_count >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(group_id) REFERENCES shortcut_groups(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_shortcut_groups_order
+  ON shortcut_groups(enabled, sort_order, id);
+CREATE INDEX IF NOT EXISTS idx_shortcuts_group_order
+  ON shortcuts(group_id, enabled, operation_count DESC, title COLLATE NOCASE);
+
 CREATE TABLE IF NOT EXISTS web_auth_pairings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     code_hash TEXT NOT NULL,
@@ -444,6 +489,7 @@ export class StateDatabase {
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec(SCHEMA);
     this.runMigrations();
+    this.seedShortcutDefaults();
   }
 
   public transaction<T>(callback: () => T): T {
@@ -548,6 +594,168 @@ export class StateDatabase {
       "INSERT OR IGNORE INTO projects (name, path, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
     ).run(name, resolve(path), input.status ?? "available", now, now);
     return this.getProject(name)!;
+  }
+
+  public getShortcutConfig(): { groups: StoredShortcutGroup[]; shortcuts: StoredShortcut[] } {
+    return { groups: this.listShortcutGroups(), shortcuts: this.listShortcuts() };
+  }
+
+  public listShortcutGroups(includeDisabled = true): StoredShortcutGroup[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM shortcut_groups${includeDisabled ? "" : " WHERE enabled = 1"}
+       ORDER BY sort_order ASC, id COLLATE NOCASE ASC`,
+    ).all() as Record<string, unknown>[];
+    return rows.map(mapShortcutGroup);
+  }
+
+  public listShortcuts(groupId?: string, includeDisabled = true): StoredShortcut[] {
+    const conditions: string[] = [];
+    const params: string[] = [];
+    if (groupId) {
+      conditions.push("group_id = ?");
+      params.push(groupId);
+    }
+    if (!includeDisabled) conditions.push("enabled = 1");
+    const where = conditions.length > 0 ? ` WHERE ${conditions.join(" AND ")}` : "";
+    const rows = this.db.prepare(
+      `SELECT * FROM shortcuts${where}
+       ORDER BY group_id COLLATE NOCASE ASC, sort_order ASC, title COLLATE NOCASE ASC, id ASC`,
+    ).all(...params) as Record<string, unknown>[];
+    return rows.map(mapShortcut);
+  }
+
+  public getShortcut(id: string): StoredShortcut | null {
+    const row = this.db.prepare("SELECT * FROM shortcuts WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? mapShortcut(row) : null;
+  }
+
+  public createShortcutGroup(input: {
+    id?: string;
+    title: string;
+    icon?: string;
+    description?: string;
+    layout?: ShortcutGroupLayout;
+    sortOrder?: number;
+    enabled?: boolean;
+    builtIn?: boolean;
+  }): StoredShortcutGroup {
+    const id = input.id?.trim() || `group-${randomUUID()}`;
+    const title = normalizeShortcutText(input.title, "分组名称", 64);
+    const icon = normalizeShortcutText(input.icon ?? "⌘", "分组图标", 8);
+    const description = normalizeShortcutText(input.description ?? "", "分组说明", 160, false);
+    const layout = normalizeShortcutLayout(input.layout ?? "grid");
+    const sortOrder = Number.isSafeInteger(input.sortOrder) ? input.sortOrder! : this.nextShortcutGroupOrder();
+    const now = this.timestamp();
+    this.db.prepare(
+      `INSERT INTO shortcut_groups
+        (id, title, icon, description, layout, sort_order, enabled, built_in, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, title, icon, description, layout, sortOrder, input.enabled === false ? 0 : 1, input.builtIn ? 1 : 0, now, now);
+    return this.getShortcutGroup(id)!;
+  }
+
+  public getShortcutGroup(id: string): StoredShortcutGroup | null {
+    const row = this.db.prepare("SELECT * FROM shortcut_groups WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? mapShortcutGroup(row) : null;
+  }
+
+  public updateShortcutGroup(id: string, input: {
+    title?: string;
+    icon?: string;
+    description?: string;
+    layout?: ShortcutGroupLayout;
+    sortOrder?: number;
+    enabled?: boolean;
+  }): StoredShortcutGroup | null {
+    const existing = this.getShortcutGroup(id);
+    if (!existing) return null;
+    const title = input.title === undefined ? existing.title : normalizeShortcutText(input.title, "分组名称", 64);
+    const icon = input.icon === undefined ? existing.icon : normalizeShortcutText(input.icon, "分组图标", 8);
+    const description = input.description === undefined ? existing.description : normalizeShortcutText(input.description, "分组说明", 160, false);
+    const layout = input.layout === undefined ? existing.layout : normalizeShortcutLayout(input.layout);
+    const sortOrder = input.sortOrder === undefined ? existing.sort_order : input.sortOrder;
+    if (!Number.isSafeInteger(sortOrder)) throw new Error("分组排序必须是整数。");
+    this.db.prepare(
+      `UPDATE shortcut_groups SET title = ?, icon = ?, description = ?, layout = ?, sort_order = ?,
+       enabled = ?, updated_at = ? WHERE id = ?`,
+    ).run(title, icon, description, layout, sortOrder, input.enabled === undefined ? (existing.enabled ? 1 : 0) : input.enabled ? 1 : 0, this.timestamp(), id);
+    return this.getShortcutGroup(id);
+  }
+
+  public deleteShortcutGroup(id: string): boolean {
+    const group = this.getShortcutGroup(id);
+    if (!group || group.built_in) return false;
+    const shortcutCount = this.db.prepare("SELECT COUNT(*) AS count FROM shortcuts WHERE group_id = ?").get(id) as { count: number };
+    if (shortcutCount.count > 0) throw new Error("请先移除该分组中的快捷键。");
+    return this.db.prepare("DELETE FROM shortcut_groups WHERE id = ? AND built_in = 0").run(id).changes > 0;
+  }
+
+  public createShortcut(input: {
+    id?: string;
+    groupId: string;
+    title: string;
+    detail?: string;
+    kind: ShortcutKind;
+    value: string;
+    enabled?: boolean;
+    builtIn?: boolean;
+    dangerous?: boolean;
+    sortOrder?: number;
+  }): StoredShortcut {
+    if (!this.getShortcutGroup(input.groupId)) throw new Error("快捷键分组不存在。");
+    const id = input.id?.trim() || `shortcut-${randomUUID()}`;
+    const title = normalizeShortcutText(input.title, "快捷键名称", 64);
+    const detail = normalizeShortcutText(input.detail ?? "", "快捷键说明", 120, false);
+    const kind = normalizeShortcutKind(input.kind);
+    const value = normalizeShortcutText(input.value, "快捷键内容", 8_000);
+    const sortOrder = Number.isSafeInteger(input.sortOrder) ? input.sortOrder! : this.nextShortcutOrder(input.groupId);
+    const now = this.timestamp();
+    this.db.prepare(
+      `INSERT INTO shortcuts
+        (id, group_id, title, detail, kind, value, enabled, built_in, dangerous, sort_order, operation_count, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+    ).run(id, input.groupId, title, detail, kind, value, input.enabled === false ? 0 : 1, input.builtIn ? 1 : 0, input.dangerous ? 1 : 0, sortOrder, now, now);
+    return this.getShortcut(id)!;
+  }
+
+  public updateShortcut(id: string, input: {
+    groupId?: string;
+    title?: string;
+    detail?: string;
+    kind?: ShortcutKind;
+    value?: string;
+    enabled?: boolean;
+    dangerous?: boolean;
+    sortOrder?: number;
+  }): StoredShortcut | null {
+    const existing = this.getShortcut(id);
+    if (!existing) return null;
+    const groupId = input.groupId ?? existing.group_id;
+    if (!this.getShortcutGroup(groupId)) throw new Error("快捷键分组不存在。");
+    const title = input.title === undefined ? existing.title : normalizeShortcutText(input.title, "快捷键名称", 64);
+    const detail = input.detail === undefined ? existing.detail : normalizeShortcutText(input.detail, "快捷键说明", 120, false);
+    const kind = input.kind === undefined ? existing.kind : normalizeShortcutKind(input.kind);
+    const value = input.value === undefined ? existing.value : normalizeShortcutText(input.value, "快捷键内容", 8_000);
+    const sortOrder = input.sortOrder === undefined ? existing.sort_order : input.sortOrder;
+    if (!Number.isSafeInteger(sortOrder)) throw new Error("快捷键排序必须是整数。");
+    this.db.prepare(
+      `UPDATE shortcuts SET group_id = ?, title = ?, detail = ?, kind = ?, value = ?, enabled = ?, dangerous = ?, sort_order = ?,
+       updated_at = ? WHERE id = ?`,
+    ).run(groupId, title, detail, kind, value, input.enabled === undefined ? (existing.enabled ? 1 : 0) : input.enabled ? 1 : 0, input.dangerous === undefined ? (existing.dangerous ? 1 : 0) : input.dangerous ? 1 : 0, sortOrder, this.timestamp(), id);
+    return this.getShortcut(id);
+  }
+
+  public deleteShortcut(id: string): boolean {
+    const shortcut = this.getShortcut(id);
+    if (!shortcut || shortcut.built_in) return false;
+    return this.db.prepare("DELETE FROM shortcuts WHERE id = ? AND built_in = 0").run(id).changes > 0;
+  }
+
+  public recordShortcutUse(id: string): StoredShortcut | null {
+    const result = this.db.prepare(
+      "UPDATE shortcuts SET operation_count = operation_count + 1, updated_at = ? WHERE id = ?",
+    ).run(this.timestamp(), id);
+    return result.changes > 0 ? this.getShortcut(id) : null;
   }
 
   public createStagedWebTaskAttachment(input: {
@@ -3032,6 +3240,50 @@ export class StateDatabase {
     addColumnIfMissing(this.db, "bridge_tasks", "recovery_count", "INTEGER NOT NULL DEFAULT 0");
     addColumnIfMissing(this.db, "bridge_tasks", "last_recovered_at", "TEXT");
     addColumnIfMissing(this.db, "bridge_task_attachments", "followup_id", "TEXT");
+    addColumnIfMissing(this.db, "shortcuts", "sort_order", "INTEGER NOT NULL DEFAULT 0");
+  }
+
+  private seedShortcutDefaults(): void {
+    this.transaction(() => {
+      const now = this.timestamp();
+      const insertGroup = this.db.prepare(
+        `INSERT OR IGNORE INTO shortcut_groups
+          (id, title, icon, description, layout, sort_order, enabled, built_in, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?)`,
+      );
+      for (const group of DEFAULT_SHORTCUT_GROUPS) {
+        insertGroup.run(group.id, group.title, group.icon, group.description, group.layout, group.sortOrder, now, now);
+      }
+      const insertShortcut = this.db.prepare(
+        `INSERT OR IGNORE INTO shortcuts
+          (id, group_id, title, detail, kind, value, enabled, built_in, dangerous, sort_order, operation_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, 0, ?, ?)`,
+      );
+      for (const [sortOrder, shortcut] of DEFAULT_SHORTCUTS.entries()) {
+        insertShortcut.run(
+          shortcut.id,
+          shortcut.groupId,
+          shortcut.title,
+          shortcut.detail,
+          shortcut.kind,
+          shortcut.value,
+          shortcut.dangerous ? 1 : 0,
+          sortOrder,
+          now,
+          now,
+        );
+      }
+    });
+  }
+
+  private nextShortcutGroupOrder(): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS max_order FROM shortcut_groups").get() as { max_order: number };
+    return Number(row.max_order) + 1;
+  }
+
+  private nextShortcutOrder(groupId: string): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS max_order FROM shortcuts WHERE group_id = ?").get(groupId) as { max_order: number };
+    return Number(row.max_order) + 1;
   }
 
 
@@ -3124,7 +3376,7 @@ function migrateBridgeTaskStatusConstraint(db: SqliteDatabase): void {
 
 function addColumnIfMissing(
   db: SqliteDatabase,
-  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments",
+  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts",
   column: string,
   definition: string,
 ): void {
@@ -3132,6 +3384,58 @@ function addColumnIfMissing(
   if (!columns.some((item) => item.name === column)) {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
+}
+
+function mapShortcutGroup(row: Record<string, unknown>): StoredShortcutGroup {
+  const layout = String(row.layout);
+  return {
+    id: String(row.id),
+    title: String(row.title),
+    icon: String(row.icon ?? "⌘"),
+    description: String(row.description ?? ""),
+    layout: SHORTCUT_GROUP_LAYOUTS.includes(layout as ShortcutGroupLayout) ? layout as ShortcutGroupLayout : "grid",
+    sort_order: Number(row.sort_order ?? 0),
+    enabled: Number(row.enabled) === 1,
+    built_in: Number(row.built_in) === 1,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapShortcut(row: Record<string, unknown>): StoredShortcut {
+  const kind = String(row.kind);
+  return {
+    id: String(row.id),
+    group_id: String(row.group_id),
+    title: String(row.title),
+    detail: String(row.detail ?? ""),
+    kind: SHORTCUT_KINDS.includes(kind as ShortcutKind) ? kind as ShortcutKind : "send",
+    value: String(row.value),
+    enabled: Number(row.enabled) === 1,
+    built_in: Number(row.built_in) === 1,
+    dangerous: Number(row.dangerous) === 1,
+    sort_order: Number(row.sort_order ?? 0),
+    operation_count: Number(row.operation_count ?? 0),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function normalizeShortcutText(value: string, field: string, maxLength: number, required = true): string {
+  const normalized = value.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  if (required && !normalized) throw new Error(`${field}不能为空。`);
+  if (normalized.length > maxLength) throw new Error(`${field}不能超过 ${maxLength} 个字符。`);
+  return normalized;
+}
+
+function normalizeShortcutKind(value: ShortcutKind): ShortcutKind {
+  if (!SHORTCUT_KINDS.includes(value)) throw new Error("快捷键类型无效。");
+  return value;
+}
+
+function normalizeShortcutLayout(value: ShortcutGroupLayout): ShortcutGroupLayout {
+  if (!SHORTCUT_GROUP_LAYOUTS.includes(value)) throw new Error("分组布局无效。");
+  return value;
 }
 
 function mapTask(row: Record<string, unknown>): StoredTask {

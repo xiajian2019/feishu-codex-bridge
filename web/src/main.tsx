@@ -10,6 +10,55 @@ import "./styles.css";
 
 const TmuxDashboard = lazy(() => import("./TmuxDashboard.js").then((module) => ({ default: module.TmuxDashboard })));
 const CodexHistory = lazy(() => import("./CodexHistory.js").then((module) => ({ default: module.CodexHistory })));
+const ShortcutManagement = lazy(() => import("./ShortcutManagement.js").then((module) => ({ default: module.ShortcutManagement })));
+
+function disableBrowserPullToRefresh(): void {
+  let startY: number | null = null;
+  let startTarget: EventTarget | null = null;
+
+  const onTouchStart = (event: TouchEvent): void => {
+    if (event.touches.length !== 1) {
+      startY = null;
+      startTarget = null;
+      return;
+    }
+    startY = event.touches[0]?.clientY ?? null;
+    startTarget = event.target;
+  };
+
+  const hasContentAbove = (target: EventTarget | null): boolean => {
+    let element = target instanceof Element ? target : null;
+    while (element) {
+      const style = window.getComputedStyle(element);
+      const scrollable = /auto|scroll|overlay/.test(style.overflowY)
+        && element.scrollHeight > element.clientHeight + 1;
+      if (scrollable && element.scrollTop > 0) return true;
+      element = element.parentElement;
+    }
+    return window.scrollY > 0
+      || document.documentElement.scrollTop > 0
+      || document.body.scrollTop > 0;
+  };
+
+  const onTouchMove = (event: TouchEvent): void => {
+    if (startY === null || event.touches.length !== 1 || !event.cancelable) return;
+    const currentY = event.touches[0]?.clientY;
+    if (currentY === undefined || currentY - startY < 4) return;
+    const target = startTarget instanceof Element ? startTarget : null;
+    if (target?.closest("input, textarea, select, [contenteditable='true'], .vc-switch")) return;
+    if (!hasContentAbove(startTarget)) event.preventDefault();
+  };
+
+  const clearTouch = (): void => {
+    startY = null;
+    startTarget = null;
+  };
+
+  document.addEventListener("touchstart", onTouchStart, { passive: true, capture: true });
+  document.addEventListener("touchmove", onTouchMove, { passive: false, capture: true });
+  document.addEventListener("touchend", clearTouch, { passive: true, capture: true });
+  document.addEventListener("touchcancel", clearTouch, { passive: true, capture: true });
+}
 
 type MobileVConsole = {
   showSwitch: () => void;
@@ -74,6 +123,7 @@ function makeVConsoleSwitchMovable(vConsole: MobileVConsole): void {
 }
 
 async function mountApp(): Promise<void> {
+  disableBrowserPullToRefresh();
   if (import.meta.env.DEV) {
     try {
       const { default: VConsole } = await import("vconsole");
@@ -105,7 +155,10 @@ async function mountApp(): Promise<void> {
                   <Route path="/codex-history" element={<CodexHistory />} />
                   <Route path="/codex-history/:homeId/:threadId" element={<CodexHistory />} />
                   <Route path="/tmux-dashboard/*" element={<TmuxDashboard />} />
-                  <Route path="/pair-admin" element={<PairingAdmin />} />
+                  <Route path="/system-management" element={<Navigate to="/system-management/devices" replace />} />
+                  <Route path="/system-management/devices" element={<PairingAdmin />} />
+                  <Route path="/system-management/shortcuts" element={<ShortcutManagement />} />
+                  <Route path="/pair-admin" element={<Navigate to="/system-management/devices" replace />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>
               </Suspense>

@@ -457,6 +457,79 @@ describe("DashboardServer", () => {
     expect(await pageResponse.text()).toContain('id="root"');
   });
 
+  it("uploads history attachments, resumes a Codex thread, and returns incremental updates", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bridge-codex-history-message-web-"));
+    await mkdir(join(directory, "sqlite"), { recursive: true });
+    temporaryDirectories.push(directory);
+    const db = new StateDatabase(":memory:");
+    openDatabases.push(db);
+    const history = new CodexHistoryService({
+      executable: "unused-in-test",
+      environment: { CODEX_HOME: directory },
+      createClient: () => ({
+        listThreads: async () => ({ data: [], nextCursor: null, backwardsCursor: null }),
+        readThread: async (threadId) => ({ thread: { id: threadId, cwd: directory, turns: [] } }),
+        close: async () => undefined,
+      }),
+      createAgent: () => ({
+        resumeThread: (threadId) => ({
+          id: threadId,
+          runStreamed: async () => ({
+            events: (async function* () {
+              yield { type: "item.completed", item: { id: "answer", type: "agent_message", text: "后台回复" } };
+              yield { type: "turn.completed", usage: { output_tokens: 2 } };
+            })(),
+          }),
+        }),
+      }),
+    });
+    const server = new DashboardServer({
+      db,
+      host: "127.0.0.1",
+      port: 0,
+      modes: [],
+      codexHistory: history,
+    });
+    openServers.push(server);
+    const url = await server.start();
+    const page = await (await fetch(url)).text();
+    const actionToken = /name="bridge-action-token" content="([^"]+)"/.exec(page)?.[1];
+    expect(actionToken).toBeTruthy();
+    const homeId = history.listHomes()[0]!.id;
+
+    const uploadResponse = await fetch(`${url}/api/codex/attachments`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "image/png",
+        "X-File-Name": encodeURIComponent("history.png"),
+        "X-Bridge-Action-Token": actionToken as string,
+      },
+      body: Buffer.from("image"),
+    });
+    expect(uploadResponse.status).toBe(201);
+    const uploaded = await uploadResponse.json() as { attachment: { attachmentId: string } };
+
+    const sendResponse = await fetch(`${url}/api/codex/threads/${encodeURIComponent(homeId)}/thread-web/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Bridge-Action-Token": actionToken as string,
+      },
+      body: JSON.stringify({ text: "继续处理", attachmentIds: [uploaded.attachment.attachmentId] }),
+    });
+    expect(sendResponse.status).toBe(202);
+    const accepted = await sendResponse.json() as { runId: string; cursor: number };
+    let updatesResponse = await fetch(`${url}/api/codex/threads/${encodeURIComponent(homeId)}/thread-web/updates?runId=${encodeURIComponent(accepted.runId)}&after=${accepted.cursor}`);
+    let updates = await updatesResponse.json() as { state: string; cursor: number; events: Array<{ type: string }> };
+    for (let attempt = 0; attempt < 20 && updates.state === "running"; attempt += 1) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+      updatesResponse = await fetch(`${url}/api/codex/threads/${encodeURIComponent(homeId)}/thread-web/updates?runId=${encodeURIComponent(accepted.runId)}&after=0`);
+      updates = await updatesResponse.json() as typeof updates;
+    }
+    expect(updates.state).toBe("completed");
+    expect(updates.events.map((event) => event.type)).toContain("item.completed");
+  });
+
 });
 
 function fakeAuthRequest(address: string, userAgent: string): IncomingMessage {

@@ -12,8 +12,16 @@ import {
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 
 import {
-  loadShortcutStore,
-  saveShortcutStore,
+  beginDebugLogCapture,
+  cancelDebugLogCapture,
+  finishDebugLogCapture,
+  isDebugLogCaptureActive,
+  isDebugLogCapturePaused,
+  logDebugDiagnostic,
+  subscribeDebugLogCapture,
+} from "./debug-log-capture.js";
+import { fetchShortcutConfig, recordShortcutUse } from "./api.js";
+import {
   type ShortcutCategory,
   type ShortcutStore,
   type TerminalShortcut,
@@ -132,16 +140,35 @@ type ComposerFieldsProps = TmuxMessageComposerProps & {
   onSendStart: () => void;
 };
 
-function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholder, preparing, onSendStart, onSubmit, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
+function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholder, preparing, onSendStart, onSubmit, onAttachmentError, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
   const aui = useAui();
-  const controlsDisabled = disabled || sending || preparing;
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [shortcutCategory, setShortcutCategory] = useState<ShortcutCategory>("favorites");
-  const [shortcutStore, setShortcutStore] = useState<ShortcutStore>(() => loadShortcutStore());
+  const [shortcutStore, setShortcutStore] = useState<ShortcutStore>({ groups: [], shortcuts: [] });
   const [previewFile, setPreviewFile] = useState<File | null>(null);
+  const [debugLogActive, setDebugLogActive] = useState(() => isDebugLogCaptureActive());
+  const [debugLogBusy, setDebugLogBusy] = useState(false);
+  const controlsDisabled = disabled || sending || preparing || debugLogBusy;
+  const debugLogControlsDisabled = sending || preparing || debugLogBusy || (disabled && !debugLogActive);
   const composerFormRef = useRef<HTMLFormElement | null>(null);
   const diagnosticActiveRef = useRef(diagnosticSessionActive);
   diagnosticActiveRef.current = diagnosticSessionActive;
+
+  useEffect(() => subscribeDebugLogCapture((active) => setDebugLogActive(active)), []);
+
+  useEffect(() => () => cancelDebugLogCapture(), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchShortcutConfig()
+      .then((nextStore) => {
+        if (!cancelled) setShortcutStore(nextStore);
+      })
+      .catch(() => {
+        // The keyboard panel remains empty until the server becomes available.
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     const form = composerFormRef.current;
@@ -150,12 +177,7 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
     const viewport = window.visualViewport;
     if (!form || !workspace || !terminalFrame || !viewport || !window.matchMedia("(max-width: 760px)").matches) return;
 
-    // Keep snapshots as JSON strings: Safari/vConsole must not show later object values.
-    // Never record draft text, attachments, session IDs, or other user content.
-    const debugWindow = window as typeof window & { __tmuxKeyboardLog?: string[]; __tmuxKeyboardPaused?: boolean };
-    const debugLog = debugWindow.__tmuxKeyboardLog ??= [];
     const instance = Math.round(performance.now());
-    let recording = false;
     let focusCycle = 0;
     let sequence = 0;
     let animationFrame = 0;
@@ -166,7 +188,7 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
       return { top: rect.top, bottom: rect.bottom, height: rect.height, width: rect.width };
     };
     const logViewport = (event: string, detail: object = {}): void => {
-      if (!import.meta.env.DEV || !recording || !diagnosticActiveRef.current || debugWindow.__tmuxKeyboardPaused) return;
+      if (!import.meta.env.DEV || !isDebugLogCaptureActive() || !diagnosticActiveRef.current || isDebugLogCapturePaused()) return;
       const rect = form.getBoundingClientRect();
       const style = getComputedStyle(form);
       const snapshot = JSON.stringify({
@@ -207,12 +229,10 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
         pageScrollMinusViewportTop: window.scrollY - viewport.offsetTop,
         ...detail,
       });
-      debugLog.push(snapshot);
-      if (debugLog.length > 300) debugLog.splice(0, debugLog.length - 300);
       console.info("[tmux-keyboard] " + snapshot);
     };
     const scheduleSamples = (source: string): void => {
-      if (!recording || !diagnosticActiveRef.current || debugWindow.__tmuxKeyboardPaused) return;
+      if (!isDebugLogCaptureActive() || !diagnosticActiveRef.current || isDebugLogCapturePaused()) return;
       window.cancelAnimationFrame(animationFrame);
       window.clearTimeout(settleTimer);
       animationFrame = window.requestAnimationFrame(() => logViewport(source + ":raf"));
@@ -226,23 +246,12 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
     const onVisualScroll = (): void => sampleViewport("visual.scroll");
     const onWindowResize = (): void => sampleViewport("window.resize");
     const onWindowScroll = (): void => sampleViewport("window.scroll");
-    const startRecording = (event: Event): void => {
-      if (!import.meta.env.DEV || !diagnosticActiveRef.current || !(event.target instanceof HTMLTextAreaElement) || event.target.disabled) return;
-      if (!recording) {
-        debugLog.length = 0;
-        recording = true;
-        sequence = 0;
-      }
-      debugWindow.__tmuxKeyboardPaused = false;
-      logViewport(event.type + ":capture-start");
-    };
     const onFocus = (event: FocusEvent): void => {
       if (!(event.target instanceof HTMLTextAreaElement)) return;
       if (event.type === "focusin") {
         focusCycle++;
-        startRecording(event);
       }
-      if (!recording || !diagnosticActiveRef.current || debugWindow.__tmuxKeyboardPaused) return;
+      if (!isDebugLogCaptureActive() || !diagnosticActiveRef.current || isDebugLogCapturePaused()) return;
       logViewport(event.type);
       // Capture even if WebKit does not dispatch a final viewport event.
       for (const delay of [100, 350, 700]) {
@@ -255,13 +264,19 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
     };
     const resizeObserver = new ResizeObserver(() => sampleViewport("composer.resize"));
     const terminalObserver = new ResizeObserver(() => logViewport("terminal.resize"));
+    const onCaptureChange = (active: boolean): void => {
+      if (active) {
+        sequence = 0;
+        sampleViewport("capture-start");
+      }
+    };
+    const unsubscribeCapture = subscribeDebugLogCapture(onCaptureChange);
     resizeObserver.observe(form);
     terminalObserver.observe(terminalFrame);
     viewport.addEventListener("resize", onVisualResize);
     viewport.addEventListener("scroll", onVisualScroll);
     window.addEventListener("resize", onWindowResize);
     window.addEventListener("scroll", onWindowScroll, { passive: true });
-    form.addEventListener("pointerdown", startRecording);
     form.addEventListener("focusin", onFocus);
     form.addEventListener("focusout", onFocus);
     sampleViewport("mount");
@@ -277,9 +292,9 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
       viewport.removeEventListener("scroll", onVisualScroll);
       window.removeEventListener("resize", onWindowResize);
       window.removeEventListener("scroll", onWindowScroll);
-      form.removeEventListener("pointerdown", startRecording);
       form.removeEventListener("focusin", onFocus);
       form.removeEventListener("focusout", onFocus);
+      unsubscribeCapture();
     };
   }, []);
 
@@ -289,21 +304,46 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
       document.documentElement.style.removeProperty("--dashboard-shortcut-max-height");
       return;
     }
+    const form = composerFormRef.current;
 
     const updateBottomOffset = (): void => {
-      const rect = composerFormRef.current?.getBoundingClientRect();
-      if (!rect) return;
+      const workspaceRect = form.parentElement?.getBoundingClientRect();
+      const rect = form.getBoundingClientRect();
+      if (!workspaceRect) return;
+      const viewport = window.visualViewport;
+      const dialog = document.querySelector<HTMLElement>(".dashboard-shortcut-dialog");
+      const dialogRect = dialog?.getBoundingClientRect();
+      const bottom = Math.max(0, workspaceRect.bottom - rect.top + 8);
+      const maxHeight = Math.max(0, rect.top - workspaceRect.top - 16);
       document.documentElement.style.setProperty(
         "--dashboard-shortcut-bottom",
-        Math.max(0, document.documentElement.clientHeight - rect.top + 8) + "px",
+        bottom + "px",
       );
       document.documentElement.style.setProperty(
         "--dashboard-shortcut-max-height",
-        Math.max(0, rect.top - (window.visualViewport?.offsetTop ?? 0) - 16) + "px",
+        maxHeight + "px",
       );
+      logDebugDiagnostic("tmux-shortcut", "layout", {
+        open: shortcutsOpen,
+        activeTag: document.activeElement?.tagName,
+        viewport: viewport ? { height: viewport.height, offsetTop: viewport.offsetTop, pageTop: viewport.pageTop } : null,
+        workspace: { top: workspaceRect.top, bottom: workspaceRect.bottom, height: workspaceRect.height },
+        composer: { top: rect.top, bottom: rect.bottom, height: rect.height },
+        dialog: dialog ? {
+          view: dialog.dataset.shortcutView,
+          top: dialogRect?.top,
+          bottom: dialogRect?.bottom,
+          height: dialogRect?.height,
+          maxHeight: getComputedStyle(dialog).maxHeight,
+          overflow: getComputedStyle(dialog).overflow,
+        } : null,
+        cssBottom: bottom + "px",
+        cssMaxHeight: maxHeight + "px",
+      });
     };
     const observer = new ResizeObserver(updateBottomOffset);
-    observer.observe(composerFormRef.current);
+    observer.observe(form);
+    if (form.parentElement) observer.observe(form.parentElement);
     window.addEventListener("resize", updateBottomOffset);
     window.visualViewport?.addEventListener("resize", updateBottomOffset);
     window.visualViewport?.addEventListener("scroll", updateBottomOffset);
@@ -319,10 +359,6 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
     };
   }, [shortcutsOpen]);
 
-  useEffect(() => {
-    saveShortcutStore(shortcutStore);
-  }, [shortcutStore]);
-
   const openShortcutPalette = (category: ShortcutCategory): void => {
     if (shortcutsOpen && shortcutCategory === category) {
       setShortcutsOpen(false);
@@ -331,6 +367,56 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
     setShortcutCategory(category);
     setShortcutsOpen(true);
   };
+
+  const toggleDebugLogCapture = async (): Promise<void> => {
+    const captureActive = isDebugLogCaptureActive();
+    if (!import.meta.env.DEV || (!diagnosticSessionActive && !captureActive) || debugLogControlsDisabled) return;
+    if (!captureActive) {
+      beginDebugLogCapture();
+      return;
+    }
+
+    setDebugLogBusy(true);
+    try {
+      const file = finishDebugLogCapture();
+      if (!file) return;
+      await aui.composer.addAttachment(file);
+    } catch (error) {
+      onAttachmentError(error instanceof Error ? error.message : "Could not attach the debug log.");
+    } finally {
+      setDebugLogBusy(false);
+    }
+  };
+
+  const handleShortcutUse = async (id: string): Promise<void> => {
+    setShortcutStore((current) => ({
+      ...current,
+      shortcuts: current.shortcuts.map((shortcut) => shortcut.id === id
+        ? { ...shortcut, operationCount: shortcut.operationCount + 1 }
+        : shortcut),
+    }));
+    try {
+      const updated = await recordShortcutUse(id);
+      setShortcutStore((current) => ({
+        ...current,
+        shortcuts: current.shortcuts.map((shortcut) => shortcut.id === id ? updated : shortcut),
+      }));
+    } catch {
+      // Keep the optimistic count; the next config refresh reconciles it.
+    }
+  };
+
+  const debugLogButton = import.meta.env.DEV ? (
+    <button
+      className={`dashboard-keybar-button is-debug-log${debugLogActive ? " is-recording" : ""}`}
+      type="button"
+      title={debugLogActive ? "完成收集并添加日志文件" : "开始收集 console 日志"}
+      aria-label={debugLogActive ? "完成收集并添加日志文件" : "开始收集 console 日志"}
+      aria-pressed={debugLogActive}
+      disabled={debugLogControlsDisabled}
+      onClick={() => void toggleDebugLogCapture()}
+    >{debugLogBusy ? "…" : debugLogActive ? "■" : "●"}</button>
+  ) : null;
 
   return (
     <>
@@ -376,12 +462,18 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
           unstable_focusOnRunStart={false}
           unstable_focusOnScrollToBottom={false}
           unstable_focusOnThreadSwitched={false}
+          onFocus={() => {
+            if (!shortcutsOpen) return;
+            logDebugDiagnostic("tmux-shortcut", "composer-focus-close", { category: shortcutCategory });
+            setShortcutsOpen(false);
+          }}
         />
         <div className="dashboard-composer-actions">
           <div className="dashboard-composer-keybar" role="toolbar" aria-label="Quick terminal keys">
             {shortcutsOpen ? (
               <>
                 <button className="dashboard-keybar-button is-close" type="button" title="关闭快捷栏" aria-label="关闭快捷栏" disabled={controlsDisabled} onClick={() => setShortcutsOpen(false)}>×</button>
+                {debugLogButton}
                 <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to top" disabled={controlsDisabled} onClick={onScrollToTop}>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 19V8m0 0-5 5m5-5 5 5" /></svg>
                 </button>
@@ -400,6 +492,7 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
             ) : (
               <>
                 <ComposerPrimitive.AddAttachment className="dashboard-keybar-button is-attachment" type="button" multiple disabled={controlsDisabled}>＋</ComposerPrimitive.AddAttachment>
+                {debugLogButton}
                 <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to top" disabled={controlsDisabled} onClick={onScrollToTop}>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 19V8m0 0-5 5m5-5 5 5" /></svg>
                 </button>
@@ -410,7 +503,6 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10m0 0 4-4m-4 4-4-4M5 15v4h14v-4" /></svg>
                 </button>
                 <button className="dashboard-keybar-button" type="button" title="Escape" aria-label="Escape" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-escape")}>Esc</button>
-                <button className="dashboard-keybar-button" type="button" title="Tab" aria-label="Tab" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-tab")}>Tab</button>
                 <button className="dashboard-keybar-button is-icon" type="button" title="上一条输入" aria-label="上一条输入" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-up")}>↑</button>
                 <button className="dashboard-keybar-button is-icon" type="button" title="下一条输入" aria-label="下一条输入" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-down")}>↓</button>
                 <button className="dashboard-keybar-button is-icon" type="button" title="回车" aria-label="回车" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-enter")}>↵</button>
@@ -434,12 +526,7 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
           onOpenChange={setShortcutsOpen}
           onCategoryChange={setShortcutCategory}
           store={shortcutStore}
-          onStoreChange={(nextStore) => {
-            setShortcutStore(nextStore);
-            if (nextStore.disabledPanels.includes(shortcutCategory)) {
-              setShortcutCategory(nextStore.panelOrder.find((id) => !nextStore.disabledPanels.includes(id)) ?? "favorites");
-            }
-          }}
+          onShortcutUse={handleShortcutUse}
           onSubmitText={onSubmit}
           onTerminalShortcut={onTerminalShortcut}
           onTerminalSequence={onTerminalSequence}

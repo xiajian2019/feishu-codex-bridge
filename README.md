@@ -20,7 +20,7 @@
 
 ## Codex 历史会话
 
-统一 Bridge 启动后，从 http://127.0.0.1:7310/codex-history 打开本机 Codex 历史页面。页面通过 Codex app-server 的只读 `thread/list` 和 `thread/read` 协议读取会话，不直接解析 `auth.json`、SQLite 或 JSONL，也不会启动任务、继续会话或写入 Bridge 数据库。
+统一 Bridge 启动后，从 http://127.0.0.1:7310/codex-history 打开本机 Codex 历史页面。页面通过 Codex app-server 的 `thread/list` 和 `thread/read` 协议读取会话，不直接解析 `auth.json`、SQLite 或 JSONL；详情页可通过 Codex SDK `resumeThread()` 继续现有 session，附件保存在本机临时目录，并通过游标轮询增量展示当前 turn 的新增事件。
 
 默认会读取当前 `CODEX_HOME`（未设置时为 `~/.codex`）以及 `~/.codex/accounts/*` 下的独立 home；每个 home 都会用自己的 `CODEX_HOME` 和状态数据库目录启动一个短生命周期查询客户端，因此两个登录账号的历史不会混在一起。若账号目录不在这个结构中，可用系统环境变量 `FEISHU_CODEX_HISTORY_HOMES`（macOS 用冒号分隔多个绝对路径）补充路径。页面支持按 home、关键词、归档状态和运行状态筛选，并可打开会话轮次与命令执行详情。
 

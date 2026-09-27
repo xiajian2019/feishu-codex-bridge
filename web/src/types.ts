@@ -74,6 +74,69 @@ export interface CodexHistoryListResponse {
 export interface CodexHistoryDetailResponse {
   home: CodexHistoryHome;
   thread: CodexThread;
+  imageAttachments?: CodexHistoryTurnAttachments[];
+}
+
+export interface CodexHistoryAttachment {
+  attachmentId: string;
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+}
+
+export interface CodexHistoryTurnAttachments {
+  runId: string;
+  turnIndex: number;
+  attachments: CodexHistoryAttachment[];
+}
+
+export type CodexHistoryRunState = "running" | "cancelling" | "completed" | "failed" | "cancelled";
+
+export interface CodexHistoryWriterStatus {
+  state: "available" | "busy" | "unknown";
+  checkedAt: string;
+  localRun?: {
+    runId: string;
+    threadId: string;
+    userText: string;
+    state: "running" | "cancelling";
+    cursor: number;
+  };
+}
+
+export interface CodexHistoryInterruptResponse {
+  ok: boolean;
+  state: CodexHistoryRunState;
+}
+
+export interface CodexHistoryMessageResponse {
+  runId: string;
+  threadId: string;
+  state: CodexHistoryRunState;
+  cursor: number;
+  turnIndex: number;
+  attachments: CodexHistoryAttachment[];
+}
+
+export interface CodexHistoryUpdateEvent {
+  cursor: number;
+  type: string;
+  item?: unknown;
+  message?: string;
+  usage?: unknown;
+}
+
+export interface CodexHistoryUpdatesResponse {
+  runId: string;
+  threadId: string;
+  userText: string;
+  state: CodexHistoryRunState;
+  cursor: number;
+  events: CodexHistoryUpdateEvent[];
+  finalResponse?: string;
+  error?: string;
+  attachments?: CodexHistoryAttachment[];
+  resetRequired?: boolean;
 }
 
 export interface TaskInput {

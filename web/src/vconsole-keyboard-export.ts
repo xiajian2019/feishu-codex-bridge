@@ -4,7 +4,9 @@ type ExportPlugin = InstanceType<typeof VConsole.VConsolePlugin>;
 type DebugWindow = Window & {
   VConsole?: typeof VConsole;
   VConsoleOutputLogsPlugin?: new (vConsole: VConsole) => ExportPlugin;
+  __tmuxDebugLog?: string[];
   __tmuxKeyboardLog?: string[];
+  __tmuxDebugLogPaused?: boolean;
   __tmuxKeyboardPaused?: boolean;
 };
 
@@ -22,13 +24,14 @@ export async function installKeyboardLogExport(vConsole: VConsole, constructor: 
   new OutputPlugin(vConsole);
 
   const message = (text: string): void => {
-    const status = document.getElementById("tmux-log-export-status");
+    const status = document.getElementById("tmux-debug-log-export-status");
     if (status) status.textContent = text;
   };
   const getLogs = (): string => {
+    debugWindow.__tmuxDebugLogPaused = true;
     debugWindow.__tmuxKeyboardPaused = true;
-    const logs = (debugWindow.__tmuxKeyboardLog ?? []).join("\n");
-    if (!logs) message("暂无记录：进入 session，点击输入框并复现后，再打开此面板。");
+    const logs = (debugWindow.__tmuxDebugLog ?? debugWindow.__tmuxKeyboardLog ?? []).join("\n");
+    if (!logs) message("暂无记录：点击输入框下方的日志按钮开始收集，再复现问题。");
     return logs;
   };
   const exportLogs = (): void => {
@@ -37,7 +40,7 @@ export async function installKeyboardLogExport(vConsole: VConsole, constructor: 
     const url = URL.createObjectURL(new Blob([logs], { type: "text/plain;charset=utf-8" }));
     const link = document.createElement("a");
     link.href = url;
-    link.download = "tmux-keyboard-" + new Date().toISOString().replace(/[:.]/g, "-") + ".log";
+    link.download = "tmux-debug-" + new Date().toISOString().replace(/[:.]/g, "-") + ".log";
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -60,21 +63,28 @@ export async function installKeyboardLogExport(vConsole: VConsole, constructor: 
     if (copied) {
       field.blur();
       field.hidden = true;
-      message("已复制全部键盘日志，采集已暂停。");
+      message("已复制全部调试日志，采集已暂停。");
     } else {
       message("自动复制未成功，请长按下方文本全选复制，或使用导出日志。");
     }
   };
-  const plugin = new constructor.VConsolePlugin("tmuxKeyboardLog", "键盘日志");
+  const plugin = new constructor.VConsolePlugin("tmuxDebugLog", "调试日志");
   plugin.on("ready", () => {});
   plugin.on("renderTab", (callback) => callback(`<div style="padding:16px">
-        <p id="tmux-log-export-status">进入 session 后点击输入框开始记录，复现后在此复制或导出。</p>
-        <p>打开 vConsole 自动暂停；关闭面板后，再点击消息输入框继续。同一 session 保留最近 300 条，新 session 首次点击重新记录。</p>
-        <textarea id="tmux-log-export-text" readonly hidden style="width:100%;height:160px;font-size:16px" aria-label="键盘日志导出文本"></textarea>
+        <p id="tmux-debug-log-export-status">点击输入框下方的日志按钮开始记录，复现后再次点击完成。</p>
+        <p>完成后日志会自动加入输入框，发送消息时上传给 Codex。打开 vConsole 会暂停继续记录。</p>
+        <textarea id="tmux-log-export-text" readonly hidden style="width:100%;height:160px;font-size:16px" aria-label="调试日志导出文本"></textarea>
       </div>`));
-  plugin.on("showConsole", () => { debugWindow.__tmuxKeyboardPaused = true; });
+  plugin.on("showConsole", () => {
+    debugWindow.__tmuxDebugLogPaused = true;
+    debugWindow.__tmuxKeyboardPaused = true;
+  });
+  plugin.on("hideConsole", () => {
+    debugWindow.__tmuxDebugLogPaused = false;
+    debugWindow.__tmuxKeyboardPaused = false;
+  });
   plugin.on("show", () => {
-    message(`已保存 ${debugWindow.__tmuxKeyboardLog?.length ?? 0} 条键盘日志，采集已暂停。`);
+    message(`已保存 ${(debugWindow.__tmuxDebugLog ?? debugWindow.__tmuxKeyboardLog)?.length ?? 0} 条调试日志，采集已暂停。`);
   });
   plugin.on("addTool", (callback) => callback([
     { name: "复制日志", onClick: copyLogs },
