@@ -3,6 +3,7 @@ import { CanvasAddon } from "@xterm/addon-canvas";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
+import { useNavigate } from "react-router";
 
 import { bindMobileTerminalViewport } from "./mobile-terminal-viewport.js";
 
@@ -117,11 +118,12 @@ function createSessionName(): string {
 }
 
 export function TmuxDashboard(): ReactElement {
+  const navigate = useNavigate();
   const { collapsed: navigationCollapsed, setCollapsed: setNavigationCollapsed } = useSystemNavigation();
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
   const [mobileView, setMobileView] = useState<"sessions" | "terminal">("sessions");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("session"));
   const [search, setSearch] = useState("");
   const [backendStatus, setBackendStatus] = useState<"connecting" | "online" | "offline">("connecting");
   const [terminalStatus, setTerminalStatus] = useState("IDLE");
@@ -140,6 +142,7 @@ export function TmuxDashboard(): ReactElement {
   const submissionWaitersRef = useRef(new Map<string, (result: SubmissionResult) => void>());
   const sessionApiResponseRef = useRef("");
   const sessionApiStatusRef = useRef<number | null>(null);
+  const restoreSessionDetailRef = useRef(new URLSearchParams(window.location.search).has("session"));
 
   useLayoutEffect(() => {
     if (mobileView === "terminal") return bindMobileTerminalViewport(window);
@@ -283,8 +286,20 @@ export function TmuxDashboard(): ReactElement {
   };
 
   useEffect(() => {
-    if (selectedId && !sessions.some((session) => session.id === selectedId)) setSelectedId(null);
-  }, [sessions, selectedId]);
+    if (backendStatus !== "online" || !selectedId || sessions.some((session) => session.id === selectedId)) return;
+    setSelectedId(null);
+    setMobileView("sessions");
+    setNavigationCollapsed(false);
+  }, [backendStatus, sessions, selectedId, setNavigationCollapsed]);
+
+  useEffect(() => {
+    if (!restoreSessionDetailRef.current || backendStatus !== "online") return;
+    restoreSessionDetailRef.current = false;
+    if (selectedId && sessions.some((session) => session.id === selectedId) && window.matchMedia("(max-width: 760px)").matches) {
+      setMobileView("terminal");
+      setNavigationCollapsed(true);
+    }
+  }, [backendStatus, sessions, selectedId, setNavigationCollapsed]);
 
   useEffect(() => {
     const host = terminalHostRef.current;
@@ -875,6 +890,9 @@ export function TmuxDashboard(): ReactElement {
             placeholder={selectedSession ? "Message the Codex session…" : "Select a session to start messaging"}
             onSubmit={sendMessage}
             onAttachmentError={showAttachmentError}
+            onOpenFiles={() => {
+              if (selectedSession) navigate(`/tmux-dashboard/files/${encodeURIComponent(selectedSession.id)}`);
+            }}
             onTerminalShortcut={sendTerminalShortcut}
             onTerminalSequence={sendTerminalSequence}
             onScrollToTop={() => terminalInstanceRef.current?.scrollToTop()}

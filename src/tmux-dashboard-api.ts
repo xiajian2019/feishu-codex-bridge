@@ -1,7 +1,8 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { link, lstat, mkdir, realpath, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { basename, extname, join } from "node:path";
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
@@ -12,6 +13,7 @@ import * as tmux from "./tmux-dashboard.js";
 
 const API_PREFIX = "/tmux-dashboard/api";
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_SESSION_FILE_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_SUBMISSION_BYTES = 32 * 1024;
 const MAX_SCROLL_DIAGNOSTIC_EXPORT_BYTES = 5 * 1024 * 1024;
 const MAX_SCROLL_DIAGNOSTIC_ENTRIES = 2_000;
@@ -157,6 +159,98 @@ export class TmuxDashboardApi {
       }
       return;
     }
+    const fileListMatch = /^\/sessions\/([^/]+)\/files$/.exec(apiPath);
+    if (request.method === "GET" && fileListMatch) {
+      let sessionId: string;
+      try {
+        sessionId = decodeURIComponent(fileListMatch[1]!);
+      } catch {
+        sendJson(response, 400, { error: "Invalid tmux session id." });
+        return;
+      }
+      try {
+        sendJson(response, 200, await this.listSessionFiles(sessionId, url.searchParams.get("path") ?? ""));
+      } catch (error) {
+        sendSessionFileError(response, error);
+      }
+      return;
+    }
+    const uploadMatch = /^\/sessions\/([^/]+)\/files\/upload$/.exec(apiPath);
+    if (request.method === "POST" && uploadMatch) {
+      let sessionId: string;
+      try {
+        sessionId = decodeURIComponent(uploadMatch[1]!);
+      } catch {
+        sendJson(response, 400, { error: "Invalid tmux session id." });
+        return;
+      }
+      try {
+        const uploaded = await readBinaryBody(
+          request,
+          MAX_SESSION_FILE_UPLOAD_BYTES,
+          "File uploads must be 100 MB or smaller.",
+        );
+        const fileNameHeader = request.headers["x-file-name"];
+        const encodedFileName = Array.isArray(fileNameHeader) ? fileNameHeader[0] ?? "" : fileNameHeader ?? "";
+        let requestedFileName = encodedFileName;
+        try {
+          requestedFileName = decodeURIComponent(encodedFileName);
+        } catch {
+          // Fall back to the raw header, then strip any path components below.
+        }
+        const fileName = sanitizeSessionFileName(requestedFileName);
+        const filePath = url.searchParams.get("path") ?? "";
+        const context = await this.getSessionFileContext(sessionId, filePath);
+        if (!(await stat(context.absolutePath)).isDirectory()) {
+          throw new DashboardBodyError("Choose a directory before uploading.", 400);
+        }
+        const targetPath = join(context.absolutePath, fileName);
+        const temporaryPath = join(context.absolutePath, `.bridge-upload-${randomUUID()}.tmp`);
+        try {
+          await writeFile(temporaryPath, uploaded, { flag: "wx", mode: 0o600 });
+          await link(temporaryPath, targetPath);
+        } finally {
+          await unlink(temporaryPath).catch(() => undefined);
+        }
+        sendJson(response, 201, { name: fileName, path: [context.path, fileName].filter(Boolean).join("/") });
+      } catch (error) {
+        sendSessionFileError(response, error);
+      }
+      return;
+    }
+    const downloadMatch = /^\/sessions\/([^/]+)\/files\/download$/.exec(apiPath);
+    if (request.method === "GET" && downloadMatch) {
+      let sessionId: string;
+      try {
+        sessionId = decodeURIComponent(downloadMatch[1]!);
+      } catch {
+        sendJson(response, 400, { error: "Invalid tmux session id." });
+        return;
+      }
+      try {
+        const context = await this.getSessionFileContext(sessionId, url.searchParams.get("path") ?? "");
+        const fileStat = await stat(context.absolutePath);
+        if (!fileStat.isFile()) throw new DashboardBodyError("Select a file to download.", 400);
+        const fileName = basename(context.absolutePath);
+        const fallbackName = fileName.replace(/[^\x20-\x7e]|[\\";]/g, "_") || "download";
+        const encodedName = encodeURIComponent(fileName).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+        response.setHeader("Cache-Control", "no-store");
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        response.setHeader("Referrer-Policy", "no-referrer");
+        response.setHeader("Content-Type", "application/octet-stream");
+        response.setHeader("Content-Length", String(fileStat.size));
+        response.setHeader("Content-Disposition", `attachment; filename="${fallbackName}"; filename*=UTF-8''${encodedName}`);
+        const stream = createReadStream(context.absolutePath);
+        stream.on("error", () => {
+          if (!response.headersSent) sendJson(response, 404, { error: "File is no longer available." });
+          else response.destroy();
+        });
+        stream.pipe(response);
+      } catch (error) {
+        sendSessionFileError(response, error);
+      }
+      return;
+    }
     if (request.method === "GET" && apiPath === "/projects") {
       sendJson(response, 200, {
         projects: this.db.listAvailableProjects().map((project) => ({ name: project.name, root: project.path })),
@@ -249,6 +343,62 @@ export class TmuxDashboardApi {
     for (const client of this.clients) client.close(1001, "Server shutting down");
     this.clients.clear();
     this.websocketServer.close();
+  }
+
+  private async getSessionFileContext(sessionId: string, requestedPath: string): Promise<SessionFileContext> {
+    if (!tmux.isSessionId(sessionId)) throw new DashboardBodyError("Invalid tmux session id.", 400);
+    const session = await this.operations.findSession(sessionId);
+    if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+    const rootPath = await realpath(session.cwd).catch(() => {
+      throw new DashboardBodyError("The session working directory is unavailable.", 404);
+    });
+    const relativePath = normalizeSessionRelativePath(requestedPath);
+    const candidatePath = resolve(rootPath, relativePath);
+    if (!isPathInside(rootPath, candidatePath)) {
+      throw new DashboardBodyError("The requested path is outside the session directory.", 400);
+    }
+    const absolutePath = await realpath(candidatePath);
+    if (!isPathInside(rootPath, absolutePath)) {
+      throw new DashboardBodyError("The requested path is outside the session directory.", 403);
+    }
+    return {
+      session,
+      rootPath,
+      absolutePath,
+      path: relative(rootPath, absolutePath).split(sep).join("/"),
+    };
+  }
+
+  private async listSessionFiles(sessionId: string, requestedPath: string): Promise<{
+    session: { id: string; name: string };
+    root: string;
+    path: string;
+    entries: Array<{ name: string; type: "directory" | "file"; size: number; modifiedAt: number }>;
+  }> {
+    const context = await this.getSessionFileContext(sessionId, requestedPath);
+    if (!(await stat(context.absolutePath)).isDirectory()) {
+      throw new DashboardBodyError("The selected path is not a directory.", 400);
+    }
+    const names = await readdir(context.absolutePath);
+    const entries = [] as Array<{ name: string; type: "directory" | "file"; size: number; modifiedAt: number }>;
+    for (const name of names.slice(0, 2_000)) {
+      const entryPath = join(context.absolutePath, name);
+      const entryStat = await lstat(entryPath).catch(() => null);
+      if (!entryStat || entryStat.isSymbolicLink()) continue;
+      if (entryStat.isDirectory()) {
+        entries.push({ name, type: "directory", size: 0, modifiedAt: entryStat.mtimeMs });
+      } else if (entryStat.isFile()) {
+        entries.push({ name, type: "file", size: entryStat.size, modifiedAt: entryStat.mtimeMs });
+      }
+    }
+    entries.sort((left, right) => Number(right.type === "directory") - Number(left.type === "directory")
+      || left.name.localeCompare(right.name));
+    return {
+      session: { id: context.session.id, name: context.session.name },
+      root: context.rootPath,
+      path: context.path,
+      entries,
+    };
   }
 
   private async openTerminal(client: WebSocket, data: TerminalData): Promise<void> {
@@ -587,4 +737,71 @@ function sendEmpty(response: ServerResponse, status: number): void {
 function rejectUpgrade(socket: Duplex, status: number, message: string): void {
   const reason = status === 403 ? "Forbidden" : "Not Found";
   socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`);
+}
+
+interface SessionFileContext {
+  session: tmux.TmuxSession;
+  rootPath: string;
+  absolutePath: string;
+  path: string;
+}
+
+function normalizeSessionRelativePath(value: string): string {
+  const normalized = value.replaceAll(String.fromCharCode(92), "/");
+  if (normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) || normalized.includes(String.fromCharCode(0))) {
+    throw new DashboardBodyError("Use a path inside the session directory.", 400);
+  }
+  const parts = normalized.split("/");
+  if (parts.some((part) => part === "..")) {
+    throw new DashboardBodyError("Parent directory traversal is not allowed.", 400);
+  }
+  return parts.filter((part) => part && part !== ".").join(sep);
+}
+
+function isPathInside(rootPath: string, candidatePath: string): boolean {
+  const relativePath = relative(rootPath, candidatePath);
+  return relativePath === ""
+    || (relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath));
+}
+
+function sanitizeSessionFileName(value: string): string {
+  const fileName = basename(value.replaceAll(String.fromCharCode(92), "/"));
+  if (
+    !fileName
+    || fileName === "."
+    || fileName === ".."
+    || fileName.includes(String.fromCharCode(0))
+    || [...fileName].some((character) => character.charCodeAt(0) === 10 || character.charCodeAt(0) === 13)
+    || Buffer.byteLength(fileName, "utf8") > 255
+  ) {
+    throw new DashboardBodyError("The uploaded file name is invalid.", 400);
+  }
+  return fileName;
+}
+
+function sendSessionFileError(response: ServerResponse, error: unknown): void {
+  if (error instanceof DashboardBodyError) {
+    sendJson(response, error.statusCode, { error: error.message });
+    return;
+  }
+  if (error instanceof tmux.SessionNotFoundError) {
+    sendJson(response, 404, { error: "tmux session not found." });
+    return;
+  }
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : "";
+  if (code === "ENOENT" || code === "ENOTDIR") {
+    sendJson(response, 404, { error: "File or directory not found." });
+    return;
+  }
+  if (code === "EACCES" || code === "EPERM") {
+    sendJson(response, 403, { error: "Permission denied for this file or directory." });
+    return;
+  }
+  if (code === "EEXIST") {
+    sendJson(response, 409, { error: "A file with that name already exists." });
+    return;
+  }
+  sendJson(response, 500, { error: "Could not access session files." });
 }

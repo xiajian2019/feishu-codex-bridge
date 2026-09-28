@@ -52,6 +52,7 @@ type TmuxMessageComposerProps = {
   placeholder: string;
   onSubmit: (text: string) => Promise<ComposerSubmissionResult>;
   onAttachmentError: (message: string) => void;
+  onOpenFiles: () => void;
   onTerminalShortcut: (shortcut: TerminalShortcut) => Promise<void>;
   onTerminalSequence: (sequence: string) => Promise<void>;
   onScrollToTop: () => void;
@@ -140,7 +141,7 @@ type ComposerFieldsProps = TmuxMessageComposerProps & {
   onSendStart: () => void;
 };
 
-function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholder, preparing, onSendStart, onSubmit, onAttachmentError, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
+function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending, placeholder, preparing, onSendStart, onSubmit, onAttachmentError, onOpenFiles, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
   const aui = useAui();
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [shortcutCategory, setShortcutCategory] = useState<ShortcutCategory>("favorites");
@@ -473,13 +474,16 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
             {shortcutsOpen ? (
               <>
                 <button className="dashboard-keybar-button is-close" type="button" title="关闭快捷栏" aria-label="关闭快捷栏" disabled={controlsDisabled} onClick={() => setShortcutsOpen(false)}>×</button>
-                {debugLogButton}
                 <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to top" disabled={controlsDisabled} onClick={onScrollToTop}>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 19V8m0 0-5 5m5-5 5 5" /></svg>
                 </button>
                 <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to bottom" disabled={controlsDisabled} onClick={onScrollToBottom}>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19h14M12 5v11m0 0 5-5m-5 5-5-5" /></svg>
                 </button>
+                <button className="dashboard-keybar-button is-files" type="button" title="浏览 Session 文件" aria-label="浏览 Session 文件" disabled={!sessionId} onClick={onOpenFiles}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9.5a1.5 1.5 0 0 1-1.5 1.5h-14a1.5 1.5 0 0 1-1.5-1.5z" /><path d="M3.5 8.5h17" /></svg>
+                </button>
+                {debugLogButton}
                 <button className="dashboard-keybar-button is-icon is-scroll-export" type="button" aria-label="Download scroll diagnostics" disabled={controlsDisabled} onClick={onExportScrollDiagnostics}>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10m0 0 4-4m-4 4-4-4M5 15v4h14v-4" /></svg>
                 </button>
@@ -492,13 +496,16 @@ function ComposerFields({ diagnosticSessionActive, disabled, sending, placeholde
             ) : (
               <>
                 <ComposerPrimitive.AddAttachment className="dashboard-keybar-button is-attachment" type="button" multiple disabled={controlsDisabled}>＋</ComposerPrimitive.AddAttachment>
-                {debugLogButton}
                 <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to top" disabled={controlsDisabled} onClick={onScrollToTop}>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 19V8m0 0-5 5m5-5 5 5" /></svg>
                 </button>
                 <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to bottom" disabled={controlsDisabled} onClick={onScrollToBottom}>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19h14M12 5v11m0 0 5-5m-5 5-5-5" /></svg>
                 </button>
+                <button className="dashboard-keybar-button is-files" type="button" title="浏览 Session 文件" aria-label="浏览 Session 文件" disabled={!sessionId} onClick={onOpenFiles}>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9.5a1.5 1.5 0 0 1-1.5 1.5h-14a1.5 1.5 0 0 1-1.5-1.5z" /><path d="M3.5 8.5h17" /></svg>
+                </button>
+                {debugLogButton}
                 <button className="dashboard-keybar-button is-icon is-scroll-export" type="button" aria-label="Download scroll diagnostics" disabled={controlsDisabled} onClick={onExportScrollDiagnostics}>
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10m0 0 4-4m-4 4-4-4M5 15v4h14v-4" /></svg>
                 </button>

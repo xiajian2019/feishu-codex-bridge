@@ -377,7 +377,7 @@ export async function postTaskAction(
   });
 }
 
-async function getActionToken(): Promise<string> {
+export async function getActionToken(): Promise<string> {
   const meta = document.querySelector<HTMLMetaElement>("meta[name=bridge-action-token]");
   const embedded = meta?.content;
   if (embedded && embedded !== "__BRIDGE_ACTION_TOKEN__") return embedded;

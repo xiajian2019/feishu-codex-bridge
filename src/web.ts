@@ -228,6 +228,11 @@ export class DashboardServer {
     }
     if (url.pathname.startsWith("/tmux-dashboard/api/") && this.options.tmuxDashboard) {
       if (!this.requireAuthorization(request, response)) return;
+      if (
+        request.method === "POST"
+        && /^\/tmux-dashboard\/api\/sessions\/[^/]+\/files\/upload$/.test(url.pathname)
+        && !this.requireActionAuthorization(request, response)
+      ) return;
       await this.options.tmuxDashboard.handleRequest(request, response);
       return;
     }

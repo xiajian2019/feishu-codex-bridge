@@ -9,6 +9,7 @@ import { ThemeProvider } from "./theme.js";
 import "./styles.css";
 
 const TmuxDashboard = lazy(() => import("./TmuxDashboard.js").then((module) => ({ default: module.TmuxDashboard })));
+const TmuxSessionFiles = lazy(() => import("./TmuxSessionFiles.js").then((module) => ({ default: module.TmuxSessionFiles })));
 const CodexHistory = lazy(() => import("./CodexHistory.js").then((module) => ({ default: module.CodexHistory })));
 const ShortcutManagement = lazy(() => import("./ShortcutManagement.js").then((module) => ({ default: module.ShortcutManagement })));
 
@@ -154,6 +155,7 @@ async function mountApp(): Promise<void> {
                   <Route path="/" element={<App />} />
                   <Route path="/codex-history" element={<CodexHistory />} />
                   <Route path="/codex-history/:homeId/:threadId" element={<CodexHistory />} />
+                  <Route path="/tmux-dashboard/files/:sessionId" element={<TmuxSessionFiles />} />
                   <Route path="/tmux-dashboard/*" element={<TmuxDashboard />} />
                   <Route path="/system-management" element={<Navigate to="/system-management/devices" replace />} />
                   <Route path="/system-management/devices" element={<PairingAdmin />} />
