@@ -23,6 +23,8 @@ import {
 import { fetchShortcutConfig, recordShortcutUse } from "./api.js";
 import {
   type ShortcutCategory,
+  DEFAULT_COMPOSER_SHORTCUTS,
+  type ShortcutDefinition,
   type ShortcutStore,
   type TerminalShortcut,
 } from "./tmux-shortcuts.js";
@@ -51,10 +53,11 @@ type TmuxMessageComposerProps = {
   sending: boolean;
   placeholder: string;
   onSubmit: (text: string) => Promise<ComposerSubmissionResult>;
+  onSubmitCommand: (text: string) => Promise<ComposerSubmissionResult>;
   onAttachmentError: (message: string) => void;
   onOpenFiles: () => void;
-  onTerminalShortcut: (shortcut: TerminalShortcut) => Promise<void>;
-  onTerminalSequence: (sequence: string) => Promise<void>;
+  onTerminalShortcut: (shortcut: TerminalShortcut) => Promise<ComposerSubmissionResult>;
+  onTerminalSequence: (sequence: string) => Promise<ComposerSubmissionResult>;
   onScrollToTop: () => void;
   onScrollToBottom: () => void;
   onExportScrollDiagnostics: () => void;
@@ -94,11 +97,31 @@ function useFileObjectUrl(file: File | null): string {
       return;
     }
     const url = URL.createObjectURL(file);
+    logDebugDiagnostic("tmux-image-preview", "object-url-created", {
+      contentType: file.type || "unknown",
+      sizeBytes: file.size,
+      sourceScheme: "blob",
+    });
     setPreviewUrl(url);
     return () => URL.revokeObjectURL(url);
   }, [file]);
 
   return previewUrl;
+}
+
+function logImagePreviewResult(
+  stage: "thumbnail-loaded" | "thumbnail-failed" | "lightbox-loaded" | "lightbox-failed",
+  file: File,
+  image: HTMLImageElement,
+): void {
+  logDebugDiagnostic("tmux-image-preview", stage, {
+    contentType: file.type || "unknown",
+    sizeBytes: file.size,
+    sourceScheme: image.currentSrc.startsWith("blob:") ? "blob" : image.currentSrc.startsWith("data:") ? "data" : "other",
+    naturalWidth: image.naturalWidth,
+    naturalHeight: image.naturalHeight,
+    complete: image.complete,
+  });
 }
 
 function ImagePreview({ file, onOpen }: { file: File; onOpen: (file: File) => void }): ReactElement {
@@ -111,7 +134,14 @@ function ImagePreview({ file, onOpen }: { file: File; onOpen: (file: File) => vo
       title="点击放大预览"
       onClick={() => onOpen(file)}
     >
-      {previewUrl ? <img src={previewUrl} alt={file.name} /> : <span>IMG</span>}
+      {previewUrl ? (
+        <img
+          src={previewUrl}
+          alt={file.name}
+          onLoad={(event) => logImagePreviewResult("thumbnail-loaded", file, event.currentTarget)}
+          onError={(event) => logImagePreviewResult("thumbnail-failed", file, event.currentTarget)}
+        />
+      ) : <span>IMG</span>}
     </button>
   );
 }
@@ -130,10 +160,29 @@ function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): 
     >
       <div className="dashboard-image-lightbox-content">
         <button className="dashboard-image-lightbox-close" type="button" aria-label="关闭图片预览" onClick={onClose}>×</button>
-        {previewUrl ? <img src={previewUrl} alt={file.name} /> : <span>图片加载中…</span>}
+        {previewUrl ? (
+          <img
+            src={previewUrl}
+            alt={file.name}
+            onLoad={(event) => logImagePreviewResult("lightbox-loaded", file, event.currentTarget)}
+            onError={(event) => logImagePreviewResult("lightbox-failed", file, event.currentTarget)}
+          />
+        ) : <span>图片加载中…</span>}
       </div>
     </div>
   );
+}
+
+function downloadDebugLog(file: File): void {
+  const url = URL.createObjectURL(file);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = file.name;
+  link.hidden = true;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 type ComposerFieldsProps = TmuxMessageComposerProps & {
@@ -141,7 +190,7 @@ type ComposerFieldsProps = TmuxMessageComposerProps & {
   onSendStart: () => void;
 };
 
-function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending, placeholder, preparing, onSendStart, onSubmit, onAttachmentError, onOpenFiles, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
+function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending, placeholder, preparing, onSendStart, onSubmit, onSubmitCommand, onAttachmentError, onOpenFiles, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
   const aui = useAui();
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [shortcutCategory, setShortcutCategory] = useState<ShortcutCategory>("favorites");
@@ -154,6 +203,14 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
   const composerFormRef = useRef<HTMLFormElement | null>(null);
   const diagnosticActiveRef = useRef(diagnosticSessionActive);
   diagnosticActiveRef.current = diagnosticSessionActive;
+  const composerShortcuts = useMemo(() => {
+    const composerGroupIds = new Set(shortcutStore.groups.filter((group) => group.surface === "composer").map((group) => group.id));
+    const hasServerConfig = composerGroupIds.size > 0;
+    const source = hasServerConfig
+      ? shortcutStore.shortcuts.filter((shortcut) => composerGroupIds.has(shortcut.groupId))
+      : [...DEFAULT_COMPOSER_SHORTCUTS];
+    return source.filter((shortcut) => shortcut.enabled).sort((left, right) => left.sortOrder - right.sortOrder);
+  }, [shortcutStore]);
 
   useEffect(() => subscribeDebugLogCapture((active) => setDebugLogActive(active)), []);
 
@@ -189,7 +246,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
       return { top: rect.top, bottom: rect.bottom, height: rect.height, width: rect.width };
     };
     const logViewport = (event: string, detail: object = {}): void => {
-      if (!import.meta.env.DEV || !isDebugLogCaptureActive() || !diagnosticActiveRef.current || isDebugLogCapturePaused()) return;
+      if (!isDebugLogCaptureActive() || !diagnosticActiveRef.current || isDebugLogCapturePaused()) return;
       const rect = form.getBoundingClientRect();
       const style = getComputedStyle(form);
       const snapshot = JSON.stringify({
@@ -371,7 +428,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
 
   const toggleDebugLogCapture = async (): Promise<void> => {
     const captureActive = isDebugLogCaptureActive();
-    if (!import.meta.env.DEV || (!diagnosticSessionActive && !captureActive) || debugLogControlsDisabled) return;
+    if (debugLogControlsDisabled) return;
     if (!captureActive) {
       beginDebugLogCapture();
       return;
@@ -381,7 +438,8 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
     try {
       const file = finishDebugLogCapture();
       if (!file) return;
-      await aui.composer.addAttachment(file);
+      if (import.meta.env.DEV) await aui.composer.addAttachment(file);
+      else downloadDebugLog(file);
     } catch (error) {
       onAttachmentError(error instanceof Error ? error.message : "Could not attach the debug log.");
     } finally {
@@ -407,17 +465,42 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
     }
   };
 
-  const debugLogButton = import.meta.env.DEV ? (
-    <button
-      className={`dashboard-keybar-button is-debug-log${debugLogActive ? " is-recording" : ""}`}
-      type="button"
-      title={debugLogActive ? "完成收集并添加日志文件" : "开始收集 console 日志"}
-      aria-label={debugLogActive ? "完成收集并添加日志文件" : "开始收集 console 日志"}
-      aria-pressed={debugLogActive}
-      disabled={debugLogControlsDisabled}
-      onClick={() => void toggleDebugLogCapture()}
-    >{debugLogBusy ? "…" : debugLogActive ? "■" : "●"}</button>
-  ) : null;
+  const composerShortcutsFor = (mode: "closed" | "expanded"): ShortcutDefinition[] =>
+    composerShortcuts.filter((shortcut) => shortcut.displayMode === mode || shortcut.displayMode === "both");
+
+  const renderComposerAction = (shortcut: ShortcutDefinition): ReactElement | null => {
+    const track = (): void => { void handleShortcutUse(shortcut.id); };
+    const terminalAction = (value: string): ReactElement => (
+      <button key={shortcut.id} className="dashboard-keybar-button is-icon" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.title} disabled={controlsDisabled} onClick={() => { track(); void onTerminalShortcut(value as TerminalShortcut); }}>{shortcut.title}</button>
+    );
+    switch (shortcut.actionKey) {
+      case "attachment":
+        return <ComposerPrimitive.AddAttachment key={shortcut.id} className="dashboard-keybar-button is-attachment" type="button" multiple disabled={controlsDisabled} onClick={track}>{shortcut.title === "附件" ? "＋" : shortcut.title}</ComposerPrimitive.AddAttachment>;
+      case "scroll-top":
+        return <button key={shortcut.id} className="dashboard-keybar-button is-icon is-scroll-jump" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.title} disabled={controlsDisabled} onClick={() => { track(); onScrollToTop(); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 19V8m0 0-5 5m5-5 5 5" /></svg></button>;
+      case "scroll-bottom":
+        return <button key={shortcut.id} className="dashboard-keybar-button is-icon is-scroll-jump" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.title} disabled={controlsDisabled} onClick={() => { track(); onScrollToBottom(); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19h14M12 5v11m0 0 5-5m-5 5-5-5" /></svg></button>;
+      case "session-files":
+        return <button key={shortcut.id} className="dashboard-keybar-button is-files" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.title} disabled={!sessionId || controlsDisabled} onClick={() => { track(); onOpenFiles(); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9.5a1.5 1.5 0 0 1-1.5 1.5h-14a1.5 1.5 0 0 1-1.5-1.5z" /><path d="M3.5 8.5h17" /></svg></button>;
+      case "debug-log":
+        return <button key={shortcut.id} className={`dashboard-keybar-button is-debug-log${debugLogActive ? " is-recording" : ""}`} type="button" title={debugLogActive ? (import.meta.env.DEV ? "完成收集并添加日志文件" : "完成收集并下载日志") : "开始收集 console 日志"} aria-label={debugLogActive ? (import.meta.env.DEV ? "完成收集并添加日志文件" : "完成收集并下载日志") : "开始收集 console 日志"} aria-pressed={debugLogActive} disabled={debugLogControlsDisabled} onClick={() => { track(); void toggleDebugLogCapture(); }}>{debugLogBusy ? "…" : debugLogActive ? "■" : "●"}</button>;
+      case "scroll-export":
+        return <button key={shortcut.id} className="dashboard-keybar-button is-icon is-scroll-export" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.title} disabled={controlsDisabled} onClick={() => { track(); onExportScrollDiagnostics(); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10m0 0 4-4m-4 4-4-4M5 15v4h14v-4" /></svg></button>;
+      case "terminal-escape":
+      case "terminal-up":
+      case "terminal-down":
+      case "terminal-enter":
+        return terminalAction(shortcut.value);
+      case "keyboard-panel":
+        return <button key={shortcut.id} className="dashboard-keybar-button is-keyboard" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.title} aria-expanded={shortcutsOpen} disabled={controlsDisabled} onClick={() => { track(); openShortcutPalette("keyboard"); }}>⌨</button>;
+      case "ctrl-panel":
+        return <button key={shortcut.id} className="dashboard-keybar-button" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.title} disabled={controlsDisabled} onClick={() => { track(); openShortcutPalette("ctrl"); }}>⌃</button>;
+      case "close-panel":
+        return <button key={shortcut.id} className="dashboard-keybar-button is-close" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.title} disabled={controlsDisabled} onClick={() => { track(); setShortcutsOpen(false); }}>×</button>;
+      default:
+        return null;
+    }
+  };
 
   return (
     <>
@@ -472,49 +555,9 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
         <div className="dashboard-composer-actions">
           <div className="dashboard-composer-keybar" role="toolbar" aria-label="Quick terminal keys">
             {shortcutsOpen ? (
-              <>
-                <button className="dashboard-keybar-button is-close" type="button" title="关闭快捷栏" aria-label="关闭快捷栏" disabled={controlsDisabled} onClick={() => setShortcutsOpen(false)}>×</button>
-                <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to top" disabled={controlsDisabled} onClick={onScrollToTop}>
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 19V8m0 0-5 5m5-5 5 5" /></svg>
-                </button>
-                <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to bottom" disabled={controlsDisabled} onClick={onScrollToBottom}>
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19h14M12 5v11m0 0 5-5m-5 5-5-5" /></svg>
-                </button>
-                <button className="dashboard-keybar-button is-files" type="button" title="浏览 Session 文件" aria-label="浏览 Session 文件" disabled={!sessionId} onClick={onOpenFiles}>
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9.5a1.5 1.5 0 0 1-1.5 1.5h-14a1.5 1.5 0 0 1-1.5-1.5z" /><path d="M3.5 8.5h17" /></svg>
-                </button>
-                {debugLogButton}
-                <button className="dashboard-keybar-button is-icon is-scroll-export" type="button" aria-label="Download scroll diagnostics" disabled={controlsDisabled} onClick={onExportScrollDiagnostics}>
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10m0 0 4-4m-4 4-4-4M5 15v4h14v-4" /></svg>
-                </button>
-                <button className="dashboard-keybar-button" type="button" title="Escape" aria-label="Escape" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-escape")}>Esc</button>
-                <button className="dashboard-keybar-button is-icon" type="button" title="上一条输入" aria-label="上一条输入" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-up")}>↑</button>
-                <button className="dashboard-keybar-button is-icon" type="button" title="下一条输入" aria-label="下一条输入" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-down")}>↓</button>
-                <button className="dashboard-keybar-button is-icon" type="button" title="回车" aria-label="回车" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-enter")}>↵</button>
-                <button className="dashboard-keybar-button" type="button" title="Ctrl 快捷键" aria-label="Ctrl 快捷键" disabled={controlsDisabled} onClick={() => openShortcutPalette("ctrl")}>⌃</button>
-              </>
+              <>{composerShortcutsFor("expanded").map(renderComposerAction)}</>
             ) : (
-              <>
-                <ComposerPrimitive.AddAttachment className="dashboard-keybar-button is-attachment" type="button" multiple disabled={controlsDisabled}>＋</ComposerPrimitive.AddAttachment>
-                <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to top" disabled={controlsDisabled} onClick={onScrollToTop}>
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 19V8m0 0-5 5m5-5 5 5" /></svg>
-                </button>
-                <button className="dashboard-keybar-button is-icon is-scroll-jump" type="button" aria-label="Scroll terminal to bottom" disabled={controlsDisabled} onClick={onScrollToBottom}>
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19h14M12 5v11m0 0 5-5m-5 5-5-5" /></svg>
-                </button>
-                <button className="dashboard-keybar-button is-files" type="button" title="浏览 Session 文件" aria-label="浏览 Session 文件" disabled={!sessionId} onClick={onOpenFiles}>
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h6l2 2h9v9.5a1.5 1.5 0 0 1-1.5 1.5h-14a1.5 1.5 0 0 1-1.5-1.5z" /><path d="M3.5 8.5h17" /></svg>
-                </button>
-                {debugLogButton}
-                <button className="dashboard-keybar-button is-icon is-scroll-export" type="button" aria-label="Download scroll diagnostics" disabled={controlsDisabled} onClick={onExportScrollDiagnostics}>
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10m0 0 4-4m-4 4-4-4M5 15v4h14v-4" /></svg>
-                </button>
-                <button className="dashboard-keybar-button" type="button" title="Escape" aria-label="Escape" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-escape")}>Esc</button>
-                <button className="dashboard-keybar-button is-icon" type="button" title="上一条输入" aria-label="上一条输入" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-up")}>↑</button>
-                <button className="dashboard-keybar-button is-icon" type="button" title="下一条输入" aria-label="下一条输入" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-down")}>↓</button>
-                <button className="dashboard-keybar-button is-icon" type="button" title="回车" aria-label="回车" disabled={controlsDisabled} onClick={() => void onTerminalShortcut("codex-enter")}>↵</button>
-                <button className="dashboard-keybar-button is-keyboard" type="button" title="打开键盘面板" aria-label="打开键盘面板" aria-expanded={shortcutsOpen} disabled={controlsDisabled} onClick={() => openShortcutPalette("keyboard")}>⌨</button>
-              </>
+              <>{composerShortcutsFor("closed").map(renderComposerAction)}</>
             )}
           </div>
           <ComposerPrimitive.Send
@@ -535,6 +578,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
           store={shortcutStore}
           onShortcutUse={handleShortcutUse}
           onSubmitText={onSubmit}
+          onSubmitCommand={onSubmitCommand}
           onTerminalShortcut={onTerminalShortcut}
           onTerminalSequence={onTerminalSequence}
         />

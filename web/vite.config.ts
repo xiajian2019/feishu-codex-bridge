@@ -23,17 +23,31 @@ export default defineConfig({
       "/tmux-dashboard/api": {
         target: tmuxApiTarget,
         changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on("proxyReq", (proxyRequest, request) => {
+            const address = request.socket.remoteAddress;
+            if (address) proxyRequest.setHeader("X-Forwarded-For", address);
+          });
+        },
       },
       "/tmux-dashboard/terminal": {
         target: tmuxWebSocketTarget,
         ws: true,
+        configure: (proxy) => {
+          proxy.on("proxyReqWs", (proxyRequest, request) => {
+            const address = request.socket.remoteAddress;
+            if (address) proxyRequest.setHeader("X-Forwarded-For", address);
+          });
+        },
       },
       "/api": {
         target: apiTarget,
         changeOrigin: true,
         configure: (proxy) => {
-          proxy.on("proxyReq", (proxyRequest) => {
+          proxy.on("proxyReq", (proxyRequest, request) => {
             proxyRequest.setHeader("Origin", apiTarget);
+            const address = request.socket.remoteAddress;
+            if (address) proxyRequest.setHeader("X-Forwarded-For", address);
           });
         },
       },

@@ -6,6 +6,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { useNavigate } from "react-router";
 
 import { bindMobileTerminalViewport } from "./mobile-terminal-viewport.js";
+import { isDebugLogCaptureActive, logDebugDiagnostic } from "./debug-log-capture.js";
 
 import { bindMobileTerminalTouch, downloadTerminalScrollDiagnostics, type TerminalSelectionDisplay } from "./terminal-touch.js";
 import { TmuxMessageComposer, type TerminalShortcut } from "./TmuxMessageComposer.js";
@@ -115,6 +116,39 @@ function tmuxSessionsEqual(left: TmuxSession[], right: TmuxSession[]): boolean {
 function createSessionName(): string {
   const stamp = new Date().toISOString();
   return `session-${stamp.slice(5, 10).replace("-", "")}-${stamp.slice(11, 16).replace(":", "")}`;
+}
+
+function summarizeUnicodeText(value: string): Record<string, number> {
+  let codePoints = 0;
+  let nonAsciiCodePoints = 0;
+  let cjkCodePoints = 0;
+  let replacementCodePoints = 0;
+  let hyphenCodePoints = 0;
+  let underscoreCodePoints = 0;
+
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    codePoints += 1;
+    if (codePoint > 0x7f) nonAsciiCodePoints += 1;
+    if (
+      (codePoint >= 0x3400 && codePoint <= 0x9fff)
+      || (codePoint >= 0xf900 && codePoint <= 0xfaff)
+      || (codePoint >= 0x20000 && codePoint <= 0x3134f)
+    ) cjkCodePoints += 1;
+    if (codePoint === 0xfffd) replacementCodePoints += 1;
+    if (codePoint === 0x2d) hyphenCodePoints += 1;
+    if (codePoint === 0x5f) underscoreCodePoints += 1;
+  }
+
+  return {
+    codePoints,
+    utf8Bytes: new TextEncoder().encode(value).byteLength,
+    nonAsciiCodePoints,
+    cjkCodePoints,
+    replacementCodePoints,
+    hyphenCodePoints,
+    underscoreCodePoints,
+  };
 }
 
 export function TmuxDashboard(): ReactElement {
@@ -395,7 +429,42 @@ export function TmuxDashboard(): ReactElement {
 
     const removeTouchScrolling = bindMobileTerminalTouch(host, terminal, setTerminalSelection);
 
-    const writeTerminalOutput = (data: string | Uint8Array): void => terminal.write(data);
+    const diagnosticOutputDecoder = new TextDecoder("utf-8");
+    let lastTerminalRenderDiagnosticAt = 0;
+    const writeTerminalOutput = (data: string | Uint8Array): void => {
+      const decodedOutput = typeof data === "string" ? data : diagnosticOutputDecoder.decode(data, { stream: true });
+      const outputMetrics = summarizeUnicodeText(decodedOutput);
+      const rawBytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+      let highBitBytes = 0;
+      for (const byte of rawBytes) if (byte >= 0x80) highBitBytes += 1;
+
+      terminal.write(data, () => {
+        if (!isDebugLogCaptureActive()) return;
+        const now = Date.now();
+        if (now - lastTerminalRenderDiagnosticAt < 750) return;
+        lastTerminalRenderDiagnosticAt = now;
+
+        const buffer = terminal.buffer.active;
+        let visibleText = "";
+        for (let row = 0; row < terminal.rows; row += 1) {
+          const line = buffer.getLine(buffer.viewportY + row);
+          if (line) visibleText += line.translateToString(true) + "\n";
+        }
+        const fontFamily = terminal.element ? getComputedStyle(terminal.element).fontFamily : "unknown";
+        logDebugDiagnostic("tmux-terminal", "render-sample", {
+          transportType: typeof data === "string" ? "websocket-text" : "websocket-binary",
+          payloadBytes: rawBytes.byteLength,
+          highBitBytes,
+          output: outputMetrics,
+          buffer: { ...summarizeUnicodeText(visibleText), type: buffer.type, viewportY: buffer.viewportY, baseY: buffer.baseY },
+          renderer: host.querySelector(".xterm-canvas") ? "canvas" : "dom",
+          fontFamily,
+          devicePixelRatio: window.devicePixelRatio,
+          cols: terminal.cols,
+          rows: terminal.rows,
+        });
+      });
+    };
 
     const sendResize = (force = false): void => {
       const activeSocket = socket;
@@ -642,6 +711,7 @@ export function TmuxDashboard(): ReactElement {
     setSendingMessage(true);
     try {
       const requestId = ["submit", Date.now(), Math.random()].join("-");
+      logDebugDiagnostic("tmux-submit", "client-send", summarizeUnicodeText(messageText));
       const result = await new Promise<SubmissionResult>((resolve) => {
         const timeout = window.setTimeout(() => {
           if (!submissionWaitersRef.current.has(requestId)) return;
@@ -664,6 +734,7 @@ export function TmuxDashboard(): ReactElement {
           });
         }
       });
+      logDebugDiagnostic("tmux-submit", "client-result", { ok: result.ok, message: result.message ?? null, ...summarizeUnicodeText(messageText) });
       if (!result.ok) {
         setToast({ message: result.message || "Could not send the message to the session.", isError: true });
         return result;
@@ -687,11 +758,48 @@ export function TmuxDashboard(): ReactElement {
     setToast({ message, isError: true });
   }, []);
 
-  const sendTerminalShortcut = async (shortcut: TerminalShortcut): Promise<void> => {
+  const sendTerminalCommand = async (command: string): Promise<SubmissionResult> => {
+    const socket = terminalSocketRef.current;
+    if (!selectedSession || !socket || socket.readyState !== WebSocket.OPEN) {
+      const result = { ok: false, message: "The terminal connection is closed." };
+      setToast({ message: result.message, isError: true });
+      return result;
+    }
+
+    const requestId = ["command", Date.now(), Math.random()].join("-");
+    const result = await new Promise<SubmissionResult>((resolve) => {
+      const timeout = window.setTimeout(() => {
+        if (!submissionWaitersRef.current.has(requestId)) return;
+        submissionWaitersRef.current.delete(requestId);
+        resolve({ ok: false, message: "The terminal did not accept the command." });
+      }, 5_000);
+      submissionWaitersRef.current.set(requestId, (response) => {
+        window.clearTimeout(timeout);
+        resolve(response);
+      });
+      try {
+        if (socket.readyState !== WebSocket.OPEN) throw new Error("The terminal connection is closed.");
+        socket.send(JSON.stringify({ type: "command", requestId, text: command.trim() }));
+      } catch (error) {
+        submissionWaitersRef.current.delete(requestId);
+        window.clearTimeout(timeout);
+        resolve({ ok: false, message: error instanceof Error ? error.message : "Could not send the command." });
+      }
+    });
+    if (!result.ok) {
+      setToast({
+        message: result.message || "Could not send the command to the session.",
+        isError: true,
+      });
+    }
+    return result;
+  };
+
+  const sendTerminalShortcut = async (shortcut: TerminalShortcut): Promise<SubmissionResult> => {
     const socket = terminalSocketRef.current;
     if (!selectedSession || !socket || socket.readyState !== WebSocket.OPEN) {
       setToast({ message: "The terminal connection is closed.", isError: true });
-      return;
+      return { ok: false, message: "The terminal connection is closed." };
     }
 
     const requestId = ["shortcut", Date.now(), Math.random()].join("-");
@@ -720,13 +828,14 @@ export function TmuxDashboard(): ReactElement {
         isError: true,
       });
     }
+    return result;
   };
 
-  const sendTerminalSequence = async (sequence: string): Promise<void> => {
+  const sendTerminalSequence = async (sequence: string): Promise<SubmissionResult> => {
     const socket = terminalSocketRef.current;
     if (!selectedSession || !socket || socket.readyState !== WebSocket.OPEN) {
       setToast({ message: "The terminal connection is closed.", isError: true });
-      return;
+      return { ok: false, message: "The terminal connection is closed." };
     }
     const requestId = ["sequence", Date.now(), Math.random()].join("-");
     const result = await new Promise<SubmissionResult>((resolve) => {
@@ -751,6 +860,7 @@ export function TmuxDashboard(): ReactElement {
     if (!result.ok) {
       setToast({ message: result.message || "Could not send the control-key sequence.", isError: true });
     }
+    return result;
   };
 
   const openCreateDialog = (): void => {
@@ -893,6 +1003,7 @@ export function TmuxDashboard(): ReactElement {
             onOpenFiles={() => {
               if (selectedSession) navigate(`/tmux-dashboard/files/${encodeURIComponent(selectedSession.id)}`);
             }}
+            onSubmitCommand={sendTerminalCommand}
             onTerminalShortcut={sendTerminalShortcut}
             onTerminalSequence={sendTerminalSequence}
             onScrollToTop={() => terminalInstanceRef.current?.scrollToTop()}

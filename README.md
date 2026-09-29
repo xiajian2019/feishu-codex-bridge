@@ -63,6 +63,16 @@ bun run portable:restart
 
 该命令会先完成构建和 smoke test，再执行带有 `--config`、`--db` 和 `--mode feishu-sqlite-codex` 的 `service restart`，最后执行 `service status`；构建失败时不会停止正在运行的服务。可用 `--config <path>`、`--db <path>` 和 `--mode <mode>` 覆盖默认值，`--skip-build` 仅重用现有 `dist` 打包。
 
+如需将当前源码打包并部署到已有的固定安装目录，然后启动 Bridge 服务，可运行：
+
+```bash
+bun run portable:deploy
+# 可通过 --root 指定已有安装目录
+bun run portable:deploy -- --root "$HOME/Applications/Feishu Codex Bridge"
+```
+
+该命令默认使用 `~/Applications/Feishu Codex Bridge`，要求目录中已有 Portable 安装和配置；它通过安装目录的更新流程切换版本，保留根目录的配置与运行数据，然后启动并检查 LaunchAgent。新生成的 LaunchAgent 会设置 `FEISHU_CODEX_BRIDGE_LAN_BIND=1`，使 Web 服务监听 `0.0.0.0`；网页仍需配对认证。
+
 发布 GitHub Release（默认使用 `package.json` 版本生成 `v0.4.0` tag）：
 
 ```bash
@@ -412,8 +422,7 @@ bun run start:all
 查询接口为 `GET /healthz`、`GET /api/session`、`GET /api/tasks`、`GET /api/tasks/:taskGuid`、`GET /api/aamp/tasks`、`GET /api/aamp/tasks/:id`、`GET /api/codex/homes`、`GET /api/codex/threads`、`GET /api/codex/threads/:homeId/:threadId` 和 `GET /api/events`；旧兼容模式的 `POST /api/tasks/:taskGuid` 操作接口当前不会配置 Dispatcher。页面包含 CSP、禁止 iframe 和 `no-store` 响应头。系统安装的服务支持局域网配对，任务 API、Codex history API、tmux API、SSE 和终端 WebSocket 都要求已配对会话；不要将服务暴露到公网。
 
 页面支持一次性配对。系统安装后运行 `feishu-codex-bridge web:pair`，源码目录运行 `bun run web:pair`；CLI 自动选择当前机器的局域网 IPv4 和 `config.json` 中的 `web.port`（默认 7310），并始终写入生产库 `runtime/bridge.db`。可用 `--url`、`--port` 覆盖地址，或用 `--db` 显式指定数据库；URL/端口不会自动切换到开发库。手机扫描二维码后，网页从 URL fragment 自动 claim，服务端签发一个 30 天 HttpOnly 会话 Cookie，二维码 5 分钟后失效且只能使用一次。未认证网页只显示等待扫码提示。认证后从 `/pair-admin` 进入设备管理，可查看已配对设备并撤销所有手机；刷新配对码需重新运行 `web:pair`。配对状态保存在 Bridge 使用的 SQLite 数据库中。\n
-前端源码位于 web/，生产构建输出到 dist/web，由同一个 Bridge Bun 进程静态托管。开发时运行 bun run dev:api 和 bun run dev:web，然后打开 http://127.0.0.1:5173。开发 API 监听 127.0.0.1:17310，只使用 runtime/dev/bridge.db，不触碰 LaunchAgent 的服务或 7310 生产数据库，也不会启动 Feishu/AAMP/Relay/Codex 消息运行时；Vite 的 Bridge 和 tmux Dashboard API/WebSocket 都代理到这个开发 API。dev:api 默认读取 config.example.json，也可用 --config、--db、--web-port 覆盖配置、数据路径和端口；Vite 目标可用 BRIDGE_WEB_API_TARGET 覆盖。tmux Dashboard 连接现有默认 tmux server。发布或 LaunchAgent 启动前仍须执行 bun run build。\n
-开发环境中的 `dev:api` 和 `dev:tmux-api` 都启动当前 `src/main.ts --web-only`，监听 17310 并使用 `runtime/dev/bridge.db`；`dev:web` 的 Vite `/api` 代理只指向这个开发 API，不依赖 7310 生产服务。开发模式会自动发现可用的 Codex CLI 路径。
+前端源码位于 web/，生产构建输出到 dist/web，由同一个 Bridge Bun 进程静态托管。源码开发环境使用 `bun run dev:start` 一次启动 Bridge Web-only API 与 Vite。两个进程以脱离启动终端的后台进程运行，启动命令退出后仍继续服务；日志和 PID 写入系统临时目录。Vite 监听 `0.0.0.0:5173`，API 监听 `0.0.0.0:17310`，Vite 将 `/api`、tmux Dashboard API 和 WebSocket 请求代理到本机 API。API 使用 `config.example.json` 并明确指定 `runtime/bridge.db`；该路径可能是指向安装目录正式库的符号链接，开发启动不会选择 `runtime/dev/bridge.db`。`--web-only` 不启动 Feishu/AAMP 消息入口。用 `bun run dev:status` 查看状态，`bun run dev:stop` 停止，`bun run dev:restart` 重启。tmux Dashboard 连接现有默认 tmux server。发布或 LaunchAgent 启动前仍须执行 `bun run build`。
 
 默认 `runTimeoutSeconds` 为 `3600` 秒（1 小时）；超时会先终止 Worker，必要时再强制结束，并将本轮标记为失败。
 

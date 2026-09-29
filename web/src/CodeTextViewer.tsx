@@ -41,7 +41,7 @@ async function loadLanguage(fileName: string): Promise<Extension | null> {
   }
 }
 
-export function CodeTextViewer({ fileName, text }: { fileName: string; text: string }): ReactElement {
+export function CodeTextViewer({ fileName, text, lineNumber }: { fileName: string; text: string; lineNumber?: number }): ReactElement {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -66,13 +66,17 @@ export function CodeTextViewer({ fileName, text }: { fileName: string; text: str
           ],
         }),
       });
+      if (lineNumber && editor.state.doc.lines > 0) {
+        const line = editor.state.doc.line(Math.min(editor.state.doc.lines, Math.max(1, Math.floor(lineNumber))));
+        editor.dispatch({ effects: EditorView.scrollIntoView(line.from, { y: "start" }) });
+      }
     };
     void loadLanguage(fileName).then(mount).catch(() => mount(null));
     return () => {
       disposed = true;
       editor?.destroy();
     };
-  }, [fileName, text]);
+  }, [fileName, lineNumber, text]);
 
   return <div className="tmux-code-editor" ref={containerRef} />;
 }

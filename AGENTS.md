@@ -20,8 +20,8 @@
 - Direct 消息中的 `项目`/`模式` 只能选择已登记的 key，不能通过消息文本指定任意仓库路径。未路由到项目时进入独立只读的非 Git 咨询目录；已登记 Direct 任务的回复应作为同一任务/线程的 follow-up。切换项目或 sandbox 时新建 Codex thread。
 - Bridge Task Desk 的 Web 新建任务要求选择已启用项目，标题由描述生成，sandbox 沿用配置默认值；附件每个最多 25 MiB、每任务最多 10 个，图片作为 Codex 视觉输入。Direct Feishu 消息附件有自己的下载/恢复生命周期，不与 Web staged attachments 共用数据库记录。
 - 若 Direct 复用 AAMP binding，选择顺序为当前 AAMP service selection、匹配 `lark.profile`、可用 Codex binding；只使用在线且可用的 binding。`lark-cli profile list` 只用于 profile 选择/状态，不是 Secret 来源。
-- `--web-only` 只启动本地 Web API/看板和 Web Task Desk，不启动 Feishu/AAMP 消息入口；`bun run dev:api` 使用 `runtime/dev/bridge.db`。开发时 Vite 在 `5173`、API 默认在 `17310`；生产 Bridge 默认在 `127.0.0.1:7310`。旧独立 verifier 的 `7320` 已退役。
-- Web 服务默认仅监听 loopback。只有显式设置 `FEISHU_CODEX_BRIDGE_LAN_BIND=1` 才开放 LAN 监听；LAN 访问仍需配对。页面读取走授权 session，状态修改还应使用 `X-Bridge-Action-Token` 和同源校验。
+- `--web-only` 只启动本地 Web API/看板和 Web Task Desk，不启动 Feishu/AAMP 消息入口。开发启动默认绑定 `0.0.0.0`：Vite 为 `5173`，Bridge API 为 `17310`；`dev`、`dev:api`、`dev:tmux-api` 脚本设置 `FEISHU_CODEX_BRIDGE_LAN_BIND=1`，`web/vite.config.ts` 的 Vite host 也为 `0.0.0.0`。`dev:web` 中的 `http://127.0.0.1:17310` 只是 Vite 本机代理目标，不是监听地址。生产 Bridge 默认仍为 `127.0.0.1:7310`。旧独立 verifier 的 `7320` 已退役。
+- 生产 Web 服务默认仅监听 loopback。只有显式设置 `FEISHU_CODEX_BRIDGE_LAN_BIND=1` 才开放 LAN 监听；LAN 访问仍需配对。页面读取走授权 session，状态修改还应使用 `X-Bridge-Action-Token` 和同源校验。
 
 ## 状态、鉴权与服务生命周期
 
@@ -35,7 +35,7 @@
 - Feishu 事件、任务/续问状态和待投递 outbox 应先持久化，再异步调用 Codex 或 Feishu 网络接口。outbox 失败由重试恢复；不要让卡片回调等待网络发送，也不要因服务重启自动重复一条已完成任务。
 - Codex app-server 的只读客户端使用 `app-server -c notify=[] --listen stdio://`，避免订阅并重放通用通知。完成提醒只接受带非空 `thread-id` 的 `agent-turn-complete`；不能把 `turn-ended` 或任意 JSON 当成完成事件。
 - Task Desk 和 Direct 中的 Feishu 项目字段必须匹配项目注册表，不能指定任意本地路径。不要为新功能清空或用测试库覆盖用户的 `bridge.db`；Task Desk、Direct 和 AAMP 的任务身份/恢复规则彼此独立，不能互相推断。
-- 开发 API 使用 `runtime/dev/bridge.db`；诊断、配对或启停服务前先确认进程实际使用的配置和 DB。`web:pair` 不带 `--db` 时连接当前 Bridge 实例的正式库，测试库必须显式传 `--db`。
+- 本地开发服务重启默认使用生产主库（源码 checkout 中通常由 `runtime/bridge.db` 指向正式数据文件）；只有任务或启动参数明确指定 `runtime/dev/bridge.db` 等开发库时才切换。重启前核实进程的配置和实际 `--db` 路径，不凭 `dev:*` 脚本名称推断数据库。诊断、配对或启停服务前也先确认实际配置和 DB。`web:pair` 不带 `--db` 时连接当前 Bridge 实例的正式库，测试库必须显式传 `--db`。
 - Portable 默认安装根目录为 `~/Applications/Feishu Codex Bridge`，版本目录通过 `current` 切换；升级保留该目录的 `config.json` 和 `runtime` 数据，先校验 SHA-256，再切换并支持回滚。不要把下载目录或仓库 `dist/` 当作长期运行目录。新版 `bun run release` 生成当前架构单一 Bun 二进制；旧 Core/Lite/Direct 多模式只属于 `bun run release:legacy`。
 - `service start` 启动 Direct；AAMP 使用 `aamp:start` 及其对应 lifecycle 命令。若 `aamp.stopOnShutdown=false`，停止 Bridge 不代表 AAMP 已停止，需分别核实。
 - Codex CLI 路径先使用有效配置，再自动发现 ChatGPT App 内置 CLI/系统 CLI；不要假定安装了 Homebrew Codex，也不要硬编码开发机个人路径。上游 AAMP 脚本可能调用 `node`/`npm`/`npx`，项目通过 Bun-backed shim 兼容，实际 runtime 仍是 Bun。

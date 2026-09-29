@@ -8,8 +8,10 @@ import { DEFAULT_SHORTCUT_GROUPS, DEFAULT_SHORTCUTS } from "./tmux-shortcut-defa
 import {
   DIRECT_FOLLOWUP_STATUSES,
   DIRECT_TASK_STATUSES,
+  SHORTCUT_DISPLAY_MODES,
   SHORTCUT_GROUP_LAYOUTS,
   SHORTCUT_KINDS,
+  SHORTCUT_SURFACES,
 } from "./types.js";
 import type { WebAuthPairingRecord, WebAuthSessionRecord } from "./web-auth.js";
 import type {
@@ -35,8 +37,10 @@ import type {
   StoredTask,
   TaskState,
   WorkerProgress,
+  ShortcutDisplayMode,
   ShortcutGroupLayout,
   ShortcutKind,
+  ShortcutSurface,
   StoredShortcut,
   StoredShortcutGroup,
 } from "./types.js";
@@ -293,6 +297,7 @@ CREATE TABLE IF NOT EXISTS shortcut_groups (
     title TEXT NOT NULL,
     icon TEXT NOT NULL DEFAULT '⌘',
     description TEXT NOT NULL DEFAULT '',
+    surface TEXT NOT NULL DEFAULT 'palette' CHECK (surface IN ('palette', 'composer')),
     layout TEXT NOT NULL DEFAULT 'grid' CHECK (layout IN ('grid', 'keyboard')),
     sort_order INTEGER NOT NULL DEFAULT 0,
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
@@ -311,6 +316,8 @@ CREATE TABLE IF NOT EXISTS shortcuts (
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     built_in INTEGER NOT NULL DEFAULT 0 CHECK (built_in IN (0, 1)),
     dangerous INTEGER NOT NULL DEFAULT 0 CHECK (dangerous IN (0, 1)),
+    action_key TEXT,
+    display_mode TEXT NOT NULL DEFAULT 'closed' CHECK (display_mode IN ('closed', 'expanded', 'both')),
     sort_order INTEGER NOT NULL DEFAULT 0,
     operation_count INTEGER NOT NULL DEFAULT 0 CHECK (operation_count >= 0),
     created_at TEXT NOT NULL,
@@ -634,6 +641,7 @@ export class StateDatabase {
     title: string;
     icon?: string;
     description?: string;
+    surface?: ShortcutSurface;
     layout?: ShortcutGroupLayout;
     sortOrder?: number;
     enabled?: boolean;
@@ -643,14 +651,15 @@ export class StateDatabase {
     const title = normalizeShortcutText(input.title, "分组名称", 64);
     const icon = normalizeShortcutText(input.icon ?? "⌘", "分组图标", 8);
     const description = normalizeShortcutText(input.description ?? "", "分组说明", 160, false);
+    const surface = normalizeShortcutSurface(input.surface ?? "palette");
     const layout = normalizeShortcutLayout(input.layout ?? "grid");
     const sortOrder = Number.isSafeInteger(input.sortOrder) ? input.sortOrder! : this.nextShortcutGroupOrder();
     const now = this.timestamp();
     this.db.prepare(
       `INSERT INTO shortcut_groups
-        (id, title, icon, description, layout, sort_order, enabled, built_in, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, title, icon, description, layout, sortOrder, input.enabled === false ? 0 : 1, input.builtIn ? 1 : 0, now, now);
+        (id, title, icon, description, surface, layout, sort_order, enabled, built_in, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, title, icon, description, surface, layout, sortOrder, input.enabled === false ? 0 : 1, input.builtIn ? 1 : 0, now, now);
     return this.getShortcutGroup(id)!;
   }
 
@@ -663,6 +672,7 @@ export class StateDatabase {
     title?: string;
     icon?: string;
     description?: string;
+    surface?: ShortcutSurface;
     layout?: ShortcutGroupLayout;
     sortOrder?: number;
     enabled?: boolean;
@@ -672,13 +682,14 @@ export class StateDatabase {
     const title = input.title === undefined ? existing.title : normalizeShortcutText(input.title, "分组名称", 64);
     const icon = input.icon === undefined ? existing.icon : normalizeShortcutText(input.icon, "分组图标", 8);
     const description = input.description === undefined ? existing.description : normalizeShortcutText(input.description, "分组说明", 160, false);
+    const surface = input.surface === undefined ? existing.surface : normalizeShortcutSurface(input.surface);
     const layout = input.layout === undefined ? existing.layout : normalizeShortcutLayout(input.layout);
     const sortOrder = input.sortOrder === undefined ? existing.sort_order : input.sortOrder;
     if (!Number.isSafeInteger(sortOrder)) throw new Error("分组排序必须是整数。");
     this.db.prepare(
-      `UPDATE shortcut_groups SET title = ?, icon = ?, description = ?, layout = ?, sort_order = ?,
+      `UPDATE shortcut_groups SET title = ?, icon = ?, description = ?, surface = ?, layout = ?, sort_order = ?,
        enabled = ?, updated_at = ? WHERE id = ?`,
-    ).run(title, icon, description, layout, sortOrder, input.enabled === undefined ? (existing.enabled ? 1 : 0) : input.enabled ? 1 : 0, this.timestamp(), id);
+    ).run(title, icon, description, surface, layout, sortOrder, input.enabled === undefined ? (existing.enabled ? 1 : 0) : input.enabled ? 1 : 0, this.timestamp(), id);
     return this.getShortcutGroup(id);
   }
 
@@ -700,6 +711,8 @@ export class StateDatabase {
     enabled?: boolean;
     builtIn?: boolean;
     dangerous?: boolean;
+    actionKey?: string;
+    displayMode?: ShortcutDisplayMode;
     sortOrder?: number;
   }): StoredShortcut {
     if (!this.getShortcutGroup(input.groupId)) throw new Error("快捷键分组不存在。");
@@ -707,14 +720,16 @@ export class StateDatabase {
     const title = normalizeShortcutText(input.title, "快捷键名称", 64);
     const detail = normalizeShortcutText(input.detail ?? "", "快捷键说明", 120, false);
     const kind = normalizeShortcutKind(input.kind);
-    const value = normalizeShortcutText(input.value, "快捷键内容", 8_000);
+    const actionKey = input.actionKey?.trim() || null;
+    const value = normalizeShortcutText(input.value, "快捷键内容", 8_000, !actionKey);
+    const displayMode = normalizeShortcutDisplayMode(input.displayMode ?? "closed");
     const sortOrder = Number.isSafeInteger(input.sortOrder) ? input.sortOrder! : this.nextShortcutOrder(input.groupId);
     const now = this.timestamp();
     this.db.prepare(
       `INSERT INTO shortcuts
-        (id, group_id, title, detail, kind, value, enabled, built_in, dangerous, sort_order, operation_count, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
-    ).run(id, input.groupId, title, detail, kind, value, input.enabled === false ? 0 : 1, input.builtIn ? 1 : 0, input.dangerous ? 1 : 0, sortOrder, now, now);
+        (id, group_id, title, detail, kind, value, enabled, built_in, dangerous, action_key, display_mode, sort_order, operation_count, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+    ).run(id, input.groupId, title, detail, kind, value, input.enabled === false ? 0 : 1, input.builtIn ? 1 : 0, input.dangerous ? 1 : 0, actionKey, displayMode, sortOrder, now, now);
     return this.getShortcut(id)!;
   }
 
@@ -726,6 +741,8 @@ export class StateDatabase {
     value?: string;
     enabled?: boolean;
     dangerous?: boolean;
+    actionKey?: string | null;
+    displayMode?: ShortcutDisplayMode;
     sortOrder?: number;
   }): StoredShortcut | null {
     const existing = this.getShortcut(id);
@@ -735,14 +752,36 @@ export class StateDatabase {
     const title = input.title === undefined ? existing.title : normalizeShortcutText(input.title, "快捷键名称", 64);
     const detail = input.detail === undefined ? existing.detail : normalizeShortcutText(input.detail, "快捷键说明", 120, false);
     const kind = input.kind === undefined ? existing.kind : normalizeShortcutKind(input.kind);
-    const value = input.value === undefined ? existing.value : normalizeShortcutText(input.value, "快捷键内容", 8_000);
+    const actionKey = input.actionKey === undefined ? existing.action_key : input.actionKey?.trim() || null;
+    const value = input.value === undefined ? existing.value : normalizeShortcutText(input.value, "快捷键内容", 8_000, !actionKey);
+    const displayMode = input.displayMode === undefined ? existing.display_mode : normalizeShortcutDisplayMode(input.displayMode);
     const sortOrder = input.sortOrder === undefined ? existing.sort_order : input.sortOrder;
     if (!Number.isSafeInteger(sortOrder)) throw new Error("快捷键排序必须是整数。");
     this.db.prepare(
-      `UPDATE shortcuts SET group_id = ?, title = ?, detail = ?, kind = ?, value = ?, enabled = ?, dangerous = ?, sort_order = ?,
+      `UPDATE shortcuts SET group_id = ?, title = ?, detail = ?, kind = ?, value = ?, enabled = ?, dangerous = ?, action_key = ?, display_mode = ?, sort_order = ?,
        updated_at = ? WHERE id = ?`,
-    ).run(groupId, title, detail, kind, value, input.enabled === undefined ? (existing.enabled ? 1 : 0) : input.enabled ? 1 : 0, input.dangerous === undefined ? (existing.dangerous ? 1 : 0) : input.dangerous ? 1 : 0, sortOrder, this.timestamp(), id);
+    ).run(groupId, title, detail, kind, value, input.enabled === undefined ? (existing.enabled ? 1 : 0) : input.enabled ? 1 : 0, input.dangerous === undefined ? (existing.dangerous ? 1 : 0) : input.dangerous ? 1 : 0, actionKey, displayMode, sortOrder, this.timestamp(), id);
     return this.getShortcut(id);
+  }
+
+  public moveShortcutToEdge(id: string, position: "start" | "end"): StoredShortcut | null {
+    const existing = this.getShortcut(id);
+    if (!existing) return null;
+    if (position !== "start" && position !== "end") throw new Error("快捷键位置必须是 start 或 end。");
+
+    return this.transaction(() => {
+      const bounds = this.db.prepare(
+        `SELECT MIN(sort_order) AS min_order, MAX(sort_order) AS max_order
+         FROM shortcuts WHERE group_id = ? AND id <> ?`,
+      ).get(existing.group_id, id) as { min_order: number | null; max_order: number | null };
+      const sortOrder = position === "start"
+        ? (bounds.min_order === null ? 0 : Number(bounds.min_order) - 1)
+        : (bounds.max_order === null ? 0 : Number(bounds.max_order) + 1);
+      this.db.prepare(
+        "UPDATE shortcuts SET sort_order = ?, updated_at = ? WHERE id = ?",
+      ).run(sortOrder, this.timestamp(), id);
+      return this.getShortcut(id);
+    });
   }
 
   public deleteShortcut(id: string): boolean {
@@ -3027,12 +3066,17 @@ export class StateDatabase {
     return row ? mapWebAuthSession(row) : null;
   }
 
-  public touchWebAuthSession(sessionId: string, lastSeenAt: string): void {
+  public touchWebAuthSession(
+    sessionId: string,
+    lastSeenAt: string,
+    userAgent: string | null,
+    remoteAddress: string | null,
+  ): void {
     this.db
       .prepare(
-        "UPDATE web_auth_sessions SET last_seen_at = ? WHERE session_id = ? AND revoked_at IS NULL",
+        "UPDATE web_auth_sessions SET last_seen_at = ?, user_agent = ?, remote_address = ? WHERE session_id = ? AND revoked_at IS NULL",
       )
-      .run(lastSeenAt, sessionId);
+      .run(lastSeenAt, userAgent, remoteAddress, sessionId);
   }
 
   public listWebAuthSessions(): WebAuthSessionRecord[] {
@@ -3241,6 +3285,9 @@ export class StateDatabase {
     addColumnIfMissing(this.db, "bridge_tasks", "last_recovered_at", "TEXT");
     addColumnIfMissing(this.db, "bridge_task_attachments", "followup_id", "TEXT");
     addColumnIfMissing(this.db, "shortcuts", "sort_order", "INTEGER NOT NULL DEFAULT 0");
+    addColumnIfMissing(this.db, "shortcut_groups", "surface", "TEXT NOT NULL DEFAULT 'palette'");
+    addColumnIfMissing(this.db, "shortcuts", "action_key", "TEXT");
+    addColumnIfMissing(this.db, "shortcuts", "display_mode", "TEXT NOT NULL DEFAULT 'closed'");
   }
 
   private seedShortcutDefaults(): void {
@@ -3248,16 +3295,16 @@ export class StateDatabase {
       const now = this.timestamp();
       const insertGroup = this.db.prepare(
         `INSERT OR IGNORE INTO shortcut_groups
-          (id, title, icon, description, layout, sort_order, enabled, built_in, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?)`,
+          (id, title, icon, description, surface, layout, sort_order, enabled, built_in, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)`,
       );
       for (const group of DEFAULT_SHORTCUT_GROUPS) {
-        insertGroup.run(group.id, group.title, group.icon, group.description, group.layout, group.sortOrder, now, now);
+        insertGroup.run(group.id, group.title, group.icon, group.description, group.surface, group.layout, group.sortOrder, now, now);
       }
       const insertShortcut = this.db.prepare(
         `INSERT OR IGNORE INTO shortcuts
-          (id, group_id, title, detail, kind, value, enabled, built_in, dangerous, sort_order, operation_count, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, 0, ?, ?)`,
+          (id, group_id, title, detail, kind, value, enabled, built_in, dangerous, action_key, display_mode, sort_order, operation_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, 0, ?, ?)`,
       );
       for (const [sortOrder, shortcut] of DEFAULT_SHORTCUTS.entries()) {
         insertShortcut.run(
@@ -3268,11 +3315,46 @@ export class StateDatabase {
           shortcut.kind,
           shortcut.value,
           shortcut.dangerous ? 1 : 0,
-          sortOrder,
+          shortcut.actionKey ?? null,
+          shortcut.displayMode ?? "closed",
+          shortcut.sortOrder ?? sortOrder,
           now,
           now,
         );
       }
+      this.db.prepare("UPDATE shortcut_groups SET surface = 'composer', updated_at = ? WHERE id = 'composer' AND built_in = 1").run(now);
+      const repairComposerShortcut = this.db.prepare(
+        `UPDATE shortcuts SET action_key = ?, display_mode = ?, updated_at = ?
+         WHERE id = ? AND group_id = 'composer' AND built_in = 1 AND (action_key IS NULL OR action_key = '')`,
+      );
+      for (const shortcut of DEFAULT_SHORTCUTS) {
+        if (shortcut.groupId === "composer" && shortcut.actionKey) {
+          repairComposerShortcut.run(shortcut.actionKey, shortcut.displayMode ?? "closed", now, shortcut.id);
+        }
+      }
+
+      // The first alias implementation used a separate command-line group.
+      // Keep its counts, enabled state and any user edits, but place the four
+      // built-in aliases into the existing Tmux/Codex groups instead.
+      const legacyCommandShortcutTargets = new Map<string, string>([
+        ["command-tmuxctl", "tmux"],
+        ["command-s", "tmux"],
+        ["command-proxyctl", "codex"],
+        ["command-jump", "codex"],
+      ]);
+      const migrateLegacyCommandShortcut = this.db.prepare(
+        `UPDATE shortcuts SET group_id = ?, sort_order = ?, updated_at = ?
+         WHERE id = ? AND group_id = 'command-line' AND built_in = 1`,
+      );
+      for (const [sortOrder, shortcut] of DEFAULT_SHORTCUTS.entries()) {
+        const targetGroupId = legacyCommandShortcutTargets.get(shortcut.id);
+        if (targetGroupId) migrateLegacyCommandShortcut.run(targetGroupId, shortcut.sortOrder ?? sortOrder, now, shortcut.id);
+      }
+      this.db.prepare(
+        `DELETE FROM shortcut_groups
+         WHERE id = 'command-line' AND built_in = 1
+           AND NOT EXISTS (SELECT 1 FROM shortcuts WHERE group_id = 'command-line')`,
+      ).run();
     });
   }
 
@@ -3376,7 +3458,7 @@ function migrateBridgeTaskStatusConstraint(db: SqliteDatabase): void {
 
 function addColumnIfMissing(
   db: SqliteDatabase,
-  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts",
+  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts" | "shortcut_groups",
   column: string,
   definition: string,
 ): void {
@@ -3388,11 +3470,13 @@ function addColumnIfMissing(
 
 function mapShortcutGroup(row: Record<string, unknown>): StoredShortcutGroup {
   const layout = String(row.layout);
+  const surface = String(row.surface ?? "palette");
   return {
     id: String(row.id),
     title: String(row.title),
     icon: String(row.icon ?? "⌘"),
     description: String(row.description ?? ""),
+    surface: SHORTCUT_SURFACES.includes(surface as ShortcutSurface) ? surface as ShortcutSurface : "palette",
     layout: SHORTCUT_GROUP_LAYOUTS.includes(layout as ShortcutGroupLayout) ? layout as ShortcutGroupLayout : "grid",
     sort_order: Number(row.sort_order ?? 0),
     enabled: Number(row.enabled) === 1,
@@ -3404,6 +3488,7 @@ function mapShortcutGroup(row: Record<string, unknown>): StoredShortcutGroup {
 
 function mapShortcut(row: Record<string, unknown>): StoredShortcut {
   const kind = String(row.kind);
+  const displayMode = String(row.display_mode ?? "closed");
   return {
     id: String(row.id),
     group_id: String(row.group_id),
@@ -3414,6 +3499,8 @@ function mapShortcut(row: Record<string, unknown>): StoredShortcut {
     enabled: Number(row.enabled) === 1,
     built_in: Number(row.built_in) === 1,
     dangerous: Number(row.dangerous) === 1,
+    action_key: row.action_key === null || row.action_key === undefined ? null : String(row.action_key),
+    display_mode: SHORTCUT_DISPLAY_MODES.includes(displayMode as ShortcutDisplayMode) ? displayMode as ShortcutDisplayMode : "closed",
     sort_order: Number(row.sort_order ?? 0),
     operation_count: Number(row.operation_count ?? 0),
     created_at: String(row.created_at),
@@ -3430,6 +3517,16 @@ function normalizeShortcutText(value: string, field: string, maxLength: number, 
 
 function normalizeShortcutKind(value: ShortcutKind): ShortcutKind {
   if (!SHORTCUT_KINDS.includes(value)) throw new Error("快捷键类型无效。");
+  return value;
+}
+
+function normalizeShortcutSurface(value: ShortcutSurface): ShortcutSurface {
+  if (!SHORTCUT_SURFACES.includes(value)) throw new Error("快捷键作用面无效。");
+  return value;
+}
+
+function normalizeShortcutDisplayMode(value: ShortcutDisplayMode): ShortcutDisplayMode {
+  if (!SHORTCUT_DISPLAY_MODES.includes(value)) throw new Error("快捷键展示状态无效。");
   return value;
 }
 

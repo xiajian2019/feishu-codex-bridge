@@ -78,6 +78,10 @@ export interface StoredProject {
 
 export const SHORTCUT_KINDS = ["terminal", "insert", "send", "sequence"] as const;
 export type ShortcutKind = (typeof SHORTCUT_KINDS)[number];
+export const SHORTCUT_SURFACES = ["palette", "composer"] as const;
+export type ShortcutSurface = (typeof SHORTCUT_SURFACES)[number];
+export const SHORTCUT_DISPLAY_MODES = ["closed", "expanded", "both"] as const;
+export type ShortcutDisplayMode = (typeof SHORTCUT_DISPLAY_MODES)[number];
 export const SHORTCUT_GROUP_LAYOUTS = ["grid", "keyboard"] as const;
 export type ShortcutGroupLayout = (typeof SHORTCUT_GROUP_LAYOUTS)[number];
 
@@ -86,6 +90,7 @@ export interface StoredShortcutGroup {
   title: string;
   icon: string;
   description: string;
+  surface: ShortcutSurface;
   layout: ShortcutGroupLayout;
   sort_order: number;
   enabled: boolean;
@@ -104,6 +109,8 @@ export interface StoredShortcut {
   enabled: boolean;
   built_in: boolean;
   dangerous: boolean;
+  action_key: string | null;
+  display_mode: ShortcutDisplayMode;
   sort_order: number;
   operation_count: number;
   created_at: string;

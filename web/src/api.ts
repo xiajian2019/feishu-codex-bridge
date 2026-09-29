@@ -15,7 +15,7 @@ import type {
   TaskDetailResponse,
   TaskListResponse,
 } from "./types.js";
-import type { ShortcutDefinition, ShortcutGroup, ShortcutKind, ShortcutStore } from "./tmux-shortcuts.js";
+import { DEFAULT_COMPOSER_SHORTCUTS, type ShortcutDefinition, type ShortcutDisplayMode, type ShortcutGroup, type ShortcutKind, type ShortcutStore, type ShortcutSurface } from "./tmux-shortcuts.js";
 
 export interface TaskQuery {
   q?: string;
@@ -229,9 +229,22 @@ export async function updateProject(
 
 export async function fetchShortcutConfig(): Promise<ShortcutStore> {
   const result = await getJson<{ groups: ShortcutGroup[]; shortcuts: ShortcutDefinition[] }>("/api/shortcut-config");
+  const composerDefaults = new Map(DEFAULT_COMPOSER_SHORTCUTS.map((shortcut) => [shortcut.id, shortcut]));
+  const shortcuts = Array.isArray(result.shortcuts)
+    ? result.shortcuts.map((shortcut) => {
+      const fallback = shortcut.groupId === "composer" && !shortcut.actionKey
+        ? composerDefaults.get(shortcut.id)
+        : undefined;
+      return fallback
+        ? { ...fallback, ...shortcut, actionKey: fallback.actionKey, displayMode: fallback.displayMode }
+        : shortcut;
+    })
+    : [];
   return {
-    groups: Array.isArray(result.groups) ? result.groups : [],
-    shortcuts: Array.isArray(result.shortcuts) ? result.shortcuts : [],
+    groups: Array.isArray(result.groups)
+      ? result.groups.map((group) => group.id === "composer" && group.surface !== "composer" ? { ...group, surface: "composer" } : group)
+      : [],
+    shortcuts,
   };
 }
 
@@ -239,6 +252,7 @@ export async function createShortcutGroup(input: {
   title: string;
   icon: string;
   description: string;
+  surface?: ShortcutSurface;
   layout: "grid" | "keyboard";
 }): Promise<ShortcutGroup> {
   const token = await getActionToken();
@@ -252,7 +266,7 @@ export async function createShortcutGroup(input: {
 
 export async function updateShortcutGroup(
   id: string,
-  input: Partial<Pick<ShortcutGroup, "title" | "icon" | "description" | "layout" | "sortOrder" | "enabled">>,
+  input: Partial<Pick<ShortcutGroup, "title" | "icon" | "description" | "surface" | "layout" | "sortOrder" | "enabled">>,
 ): Promise<ShortcutGroup> {
   const token = await getActionToken();
   const result = await getJson<{ group: ShortcutGroup }>(`/api/shortcut-groups/${encodeURIComponent(id)}`, {
@@ -277,6 +291,8 @@ export async function createShortcut(input: {
   detail: string;
   kind: ShortcutKind;
   value: string;
+  actionKey?: string;
+  displayMode?: ShortcutDisplayMode;
   enabled: boolean;
   dangerous: boolean;
 }): Promise<ShortcutDefinition> {
@@ -291,13 +307,26 @@ export async function createShortcut(input: {
 
 export async function updateShortcut(
   id: string,
-  input: Partial<Pick<ShortcutDefinition, "groupId" | "title" | "detail" | "kind" | "value" | "enabled" | "dangerous" | "sortOrder">>,
+  input: Partial<Pick<ShortcutDefinition, "groupId" | "title" | "detail" | "kind" | "value" | "actionKey" | "displayMode" | "enabled" | "dangerous" | "sortOrder">>,
 ): Promise<ShortcutDefinition> {
   const token = await getActionToken();
   const result = await getJson<{ shortcut: ShortcutDefinition }>(`/api/shortcuts/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
     body: JSON.stringify(input),
+  });
+  return result.shortcut;
+}
+
+export async function moveShortcutToEdge(
+  id: string,
+  position: "start" | "end",
+): Promise<ShortcutDefinition> {
+  const token = await getActionToken();
+  const result = await getJson<{ shortcut: ShortcutDefinition }>(`/api/shortcuts/${encodeURIComponent(id)}/move`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
+    body: JSON.stringify({ position }),
   });
   return result.shortcut;
 }

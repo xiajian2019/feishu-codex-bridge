@@ -37,6 +37,7 @@ import {
   type TaskListResponse,
   type TaskSummary,
 } from "./types.js";
+import { TaskFileBrowser } from "./TaskFileBrowser.js";
 
 const PAGE_SIZE = 50;
 
@@ -520,6 +521,7 @@ export function App(): ReactElement {
 
       {selectedGuid ? (
         <TaskDetailDialog
+          key={selectedGuid}
           detail={detail}
           selectedGuid={selectedGuid}
           loading={detailLoading}
@@ -686,6 +688,7 @@ const TaskDetailDialog = memo(function TaskDetailDialog({
   onFeedbackSubmit,
 }: TaskDetailDialogProps): ReactElement {
   const task = detail?.task;
+  const [filesOpen, setFilesOpen] = useState(false);
   return (
     <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="dialog" role="dialog" aria-modal="true" aria-labelledby="detail-title">
@@ -735,6 +738,15 @@ const TaskDetailDialog = memo(function TaskDetailDialog({
                   })}
                 </div>
               </> : null}
+              <section className="task-files-section">
+                <div className="task-files-heading">
+                  <div><h3>服务器文件</h3><span className="muted">只读浏览此任务的项目目录，可预览 Markdown。</span></div>
+                  <button type="button" disabled={!task.repo} aria-expanded={filesOpen} onClick={() => setFilesOpen((value) => !value)}>
+                    {filesOpen ? "收起文件" : "浏览项目文件"}
+                  </button>
+                </div>
+                {filesOpen ? <TaskFileBrowser key={selectedGuid} taskGuid={selectedGuid} /> : null}
+              </section>
               {task.last_error ? <><h3>最近错误</h3><pre>{task.last_error}</pre></> : null}
               <h3>运行记录（{detail?.runs.length ?? 0}）</h3>
               {detail?.runs.length ? detail.runs.map((run) => <RunCard key={run.run_id} run={run} />) : <div className="muted">暂无运行记录</div>}

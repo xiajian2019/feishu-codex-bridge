@@ -4,15 +4,17 @@ import {
   createShortcut,
   createShortcutGroup,
   fetchShortcutConfig,
+  moveShortcutToEdge,
   updateShortcut,
   updateShortcutGroup,
 } from "./api.js";
-import { parseTerminalSequence, type ShortcutDefinition, type ShortcutGroup, type ShortcutKind, type ShortcutStore } from "./tmux-shortcuts.js";
+import { COMPOSER_ACTION_OPTIONS, parseTerminalSequence, type ShortcutDefinition, type ShortcutDisplayMode, type ShortcutGroup, type ShortcutKind, type ShortcutStore, type ShortcutSurface } from "./tmux-shortcuts.js";
 
 type GroupDraft = {
   title: string;
   icon: string;
   description: string;
+  surface: ShortcutSurface;
   layout: "grid" | "keyboard";
 };
 
@@ -22,12 +24,14 @@ type ShortcutDraft = {
   detail: string;
   kind: ShortcutKind;
   value: string;
+  actionKey: string;
+  displayMode: ShortcutDisplayMode;
   enabled: boolean;
   dangerous: boolean;
 };
 
-const EMPTY_GROUP: GroupDraft = { title: "", icon: "⌘", description: "", layout: "grid" };
-const EMPTY_SHORTCUT: ShortcutDraft = { groupId: "", title: "", detail: "", kind: "send", value: "", enabled: true, dangerous: false };
+const EMPTY_GROUP: GroupDraft = { title: "", icon: "⌘", description: "", surface: "palette", layout: "grid" };
+const EMPTY_SHORTCUT: ShortcutDraft = { groupId: "", title: "", detail: "", kind: "send", value: "", actionKey: "", displayMode: "closed", enabled: true, dangerous: false };
 
 export function ShortcutManagement(): ReactElement {
   const [store, setStore] = useState<ShortcutStore>({ groups: [], shortcuts: [] });
@@ -71,12 +75,12 @@ export function ShortcutManagement(): ReactElement {
     [selectedGroupId, store.shortcuts],
   );
 
-  const run = async (operation: () => Promise<void>): Promise<void> => {
+  const run = async (operation: () => Promise<void>, reload = true): Promise<void> => {
     setBusy(true);
     setError(null);
     try {
       await operation();
-      await load();
+      if (reload) await load();
     } catch (operationError) {
       setError(operationError instanceof Error ? operationError.message : String(operationError));
     } finally {
@@ -100,11 +104,19 @@ export function ShortcutManagement(): ReactElement {
   const saveShortcut = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     const input = { ...shortcutDraft, title: shortcutDraft.title.trim(), detail: shortcutDraft.detail.trim(), value: shortcutDraft.value.trim() };
-    if (!input.groupId || !input.title || !input.value) return setError("请填写分组、名称和内容。");
-    if (input.kind === "sequence" && !parseTerminalSequence(input.value)) return setError("控制键组合格式无效。");
+    const group = groups.find((item) => item.id === input.groupId);
+    const isComposerShortcut = group?.surface === "composer";
+    if (!input.groupId || !input.title || (!isComposerShortcut && !input.value) || (isComposerShortcut && !input.actionKey)) return setError(isComposerShortcut ? "请填写分组、名称和动作。" : "请填写分组、名称和内容。");
+    if (!isComposerShortcut && input.kind === "sequence" && !parseTerminalSequence(input.value)) return setError("控制键组合格式无效。");
+    const shortcutInput = {
+      ...input,
+      value: isComposerShortcut ? "" : input.value,
+      actionKey: isComposerShortcut ? input.actionKey : undefined,
+      displayMode: isComposerShortcut ? input.displayMode : undefined,
+    };
     await run(async () => {
-      if (editingShortcutId) await updateShortcut(editingShortcutId, input);
-      else await createShortcut(input);
+      if (editingShortcutId) await updateShortcut(editingShortcutId, shortcutInput);
+      else await createShortcut(shortcutInput);
       setShortcutDraft({ ...EMPTY_SHORTCUT, groupId: input.groupId });
       setEditingShortcutId(null);
       setShowShortcutForm(false);
@@ -113,7 +125,7 @@ export function ShortcutManagement(): ReactElement {
 
   const editGroup = (group: ShortcutGroup): void => {
     setEditingGroupId(group.id);
-    setGroupDraft({ title: group.title, icon: group.icon, description: group.description, layout: group.layout });
+    setGroupDraft({ title: group.title, icon: group.icon, description: group.description, surface: group.surface, layout: group.layout });
     setShowGroupForm(true);
   };
 
@@ -125,6 +137,8 @@ export function ShortcutManagement(): ReactElement {
       detail: shortcut.detail,
       kind: shortcut.kind,
       value: shortcut.value,
+      actionKey: shortcut.actionKey ?? "",
+      displayMode: shortcut.displayMode,
       enabled: shortcut.enabled,
       dangerous: shortcut.dangerous,
     });
@@ -133,7 +147,8 @@ export function ShortcutManagement(): ReactElement {
 
   const openShortcutForm = (groupId: string): void => {
     setEditingShortcutId(null);
-    setShortcutDraft({ ...EMPTY_SHORTCUT, groupId });
+    const group = groups.find((item) => item.id === groupId);
+    setShortcutDraft({ ...EMPTY_SHORTCUT, groupId, kind: group?.surface === "composer" ? "insert" : "send" });
     setShowShortcutForm(true);
   };
 
@@ -162,12 +177,13 @@ export function ShortcutManagement(): ReactElement {
     if (index < 0 || visibleShortcuts.length < 2) return;
     const targetIndex = direction < 0 ? 0 : visibleShortcuts.length - 1;
     if (index === targetIndex) return;
-    const reordered = direction < 0
-      ? [shortcut, ...visibleShortcuts.filter((item) => item.id !== shortcut.id)]
-      : [...visibleShortcuts.filter((item) => item.id !== shortcut.id), shortcut];
     void run(async () => {
-      await Promise.all(reordered.map((item, order) => updateShortcut(item.id, { sortOrder: order })));
-    });
+      const updated = await moveShortcutToEdge(shortcut.id, direction < 0 ? "start" : "end");
+      setStore((current) => ({
+        ...current,
+        shortcuts: current.shortcuts.map((item) => item.id === updated.id ? updated : item),
+      }));
+    }, false);
   };
 
   return (
@@ -222,6 +238,7 @@ export function ShortcutManagement(): ReactElement {
             <label>名称<input value={groupDraft.title} onChange={(event) => setGroupDraft({ ...groupDraft, title: event.target.value })} maxLength={64} required /></label>
             <label>图标<input value={groupDraft.icon} onChange={(event) => setGroupDraft({ ...groupDraft, icon: event.target.value })} maxLength={8} required /></label>
             <label>说明<input value={groupDraft.description} onChange={(event) => setGroupDraft({ ...groupDraft, description: event.target.value })} maxLength={160} /></label>
+            <label>作用位置<select value={groupDraft.surface} onChange={(event) => setGroupDraft({ ...groupDraft, surface: event.target.value as ShortcutSurface })}><option value="palette">快捷键面板</option><option value="composer">输入框快捷栏</option></select></label>
             <label>布局<select value={groupDraft.layout} onChange={(event) => setGroupDraft({ ...groupDraft, layout: event.target.value as GroupDraft["layout"] })}><option value="grid">普通网格</option><option value="keyboard">键盘网格</option></select></label>
             <div className="shortcut-management-modal-actions"><button className="secondary" type="button" onClick={() => setShowGroupForm(false)}>取消</button><button className="primary" type="submit" disabled={busy}>保存</button></div>
           </form>
@@ -235,8 +252,17 @@ export function ShortcutManagement(): ReactElement {
             <label>所属分组<select value={shortcutDraft.groupId} onChange={(event) => setShortcutDraft({ ...shortcutDraft, groupId: event.target.value })}>{groups.map((group) => <option value={group.id} key={group.id}>{group.title}</option>)}</select></label>
             <label>显示文字<input value={shortcutDraft.title} onChange={(event) => setShortcutDraft({ ...shortcutDraft, title: event.target.value })} maxLength={64} required /></label>
             <label>说明文字<input value={shortcutDraft.detail} onChange={(event) => setShortcutDraft({ ...shortcutDraft, detail: event.target.value })} maxLength={120} /></label>
-            <label>类型<select value={shortcutDraft.kind} onChange={(event) => setShortcutDraft({ ...shortcutDraft, kind: event.target.value as ShortcutKind })}><option value="send">发送文本</option><option value="sequence">控制键组合</option><option value="terminal">终端快捷键</option><option value="insert">插入文本</option></select></label>
-            <label>{shortcutDraft.kind === "sequence" ? "控制键组合" : "发送内容"}<textarea value={shortcutDraft.value} onChange={(event) => setShortcutDraft({ ...shortcutDraft, value: event.target.value })} rows={4} maxLength={8000} required /></label>
+            {groups.find((group) => group.id === shortcutDraft.groupId)?.surface === "composer" ? (
+              <>
+                <label>输入框动作<select value={shortcutDraft.actionKey} onChange={(event) => setShortcutDraft({ ...shortcutDraft, actionKey: event.target.value })} required><option value="">请选择动作</option>{COMPOSER_ACTION_OPTIONS.map((action) => <option value={action.key} key={action.key}>{action.label}</option>)}</select></label>
+                <label>显示位置<select value={shortcutDraft.displayMode} onChange={(event) => setShortcutDraft({ ...shortcutDraft, displayMode: event.target.value as ShortcutDisplayMode })}><option value="closed">快捷栏收起时</option><option value="expanded">快捷栏展开时</option><option value="both">两种状态都显示</option></select></label>
+              </>
+            ) : (
+              <>
+                <label>类型<select value={shortcutDraft.kind} onChange={(event) => setShortcutDraft({ ...shortcutDraft, kind: event.target.value as ShortcutKind })}><option value="send">发送文本</option><option value="sequence">控制键组合</option><option value="terminal">终端快捷键</option><option value="insert">插入文本</option></select></label>
+                <label>{shortcutDraft.kind === "sequence" ? "控制键组合" : "发送内容"}<textarea value={shortcutDraft.value} onChange={(event) => setShortcutDraft({ ...shortcutDraft, value: event.target.value })} rows={4} maxLength={8000} required /></label>
+              </>
+            )}
             <label className="shortcut-check"><input type="checkbox" checked={shortcutDraft.enabled} onChange={(event) => setShortcutDraft({ ...shortcutDraft, enabled: event.target.checked })} /> 启用</label>
             <label className="shortcut-check"><input type="checkbox" checked={shortcutDraft.dangerous} onChange={(event) => setShortcutDraft({ ...shortcutDraft, dangerous: event.target.checked })} /> 标记为危险操作</label>
             <div className="shortcut-management-modal-actions"><button className="secondary" type="button" onClick={() => setShowShortcutForm(false)}>取消</button><button className="primary" type="submit" disabled={busy}>保存</button></div>

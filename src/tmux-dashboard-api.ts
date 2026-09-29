@@ -43,6 +43,23 @@ const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.fre
   "tmux-window-list": "\u0002w",
   "tmux-zoom-pane": "\u0002z",
   "tmux-detach": "\u0002d",
+  "tmux-send-prefix": "\u0002\u0002",
+  "tmux-rotate-pane": "\u0002o",
+  "tmux-suspend": "\u0002\u001a",
+  "tmux-break-pane": "\u0002!",
+  "tmux-split-horizontal": "\u0002\"",
+  "tmux-list-buffers": "\u0002#",
+  "tmux-rename-session": "\u0002$",
+  "tmux-split-vertical": "\u0002%",
+  "tmux-kill-window": "\u0002&",
+  "tmux-select-window-prompt": "\u0002'",
+  "tmux-previous-session": "\u0002(",
+  "tmux-next-session": "\u0002)",
+  "tmux-new-floating-pane": "\u0002*",
+  "tmux-rename-window": "\u0002,",
+  "tmux-delete-buffer": "\u0002-",
+  "tmux-move-window-prompt": "\u0002.",
+  "tmux-window-0": "\u00020",
   "tmux-window-1": "\u00021",
   "tmux-window-2": "\u00022",
   "tmux-window-3": "\u00023",
@@ -50,6 +67,63 @@ const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.fre
   "tmux-window-5": "\u00025",
   "tmux-window-6": "\u00026",
   "tmux-window-7": "\u00027",
+  "tmux-window-8": "\u00028",
+  "tmux-window-9": "\u00029",
+  "tmux-command-prompt": "\u0002:",
+  "tmux-last-pane": "\u0002;",
+  "tmux-choose-buffer": "\u0002=",
+  "tmux-list-keys": "\u0002?",
+  "tmux-detach-client": "\u0002D",
+  "tmux-last-session": "\u0002L",
+  "tmux-copy-mode": "\u0002[",
+  "tmux-paste-buffer": "\u0002]",
+  "tmux-find-window": "\u0002f",
+  "tmux-display-window-info": "\u0002i",
+  "tmux-last-window": "\u0002l",
+  "tmux-mark-pane": "\u0002m",
+  "tmux-clear-mark": "\u0002M",
+  "tmux-display-pane-index": "\u0002q",
+  "tmux-refresh-client": "\u0002r",
+  "tmux-choose-session": "\u0002s",
+  "tmux-display-time": "\u0002t",
+  "tmux-set-pane-title": "\u0002T",
+  "tmux-kill-pane": "\u0002x",
+  "tmux-choose-tree": "\u0002\t",
+  "tmux-swap-pane-up": "\u0002{",
+  "tmux-swap-pane-down": "\u0002}",
+  "tmux-floating-g1": "\u0002g1",
+  "tmux-floating-g2": "\u0002g2",
+  "tmux-floating-g3": "\u0002g3",
+  "tmux-floating-g4": "\u0002g4",
+  "tmux-floating-up": "\u0002g\u001b[A",
+  "tmux-floating-down": "\u0002g\u001b[B",
+  "tmux-floating-left": "\u0002g\u001b[D",
+  "tmux-floating-right": "\u0002g\u001b[C",
+  "tmux-show-messages": "\u0002~",
+  "tmux-copy-mode-page-up": "\u0002\u001b[5~",
+  "tmux-select-pane-up": "\u0002\u001b[A",
+  "tmux-select-pane-down": "\u0002\u001b[B",
+  "tmux-select-pane-left": "\u0002\u001b[D",
+  "tmux-select-pane-right": "\u0002\u001b[C",
+  "tmux-layout-m1": "\u0002\u001b1",
+  "tmux-layout-m2": "\u0002\u001b2",
+  "tmux-layout-m3": "\u0002\u001b3",
+  "tmux-layout-m4": "\u0002\u001b4",
+  "tmux-layout-m5": "\u0002\u001b5",
+  "tmux-layout-m6": "\u0002\u001b6",
+  "tmux-layout-m7": "\u0002\u001b7",
+  "tmux-next-layout": "\u0002 ",
+  "tmux-next-alert-window": "\u0002\u001bn",
+  "tmux-rotate-pane-backward": "\u0002\u001bo",
+  "tmux-previous-alert-window": "\u0002\u001bp",
+  "tmux-resize-pane-up": "\u0002\u001b[1;5A",
+  "tmux-resize-pane-down": "\u0002\u001b[1;5B",
+  "tmux-resize-pane-left": "\u0002\u001b[1;5D",
+  "tmux-resize-pane-right": "\u0002\u001b[1;5C",
+  "tmux-resize-pane-5-up": "\u0002\u001b[1;3A",
+  "tmux-resize-pane-5-down": "\u0002\u001b[1;3B",
+  "tmux-resize-pane-5-left": "\u0002\u001b[1;3D",
+  "tmux-resize-pane-5-right": "\u0002\u001b[1;3C",
 });
 const ATTACHMENT_DIRECTORY = join(tmpdir(), "feishu-codex-bridge", "tmux-dashboard-attachments");
 
@@ -468,7 +542,7 @@ export class TmuxDashboardApi {
           data.terminal?.write(control.data);
         return;
       }
-      if (control.type === "submit" || control.type === "key" || control.type === "sequence") {
+      if (control.type === "submit" || control.type === "command" || control.type === "key" || control.type === "sequence") {
         const requestId = typeof control.requestId === "string" && control.requestId.length <= 80
           ? control.requestId
           : "";
@@ -543,6 +617,17 @@ export class TmuxDashboardApi {
           reply(false, "The tmux session is not attached.");
           return;
         }
+        if (control.type === "command") {
+          try {
+            flushOutput();
+            immediateOutputFlushUntil = Date.now() + SUBMIT_FAST_FLUSH_WINDOW_MS;
+            data.terminal.write("\u001b[200~" + text + "\u001b[201~\r");
+            reply(true);
+          } catch {
+            reply(false, "Could not send the command to the tmux session.");
+          }
+          return;
+        }
         const paneBefore = await tmux.capturePane(data.sessionId, data.rows).catch(() => null);
         if (paneBefore === null) {
           reply(false, "消息未发送：无法读取 session 当前状态，请稍后重试。");
@@ -582,9 +667,17 @@ export class TmuxDashboardApi {
     });
 
     try {
+      // LaunchAgents may omit locale variables even when the tmux server is UTF-8.
+      // Give this attach client a UTF-8 locale so CJK text is emitted correctly.
+      const inheritedUtf8Locale = [process.env.LC_ALL, process.env.LC_CTYPE, process.env.LANG]
+        .find((locale) => locale && /UTF-?8/i.test(locale));
+      const terminalLocale = inheritedUtf8Locale ?? "C.UTF-8";
       const child = getBunRuntime().spawn(["tmux", "attach-session", "-t", data.sessionId], {
         env: {
           ...process.env,
+          LC_ALL: process.env.LC_ALL && /UTF-?8/i.test(process.env.LC_ALL) ? process.env.LC_ALL : undefined,
+          LANG: terminalLocale,
+          LC_CTYPE: terminalLocale,
           TMUX: undefined,
           TMUX_PANE: undefined,
           TERM: "xterm-256color",

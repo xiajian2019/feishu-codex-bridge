@@ -16,11 +16,22 @@ describe("SQLite shortcut configuration", () => {
     const database = new StateDatabase(":memory:");
     databases.push(database);
     const config = database.getShortcutConfig();
-    expect(config.groups.map((group) => group.id)).toEqual(["favorites", "tmux", "codex", "ctrl", "keyboard"]);
-    expect(config.shortcuts.length).toBeGreaterThan(60);
+    expect(config.groups.map((group) => group.id)).toEqual(["favorites", "tmux", "codex", "ctrl", "keyboard", "composer"]);
+    expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "composer")).toHaveLength(13);
+    expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "tmux").map((shortcut) => shortcut.id)).toContain("command-tmuxctl");
+    expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "tmux").map((shortcut) => shortcut.id)).toContain("tmux-resize-pane-5-right");
+    expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "codex").map((shortcut) => shortcut.value)).toContain("/keymap");
+    expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "codex").map((shortcut) => shortcut.value)).toContain("proxyctl");
+    expect(config.shortcuts.length).toBeGreaterThan(130);
     const target = config.shortcuts.find((shortcut) => shortcut.id === "favorite-git-status")!;
     expect(database.recordShortcutUse(target.id)?.operation_count).toBe(1);
     expect(database.recordShortcutUse(target.id)?.operation_count).toBe(2);
+
+    const codexShortcuts = database.listShortcuts("codex");
+    const lastCodexShortcut = codexShortcuts[codexShortcuts.length - 1]!;
+    const movedCodexShortcut = database.moveShortcutToEdge(lastCodexShortcut.id, "start")!;
+    expect(database.listShortcuts("codex")[0]?.id).toBe(lastCodexShortcut.id);
+    expect(movedCodexShortcut.sort_order).toBeLessThan(codexShortcuts[0]!.sort_order);
   });
 
   test("serves CRUD and use-count APIs", async () => {
@@ -31,6 +42,14 @@ describe("SQLite shortcut configuration", () => {
     const baseUrl = await server.start();
     const session = await fetch(baseUrl + "/api/session").then((response) => response.json()) as { actionToken: string };
     const headers = { "Content-Type": "application/json", "X-Bridge-Action-Token": session.actionToken };
+    const initialConfig = await fetch(baseUrl + "/api/shortcut-config").then((response) => response.json()) as { groups: Array<{ id: string; surface: string }>; shortcuts: Array<{ id: string; groupId: string; sortOrder: number }> };
+    const composerGroup = initialConfig.groups.find((group) => group.surface === "composer")!;
+    const composerShortcutResponse = await fetch(baseUrl + "/api/shortcuts", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ groupId: composerGroup.id, title: "自定义文件", detail: "custom", kind: "insert", value: "", actionKey: "session-files", displayMode: "closed" }),
+    });
+    expect(composerShortcutResponse.status).toBe(201);
 
     const groupResponse = await fetch(baseUrl + "/api/shortcut-groups", {
       method: "POST",
@@ -56,6 +75,22 @@ describe("SQLite shortcut configuration", () => {
     });
     expect(reorderResponse.status).toBe(200);
     expect((await reorderResponse.json() as { shortcut: { sortOrder: number } }).shortcut.sortOrder).toBe(17);
+
+    const secondShortcutResponse = await fetch(baseUrl + "/api/shortcuts", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ groupId: group.id, title: "world", detail: "test", kind: "send", value: "echo world" }),
+    });
+    expect(secondShortcutResponse.status).toBe(201);
+    const secondShortcut = (await secondShortcutResponse.json() as { shortcut: { id: string; sortOrder: number } }).shortcut;
+    const moveToStartResponse = await fetch(baseUrl + `/api/shortcuts/${encodeURIComponent(secondShortcut.id)}/move`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ position: "start" }),
+    });
+    expect(moveToStartResponse.status).toBe(200);
+    expect((await moveToStartResponse.json() as { shortcut: { sortOrder: number } }).shortcut.sortOrder).toBeLessThan(17);
+    expect(database.getShortcut(shortcut.id)?.sort_order).toBe(17);
 
     const useResponse = await fetch(baseUrl + `/api/shortcuts/${encodeURIComponent(shortcut.id)}/use`, {
       method: "POST",

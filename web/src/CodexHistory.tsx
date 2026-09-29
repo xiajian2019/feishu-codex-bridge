@@ -5,8 +5,11 @@ import {
   useExternalStoreRuntime,
   type ThreadMessageLike,
 } from "@assistant-ui/react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
+  createContext,
+  useContext,
   useCallback,
   useEffect,
   useMemo,
@@ -17,6 +20,7 @@ import {
 } from "react";
 import { useNavigate, useParams } from "react-router";
 
+import { CodeTextViewer } from "./CodeTextViewer.js";
 import {
   codexHistoryRunAttachmentUrl,
   fetchCodexHistory,
@@ -42,6 +46,20 @@ import {
 } from "./types.js";
 
 const PAGE_SIZE = 40;
+
+interface CodexFilePreviewTarget {
+  relativePath: string;
+  lineNumber?: number;
+}
+
+type CodexFileLinkTarget = CodexFilePreviewTarget | { outside: true };
+
+interface CodexMarkdownLinkContextValue {
+  rootPath: string;
+  onOpenFile: (target: CodexFileLinkTarget) => void;
+}
+
+const CODEX_MARKDOWN_LINK_CONTEXT = createContext<CodexMarkdownLinkContextValue | null>(null);
 
 interface HistoryFilters {
   home: string;
@@ -129,8 +147,8 @@ export function CodexHistory(): ReactElement {
             value={draftFilters.q}
             onChange={(event) => setDraftFilters((current) => ({ ...current, q: event.target.value }))}
           />
-          <select aria-label="Codex home" value={draftFilters.home} onChange={(event) => setDraftFilters((current) => ({ ...current, home: event.target.value }))}>
-            <option value="">全部 home</option>
+          <select aria-label="Codex账户" value={draftFilters.home} onChange={(event) => setDraftFilters((current) => ({ ...current, home: event.target.value }))}>
+            <option value="">Codex账户</option>
             {homes.map((home) => <option key={home.id} value={home.id}>{home.label}</option>)}
           </select>
           <select aria-label="运行状态" value={draftFilters.status} onChange={(event) => setDraftFilters((current) => ({ ...current, status: event.target.value }))}>
@@ -227,6 +245,7 @@ function CodexThreadDetail({ homeId, threadId, onBack }: { homeId: string; threa
   const [runNotice, setRunNotice] = useState<string | null>(null);
   const [liveRun, setLiveRun] = useState<LiveThreadRun | null>(null);
   const [imagePreviews, setImagePreviews] = useState<Record<number, CodexImagePreview[]>>({});
+  const [filePreviewTarget, setFilePreviewTarget] = useState<CodexFilePreviewTarget | null>(null);
   const [writerStatus, setWriterStatus] = useState<CodexHistoryWriterStatus | null>(null);
   const liveCursorRef = useRef(0);
 
@@ -234,6 +253,7 @@ function CodexThreadDetail({ homeId, threadId, onBack }: { homeId: string; threa
     const controller = new AbortController();
     setLoading(true);
     setError(null);
+    setFilePreviewTarget(null);
     void fetchCodexThreadDetail(homeId, threadId, controller.signal)
       .then((next) => {
         if (!controller.signal.aborted) {
@@ -349,6 +369,21 @@ function CodexThreadDetail({ homeId, threadId, onBack }: { homeId: string; threa
     ],
   }] : [];
   const displayedTurnCount = turns.length + (liveRun ? 1 : 0);
+  const busyInOtherLocation = writerStatus?.state === "busy"
+    && !writerStatus.localRun
+    && !isLiveRunActive(liveRun?.state);
+  const openFilePreview = useCallback((target: CodexFileLinkTarget): void => {
+    if ("outside" in target) {
+      setError("此文件链接不在当前 Codex session 的工作目录内，无法在此预览。");
+      return;
+    }
+    setError(null);
+    setFilePreviewTarget(target);
+  }, []);
+  const markdownLinkContext = useMemo<CodexMarkdownLinkContextValue>(() => ({
+    rootPath: thread.cwd ?? "",
+    onOpenFile: openFilePreview,
+  }), [openFilePreview, thread.cwd]);
 
   const submitMessage = useCallback(async (
     text: string,
@@ -411,7 +446,8 @@ function CodexThreadDetail({ homeId, threadId, onBack }: { homeId: string; threa
   }, [homeId, threadId, liveRun]);
 
   return (
-    <section className="codex-thread-panel" aria-labelledby="codex-thread-title">
+    <CODEX_MARKDOWN_LINK_CONTEXT.Provider value={markdownLinkContext}>
+      <section className="codex-thread-panel" aria-labelledby="codex-thread-title">
       <div className="codex-thread-view-head">
         <button className="codex-thread-back" type="button" onClick={onBack} aria-label="返回会话列表" title="返回会话列表">‹</button>
         <div className="codex-thread-view-heading">
@@ -420,7 +456,7 @@ function CodexThreadDetail({ homeId, threadId, onBack }: { homeId: string; threa
           <span>{loading ? "" : `${displayedTurnCount} 轮${liveRun?.state === "running" ? " · 正在运行" : liveRun?.state === "cancelling" ? " · 正在中断" : ""}`}</span>
         </div>
       </div>
-      {writerStatus?.state === "busy" && !writerStatus.localRun && !isLiveRunActive(liveRun?.state) ? (
+      {busyInOtherLocation ? (
         <div className="codex-thread-writer-status is-busy" role="status">
           此 Codex session 正在其他位置使用。发送已暂停，释放后会自动恢复。
         </div>
@@ -446,20 +482,33 @@ function CodexThreadDetail({ homeId, threadId, onBack }: { homeId: string; threa
           {!loading && turns.length === 0 && !liveRun ? <div className="empty">该会话没有可展示的轮次。</div> : null}
           {!loading && (turns.length > 0 || liveRun) ? <CodexAssistantTranscript thread={thread} extraTurns={liveTurns} imagePreviews={imagePreviews} /> : null}
         </div>
-        <CodexHistoryMessageComposer
-          disabled={loading || !detail}
-          sendDisabled={writerStatus === null || (writerStatus.state === "busy" && !writerStatus.localRun) || isLiveRunActive(liveRun?.state)}
-          sending={isLiveRunActive(liveRun?.state)}
-          cancelling={liveRun?.state === "cancelling"}
-          placeholder="发送消息到当前 Codex session…"
-          onSubmit={submitMessage}
-          onInterrupt={() => void interruptRun()}
-          onAttachmentError={(message) => setError(message)}
-          onScrollToTop={() => scrollCodexTranscript("top")}
-          onScrollToBottom={() => scrollCodexTranscript("bottom")}
-        />
+        <div className="codex-history-composer-slot" hidden={busyInOtherLocation}>
+          <CodexHistoryMessageComposer
+            disabled={loading || !detail}
+            sendDisabled={writerStatus === null || (writerStatus.state === "busy" && !writerStatus.localRun) || isLiveRunActive(liveRun?.state)}
+            sending={isLiveRunActive(liveRun?.state)}
+            cancelling={liveRun?.state === "cancelling"}
+            placeholder="发送消息到当前 Codex session…"
+            onSubmit={submitMessage}
+            onInterrupt={() => void interruptRun()}
+            onAttachmentError={(message) => setError(message)}
+            onScrollToTop={() => scrollCodexTranscript("top")}
+            onScrollToBottom={() => scrollCodexTranscript("bottom")}
+          />
+        </div>
       </div>
-    </section>
+      {filePreviewTarget ? (
+        <CodexFilePreviewDialog
+          key={`${filePreviewTarget.relativePath}:${filePreviewTarget.lineNumber ?? ""}`}
+          homeId={homeId}
+          threadId={threadId}
+          rootPath={thread.cwd ?? ""}
+          target={filePreviewTarget}
+          onClose={() => setFilePreviewTarget(null)}
+        />
+      ) : null}
+      </section>
+    </CODEX_MARKDOWN_LINK_CONTEXT.Provider>
   );
 }
 
@@ -658,7 +707,199 @@ function CodexAssistantMessage(): ReactElement {
 }
 
 function CodexMarkdownText({ text }: { text: string }): ReactElement {
-  return <div className="codex-assistant-markdown"><ReactMarkdown>{text}</ReactMarkdown></div>;
+  return <div className="codex-assistant-markdown"><CodexMarkdown text={text} /></div>;
+}
+
+const CODEX_MARKDOWN_COMPONENTS: Components = {
+  table: ({ node, ...props }) => {
+    void node;
+    return <div className="codex-markdown-table-scroll"><table {...props} /></div>;
+  },
+};
+
+function resolveCodexFileLink(href: string, rootPath: string): CodexFileLinkTarget | null {
+  let value = href.trim();
+  if (!value || value.startsWith("#") || value.startsWith("//")) return null;
+  if (/^https?:\/\//i.test(value)) {
+    try {
+      const url = new URL(value, window.location.origin);
+      if (url.origin !== window.location.origin) return null;
+      value = url.pathname + url.search + url.hash;
+    } catch {
+      return null;
+    }
+  } else if (/^(mailto|tel|javascript|data|file):/i.test(value)) {
+    return null;
+  }
+
+  let lineNumber: number | undefined;
+  const hashIndex = value.indexOf("#");
+  if (hashIndex >= 0) {
+    const fragment = value.slice(hashIndex + 1);
+    const lineFragment = /^L(\d+)(?:-L?\d+)?$/i.exec(fragment);
+    if (lineFragment) lineNumber = Number(lineFragment[1]);
+    else if (hashIndex === 0) return null;
+    value = value.slice(0, hashIndex);
+  }
+  const queryIndex = value.indexOf("?");
+  if (queryIndex >= 0) value = value.slice(0, queryIndex);
+  try {
+    value = decodeURIComponent(value);
+  } catch {
+    // Keep literal percent characters when the href is not URI-encoded.
+  }
+  value = value.replaceAll("\\", "/");
+  const lineSuffix = /:(\d+)(?::\d+)?$/.exec(value);
+  if (lineSuffix) {
+    lineNumber ??= Number(lineSuffix[1]);
+    value = value.slice(0, lineSuffix.index);
+  }
+
+  const normalizedRoot = rootPath.replaceAll("\\", "/").replace(/\/+$/, "");
+  let pathParts: string[];
+  if (normalizedRoot && value === normalizedRoot) return { outside: true };
+  if (normalizedRoot && value.startsWith(`${normalizedRoot}/`)) {
+    value = value.slice(normalizedRoot.length + 1);
+    pathParts = [];
+  } else if (value.startsWith("/")) {
+    return /^\/(Users|private|home|tmp|var|opt|Volumes)\//.test(value) ? { outside: true } : null;
+  } else {
+    if (!normalizedRoot) return { outside: true };
+    pathParts = [];
+  }
+
+  for (const part of value.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (pathParts.length === 0) return { outside: true };
+      pathParts.pop();
+    } else {
+      pathParts.push(part);
+    }
+  }
+  if (pathParts.length === 0) return { outside: true };
+  return { relativePath: pathParts.join("/"), ...(lineNumber ? { lineNumber } : {}) };
+}
+
+function CodexMarkdown({ text }: { text: string }): ReactElement {
+  const linkContext = useContext(CODEX_MARKDOWN_LINK_CONTEXT);
+  const components = useMemo<Components>(() => ({
+    ...CODEX_MARKDOWN_COMPONENTS,
+    a: ({ node, href, children, ...props }) => {
+      void node;
+      const target = typeof href === "string" && linkContext
+        ? resolveCodexFileLink(href, linkContext.rootPath)
+        : null;
+      return (
+        <a
+          {...props}
+          href={href}
+          onClick={(event) => {
+            if (!target || !linkContext) return;
+            event.preventDefault();
+            linkContext.onOpenFile(target);
+          }}
+        >{children}</a>
+      );
+    },
+  }), [linkContext]);
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      {text}
+    </ReactMarkdown>
+  );
+}
+
+const CODEX_FILE_IMAGE_EXTENSIONS = new Set(["apng", "avif", "bmp", "gif", "jpeg", "jpg", "png", "webp"]);
+
+function codexFilePreviewUrl(homeId: string, threadId: string, relativePath: string): string {
+  const url = new URL(
+    `/api/codex/threads/${encodeURIComponent(homeId)}/${encodeURIComponent(threadId)}/files/preview`,
+    window.location.origin,
+  );
+  url.searchParams.set("path", relativePath);
+  return url.pathname + url.search;
+}
+
+function CodexFilePreviewDialog({
+  homeId,
+  threadId,
+  rootPath,
+  target,
+  onClose,
+}: {
+  homeId: string;
+  threadId: string;
+  rootPath: string;
+  target: CodexFilePreviewTarget;
+  onClose: () => void;
+}): ReactElement {
+  const [text, setText] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const previewUrl = codexFilePreviewUrl(homeId, threadId, target.relativePath);
+  const fileName = target.relativePath.split("/").filter(Boolean).at(-1) ?? target.relativePath;
+  const extension = fileName.split(".").pop()?.toLowerCase() ?? "";
+  const isImage = CODEX_FILE_IMAGE_EXTENSIONS.has(extension);
+
+  useEffect(() => {
+    if (isImage) {
+      setLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    setLoading(true);
+    setError("");
+    void fetch(previewUrl, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) {
+          const payload = await response.json().catch(() => null) as { error?: string } | null;
+          throw new Error(payload?.error || `请求失败：${response.status}`);
+        }
+        return response.text();
+      })
+      .then((contents) => {
+        if (!controller.signal.aborted) setText(contents);
+      })
+      .catch((previewError: unknown) => {
+        if (!controller.signal.aborted) setError(previewError instanceof Error ? previewError.message : "读取文件失败。");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+  }, [isImage, previewUrl]);
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  const absolutePath = `${rootPath.replace(/[\\/]+$/, "")}/${target.relativePath}`;
+  return (
+    <div className="codex-file-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="codex-file-preview" role="dialog" aria-modal="true" aria-label={`预览 ${fileName}`}>
+        <header>
+          <div><strong title={absolutePath}>{fileName}{target.lineNumber ? `:${target.lineNumber}` : ""}</strong><small title={absolutePath}>{absolutePath}</small></div>
+          <button type="button" onClick={onClose} aria-label="关闭文件预览">×</button>
+        </header>
+        <div className="codex-file-preview-body">
+          {loading ? <div className="empty">正在读取文件…</div> : null}
+          {error ? <div className="codex-file-preview-error" role="alert">{error}</div> : null}
+          {!loading && !error && isImage ? <img src={previewUrl} alt={fileName} onError={() => setError("无法读取图片文件。")} /> : null}
+          {!loading && !error && !isImage && (extension === "md" || extension === "markdown") ? (
+            <div className="codex-file-preview-markdown codex-assistant-markdown"><CodexMarkdown text={text} /></div>
+          ) : null}
+          {!loading && !error && !isImage && extension !== "md" && extension !== "markdown" ? (
+            <CodeTextViewer fileName={fileName} text={text} lineNumber={target.lineNumber} />
+          ) : null}
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function CodexProcessPart({ data }: { data: CodexProcessPayload }): ReactElement {
@@ -685,7 +926,7 @@ function CodexProcessPart({ data }: { data: CodexProcessPayload }): ReactElement
 function CodexProcessGroupView({ group }: { group: CodexProcessGroup }): ReactElement {
   return (
     <section className="codex-assistant-process-group">
-      {group.summary ? <div className="codex-assistant-reasoning"><ReactMarkdown>{group.summary.text}</ReactMarkdown></div> : null}
+      {group.summary ? <div className="codex-assistant-reasoning"><CodexMarkdown text={group.summary.text} /></div> : null}
       {group.commands.length > 0 ? (
         <details className="codex-assistant-command-details">
           <summary><span>{group.commands.length} 条</span><span className="codex-command-chevron" aria-hidden="true">›</span></summary>

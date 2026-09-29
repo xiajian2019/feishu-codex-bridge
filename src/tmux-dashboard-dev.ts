@@ -49,7 +49,7 @@ async function main(): Promise<void> {
     db,
     auth: new WebPairingAuth({ db }),
     tmuxDashboard,
-    host: "127.0.0.1",
+    host: "0.0.0.0",
     port: options.port,
     modes: [],
     taskAttachmentsDirectory: join(tmpdir(), "feishu-codex-bridge", "tmux-dashboard-dev-unused"),

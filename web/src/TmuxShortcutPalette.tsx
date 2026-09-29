@@ -1,4 +1,4 @@
-import { useEffect, useMemo, type ReactElement } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { useNavigate } from "react-router";
 
 import { logDebugDiagnostic } from "./debug-log-capture.js";
@@ -21,19 +21,20 @@ type TmuxShortcutPaletteProps = {
   onCategoryChange: (category: PaletteCategory) => void;
   onShortcutUse: (id: string) => Promise<void>;
   onSubmitText: (text: string) => Promise<SubmissionResult>;
-  onTerminalShortcut: (shortcut: TerminalShortcut) => Promise<void>;
-  onTerminalSequence: (sequence: string) => Promise<void>;
+  onSubmitCommand: (command: string) => Promise<SubmissionResult>;
+  onTerminalShortcut: (shortcut: TerminalShortcut) => Promise<SubmissionResult>;
+  onTerminalSequence: (sequence: string) => Promise<SubmissionResult>;
 };
 
 function sortGroups(store: ShortcutStore): ShortcutStore["groups"] {
   return store.groups
-    .filter((group) => group.enabled)
+    .filter((group) => group.enabled && group.surface === "palette")
     .slice()
     .sort((left, right) => left.sortOrder - right.sortOrder || left.id.localeCompare(right.id));
 }
 
 function panelShortcuts(store: ShortcutStore, category: ShortcutCategory): ShortcutDefinition[] {
-  const enabledGroups = new Set(store.groups.filter((group) => group.enabled).map((group) => group.id));
+  const enabledGroups = new Set(store.groups.filter((group) => group.enabled && group.surface === "palette").map((group) => group.id));
   const enabled = store.shortcuts.filter((shortcut) => shortcut.enabled && enabledGroups.has(shortcut.groupId));
   if (category === "favorites") {
     return enabled
@@ -61,6 +62,7 @@ export function TmuxShortcutPalette({
   onCategoryChange,
   onShortcutUse,
   onSubmitText,
+  onSubmitCommand,
   onTerminalShortcut,
   onTerminalSequence,
 }: TmuxShortcutPaletteProps): ReactElement {
@@ -71,6 +73,32 @@ export function TmuxShortcutPalette({
   const pageSize = group?.layout === "keyboard" ? 20 : 8;
   const pages = shortcutPages(cards, pageSize);
   const gridSize = pageSize;
+  const pagesRef = useRef<HTMLDivElement>(null);
+  const [pageIndex, setPageIndex] = useState(0);
+
+  useEffect(() => {
+    setPageIndex(0);
+    pagesRef.current?.scrollTo({ left: 0, behavior: "auto" });
+  }, [category, cards.length, pageSize]);
+
+  useEffect(() => {
+    const pagesElement = pagesRef.current;
+    if (!pagesElement || pages.length < 2) return;
+    const onScroll = (): void => {
+      const width = pagesElement.clientWidth;
+      if (width > 0) setPageIndex(Math.max(0, Math.min(pages.length - 1, Math.round(pagesElement.scrollLeft / width))));
+    };
+    pagesElement.addEventListener("scroll", onScroll, { passive: true });
+    return () => pagesElement.removeEventListener("scroll", onScroll);
+  }, [pages.length]);
+
+  const goToPage = (nextIndex: number): void => {
+    const target = Math.max(0, Math.min(pages.length - 1, nextIndex));
+    setPageIndex(target);
+    const pagesElement = pagesRef.current;
+    const page = pagesElement?.children.item(target);
+    if (page instanceof HTMLElement) page.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "start" });
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -111,16 +139,23 @@ export function TmuxShortcutPalette({
 
   const selectShortcut = (shortcut: ShortcutDefinition): void => {
     void onShortcutUse(shortcut.id);
+    const closeAfterSuccess = shortcut.groupId === "codex" || shortcut.groupId === "tmux";
+    const deliver = async (submission: Promise<SubmissionResult>): Promise<void> => {
+      const result = await submission;
+      if (closeAfterSuccess && result.ok) onOpenChange(false);
+    };
     if (shortcut.kind === "terminal") {
-      void onTerminalShortcut(shortcut.value as TerminalShortcut);
+      void deliver(onTerminalShortcut(shortcut.value as TerminalShortcut));
       return;
     }
     if (shortcut.kind === "sequence") {
       const sequence = parseTerminalSequence(shortcut.value);
-      if (sequence) void onTerminalSequence(sequence);
+      if (sequence) void deliver(onTerminalSequence(sequence));
       return;
     }
-    void onSubmitText(shortcut.value);
+    void deliver(closeAfterSuccess
+      ? onSubmitCommand(shortcut.value)
+      : onSubmitText(shortcut.value));
   };
 
   if (!open) return <></>;
@@ -159,7 +194,7 @@ export function TmuxShortcutPalette({
           <button className="dashboard-shortcut-close" type="button" aria-label="关闭快捷键" onClick={() => onOpenChange(false)}>×</button>
         </nav>
         <div className="dashboard-shortcut-list" aria-label={group?.title ?? "快捷键"}>
-          <div className="dashboard-shortcut-pages">
+            <div className="dashboard-shortcut-pages" ref={pagesRef}>
             {pages.map((page, pageIndex) => (
               <div className="dashboard-shortcut-page" key={category + "-page-" + pageIndex}>
                 <div className="dashboard-shortcut-grid">
@@ -187,6 +222,13 @@ export function TmuxShortcutPalette({
               </div>
             ))}
           </div>
+          {pages.length > 1 ? (
+            <div className="dashboard-shortcut-pagination" aria-label="快捷键分页">
+              <button type="button" aria-label="上一页快捷键" onClick={() => goToPage(pageIndex - 1)} disabled={pageIndex === 0}>‹</button>
+              <span>{pageIndex + 1} / {pages.length}</span>
+              <button type="button" aria-label="下一页快捷键" onClick={() => goToPage(pageIndex + 1)} disabled={pageIndex === pages.length - 1}>›</button>
+            </div>
+          ) : null}
         </div>
       </div>
     </div>

@@ -143,18 +143,13 @@ export function PairingAdmin(): ReactElement {
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [pairingBusy, setPairingBusy] = useState(false);
   const [pairingError, setPairingError] = useState<string | null>(null);
-  const [pairingLogs, setPairingLogs] = useState<string[]>([]);
+  const [pairingLinkCopied, setPairingLinkCopied] = useState(false);
+  const [pairingLinkCopyError, setPairingLinkCopyError] = useState<string | null>(null);
   const [pairingCommandError, setPairingCommandError] = useState<string | null>(null);
   const [pairingCommandCopied, setPairingCommandCopied] = useState(false);
   const [editingDeviceId, setEditingDeviceId] = useState<string | null>(null);
   const [editingDeviceName, setEditingDeviceName] = useState("");
   const [renamingDeviceId, setRenamingDeviceId] = useState<string | null>(null);
-  const qrLoggedPairingUrlRef = useRef<string | null>(null);
-
-  const appendPairingLog = (message: string): void => {
-    const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-    setPairingLogs((previous) => [...previous, `[${time}] ${redactPairingSecrets(message)}`].slice(-80));
-  };
 
   const loadManagement = async (): Promise<void> => {
     setLoading(true);
@@ -191,10 +186,6 @@ export function PairingAdmin(): ReactElement {
     }
     let cancelled = false;
     setQrDataUrl(null);
-    if (qrLoggedPairingUrlRef.current !== pairing.pairingUrl) {
-      qrLoggedPairingUrlRef.current = pairing.pairingUrl;
-      appendPairingLog("开始在浏览器生成二维码：" + describePairingUrl(pairing.pairingUrl));
-    }
     void QRCode.toDataURL(pairing.pairingUrl, {
       errorCorrectionLevel: "M",
       margin: 2,
@@ -204,13 +195,11 @@ export function PairingAdmin(): ReactElement {
       .then((dataUrl) => {
         if (!cancelled) {
           setQrDataUrl(dataUrl);
-          appendPairingLog("浏览器二维码渲染完成。");
         }
       })
       .catch((qrError: unknown) => {
         if (!cancelled) {
           const message = qrError instanceof Error ? qrError.message : String(qrError);
-          appendPairingLog("浏览器二维码渲染失败：" + message);
           setPairingError(redactPairingSecrets(message));
         }
       });
@@ -230,14 +219,15 @@ export function PairingAdmin(): ReactElement {
     }
   };
 
-  const copyPairingLogs = async (): Promise<void> => {
+  const copyPairingLink = async (): Promise<void> => {
+    if (!pairing) return;
+    setPairingLinkCopyError(null);
+    setPairingLinkCopied(false);
     try {
-      await copyTextToClipboard(pairingLogs.join("\n"));
-      appendPairingLog("诊断日志已复制到剪贴板。");
+      await copyTextToClipboard(pairing.pairingUrl);
+      setPairingLinkCopied(true);
     } catch (copyError: unknown) {
-      const message = copyError instanceof Error ? copyError.message : String(copyError);
-      appendPairingLog("诊断日志复制失败：" + message);
-      setPairingError(redactPairingSecrets(message));
+      setPairingLinkCopyError(copyError instanceof Error ? copyError.message : String(copyError));
     }
   };
 
@@ -245,9 +235,8 @@ export function PairingAdmin(): ReactElement {
     setPairingBusy(true);
     setPairingError(null);
     setPairing(null);
-    appendPairingLog("开始请求生成配对二维码。");
-    appendPairingLog("当前页面 origin：" + window.location.origin);
-    appendPairingLog("请求 POST /api/auth/pairing/start。");
+    setPairingLinkCopied(false);
+    setPairingLinkCopyError(null);
     const controller = new AbortController();
     const timeoutId = window.setTimeout(() => controller.abort(), 10_000);
     try {
@@ -257,23 +246,14 @@ export function PairingAdmin(): ReactElement {
         credentials: "same-origin",
         signal: controller.signal,
       });
-      const contentType = response.headers.get("content-type") || "未知";
-      appendPairingLog(`收到 HTTP ${response.status} ${response.statusText || ""}，Content-Type: ${contentType}`);
-      const responseText = await response.text();
       let body: { pairingUrl?: string; expiresAt?: number } & ApiError;
       try {
-        body = JSON.parse(responseText) as { pairingUrl?: string; expiresAt?: number } & ApiError;
+        body = await response.json() as { pairingUrl?: string; expiresAt?: number } & ApiError;
       } catch {
-        appendPairingLog("响应不是有效 JSON：" + responseText.slice(0, 300));
         throw new Error("服务端没有返回有效的 JSON 响应。");
       }
       if (!response.ok) {
-        appendPairingLog("服务端返回错误：" + (body.error || "未提供错误信息"));
-        if (response.status === 404) {
-          appendPairingLog("服务端未加载 /api/auth/pairing/start 路由；请确认 Vite 代理目标已重启并使用当前版本。");
-        }
         if (response.status === 401) {
-          appendPairingLog("当前管理会话未被服务端接受，即将返回首页重新检查鉴权。");
           window.location.assign("/");
           return;
         }
@@ -283,16 +263,13 @@ export function PairingAdmin(): ReactElement {
         throw new Error("二维码响应不完整。");
       }
       const serverPairingUrl = new URL(body.pairingUrl);
-      appendPairingLog("服务端配对地址：" + describePairingUrl(serverPairingUrl.toString()));
       const currentPairingUrl = new URL("/", window.location.origin);
       currentPairingUrl.hash = serverPairingUrl.hash;
-      appendPairingLog("实际二维码地址：" + describePairingUrl(currentPairingUrl.toString()));
       setPairing({ pairingUrl: currentPairingUrl.toString(), expiresAt: body.expiresAt });
     } catch (requestError: unknown) {
       const message = requestError instanceof DOMException && requestError.name === "AbortError"
         ? "请求超过 10 秒没有返回。"
         : requestError instanceof Error ? requestError.message : String(requestError);
-      appendPairingLog("二维码生成请求失败：" + message);
       setPairingError(redactPairingSecrets(message));
     } finally {
       window.clearTimeout(timeoutId);
@@ -408,7 +385,6 @@ export function PairingAdmin(): ReactElement {
         <section className="device-list-panel">
           <div className="device-panel-heading">
             <div>
-              <p className="device-panel-kicker">PAIRED DEVICES</p>
               <h2>已配对设备</h2>
             </div>
             <div className="device-panel-heading-actions">
@@ -461,9 +437,7 @@ export function PairingAdmin(): ReactElement {
 
         <section className="device-side-panel">
           <div className="device-info-section">
-            <p className="device-panel-kicker">PAIRING</p>
             <h2>添加新设备</h2>
-            <p>在管理端生成一次性二维码，让新设备扫码即可完成配对。二维码只对当前已授权的管理页面开放。</p>
             <div className="device-pairing-actions">
               <button className="primary" type="button" disabled={pairingBusy} onClick={() => void generatePairingQr()}>
                 {pairingBusy ? "正在生成…" : pairing ? "重新生成二维码" : "生成二维码"}
@@ -473,34 +447,39 @@ export function PairingAdmin(): ReactElement {
             {pairing ? (
               <div className="device-qr-card">
                 <div className="device-qr-frame">
-                  {qrDataUrl ? <img src={qrDataUrl} alt="添加新设备二维码" /> : <span>二维码生成中…</span>}
+                  {qrDataUrl ? <img src={qrDataUrl} alt="设备配对二维码" /> : <span>二维码生成中…</span>}
                 </div>
                 <div className="device-qr-copy">
-                  <strong>请使用新设备扫码</strong>
-                  <span>5 分钟有效，扫码成功后立即失效。</span>
+                  <strong>扫码或打开链接配对</strong>
+                  <span>二维码和链接 5 分钟有效，配对成功后立即失效。</span>
+                  <div className="device-pairing-link">
+                    <p>没有扫码功能？在新设备的浏览器中打开此链接：</p>
+                    <div className="device-pairing-link-row">
+                      <a href={pairing.pairingUrl} target="_blank" rel="noreferrer">
+                        {pairing.pairingUrl}
+                      </a>
+                      <button
+                        className="secondary device-pairing-link-copy"
+                        type="button"
+                        onClick={() => void copyPairingLink()}
+                        aria-label={pairingLinkCopied ? "配对链接已复制" : "复制配对链接"}
+                        title={pairingLinkCopied ? "已复制" : "复制配对链接"}
+                      >
+                        {pairingLinkCopied ? (
+                          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6" /></svg>
+                        ) : (
+                          <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" /></svg>
+                        )}
+                      </button>
+                    </div>
+                    {pairingLinkCopyError ? <p className="device-pairing-link-error" role="status">{pairingLinkCopyError}</p> : null}
+                  </div>
                 </div>
               </div>
             ) : (
               <div className="device-qr-placeholder">点击“生成二维码”，在这里显示新设备的配对二维码。</div>
             )}
             {pairingError ? <p className="device-command-error" role="status">{pairingError}</p> : null}
-            {pairingLogs.length > 0 ? (
-              <details className="device-diagnostic-log" open>
-                <summary>二维码诊断日志（{pairingLogs.length}）</summary>
-                <div className="device-diagnostic-toolbar">
-                  <span>配对码已脱敏，不会出现在日志中。</span>
-                  <div>
-                    <button className="secondary" type="button" onClick={() => void copyPairingLogs()}>
-                      复制日志
-                    </button>
-                    <button className="secondary" type="button" onClick={() => setPairingLogs([])}>
-                      清空
-                    </button>
-                  </div>
-                </div>
-                <pre>{pairingLogs.join("\n")}</pre>
-              </details>
-            ) : null}
             <details className="device-cli-fallback">
               <summary>也可在 Mac 终端生成</summary>
               <p>终端命令会使用正式数据库，并自动检测局域网 IP 和服务端口。</p>
@@ -587,15 +566,6 @@ function formatDate(value: string | number): string {
 
 function redactPairingSecrets(value: string): string {
   return value.replace(/#pair=[^\s&"'}]+/gi, "#pair=<已隐藏>");
-}
-
-function describePairingUrl(value: string): string {
-  try {
-    const url = new URL(value);
-    return url.origin + url.pathname + "#pair=<已隐藏>";
-  } catch {
-    return redactPairingSecrets(value);
-  }
 }
 
 function PairingClaim({

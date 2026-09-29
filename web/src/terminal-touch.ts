@@ -12,7 +12,8 @@ function cellPosition(terminal: Terminal, element: HTMLElement, clientX: number,
 type BufferCell = { column: number; row: number };
 type BufferRange = { start: number; end: number };
 export type TerminalSelectionDisplay = { text: string; left: number; top: number };
-const LONG_PRESS_DELAY_MS = 3_000;
+const LONG_PRESS_DELAY_MS = 1_500;
+const LONG_PRESS_MOVE_CANCEL_PX = 20;
 const TOUCH_SCROLL_PIXELS_PER_LINE = 10;
 const TOUCH_INERTIA_FRICTION_MS = 280;
 const TOUCH_INERTIA_MIN_VELOCITY = 0.12;
@@ -321,6 +322,7 @@ export function bindMobileTerminalTouch(
   let touchVelocityPxPerMs = 0;
   let inertiaFrame = 0;
   let longPressTimer = 0;
+  let longPressStartedAt = 0;
   let longPressTriggered = false;
   let scrollTrace: ScrollTrace | null = null;
   let selectedRange: BufferRange | null = null;
@@ -505,6 +507,7 @@ export function bindMobileTerminalTouch(
     const startCell = cellPosition(terminal, host, startX, startY);
     const buffer = terminal.buffer.active;
     const startedAt = performance.now();
+    longPressStartedAt = startedAt;
     scrollTrace = {
       startedAt,
       startX,
@@ -522,25 +525,47 @@ export function bindMobileTerminalTouch(
       actualRows: 0,
       maxHandlerMs: 0,
     };
+    logScrollDiagnostic("long-press-start", {
+      delayMs: LONG_PRESS_DELAY_MS,
+      movementTolerancePx: LONG_PRESS_MOVE_CANCEL_PX,
+      target: scrollTrace.target,
+    });
     longPressTimer = window.setTimeout(() => {
+      const elapsedMs = Number((performance.now() - longPressStartedAt).toFixed(1));
       longPressTimer = 0;
       const range = longPressRange(terminal, host, startX, startY);
-      if (!range) return;
+      if (!range) {
+        logScrollDiagnostic("long-press-no-text", { elapsedMs, target: touchTargetName(event.target) });
+        return;
+      }
       longPressTriggered = true;
       selectBufferRange(terminal, range);
       updateSelectionControls(range);
+      logScrollDiagnostic("long-press-selected", { elapsedMs, selectedCells: range.end - range.start });
     }, LONG_PRESS_DELAY_MS);
   };
   const onTouchMove = (event: TouchEvent): void => {
     const touch = Array.from(event.touches).find((candidate) => candidate.identifier === activeTouchIdentifier);
     if (!touch || previousY === null) return;
     if (event.cancelable) event.preventDefault();
-    if (
-      !longPressTriggered
-      && touchStartX !== null
-      && touchStartY !== null
-      && Math.hypot(touch.clientX - touchStartX, touch.clientY - touchStartY) >= 10
-    ) clearLongPressTimer();
+    if (!longPressTriggered && touchStartX !== null && touchStartY !== null && longPressTimer) {
+      const movementDistancePx = Math.hypot(touch.clientX - touchStartX, touch.clientY - touchStartY);
+      if (movementDistancePx < LONG_PRESS_MOVE_CANCEL_PX) {
+        // Treat small finger drift as part of the hold, not as a scroll gesture.
+        previousY = touch.clientY;
+        lastTouchMoveY = touch.clientY;
+        lastTouchMoveAt = performance.now();
+        touchVelocityPxPerMs = 0;
+        if (scrollTrace) scrollTrace.lastMoveAt = lastTouchMoveAt;
+        return;
+      }
+      logScrollDiagnostic("long-press-cancelled-by-movement", {
+        elapsedMs: Number((performance.now() - longPressStartedAt).toFixed(1)),
+        movementDistancePx: Number(movementDistancePx.toFixed(1)),
+        movementTolerancePx: LONG_PRESS_MOVE_CANCEL_PX,
+      });
+      clearLongPressTimer();
+    }
 
     if (dragHandle && selectedRange) {
       const position = bufferCellPosition(terminal, host, touch.clientX, touch.clientY);
@@ -647,6 +672,13 @@ export function bindMobileTerminalTouch(
   const onTouchEnd = (event: TouchEvent): void => {
     const endedTouch = Array.from(event.changedTouches).find((touch) => touch.identifier === activeTouchIdentifier);
     if (!endedTouch) return;
+    if (longPressTimer) {
+      logScrollDiagnostic("long-press-ended-before-delay", {
+        elapsedMs: Number((performance.now() - longPressStartedAt).toFixed(1)),
+        delayMs: LONG_PRESS_DELAY_MS,
+        endType: event.type,
+      });
+    }
     clearLongPressTimer();
     const now = performance.now();
     const canFinishScroll = event.type === "touchend" && !longPressTriggered && !dragHandle && previousY !== null;

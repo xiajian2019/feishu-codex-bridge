@@ -1,9 +1,9 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { extname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
 
 import { StateDatabase } from "./db.js";
@@ -23,15 +23,19 @@ import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import {
   AAMP_TASK_STATUSES,
   PROJECT_STATUSES,
+  SHORTCUT_DISPLAY_MODES,
   SHORTCUT_GROUP_LAYOUTS,
   SHORTCUT_KINDS,
+  SHORTCUT_SURFACES,
   TASK_STATES,
   type AampTaskStatus,
   type DatabaseChange,
   type Logger,
   type ProjectStatus,
+  type ShortcutDisplayMode,
   type ShortcutGroupLayout,
   type ShortcutKind,
+  type ShortcutSurface,
   type StoredShortcut,
   type StoredShortcutGroup,
   type TaskState,
@@ -45,6 +49,22 @@ const MAX_TASK_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_STAGED_TASK_ATTACHMENTS = 100;
 const MAX_STAGED_TASK_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 const MAX_TASK_ATTACHMENTS = 10;
+const TASK_FILE_TEXT_EXTENSIONS = new Set([
+  "c", "cc", "conf", "cpp", "css", "csv", "go", "h", "hpp", "html", "ini", "java", "js", "json", "jsx",
+  "log", "lua", "md", "markdown", "mjs", "py", "rb", "rs", "sh", "sql", "svg", "toml", "ts", "tsx", "txt", "xml", "yaml", "yml",
+]);
+
+interface TaskFileContext {
+  rootPath: string;
+  absolutePath: string;
+  path: string;
+}
+
+class TaskFileRequestError extends Error {
+  public constructor(public readonly statusCode: number, message: string) {
+    super(message);
+  }
+}
 
 export interface DashboardServerOptions {
   db: StateDatabase;
@@ -312,6 +332,11 @@ export class DashboardServer {
         return;
       }
     }
+    const shortcutMoveMatch = /^\/api\/shortcuts\/([^/]+)\/move$/.exec(url.pathname);
+    if (request.method === "POST" && shortcutMoveMatch) {
+      await this.moveShortcutToEdge(decodeURIComponent(shortcutMoveMatch[1]!), request, response);
+      return;
+    }
     const shortcutUseMatch = /^\/api\/shortcuts\/([^/]+)\/use$/.exec(url.pathname);
     if (request.method === "POST" && shortcutUseMatch) {
       if (!this.requireActionAuthorization(request, response)) return;
@@ -387,6 +412,23 @@ export class DashboardServer {
         return;
       }
       await this.getCodexThreadAttachment(selectors[0]!, selectors[1]!, selectors[2]!, selectors[3]!, response);
+      return;
+    }
+    const codexThreadFilePreviewMatch = /^\/api\/codex\/threads\/([^/]+)\/([^/]+)\/files\/preview$/.exec(url.pathname);
+    if (request.method === "GET" && codexThreadFilePreviewMatch) {
+      let selectors: string[];
+      try {
+        selectors = codexThreadFilePreviewMatch.slice(1).map((value) => decodeURIComponent(value));
+      } catch {
+        sendJson(response, 400, { error: "invalid Codex file selector" });
+        return;
+      }
+      await this.getCodexThreadFilePreview(
+        selectors[0]!,
+        selectors[1]!,
+        url.searchParams.get("path") ?? "",
+        response,
+      );
       return;
     }
     const codexThreadMessagesMatch = /^\/api\/codex\/threads\/([^/]+)\/([^/]+)\/messages$/.exec(url.pathname);
@@ -493,6 +535,39 @@ export class DashboardServer {
         decodeURIComponent(taskAttachmentMatch[2]),
         response,
       );
+      return;
+    }
+    const taskFilesMatch = /^\/api\/tasks\/([^/]+)\/files$/.exec(url.pathname);
+    if (request.method === "GET" && taskFilesMatch) {
+      let taskGuid: string;
+      try {
+        taskGuid = decodeURIComponent(taskFilesMatch[1]!);
+      } catch {
+        sendJson(response, 400, { error: "invalid task selector" });
+        return;
+      }
+      await this.listTaskFiles(
+        taskGuid,
+        url.searchParams.get("path") ?? "",
+        response,
+      );
+      return;
+    }
+    const taskFileMatch = /^\/api\/tasks\/([^/]+)\/files\/(content|download)$/.exec(url.pathname);
+    if (request.method === "GET" && taskFileMatch) {
+      let taskGuid: string;
+      try {
+        taskGuid = decodeURIComponent(taskFileMatch[1]!);
+      } catch {
+        sendJson(response, 400, { error: "invalid task selector" });
+        return;
+      }
+      const path = url.searchParams.get("path") ?? "";
+      if (taskFileMatch[2] === "content") {
+        await this.previewTaskFile(taskGuid, path, response);
+      } else {
+        await this.downloadTaskFile(taskGuid, path, response);
+      }
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/aamp/tasks") {
@@ -657,6 +732,68 @@ export class DashboardServer {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       sendJson(response, message.startsWith("找不到 Codex home") ? 404 : 502, { error: message });
+    }
+  }
+
+  private async getCodexThreadFilePreview(
+    homeId: string,
+    threadId: string,
+    requestedPath: string,
+    response: ServerResponse,
+  ): Promise<void> {
+    const history = this.options.codexHistory;
+    if (!history) {
+      sendJson(response, 501, { error: "Codex history is not configured" });
+      return;
+    }
+
+    let workingDirectory: string | undefined;
+    try {
+      const detail = await history.readThread(homeId, threadId, false);
+      workingDirectory = detail.thread.cwd;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendJson(response, message.startsWith("找不到 Codex home") ? 404 : 502, { error: message });
+      return;
+    }
+    if (typeof workingDirectory !== "string" || !isAbsolute(workingDirectory)) {
+      sendJson(response, 404, { error: "Codex thread working directory is unavailable" });
+      return;
+    }
+
+    try {
+      const rootPath = await realpath(workingDirectory);
+      const relativePath = normalizeTaskRelativePath(requestedPath);
+      if (!relativePath) throw new TaskFileRequestError(400, "Select a file to preview.");
+      const candidatePath = resolve(rootPath, relativePath);
+      if (!isTaskPathInside(rootPath, candidatePath)) {
+        throw new TaskFileRequestError(400, "The requested path is outside the Codex thread directory.");
+      }
+      const absolutePath = await realpath(candidatePath);
+      if (!isTaskPathInside(rootPath, absolutePath)) {
+        throw new TaskFileRequestError(403, "The requested path is outside the Codex thread directory.");
+      }
+      const fileStat = await stat(absolutePath);
+      if (!fileStat.isFile()) throw new TaskFileRequestError(400, "Select a file to preview.");
+      const extension = extname(absolutePath).slice(1).toLowerCase();
+      const imageContentType = taskImageContentType(extension);
+      const isImage = imageContentType !== null;
+      if (!isImage && !TASK_FILE_TEXT_EXTENSIONS.has(extension)) {
+        throw new TaskFileRequestError(415, "This file type does not support preview.");
+      }
+      const sizeLimit = isImage ? 20 * 1024 * 1024 : 2 * 1024 * 1024;
+      if (fileStat.size > sizeLimit) {
+        throw new TaskFileRequestError(413, isImage ? "Images larger than 20 MiB cannot be previewed here." : "Text files larger than 2 MiB cannot be previewed here.");
+      }
+      const contents = await readFile(absolutePath);
+      setSecurityHeaders(response);
+      response.statusCode = 200;
+      response.setHeader("Content-Type", imageContentType ?? "text/plain; charset=utf-8");
+      response.setHeader("Content-Length", String(contents.length));
+      response.setHeader("Content-Disposition", attachmentDisposition(basename(absolutePath), true));
+      response.end(contents);
+    } catch (error) {
+      sendTaskFileError(response, error);
     }
   }
 
@@ -1054,6 +1191,109 @@ export class DashboardServer {
     stream.pipe(response);
   }
 
+  private async getTaskFileContext(taskGuid: string, requestedPath: string): Promise<TaskFileContext> {
+    const task = this.options.db.getTask(taskGuid);
+    if (!task) throw new TaskFileRequestError(404, "task not found");
+    if (!this.options.db.getProject(task.project_key) || !task.repo || !isAbsolute(task.repo)) {
+      throw new TaskFileRequestError(404, "task working directory is unavailable");
+    }
+
+    const rootPath = await realpath(task.repo).catch(() => {
+      throw new TaskFileRequestError(404, "task working directory is unavailable");
+    });
+    const relativePath = normalizeTaskRelativePath(requestedPath);
+    const candidatePath = resolve(rootPath, relativePath);
+    if (!isTaskPathInside(rootPath, candidatePath)) {
+      throw new TaskFileRequestError(400, "The requested path is outside the task directory.");
+    }
+    const absolutePath = await realpath(candidatePath);
+    if (!isTaskPathInside(rootPath, absolutePath)) {
+      throw new TaskFileRequestError(403, "The requested path is outside the task directory.");
+    }
+    return {
+      rootPath,
+      absolutePath,
+      path: relative(rootPath, absolutePath).split(sep).join("/"),
+    };
+  }
+
+  private async listTaskFiles(taskGuid: string, requestedPath: string, response: ServerResponse): Promise<void> {
+    try {
+      const context = await this.getTaskFileContext(taskGuid, requestedPath);
+      if (!(await stat(context.absolutePath)).isDirectory()) {
+        throw new TaskFileRequestError(400, "The selected path is not a directory.");
+      }
+      const names = await readdir(context.absolutePath);
+      const entries: Array<{ name: string; type: "directory" | "file"; size: number; modifiedAt: number }> = [];
+      for (const name of names.slice(0, 2_000)) {
+        const entryStat = await lstat(join(context.absolutePath, name)).catch(() => null);
+        if (!entryStat || entryStat.isSymbolicLink()) continue;
+        if (entryStat.isDirectory()) {
+          entries.push({ name, type: "directory", size: 0, modifiedAt: entryStat.mtimeMs });
+        } else if (entryStat.isFile()) {
+          entries.push({ name, type: "file", size: entryStat.size, modifiedAt: entryStat.mtimeMs });
+        }
+      }
+      entries.sort((left, right) => Number(right.type === "directory") - Number(left.type === "directory")
+        || left.name.localeCompare(right.name));
+      sendJson(response, 200, {
+        root: context.rootPath,
+        path: context.path,
+        entries,
+      });
+    } catch (error) {
+      sendTaskFileError(response, error);
+    }
+  }
+
+  private async previewTaskFile(taskGuid: string, requestedPath: string, response: ServerResponse): Promise<void> {
+    try {
+      const context = await this.getTaskFileContext(taskGuid, requestedPath);
+      const fileStat = await stat(context.absolutePath);
+      if (!fileStat.isFile()) throw new TaskFileRequestError(400, "Select a file to preview.");
+      const extension = extname(context.absolutePath).slice(1).toLowerCase();
+      const imageContentType = taskImageContentType(extension);
+      const isImage = imageContentType !== null;
+      if (!isImage && !TASK_FILE_TEXT_EXTENSIONS.has(extension)) {
+        throw new TaskFileRequestError(415, "This file type does not support preview.");
+      }
+      const sizeLimit = isImage ? 20 * 1024 * 1024 : 2 * 1024 * 1024;
+      if (fileStat.size > sizeLimit) {
+        throw new TaskFileRequestError(413, isImage ? "Images larger than 20 MiB must be downloaded." : "Text files larger than 2 MiB must be downloaded.");
+      }
+      const contents = await readFile(context.absolutePath);
+      setSecurityHeaders(response);
+      response.statusCode = 200;
+      response.setHeader("Content-Type", imageContentType ?? "text/plain; charset=utf-8");
+      response.setHeader("Content-Length", String(contents.length));
+      response.setHeader("Content-Disposition", attachmentDisposition(basename(context.absolutePath), true));
+      response.end(contents);
+    } catch (error) {
+      sendTaskFileError(response, error);
+    }
+  }
+
+  private async downloadTaskFile(taskGuid: string, requestedPath: string, response: ServerResponse): Promise<void> {
+    try {
+      const context = await this.getTaskFileContext(taskGuid, requestedPath);
+      const fileStat = await stat(context.absolutePath);
+      if (!fileStat.isFile()) throw new TaskFileRequestError(400, "Select a file to download.");
+      setSecurityHeaders(response);
+      response.statusCode = 200;
+      response.setHeader("Content-Type", "application/octet-stream");
+      response.setHeader("Content-Length", String(fileStat.size));
+      response.setHeader("Content-Disposition", attachmentDisposition(basename(context.absolutePath), false));
+      const stream = createReadStream(context.absolutePath);
+      stream.on("error", () => {
+        if (!response.headersSent) sendJson(response, 404, { error: "File is no longer available." });
+        else response.destroy();
+      });
+      stream.pipe(response);
+    } catch (error) {
+      sendTaskFileError(response, error);
+    }
+  }
+
   private async cleanupExpiredStagedAttachments(): Promise<void> {
     const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const expired = this.options.db.deleteExpiredStagedWebTaskAttachments(cutoff);
@@ -1131,6 +1371,7 @@ export class DashboardServer {
         title: requiredText(body.title, "title"),
         icon: optionalText(body.icon),
         description: optionalText(body.description),
+        surface: optionalShortcutSurface(body.surface),
         layout: optionalShortcutGroupLayout(body.layout),
         sortOrder: optionalInteger(body.sortOrder),
         enabled: optionalBoolean(body.enabled),
@@ -1153,6 +1394,7 @@ export class DashboardServer {
         ...(body.title !== undefined ? { title: requiredText(body.title, "title") } : {}),
         ...(body.icon !== undefined ? { icon: requiredText(body.icon, "icon") } : {}),
         ...(body.description !== undefined ? { description: optionalText(body.description) ?? "" } : {}),
+        ...(body.surface !== undefined ? { surface: requiredShortcutSurface(body.surface) } : {}),
         ...(body.layout !== undefined ? { layout: requiredShortcutGroupLayout(body.layout) } : {}),
         ...(body.sortOrder !== undefined ? { sortOrder: requiredInteger(body.sortOrder, "sortOrder") } : {}),
         ...(body.enabled !== undefined ? { enabled: requiredBoolean(body.enabled, "enabled") } : {}),
@@ -1171,12 +1413,15 @@ export class DashboardServer {
     if (!this.requireActionAuthorization(request, response)) return;
     try {
       const body = await readJsonBody(request);
+      const actionKey = optionalText(body.actionKey);
       const shortcut = this.options.db.createShortcut({
         groupId: requiredText(body.groupId, "groupId"),
         title: requiredText(body.title, "title"),
         detail: optionalText(body.detail),
         kind: requiredShortcutKind(body.kind),
-        value: requiredText(body.value, "value"),
+        value: actionKey ? optionalText(body.value) ?? "" : requiredText(body.value, "value"),
+        actionKey,
+        displayMode: optionalShortcutDisplayMode(body.displayMode),
         enabled: optionalBoolean(body.enabled),
         dangerous: optionalBoolean(body.dangerous),
       });
@@ -1194,12 +1439,15 @@ export class DashboardServer {
     if (!this.requireActionAuthorization(request, response)) return;
     try {
       const body = await readJsonBody(request);
+      const actionKey = body.actionKey !== undefined ? optionalText(body.actionKey) : undefined;
       const shortcut = this.options.db.updateShortcut(shortcutId, {
         ...(body.groupId !== undefined ? { groupId: requiredText(body.groupId, "groupId") } : {}),
         ...(body.title !== undefined ? { title: requiredText(body.title, "title") } : {}),
         ...(body.detail !== undefined ? { detail: optionalText(body.detail) ?? "" } : {}),
         ...(body.kind !== undefined ? { kind: requiredShortcutKind(body.kind) } : {}),
-        ...(body.value !== undefined ? { value: requiredText(body.value, "value") } : {}),
+        ...(body.value !== undefined ? { value: typeof body.value === "string" ? body.value : requiredText(body.value, "value") } : {}),
+        ...(body.actionKey !== undefined ? { actionKey: actionKey ?? null } : {}),
+        ...(body.displayMode !== undefined ? { displayMode: requiredShortcutDisplayMode(body.displayMode) } : {}),
         ...(body.enabled !== undefined ? { enabled: requiredBoolean(body.enabled, "enabled") } : {}),
         ...(body.dangerous !== undefined ? { dangerous: requiredBoolean(body.dangerous, "dangerous") } : {}),
         ...(body.sortOrder !== undefined ? { sortOrder: requiredInteger(body.sortOrder, "sortOrder") } : {}),
@@ -1211,6 +1459,28 @@ export class DashboardServer {
       sendJson(response, 200, { shortcut: publicShortcut(shortcut) });
     } catch (error) {
       sendJson(response, 422, { error: error instanceof Error ? error.message : "shortcut update failed" });
+    }
+  }
+
+  private async moveShortcutToEdge(
+    shortcutId: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    try {
+      const body = await readJsonBody(request);
+      const shortcut = this.options.db.moveShortcutToEdge(
+        shortcutId,
+        requiredShortcutMovePosition(body.position),
+      );
+      if (!shortcut) {
+        sendJson(response, 404, { error: "shortcut not found" });
+        return;
+      }
+      sendJson(response, 200, { shortcut: publicShortcut(shortcut) });
+    } catch (error) {
+      sendJson(response, 422, { error: error instanceof Error ? error.message : "shortcut move failed" });
     }
   }
 
@@ -1638,6 +1908,7 @@ function publicShortcutGroup(group: StoredShortcutGroup): Record<string, unknown
     title: group.title,
     icon: group.icon,
     description: group.description,
+    surface: group.surface,
     layout: group.layout,
     sortOrder: group.sort_order,
     enabled: group.enabled,
@@ -1658,6 +1929,8 @@ function publicShortcut(shortcut: StoredShortcut): Record<string, unknown> {
     enabled: shortcut.enabled,
     builtIn: shortcut.built_in,
     dangerous: shortcut.dangerous,
+    actionKey: shortcut.action_key,
+    displayMode: shortcut.display_mode,
     sortOrder: shortcut.sort_order,
     operationCount: shortcut.operation_count,
     createdAt: shortcut.created_at,
@@ -1699,6 +1972,33 @@ function requiredShortcutKind(value: unknown): ShortcutKind {
     throw new Error("kind is invalid");
   }
   return value as ShortcutKind;
+}
+
+function optionalShortcutSurface(value: unknown): ShortcutSurface | undefined {
+  return value === undefined ? undefined : requiredShortcutSurface(value);
+}
+
+function requiredShortcutSurface(value: unknown): ShortcutSurface {
+  if (typeof value !== "string" || !SHORTCUT_SURFACES.includes(value as ShortcutSurface)) {
+    throw new Error("surface is invalid");
+  }
+  return value as ShortcutSurface;
+}
+
+function optionalShortcutDisplayMode(value: unknown): ShortcutDisplayMode | undefined {
+  return value === undefined ? undefined : requiredShortcutDisplayMode(value);
+}
+
+function requiredShortcutDisplayMode(value: unknown): ShortcutDisplayMode {
+  if (typeof value !== "string" || !SHORTCUT_DISPLAY_MODES.includes(value as ShortcutDisplayMode)) {
+    throw new Error("displayMode is invalid");
+  }
+  return value as ShortcutDisplayMode;
+}
+
+function requiredShortcutMovePosition(value: unknown): "start" | "end" {
+  if (value !== "start" && value !== "end") throw new Error("position must be start or end");
+  return value;
 }
 
 function optionalShortcutGroupLayout(value: unknown): ShortcutGroupLayout | undefined {
@@ -1804,6 +2104,62 @@ function firstHeaderValue(value: string | string[] | undefined): string | undefi
   return normalized || undefined;
 }
 
+function normalizeTaskRelativePath(value: string): string {
+  const normalized = value.replaceAll(String.fromCharCode(92), "/");
+  if (
+    Buffer.byteLength(normalized, "utf8") > 4_096
+    || normalized.startsWith("/")
+    || /^[A-Za-z]:/.test(normalized)
+    || normalized.includes(String.fromCharCode(0))
+  ) {
+    throw new TaskFileRequestError(400, "Use a path inside the task directory.");
+  }
+  const parts = normalized.split("/");
+  if (parts.some((part) => part === "..")) {
+    throw new TaskFileRequestError(400, "Parent directory traversal is not allowed.");
+  }
+  return parts.filter((part) => part && part !== ".").join(sep);
+}
+
+function isTaskPathInside(rootPath: string, candidatePath: string): boolean {
+  const relativePath = relative(rootPath, candidatePath);
+  return relativePath === ""
+    || (relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath));
+}
+
+function taskImageContentType(extension: string): string | null {
+  switch (extension) {
+    case "apng": return "image/apng";
+    case "avif": return "image/avif";
+    case "bmp": return "image/bmp";
+    case "gif": return "image/gif";
+    case "jpeg":
+    case "jpg": return "image/jpeg";
+    case "png": return "image/png";
+    case "webp": return "image/webp";
+    default: return null;
+  }
+}
+
+function sendTaskFileError(response: ServerResponse, error: unknown): void {
+  if (error instanceof TaskFileRequestError) {
+    sendJson(response, error.statusCode, { error: error.message });
+    return;
+  }
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : "";
+  if (code === "ENOENT" || code === "ENOTDIR") {
+    sendJson(response, 404, { error: "File or directory not found." });
+    return;
+  }
+  if (code === "EACCES" || code === "EPERM") {
+    sendJson(response, 403, { error: "Permission denied for this file or directory." });
+    return;
+  }
+  sendJson(response, 500, { error: "Could not read project files." });
+}
+
 function attachmentFileExtension(fileName: string, mimeType: string): string {
   const knownExtensions: Record<string, string> = {
     "image/avif": ".avif",
@@ -1856,7 +2212,7 @@ function setSecurityHeaders(response: ServerResponse): void {
   response.setHeader("X-Frame-Options", "DENY");
   response.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'",
+    "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'",
   );
 }
 

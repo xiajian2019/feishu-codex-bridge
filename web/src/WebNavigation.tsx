@@ -43,6 +43,9 @@ export function WebNavigation(): ReactElement {
   useEffect(() => {
     if (systemActive) setSystemOpen(true);
   }, [systemActive]);
+  useEffect(() => {
+    if (!systemActive) setSystemOpen(false);
+  }, [location.pathname, systemActive]);
   return (
     <div className={`system-navigation-shell${collapsed ? " is-collapsed" : ""}`}>
       <nav className="web-navigation" aria-label="系统页面">
@@ -57,7 +60,7 @@ export function WebNavigation(): ReactElement {
         ><span aria-hidden="true">☰</span></button>
         <div id="web-navigation-menu" className="web-navigation-menu" hidden={collapsed}>
           {PAGES.map((page) => (
-            <NavLink key={page.to} to={page.to} end={page.end}>
+            <NavLink key={page.to} to={page.to} end={page.end} onClick={() => setSystemOpen(false)}>
               {page.label}
             </NavLink>
           ))}
