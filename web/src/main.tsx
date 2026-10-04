@@ -1,6 +1,6 @@
 import { lazy, StrictMode, Suspense } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter, Navigate, Route, Routes } from "react-router";
+import { BrowserRouter, Navigate, Route, Routes, useLocation } from "react-router";
 
 import { App } from "./App.js";
 import { SystemNavigationProvider, WebNavigation } from "./WebNavigation.js";
@@ -10,8 +10,24 @@ import "./styles.css";
 
 const TmuxDashboard = lazy(() => import("./TmuxDashboard.js").then((module) => ({ default: module.TmuxDashboard })));
 const TmuxSessionFiles = lazy(() => import("./TmuxSessionFiles.js").then((module) => ({ default: module.TmuxSessionFiles })));
+const TmuxSessionHistory = lazy(() => import("./TmuxSessionHistory.js").then((module) => ({ default: module.TmuxSessionHistory })));
 const CodexHistory = lazy(() => import("./CodexHistory.js").then((module) => ({ default: module.CodexHistory })));
 const ShortcutManagement = lazy(() => import("./ShortcutManagement.js").then((module) => ({ default: module.ShortcutManagement })));
+const CodexUsage = lazy(() => import("./CodexUsage.js").then((module) => ({ default: module.CodexUsage })));
+const ProjectManagement = lazy(() => import("./ProjectManagement.js").then((module) => ({ default: module.ProjectManagement })));
+const TaskDetailPage = lazy(() => import("./TaskDetailPage.js").then((module) => ({ default: module.TaskDetailPage })));
+
+function LegacyDirectTasksRedirect() {
+  const location = useLocation();
+  const oldParams = new URLSearchParams(location.search);
+  const params = new URLSearchParams({ source: "direct" });
+  if (oldParams.get("q")) params.set("q", oldParams.get("q")!);
+  if (oldParams.get("status")) params.set("state", oldParams.get("status")!);
+  if (oldParams.get("offset")) params.set("offset", oldParams.get("offset")!);
+  const taskId = oldParams.get("task");
+  if (taskId) return <Navigate to={`/tasks/direct/${encodeURIComponent(taskId)}`} state={{ returnTo: `/?${params.toString()}` }} replace />;
+  return <Navigate to={`/?${params.toString()}`} replace />;
+}
 
 function disableBrowserPullToRefresh(): void {
   let startY: number | null = null;
@@ -153,13 +169,18 @@ async function mountApp(): Promise<void> {
               <Suspense fallback={<div className="route-loading">页面加载中…</div>}>
                 <Routes>
                   <Route path="/" element={<App />} />
+                  <Route path="/tasks/:source/:taskId" element={<TaskDetailPage />} />
+                  <Route path="/direct-tasks" element={<LegacyDirectTasksRedirect />} />
                   <Route path="/codex-history" element={<CodexHistory />} />
                   <Route path="/codex-history/:homeId/:threadId" element={<CodexHistory />} />
+                  <Route path="/tmux-dashboard/history" element={<TmuxSessionHistory />} />
                   <Route path="/tmux-dashboard/files/:sessionId" element={<TmuxSessionFiles />} />
                   <Route path="/tmux-dashboard/*" element={<TmuxDashboard />} />
                   <Route path="/system-management" element={<Navigate to="/system-management/devices" replace />} />
                   <Route path="/system-management/devices" element={<PairingAdmin />} />
+                  <Route path="/system-management/projects" element={<ProjectManagement />} />
                   <Route path="/system-management/shortcuts" element={<ShortcutManagement />} />
+                  <Route path="/system-management/usage" element={<CodexUsage />} />
                   <Route path="/pair-admin" element={<Navigate to="/system-management/devices" replace />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>

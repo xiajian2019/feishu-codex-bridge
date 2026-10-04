@@ -167,9 +167,13 @@ export function TmuxDashboard(): ReactElement {
   const [createBusy, setCreateBusy] = useState(false);
   const [newName, setNewName] = useState("");
   const [newProjectName, setNewProjectName] = useState("");
+  const [projectPickerOpen, setProjectPickerOpen] = useState(false);
+  const [projectQuery, setProjectQuery] = useState("");
+  const [projectActiveIndex, setProjectActiveIndex] = useState(0);
   const [sendingMessage, setSendingMessage] = useState(false);
   const [terminalSelection, setTerminalSelection] = useState<TerminalSelectionDisplay | null>(null);
   const terminalHostRef = useRef<HTMLDivElement | null>(null);
+  const projectPickerRef = useRef<HTMLDivElement | null>(null);
   const terminalInstanceRef = useRef<Terminal | null>(null);
   const terminalSocketRef = useRef<WebSocket | null>(null);
   const terminalReconnectRef = useRef<(() => void) | null>(null);
@@ -287,6 +291,23 @@ export function TmuxDashboard(): ReactElement {
   }, []);
 
   useEffect(() => {
+    if (!projectPickerOpen) return;
+    const closeProjectPicker = (event: PointerEvent): void => {
+      if (!(event.target instanceof Node) || projectPickerRef.current?.contains(event.target)) return;
+      setProjectPickerOpen(false);
+      setProjectQuery("");
+      setProjectActiveIndex(-1);
+    };
+    document.addEventListener("pointerdown", closeProjectPicker);
+    return () => document.removeEventListener("pointerdown", closeProjectPicker);
+  }, [projectPickerOpen]);
+
+  useEffect(() => {
+    if (!projectPickerOpen || projectActiveIndex < 0) return;
+    document.getElementById(`dashboard-project-option-${projectActiveIndex}`)?.scrollIntoView({ block: "nearest" });
+  }, [projectActiveIndex, projectPickerOpen]);
+
+  useEffect(() => {
     if (mobileView === "terminal") return;
     void loadSessions();
     const timer = window.setInterval(() => void loadSessions(), SESSION_REFRESH_INTERVAL_MS);
@@ -299,6 +320,13 @@ export function TmuxDashboard(): ReactElement {
       ? sessions.filter((session) => `${session.name} ${session.cwd}`.toLowerCase().includes(query))
       : sessions;
   }, [search, sessions]);
+  const filteredProjects = useMemo(() => {
+    const query = projectQuery.trim().toLowerCase();
+    return query
+      ? projects.filter((project) => `${project.name} ${project.root}`.toLowerCase().includes(query))
+      : projects;
+  }, [projectQuery, projects]);
+  const selectedProject = projects.find((project) => project.name === newProjectName) ?? null;
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? null;
   const selectSession = (sessionId: string): void => {
     setSelectedId(sessionId);
@@ -494,7 +522,7 @@ export function TmuxDashboard(): ReactElement {
 
     const resolvePendingSubmissions = (): void => {
       for (const resolve of submissionWaitersRef.current.values()) {
-        resolve({ ok: false, message: "The terminal connection closed before delivery was confirmed." });
+        resolve({ ok: false, message: "终端连接已断开，消息可能已经送达；请先检查 Session，再决定是否重发。" });
       }
       submissionWaitersRef.current.clear();
     };
@@ -716,7 +744,7 @@ export function TmuxDashboard(): ReactElement {
         const timeout = window.setTimeout(() => {
           if (!submissionWaitersRef.current.has(requestId)) return;
           submissionWaitersRef.current.delete(requestId);
-          resolve({ ok: false, message: "The session did not confirm message delivery." });
+          resolve({ ok: false, message: "等待确认超时，消息可能已经送达；请先检查 Session，避免重复发送。" });
         }, 10_000);
         submissionWaitersRef.current.set(requestId, (response) => {
           window.clearTimeout(timeout);
@@ -866,7 +894,23 @@ export function TmuxDashboard(): ReactElement {
   const openCreateDialog = (): void => {
     setNewName(createSessionName());
     setNewProjectName(projects[0]?.name || "");
+    setProjectQuery("");
+    setProjectPickerOpen(false);
+    setProjectActiveIndex(0);
     setCreateOpen(true);
+  };
+
+  const openProjectPicker = (): void => {
+    setProjectQuery("");
+    setProjectActiveIndex(Math.max(0, projects.findIndex((project) => project.name === newProjectName)));
+    setProjectPickerOpen(true);
+  };
+
+  const selectProject = (project: ProjectOption): void => {
+    setNewProjectName(project.name);
+    setProjectQuery("");
+    setProjectPickerOpen(false);
+    setProjectActiveIndex(-1);
   };
 
   const createSession = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
@@ -895,19 +939,20 @@ export function TmuxDashboard(): ReactElement {
     }
   };
 
-  const endSession = async (): Promise<void> => {
-    if (!selectedSession || !window.confirm(`End “${selectedSession.name}” and close all attached clients?`)) return;
+  const endSession = async (session: TmuxSession | null = selectedSession): Promise<void> => {
+    if (!session || !window.confirm(`确认终结 Session「${session.name}」？这会关闭所有已连接的客户端。`)) return;
     try {
-      await requestApi<void>(`/sessions/${encodeURIComponent(selectedSession.id)}`, { method: "DELETE" });
-      setSelectedId(null);
-      if (window.matchMedia("(max-width: 760px)").matches) {
+      await requestApi<void>(`/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
+      const wasSelected = selectedId === session.id;
+      if (wasSelected) setSelectedId(null);
+      if (wasSelected && window.matchMedia("(max-width: 760px)").matches) {
         setMobileView("sessions");
-      } else {
-        await loadSessions();
+        setNavigationCollapsed(false);
       }
-      setToast({ message: `Session “${selectedSession.name}” ended.`, isError: false });
+      await loadSessions();
+      setToast({ message: `Session「${session.name}」已终结。`, isError: false });
     } catch (endError) {
-      setToast({ message: endError instanceof Error ? endError.message : "Could not end session.", isError: true });
+      setToast({ message: endError instanceof Error ? endError.message : "无法终结 Session。", isError: true });
     }
   };
 
@@ -930,6 +975,13 @@ export function TmuxDashboard(): ReactElement {
             <div className="dashboard-session-tools">
               <span className={`dashboard-backend dashboard-backend-${backendStatus}`}>{backendStatus.toUpperCase()}</span>
               <button className="dashboard-action" type="button" onClick={() => void loadSessions()}>Refresh</button>
+              <button
+                className="dashboard-action dashboard-history-top"
+                type="button"
+                onClick={() => navigate("/tmux-dashboard/history")}
+                aria-label="查看 Session 操作历史"
+                title="查看 Session 操作历史"
+              >历史</button>
               {import.meta.env.DEV ? (
                 <button
                   className="dashboard-action dashboard-copy-api"
@@ -943,7 +995,12 @@ export function TmuxDashboard(): ReactElement {
             </div>
           </div>
           <label className="dashboard-filter">
-            <span aria-hidden="true">⌕</span>
+            <span className="dashboard-filter-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false">
+                <circle cx="10.75" cy="10.75" r="6.25" />
+                <path d="m15.5 15.5 4.25 4.25" />
+              </svg>
+            </span>
             <input
               type="search"
               aria-label="筛选 session"
@@ -956,11 +1013,20 @@ export function TmuxDashboard(): ReactElement {
             {sessions.length === 0 && backendStatus === "online" ? <p className="dashboard-empty-list">No local tmux sessions.</p> : null}
             {sessions.length > 0 && filteredSessions.length === 0 ? <p className="dashboard-empty-list">No matching sessions.</p> : null}
             {filteredSessions.map((session) => (
-              <button key={session.id} className={`dashboard-session-card${selectedId === session.id ? " is-selected" : ""}`} type="button" onClick={() => selectSession(session.id)} aria-current={selectedId === session.id ? "true" : undefined}>
-                <span className="dashboard-session-top"><strong>{session.name}</strong><span className={session.attachedClients > 0 ? "is-active" : ""} title={session.attachedClients > 0 ? "Attached" : "Detached"} /></span>
-                <span className="dashboard-session-path" title={session.cwd}>{session.cwd}</span>
-                <span className="dashboard-session-meta">{session.windows} {session.windows === 1 ? "window" : "windows"}<span>{session.attachedClients > 0 ? `${session.attachedClients} attached` : "detached"}</span></span>
-              </button>
+              <div key={session.id} className={`dashboard-session-entry${selectedId === session.id ? " is-selected" : ""}`}>
+                <button className="dashboard-session-card" type="button" onClick={() => selectSession(session.id)} aria-current={selectedId === session.id ? "true" : undefined}>
+                  <span className="dashboard-session-top"><strong>{session.name}</strong><span className={session.attachedClients > 0 ? "is-active" : ""} title={session.attachedClients > 0 ? "Attached" : "Detached"} /></span>
+                  <span className="dashboard-session-path" title={session.cwd}>{session.cwd}</span>
+                  <span className="dashboard-session-meta">{session.windows} {session.windows === 1 ? "window" : "windows"}<span>{session.attachedClients > 0 ? `${session.attachedClients} attached` : "detached"}</span></span>
+                </button>
+                <div className="dashboard-session-actions" aria-label={`${session.name} 操作`}>
+                  <button type="button" onClick={() => selectSession(session.id)}>详情</button>
+                  <span className="dashboard-session-action-divider" aria-hidden="true" />
+                  <button type="button" onClick={() => navigate(`/tmux-dashboard/history?session=${encodeURIComponent(session.id)}`)}>历史</button>
+                  <span className="dashboard-session-action-divider" aria-hidden="true" />
+                  <button className="dashboard-session-end" type="button" onClick={() => void endSession(session)}>终结</button>
+                </div>
+              </div>
             ))}
           </div>
           <div className="dashboard-sidebar-footer"><span />Connected to your local tmux</div>
@@ -969,7 +1035,7 @@ export function TmuxDashboard(): ReactElement {
           <div className="dashboard-workspace-toolbar">
             <button className="dashboard-mobile-back" type="button" onClick={showSessionsOnMobile} aria-label="Back to sessions">‹</button>
             <div className="dashboard-active-session"><span className="dashboard-terminal-glyph">⌘</span><div><strong>{selectedSession?.name ?? "No session selected"}</strong><span title={selectedSession?.cwd}>{selectedSession?.cwd ?? "Choose a session to open its terminal"}</span></div></div>
-            <div className="dashboard-terminal-actions"><span className={terminalStatus === "ATTACHED" ? "is-connected" : ""}>{selectedSession ? terminalStatus : "IDLE"}</span><button type="button" onClick={() => void refreshSelectedSession()} disabled={!selectedSession}>Refresh session</button><button type="button" onClick={() => void endSession()} disabled={!selectedSession}>End session</button></div>
+            <div className="dashboard-terminal-actions"><span className={terminalStatus === "ATTACHED" ? "is-connected" : ""}>{selectedSession ? terminalStatus : "IDLE"}</span><button type="button" onClick={() => void refreshSelectedSession()} disabled={!selectedSession}>Refresh session</button><button className="dashboard-session-end" type="button" onClick={() => void endSession()} disabled={!selectedSession}>终结</button></div>
           </div>
           {showConnectionBanner ? (
             <div className={`dashboard-connection-banner is-${terminalStatus.toLowerCase()}`} role="alert">
@@ -1018,7 +1084,90 @@ export function TmuxDashboard(): ReactElement {
           <form className="dashboard-modal" onSubmit={(event) => void createSession(event)}>
             <div className="dashboard-modal-heading"><div><p className="dashboard-eyebrow">NEW WORKSPACE</p><h2>Create a tmux session</h2></div><button type="button" onClick={() => setCreateOpen(false)} aria-label="Close">×</button></div>
             <label className="dashboard-modal-field">Session name<input value={newName} onChange={(event) => setNewName(event.target.value)} required maxLength={64} pattern="[A-Za-z0-9][A-Za-z0-9_.-]*" autoComplete="off" /></label>
-            <label className="dashboard-modal-field">Working directory<select value={newProjectName} onChange={(event) => setNewProjectName(event.target.value)} required>{projects.map((item) => <option key={item.name} value={item.name}>{item.name} — {item.root}</option>)}</select></label>
+            <div className="dashboard-modal-field">
+              <label htmlFor="dashboard-project-search">Working directory</label>
+              <div className="dashboard-project-picker" ref={projectPickerRef}>
+                <input
+                  id="dashboard-project-search"
+                  type="text"
+                  role="combobox"
+                  aria-label="Working directory"
+                  aria-autocomplete="list"
+                  aria-haspopup="listbox"
+                  aria-required="true"
+                  aria-expanded={projectPickerOpen}
+                  aria-controls="dashboard-project-options"
+                  aria-activedescendant={projectPickerOpen && filteredProjects[projectActiveIndex] ? `dashboard-project-option-${projectActiveIndex}` : undefined}
+                  autoComplete="off"
+                  placeholder="Type to filter projects…"
+                  value={projectPickerOpen ? projectQuery : selectedProject?.name ?? ""}
+                  onFocus={openProjectPicker}
+                  onChange={(event) => {
+                    setProjectQuery(event.currentTarget.value);
+                    setProjectActiveIndex(0);
+                    if (event.currentTarget.value) setNewProjectName("");
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                      event.preventDefault();
+                      if (!projectPickerOpen) {
+                        openProjectPicker();
+                        return;
+                      }
+                      if (filteredProjects.length === 0) return;
+                      setProjectActiveIndex((current) => Math.max(0, Math.min(filteredProjects.length - 1, current + (event.key === "ArrowDown" ? 1 : -1))));
+                    } else if (event.key === "Enter" && projectPickerOpen) {
+                      event.preventDefault();
+                      const activeProject = filteredProjects[projectActiveIndex];
+                      if (activeProject) selectProject(activeProject);
+                    } else if (event.key === "Escape" && projectPickerOpen) {
+                      event.preventDefault();
+                      setProjectPickerOpen(false);
+                      setProjectQuery("");
+                      setProjectActiveIndex(-1);
+                    }
+                  }}
+                />
+                <button
+                  className="dashboard-project-picker-toggle"
+                  type="button"
+                  aria-label={projectPickerOpen ? "Close project options" : "Show project options"}
+                  aria-expanded={projectPickerOpen}
+                  onClick={() => {
+                    if (projectPickerOpen) {
+                      setProjectPickerOpen(false);
+                      setProjectQuery("");
+                      setProjectActiveIndex(-1);
+                    } else {
+                      openProjectPicker();
+                    }
+                  }}
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+                </button>
+                {projectPickerOpen ? (
+                  <div className="dashboard-project-option-list" id="dashboard-project-options" role="listbox" aria-label="Working directory options">
+                    {filteredProjects.length === 0 ? (
+                      <div className="dashboard-project-option-empty" role="option" aria-selected="false" aria-disabled="true">No matching projects.</div>
+                    ) : filteredProjects.map((project, index) => (
+                      <button
+                        className={`dashboard-project-option${newProjectName === project.name ? " is-selected" : ""}${projectActiveIndex === index ? " is-active" : ""}`}
+                        id={`dashboard-project-option-${index}`}
+                        key={project.name}
+                        type="button"
+                        role="option"
+                        tabIndex={-1}
+                        aria-selected={newProjectName === project.name}
+                        onClick={() => selectProject(project)}
+                      >
+                        <span className="dashboard-project-option-copy"><strong>{project.name}</strong><small>{project.root}</small></span>
+                        <span className="dashboard-project-option-check" aria-hidden="true">{newProjectName === project.name ? "✓" : ""}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            </div>
             <div className="dashboard-modal-actions"><button className="dashboard-action" type="button" onClick={() => setCreateOpen(false)}>Cancel</button><button className="dashboard-submit" type="submit" disabled={createBusy || !newProjectName}>{createBusy ? "Creating…" : "Create session"}</button></div>
           </form>
         </div>

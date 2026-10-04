@@ -123,6 +123,18 @@ export class WebPairingAuth {
     return true;
   }
 
+  public currentDeviceId(request: IncomingMessage): string | null {
+    const token = readCookie(request.headers.cookie, SESSION_COOKIE);
+    if (!token) return null;
+    const session = this.getSession(hashToken(token));
+    if (!session || session.revokedAt !== null) return null;
+    if (Date.parse(session.expiresAt) <= this.now()) {
+      this.revokeSession(session.sessionId);
+      return null;
+    }
+    return session.sessionId;
+  }
+
   public status(request: IncomingMessage): PairingStatus {
     const pairing = this.getPairing();
     const authenticated = this.isAuthorized(request);

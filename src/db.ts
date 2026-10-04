@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
@@ -6,12 +6,14 @@ import { mkdirSync } from "node:fs";
 import { DatabaseSync as DatabaseSyncConstructor, type SqliteDatabase } from "./sqlite.js";
 import { DEFAULT_SHORTCUT_GROUPS, DEFAULT_SHORTCUTS } from "./tmux-shortcut-defaults.js";
 import {
+  WebTaskSubmissionConflictError,
   DIRECT_FOLLOWUP_STATUSES,
   DIRECT_TASK_STATUSES,
   SHORTCUT_DISPLAY_MODES,
   SHORTCUT_GROUP_LAYOUTS,
   SHORTCUT_KINDS,
   SHORTCUT_SURFACES,
+  TASK_STATES,
 } from "./types.js";
 import type { WebAuthPairingRecord, WebAuthSessionRecord } from "./web-auth.js";
 import type {
@@ -43,6 +45,11 @@ import type {
   ShortcutSurface,
   StoredShortcut,
   StoredShortcutGroup,
+  StoredTmuxSession,
+  StoredTmuxSessionAction,
+  TmuxSessionActionQuery,
+  TmuxSessionActionStatus,
+  TmuxSessionActionType,
 } from "./types.js";
 
 const SCHEMA = `
@@ -176,6 +183,17 @@ CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(completed_at, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_aamp_tasks_status ON aamp_tasks(status, updated_at);
 
+CREATE TABLE IF NOT EXISTS web_task_submissions (
+    idempotency_key TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    normalized_request_json TEXT NOT NULL,
+    task_guid TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(task_guid) REFERENCES tasks(task_guid),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
+
 -- Direct Feishu + Codex SDK mode. These tables deliberately do not share the
 -- legacy task-list state machine: an unrelated message starts a task, while a
 -- reply is stored as a follow-up turn on the existing task.
@@ -219,12 +237,34 @@ CREATE TABLE IF NOT EXISTS bridge_tasks (
     cancel_reason TEXT,
     recovery_count INTEGER NOT NULL DEFAULT 0,
     last_recovered_at TEXT,
+    initial_final_response TEXT,
     final_response TEXT,
     error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(source_event_id) REFERENCES inbound_events(source_event_id)
 );
+
+CREATE TABLE IF NOT EXISTS codex_history_list_cache (
+    home_id TEXT NOT NULL,
+    filter_key TEXT NOT NULL,
+    source_fingerprint TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    refreshed_at TEXT NOT NULL,
+    PRIMARY KEY(home_id, filter_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_codex_history_list_cache_refreshed
+  ON codex_history_list_cache(home_id, refreshed_at DESC);
+
+CREATE TABLE IF NOT EXISTS codex_history_thread_home_preferences (
+    thread_id TEXT PRIMARY KEY,
+    preferred_home_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_codex_history_thread_home_preferences_home
+  ON codex_history_thread_home_preferences(preferred_home_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS bridge_task_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -350,6 +390,48 @@ CREATE TABLE IF NOT EXISTS web_auth_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_web_auth_sessions_active
   ON web_auth_sessions(revoked_at, expires_at);
+
+CREATE TABLE IF NOT EXISTS tmux_sessions (
+    record_id TEXT PRIMARY KEY,
+    tmux_session_id TEXT NOT NULL,
+    session_name TEXT NOT NULL,
+    project_key TEXT,
+    working_directory TEXT NOT NULL,
+    tmux_created_at INTEGER NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    ended_at TEXT,
+    created_by_device_id TEXT,
+    FOREIGN KEY(created_by_device_id) REFERENCES web_auth_sessions(session_id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tmux_sessions_active
+  ON tmux_sessions(ended_at, last_seen_at DESC);
+
+CREATE TABLE IF NOT EXISTS tmux_session_actions (
+    action_id TEXT PRIMARY KEY,
+    session_record_id TEXT NOT NULL,
+    tmux_session_id TEXT NOT NULL,
+    session_name TEXT NOT NULL,
+    project_key TEXT,
+    working_directory TEXT NOT NULL,
+    device_id TEXT,
+    action_type TEXT NOT NULL CHECK (action_type IN ('task_submit', 'terminal_command', 'shortcut', 'control_sequence')),
+    request_id TEXT,
+    submission_fingerprint TEXT,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('sending', 'sent', 'confirmed', 'unconfirmed', 'failed')),
+    error TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY(session_record_id) REFERENCES tmux_sessions(record_id) ON DELETE CASCADE,
+    FOREIGN KEY(device_id) REFERENCES web_auth_sessions(session_id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tmux_session_actions_session
+  ON tmux_session_actions(session_record_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tmux_session_actions_created
+  ON tmux_session_actions(created_at DESC);
 `;
 
 export interface ClaimRunArgs {
@@ -359,6 +441,24 @@ export interface ClaimRunArgs {
   startedComment?: string | ((runId: string) => string);
   attachmentIds?: string[];
 }
+
+export interface ClaimWebTaskSubmissionArgs extends ClaimRunArgs {
+  idempotencyKey: string;
+  normalizedRequestJson: string;
+}
+
+export interface StoredWebTaskSubmission {
+  idempotency_key: string;
+  request_hash: string;
+  normalized_request_json: string;
+  task_guid: string;
+  run_id: string;
+  created_at: string;
+}
+
+export type ClaimWebTaskSubmissionResult =
+  | { status: "created"; claim: RunClaim }
+  | { status: "existing"; submission: StoredWebTaskSubmission };
 
 export interface AampTaskInit {
   aampTaskId: string;
@@ -471,6 +571,16 @@ export interface RecoveredRun {
 
 export interface TaskQuery {
   states?: TaskState[];
+  projectKey?: string;
+  mode?: string;
+  search?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface TaskPanelQuery {
+  source?: "all" | "desk" | "direct";
+  states?: string[];
   projectKey?: string;
   mode?: string;
   search?: string;
@@ -898,6 +1008,21 @@ export class StateDatabase {
     return row ? mapTask(row) : null;
   }
 
+  public getWebTaskSubmission(idempotencyKey: string): StoredWebTaskSubmission | null {
+    const row = this.db
+      .prepare("SELECT * FROM web_task_submissions WHERE idempotency_key = ?")
+      .get(idempotencyKey) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      idempotency_key: String(row.idempotency_key),
+      request_hash: String(row.request_hash),
+      normalized_request_json: String(row.normalized_request_json),
+      task_guid: String(row.task_guid),
+      run_id: String(row.run_id),
+      created_at: String(row.created_at),
+    };
+  }
+
   public getAampTask(aampTaskId: string): StoredAampTask | null {
     const row = this.db
       .prepare("SELECT * FROM aamp_tasks WHERE aamp_task_id = ?")
@@ -931,6 +1056,81 @@ export class StateDatabase {
       .prepare("SELECT * FROM inbound_events WHERE source_event_id = ?")
       .get(sourceEventId) as Record<string, unknown> | undefined;
     return row ? mapInboundEvent(row) : null;
+  }
+
+  public getCodexHistoryListCache(homeId: string, filterKey: string): {
+    sourceFingerprint: string;
+    payloadJson: string;
+    refreshedAt: string;
+  } | null {
+    const row = this.db.prepare(
+      `SELECT source_fingerprint, payload_json, refreshed_at
+       FROM codex_history_list_cache WHERE home_id = ? AND filter_key = ?`,
+    ).get(homeId, filterKey) as Record<string, unknown> | undefined;
+    return row ? {
+      sourceFingerprint: String(row.source_fingerprint),
+      payloadJson: String(row.payload_json),
+      refreshedAt: String(row.refreshed_at),
+    } : null;
+  }
+
+  public saveCodexHistoryListCache(
+    homeId: string,
+    filterKey: string,
+    sourceFingerprint: string,
+    payloadJson: string,
+  ): void {
+    const refreshedAt = this.timestamp();
+    this.db.prepare(
+      `INSERT INTO codex_history_list_cache
+         (home_id, filter_key, source_fingerprint, payload_json, refreshed_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(home_id, filter_key) DO UPDATE SET
+         source_fingerprint = excluded.source_fingerprint,
+         payload_json = excluded.payload_json,
+         refreshed_at = excluded.refreshed_at`,
+    ).run(homeId, filterKey, sourceFingerprint, payloadJson, refreshedAt);
+    this.db.prepare(
+      `DELETE FROM codex_history_list_cache
+       WHERE home_id = ? AND filter_key IN (
+         SELECT filter_key FROM codex_history_list_cache
+         WHERE home_id = ? ORDER BY refreshed_at DESC, filter_key ASC LIMIT -1 OFFSET 24
+       )`,
+    ).run(homeId, homeId);
+  }
+
+  public getCodexHistoryThreadHomePreferences(threadIds: string[]): Map<string, string> {
+    const uniqueThreadIds = [...new Set(threadIds.map((threadId) => threadId.trim()).filter(Boolean))];
+    if (uniqueThreadIds.length === 0) return new Map();
+    const preferences = new Map<string, string>();
+    for (let offset = 0; offset < uniqueThreadIds.length; offset += 500) {
+      const batch = uniqueThreadIds.slice(offset, offset + 500);
+      const placeholders = batch.map(() => "?").join(", ");
+      const rows = this.db.prepare(
+        `SELECT thread_id, preferred_home_id
+         FROM codex_history_thread_home_preferences
+         WHERE thread_id IN (${placeholders})`,
+      ).all(...batch) as Array<{ thread_id: string; preferred_home_id: string }>;
+      for (const row of rows) preferences.set(String(row.thread_id), String(row.preferred_home_id));
+    }
+    return preferences;
+  }
+
+  public saveCodexHistoryThreadHomePreference(threadId: string, preferredHomeId: string): string {
+    const normalizedThreadId = requireNonEmpty(threadId, "threadId");
+    const normalizedHomeId = requireNonEmpty(preferredHomeId, "preferredHomeId");
+    if (normalizedThreadId.length > 200 || normalizedHomeId.length > 200) {
+      throw new Error("threadId and preferredHomeId must be 200 characters or fewer");
+    }
+    const updatedAt = this.timestamp();
+    this.db.prepare(
+      `INSERT INTO codex_history_thread_home_preferences (thread_id, preferred_home_id, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(thread_id) DO UPDATE SET
+         preferred_home_id = excluded.preferred_home_id,
+         updated_at = excluded.updated_at`,
+    ).run(normalizedThreadId, normalizedHomeId, updatedAt);
+    return updatedAt;
   }
 
   public getBridgeTask(bridgeTaskId: string): StoredBridgeTask | null {
@@ -1216,9 +1416,70 @@ export class StateDatabase {
       .prepare(`SELECT COUNT(*) AS total FROM bridge_tasks${where}`)
       .get(...params) as { total: number };
     const rows = this.db
-      .prepare(`SELECT * FROM bridge_tasks${where} ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
+      .prepare(`SELECT * FROM bridge_tasks${where} ORDER BY updated_at DESC, bridge_task_id DESC LIMIT ? OFFSET ?`)
       .all(...params, limit, offset) as Record<string, unknown>[];
     return { items: rows.map(mapBridgeTask), total: countRow.total };
+  }
+
+  public readBridgeTaskPage(taskId: string, limit: number, offset: number, includeEvents = true): {
+    followups: { items: StoredBridgeTaskFollowup[]; total: number };
+    attachments: { items: StoredBridgeTaskAttachment[]; total: number };
+    events: { items: StoredBridgeTaskEvent[]; total: number };
+  } {
+    const page = <T>(table: string, order: string, map: (row: Record<string, unknown>) => T, includeItems = true) => {
+      const total = (this.db.prepare(`SELECT COUNT(*) AS total FROM ${table} WHERE bridge_task_id = ?`)
+        .get(taskId) as { total: number }).total;
+      const rows = includeItems ? this.db.prepare(`SELECT * FROM ${table} WHERE bridge_task_id = ? ORDER BY ${order} LIMIT ? OFFSET ?`)
+        .all(taskId, limit, offset) as Record<string, unknown>[] : [];
+      return { total, items: rows.map(map) };
+    };
+    return {
+      followups: page("bridge_task_followups", "created_at DESC, followup_id DESC", mapBridgeTaskFollowup),
+      attachments: page("bridge_task_attachments", "created_at DESC, attachment_id DESC", mapBridgeTaskAttachment),
+      events: page("bridge_task_events", "id DESC", mapBridgeTaskEvent, includeEvents),
+    };
+  }
+
+  public appendWebDirectFollowup(taskId: string, text: string, idempotencyKey: string): StoredBridgeTask {
+    const normalizedTaskId = requireNonEmpty(taskId, "taskId");
+    const normalizedText = requireNonEmpty(text.trim(), "text");
+    const key = requireNonEmpty(idempotencyKey.trim(), "idempotencyKey");
+    if (normalizedText.length > 2000) throw new Error("补充内容不能超过 2000 个字符。");
+    if (!/^[a-zA-Z0-9_-]{8,100}$/.test(key)) throw new Error("无效的幂等键。");
+    const sourceEventId = `web-task-followup:${key}`;
+    return this.transaction(() => {
+      const existing = this.db.prepare(
+        "SELECT bridge_task_id, text FROM bridge_task_followups WHERE source_event_id = ?",
+      ).get(sourceEventId) as { bridge_task_id: string; text: string } | undefined;
+      if (existing) {
+        if (existing.bridge_task_id !== normalizedTaskId || existing.text !== normalizedText) {
+          throw new WebTaskSubmissionConflictError();
+        }
+        return this.getBridgeTask(normalizedTaskId)!;
+      }
+      const task = this.getBridgeTask(normalizedTaskId);
+      if (!task) throw new Error("Direct 任务不存在。");
+      if (!task.thread_id) throw new Error("该任务尚无可续接的 Codex thread。");
+      if (task.status === "CANCEL_REQUESTED") throw new Error("任务正在取消，请稍后再追加。");
+      const result = this.ingestDirectMessage({
+        sourceEventId,
+        eventType: "web.task.followup",
+        messageId: sourceEventId,
+        chatId: task.chat_id,
+        chatType: task.chat_type,
+        senderId: task.sender_id,
+        senderName: "Bridge Web",
+        text: normalizedText,
+        sessionKey: task.session_key,
+        replyToMessageId: task.message_id,
+        payload: { source: "web-task-panel" },
+        attachments: [],
+      });
+      if (!result.continued || result.task.bridge_task_id !== normalizedTaskId) {
+        throw new Error("续问没有关联到原 Direct 任务。");
+      }
+      return result.task;
+    });
   }
 
   public getBridgeTaskStatusCounts(): Record<DirectTaskStatus, number> {
@@ -1875,6 +2136,7 @@ export class StateDatabase {
     finalResponse?: string,
     error?: string,
     workerId?: string,
+    initialTurn = true,
   ): StoredBridgeTask | null {
     const taskId = requireNonEmpty(bridgeTaskId, "bridgeTaskId");
     return this.transaction(() => {
@@ -1899,10 +2161,12 @@ export class StateDatabase {
       this.db
         .prepare(
           `UPDATE bridge_tasks SET status = ?, final_response = ?, error = ?,
+             initial_final_response = CASE WHEN ? THEN COALESCE(initial_final_response, ?) ELSE initial_final_response END,
              lease_owner = NULL, lease_expires_at = NULL, next_attempt_at = ?,
              updated_at = ? WHERE bridge_task_id = ?`,
         )
-        .run(finalStatus, response, failure, finalStatus === "QUEUED" ? now : null, now, taskId);
+        .run(finalStatus, response, failure, initialTurn ? 1 : 0, finalResponse?.trim() || null,
+          finalStatus === "QUEUED" ? now : null, now, taskId);
       if (hasPendingFollowup) {
         this.db
           .prepare(
@@ -1944,7 +2208,7 @@ export class StateDatabase {
     }
     const followup = this.finishBridgeTaskFollowup(followupId, status, finalResponse, error);
     if (!followup) return this.getBridgeTask(bridgeTaskId);
-    return this.finishBridgeTask(bridgeTaskId, status, finalResponse, error, workerId);
+    return this.finishBridgeTask(bridgeTaskId, status, finalResponse, error, workerId, false);
   }
 
   /** Requeue a terminal direct task after an explicit operator retry request. */
@@ -2317,6 +2581,55 @@ export class StateDatabase {
     return { items: rows.map(mapTask), total: countRow.total };
   }
 
+  public queryTaskPanel(query: TaskPanelQuery = {}): {
+    items: Array<{ source: "desk"; task: StoredTask } | { source: "direct"; task: StoredBridgeTask }>;
+    total: number;
+  } {
+    const candidates: string[] = [];
+    const params: Array<string | number> = [];
+    const deskStates = query.states?.filter((state) => TASK_STATES.includes(state as TaskState)) ?? [];
+    const directStates = query.states?.filter((state) => DIRECT_TASK_STATUSES.includes(state as DirectTaskStatus)) ?? [];
+    if (query.source !== "direct" && (!query.states?.length || deskStates.length)) {
+      const clauses: string[] = [];
+      if (deskStates.length) { clauses.push(`state IN (${deskStates.map(() => "?").join(", ")})`); params.push(...deskStates); }
+      if (query.projectKey) { clauses.push("project_key = ?"); params.push(query.projectKey); }
+      if (query.mode) { clauses.push("mode = ?"); params.push(query.mode); }
+      if (query.search) {
+        clauses.push("(task_guid LIKE ? OR input_text LIKE ? OR COALESCE(thread_id, '') LIKE ? OR COALESCE(last_error, '') LIKE ?)");
+        params.push(...Array(4).fill(`%${query.search}%`));
+      }
+      candidates.push(`SELECT 'desk' AS source, task_guid AS id, updated_at FROM tasks${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""}`);
+    }
+    if (query.source !== "desk" && !query.projectKey && !query.mode
+      && (!query.states?.length || directStates.length)) {
+      const clauses: string[] = [];
+      if (directStates.length) { clauses.push(`status IN (${directStates.map(() => "?").join(", ")})`); params.push(...directStates); }
+      if (query.search) {
+        clauses.push("(bridge_task_id LIKE ? OR text LIKE ? OR COALESCE(thread_id, '') LIKE ? OR COALESCE(error, '') LIKE ?)");
+        params.push(...Array(4).fill(`%${query.search}%`));
+      }
+      candidates.push(`SELECT 'direct' AS source, bridge_task_id AS id, updated_at FROM bridge_tasks${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""}`);
+    }
+    if (!candidates.length) return { items: [], total: 0 };
+    const union = candidates.join(" UNION ALL ");
+    const total = (this.db.prepare(`SELECT COUNT(*) AS total FROM (${union})`).get(...params) as { total: number }).total;
+    const limit = Math.min(200, Math.max(1, query.limit ?? 50));
+    const offset = Math.max(0, query.offset ?? 0);
+    const rows = this.db.prepare(`SELECT source, id FROM (${union}) ORDER BY updated_at DESC, source, id DESC LIMIT ? OFFSET ?`)
+      .all(...params, limit, offset) as Array<{ source: "desk" | "direct"; id: string }>;
+    const items: Array<{ source: "desk"; task: StoredTask } | { source: "direct"; task: StoredBridgeTask }> = [];
+    for (const row of rows) {
+      if (row.source === "desk") {
+        const task = this.getTask(row.id);
+        if (task) items.push({ source: "desk", task });
+      } else {
+        const task = this.getBridgeTask(row.id);
+        if (task) items.push({ source: "direct", task });
+      }
+    }
+    return { total, items };
+  }
+
   public getRun(runId: string): StoredRun | null {
     const row = this.db
       .prepare("SELECT * FROM runs WHERE run_id = ?")
@@ -2406,6 +2719,33 @@ export class StateDatabase {
       });
       return true;
     });
+  }
+
+  public claimWebTaskSubmission(args: ClaimWebTaskSubmissionArgs): ClaimWebTaskSubmissionResult {
+    return this.transaction(() => {
+      const existing = this.getWebTaskSubmission(args.idempotencyKey);
+      const requestHash = createHash("sha256").update(args.normalizedRequestJson).digest("hex");
+      if (existing) {
+        if (existing.request_hash !== requestHash || existing.normalized_request_json !== args.normalizedRequestJson) {
+          throw new WebTaskSubmissionConflictError();
+        }
+        return { status: "existing", submission: existing };
+      }
+      const claim = this.claimRun(args);
+      if (!claim) throw new Error("任务暂时无法排队，请稍后重试。");
+      this.db.prepare(`INSERT INTO web_task_submissions
+        (idempotency_key, request_hash, normalized_request_json, task_guid, run_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(
+          args.idempotencyKey, requestHash, args.normalizedRequestJson, claim.taskGuid, claim.runId, this.timestamp(),
+        );
+      return { status: "created", claim };
+    });
+  }
+
+  public listQueuedWebRunIds(): string[] {
+    return (this.db.prepare(`SELECT r.run_id FROM runs r JOIN tasks t ON t.task_guid = r.task_guid
+      WHERE t.origin = 'web' AND t.active_run_id = r.run_id AND t.state = 'QUEUED' AND r.state = 'QUEUED'
+      ORDER BY r.started_at, r.run_id`).all() as Array<{ run_id: string }>).map((row) => row.run_id);
   }
 
   public claimRun(args: ClaimRunArgs): RunClaim | null {
@@ -3106,6 +3446,198 @@ export class StateDatabase {
       .run(revokedAt);
   }
 
+  public recordTmuxSession(
+    session: { id: string; name: string; cwd: string; createdAt: number },
+    options: { projectKey?: string | null; createdByDeviceId?: string | null } = {},
+  ): StoredTmuxSession {
+    const resolvedCwd = resolve(session.cwd);
+    const inferredProject = this.db.prepare(
+      "SELECT name FROM projects WHERE path = ? AND status = 'available' LIMIT 1",
+    ).get(resolvedCwd) as { name: string } | undefined;
+    const projectKey = options.projectKey ?? inferredProject?.name ?? null;
+    const existing = this.db.prepare(
+      `SELECT record_id, session_name, project_key, working_directory, last_seen_at, ended_at, created_by_device_id
+       FROM tmux_sessions WHERE tmux_session_id = ? AND tmux_created_at = ? AND ended_at IS NULL
+       ORDER BY first_seen_at DESC LIMIT 1`,
+    ).get(session.id, session.createdAt) as {
+      record_id: string;
+      session_name: string;
+      project_key: string | null;
+      working_directory: string;
+      last_seen_at: string;
+      ended_at: string | null;
+      created_by_device_id: string | null;
+    } | undefined;
+    const now = this.timestamp();
+    if (existing) {
+      const current = existing;
+      const refreshAfter = new Date(this.now().getTime() - 60_000).toISOString();
+      const refreshedLastSeen = current.last_seen_at <= refreshAfter ? now : current.last_seen_at;
+      const nextProjectKey = projectKey ?? current.project_key;
+      const nextDeviceId = current.created_by_device_id ?? options.createdByDeviceId ?? null;
+      if (
+        current.session_name !== session.name
+        || current.project_key !== nextProjectKey
+        || current.working_directory !== session.cwd
+        || current.last_seen_at !== refreshedLastSeen
+        || current.ended_at !== null
+        || current.created_by_device_id !== nextDeviceId
+      ) {
+        this.db.prepare(`UPDATE tmux_sessions SET
+          session_name = ?, project_key = ?, working_directory = ?, last_seen_at = ?,
+          ended_at = NULL, created_by_device_id = ? WHERE record_id = ?`).run(
+            session.name,
+            nextProjectKey,
+            session.cwd,
+            refreshedLastSeen,
+            nextDeviceId,
+            current.record_id,
+          );
+      }
+      return this.getTmuxSession(current.record_id)!;
+    }
+
+    const recordId = randomUUID();
+    this.db.prepare(`INSERT INTO tmux_sessions
+      (record_id, tmux_session_id, session_name, project_key, working_directory,
+       tmux_created_at, first_seen_at, last_seen_at, ended_at, created_by_device_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`).run(
+        recordId,
+        session.id,
+        session.name,
+        projectKey,
+        session.cwd,
+        session.createdAt,
+        now,
+        now,
+        options.createdByDeviceId ?? null,
+      );
+    return this.getTmuxSession(recordId)!;
+  }
+
+  public syncTmuxSessions(sessions: Array<{ id: string; name: string; cwd: string; createdAt: number }>): void {
+    const currentKeys = new Set(sessions.map((session) => `${session.id}\u0000${session.createdAt}`));
+    const endedAt = this.timestamp();
+    this.transaction(() => {
+      const active = this.db.prepare(
+        "SELECT record_id, tmux_session_id, tmux_created_at FROM tmux_sessions WHERE ended_at IS NULL",
+      ).all() as Array<{ record_id: string; tmux_session_id: string; tmux_created_at: number }>;
+      for (const record of active) {
+        if (!currentKeys.has(`${record.tmux_session_id}\u0000${record.tmux_created_at}`)) {
+          this.db.prepare("UPDATE tmux_sessions SET ended_at = ? WHERE record_id = ? AND ended_at IS NULL")
+            .run(endedAt, record.record_id);
+        }
+      }
+      for (const session of sessions) this.recordTmuxSession(session);
+    });
+  }
+
+  public getTmuxSession(recordId: string): StoredTmuxSession | null {
+    const row = this.db.prepare("SELECT * FROM tmux_sessions WHERE record_id = ?")
+      .get(recordId) as Record<string, unknown> | undefined;
+    return row ? mapTmuxSession(row) : null;
+  }
+
+  public getLatestTmuxSession(tmuxSessionId: string): StoredTmuxSession | null {
+    const row = this.db.prepare(`SELECT * FROM tmux_sessions
+      WHERE tmux_session_id = ?
+      ORDER BY (ended_at IS NULL) DESC, first_seen_at DESC
+      LIMIT 1`).get(tmuxSessionId) as Record<string, unknown> | undefined;
+    return row ? mapTmuxSession(row) : null;
+  }
+
+  public markTmuxSessionEnded(tmuxSessionId: string): void {
+    this.db.prepare("UPDATE tmux_sessions SET ended_at = ? WHERE tmux_session_id = ? AND ended_at IS NULL")
+      .run(this.timestamp(), tmuxSessionId);
+  }
+
+  public beginTmuxSessionAction(input: {
+    sessionRecordId: string;
+    deviceId: string | null;
+    actionType: TmuxSessionActionType;
+    requestId: string | null;
+    content: string;
+    submissionFingerprint?: string;
+  }): { actionId: string; duplicate: boolean } {
+    const session = this.getTmuxSession(input.sessionRecordId);
+    if (!session) throw new Error("tmux session record not found");
+    return this.transaction(() => {
+      if (input.actionType === "task_submit" && input.submissionFingerprint) {
+        const recent = this.db.prepare(`SELECT action_id FROM tmux_session_actions
+          WHERE session_record_id = ? AND submission_fingerprint = ?
+            AND status IN ('sending', 'confirmed', 'unconfirmed') AND created_at >= ?
+          LIMIT 1`).get(
+            session.record_id,
+            input.submissionFingerprint,
+            new Date(this.now().getTime() - 5 * 60_000).toISOString(),
+          );
+        if (recent) return { actionId: "", duplicate: true };
+      }
+      const actionId = randomUUID();
+      this.db.prepare(`INSERT INTO tmux_session_actions
+      (action_id, session_record_id, tmux_session_id, session_name, project_key, working_directory,
+       device_id, action_type, request_id, content, submission_fingerprint, status, error, created_at, completed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sending', NULL, ?, NULL)`).run(
+        actionId,
+        session.record_id,
+        session.tmux_session_id,
+        session.session_name,
+        session.project_key,
+        session.working_directory,
+        input.deviceId,
+        input.actionType,
+        input.requestId,
+        input.content,
+        input.submissionFingerprint ?? null,
+        this.timestamp(),
+      );
+      return { actionId, duplicate: false };
+    });
+  }
+
+  public finishTmuxSessionAction(
+    actionId: string,
+    status: Exclude<TmuxSessionActionStatus, "sending">,
+    error: string | null = null,
+  ): boolean {
+    const result = this.db.prepare(`UPDATE tmux_session_actions
+      SET status = ?, error = ?, completed_at = ?
+      WHERE action_id = ? AND status = 'sending'`).run(status, error, this.timestamp(), actionId);
+    return result.changes > 0;
+  }
+
+  public listTmuxSessionActions(query: TmuxSessionActionQuery = {}): { items: StoredTmuxSessionAction[]; total: number } {
+    const clauses: string[] = [];
+    const params: Array<string> = [];
+    if (query.tmuxSessionId) {
+      clauses.push("(s.tmux_session_id = ? OR s.record_id = ?)");
+      params.push(query.tmuxSessionId, query.tmuxSessionId);
+    }
+    if (query.search?.trim()) {
+      const pattern = `%${query.search.trim().slice(0, 500)}%`;
+      clauses.push("(a.content LIKE ? OR a.session_name LIKE ? OR a.working_directory LIKE ? OR COALESCE(d.device_name, '') LIKE ?)");
+      params.push(pattern, pattern, pattern, pattern);
+    }
+    const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
+    const limit = Math.min(200, Math.max(1, Math.trunc(query.limit ?? 50)));
+    const offset = Math.max(0, Math.trunc(query.offset ?? 0));
+    const count = this.db.prepare(`SELECT COUNT(*) AS total
+      FROM tmux_session_actions a
+      JOIN tmux_sessions s ON s.record_id = a.session_record_id
+      LEFT JOIN web_auth_sessions d ON d.session_id = a.device_id${where}`)
+      .get(...params) as { total: number };
+    const rows = this.db.prepare(`SELECT
+      a.action_id, a.session_record_id, a.tmux_session_id, a.session_name, a.project_key,
+      a.working_directory, s.ended_at AS session_ended_at, a.device_id, d.device_name,
+      a.action_type, a.request_id, a.content, a.status, a.error, a.created_at, a.completed_at
+      FROM tmux_session_actions a
+      JOIN tmux_sessions s ON s.record_id = a.session_record_id
+      LEFT JOIN web_auth_sessions d ON d.session_id = a.device_id${where}
+      ORDER BY a.created_at DESC, a.action_id DESC LIMIT ? OFFSET ?`)
+      .all(...params, limit, offset) as Record<string, unknown>[];
+    return { items: rows.map(mapTmuxSessionAction), total: count.total };
+  }
+
   public close(): void {
     try {
       this.db.close();
@@ -3251,6 +3783,31 @@ export class StateDatabase {
   private runMigrations(): void {
     // These columns were added after the minimal schema in the design document.
     // Keeping the migration additive lets an operator upgrade an existing database.
+    addColumnIfMissing(this.db, "tmux_session_actions", "tmux_session_id", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(this.db, "tmux_session_actions", "session_name", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(this.db, "tmux_session_actions", "project_key", "TEXT");
+    addColumnIfMissing(this.db, "tmux_session_actions", "working_directory", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(this.db, "tmux_session_actions", "submission_fingerprint", "TEXT");
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tmux_session_actions_fingerprint
+      ON tmux_session_actions(session_record_id, submission_fingerprint, created_at DESC)`);
+    this.db.exec(`UPDATE tmux_session_actions
+      SET tmux_session_id = COALESCE(NULLIF(tmux_session_id, ''), (
+            SELECT tmux_session_id FROM tmux_sessions WHERE record_id = tmux_session_actions.session_record_id
+          )),
+          session_name = COALESCE(NULLIF(session_name, ''), (
+            SELECT session_name FROM tmux_sessions WHERE record_id = tmux_session_actions.session_record_id
+          )),
+          project_key = COALESCE(project_key, (
+            SELECT project_key FROM tmux_sessions WHERE record_id = tmux_session_actions.session_record_id
+          )),
+          working_directory = COALESCE(NULLIF(working_directory, ''), (
+            SELECT working_directory FROM tmux_sessions WHERE record_id = tmux_session_actions.session_record_id
+          ))
+      WHERE EXISTS (
+        SELECT 1 FROM tmux_sessions WHERE record_id = tmux_session_actions.session_record_id
+      ) AND (
+        tmux_session_id = '' OR session_name = '' OR working_directory = ''
+      )`);
     addColumnIfMissing(this.db, "tasks", "worker_pid", "INTEGER");
     addColumnIfMissing(this.db, "tasks", "origin", "TEXT NOT NULL DEFAULT 'feishu'");
     addColumnIfMissing(this.db, "tasks", "service_instance_id", "TEXT");
@@ -3283,6 +3840,10 @@ export class StateDatabase {
     addColumnIfMissing(this.db, "bridge_tasks", "cancel_reason", "TEXT");
     addColumnIfMissing(this.db, "bridge_tasks", "recovery_count", "INTEGER NOT NULL DEFAULT 0");
     addColumnIfMissing(this.db, "bridge_tasks", "last_recovered_at", "TEXT");
+    addColumnIfMissing(this.db, "bridge_tasks", "initial_final_response", "TEXT");
+    this.db.exec(`UPDATE bridge_tasks SET initial_final_response = final_response
+      WHERE initial_final_response IS NULL AND final_response IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM bridge_task_followups f WHERE f.bridge_task_id = bridge_tasks.bridge_task_id)`);
     addColumnIfMissing(this.db, "bridge_task_attachments", "followup_id", "TEXT");
     addColumnIfMissing(this.db, "shortcuts", "sort_order", "INTEGER NOT NULL DEFAULT 0");
     addColumnIfMissing(this.db, "shortcut_groups", "surface", "TEXT NOT NULL DEFAULT 'palette'");
@@ -3458,7 +4019,7 @@ function migrateBridgeTaskStatusConstraint(db: SqliteDatabase): void {
 
 function addColumnIfMissing(
   db: SqliteDatabase,
-  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts" | "shortcut_groups",
+  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts" | "shortcut_groups" | "tmux_session_actions",
   column: string,
   definition: string,
 ): void {
@@ -3651,6 +4212,7 @@ function mapBridgeTask(row: Record<string, unknown>): StoredBridgeTask {
     cancel_reason: nullableString(row.cancel_reason),
     recovery_count: Number(row.recovery_count ?? 0),
     last_recovered_at: nullableString(row.last_recovered_at),
+    initial_final_response: nullableString(row.initial_final_response),
     final_response: nullableString(row.final_response),
     error: nullableString(row.error),
     created_at: String(row.created_at),
@@ -3768,6 +4330,42 @@ function mapWebAuthSession(row: Record<string, unknown>): WebAuthSessionRecord {
     lastSeenAt: String(row.last_seen_at),
     expiresAt: String(row.expires_at),
     revokedAt: nullableString(row.revoked_at),
+  };
+}
+
+function mapTmuxSession(row: Record<string, unknown>): StoredTmuxSession {
+  return {
+    record_id: String(row.record_id),
+    tmux_session_id: String(row.tmux_session_id),
+    session_name: String(row.session_name),
+    project_key: nullableString(row.project_key),
+    working_directory: String(row.working_directory),
+    tmux_created_at: Number(row.tmux_created_at),
+    first_seen_at: String(row.first_seen_at),
+    last_seen_at: String(row.last_seen_at),
+    ended_at: nullableString(row.ended_at),
+    created_by_device_id: nullableString(row.created_by_device_id),
+  };
+}
+
+function mapTmuxSessionAction(row: Record<string, unknown>): StoredTmuxSessionAction {
+  return {
+    action_id: String(row.action_id),
+    session_record_id: String(row.session_record_id),
+    tmux_session_id: String(row.tmux_session_id),
+    session_name: String(row.session_name),
+    project_key: nullableString(row.project_key),
+    working_directory: String(row.working_directory),
+    session_ended_at: nullableString(row.session_ended_at),
+    device_id: nullableString(row.device_id),
+    device_name: nullableString(row.device_name),
+    action_type: String(row.action_type) as StoredTmuxSessionAction["action_type"],
+    request_id: nullableString(row.request_id),
+    content: String(row.content),
+    status: String(row.status) as StoredTmuxSessionAction["status"],
+    error: nullableString(row.error),
+    created_at: String(row.created_at),
+    completed_at: nullableString(row.completed_at),
   };
 }
 

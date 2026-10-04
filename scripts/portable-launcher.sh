@@ -190,6 +190,7 @@ run_entry() {
       codex-cli) internal_command="--bridge-codex" ;;
       install-cli) internal_command="--bridge-install" ;;
       web-pair-cli) internal_command="--bridge-web-pair" ;;
+      backup-cli) internal_command="--bridge-backup" ;;
       aamp-cli)
         echo "Direct 单二进制包不提供 AAMP 管理命令。" >&2
         exit 2
@@ -237,7 +238,7 @@ case "$1" in
   list|scripts)
     printf '%s\n' \
       install init doctor start update service \
-      web:pair \
+      web:pair backup \
       aamp aamp:install aamp:start aamp:stop aamp:restart aamp:status aamp:logs aamp:update aamp:add aamp:remove \
       aamp:recent aamp:task aamp:inspect aamp:worktrees \
       codex codex:install codex:setup codex:start codex:stop codex:restart codex:status codex:logs \
@@ -273,6 +274,10 @@ case "$1" in
   bridge:install)
     shift
     run_entry install-cli install "$@"
+    ;;
+  backup)
+    shift
+    run_entry backup-cli "$@"
     ;;
   web:pair)
     shift

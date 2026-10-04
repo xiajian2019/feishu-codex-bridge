@@ -59,6 +59,7 @@ export interface CodexHistoryHome {
 export interface CodexHistoryItem {
   home: CodexHistoryHome;
   thread: CodexThread;
+  preferredHomeId?: string;
 }
 
 export interface CodexHistoryListResponse {
@@ -71,10 +72,127 @@ export interface CodexHistoryListResponse {
   dataSource?: string;
 }
 
+export interface CodexUsageRateLimitWindow {
+  usedPercent: number;
+  windowDurationMins?: number | null;
+  resetsAt?: number | null;
+}
+
+export interface CodexUsageLimitBucket {
+  limitId?: string | null;
+  limitName?: string | null;
+  normalModelSlug?: string | null;
+  planType?: string | null;
+  primary?: CodexUsageRateLimitWindow | null;
+  secondary?: CodexUsageRateLimitWindow | null;
+  credits?: {
+    balance?: string | null;
+    hasCredits?: boolean;
+    unlimited?: boolean;
+  } | null;
+  individualLimit?: {
+    limit?: string;
+    used?: string;
+    remainingPercent?: number;
+    resetsAt?: number;
+  } | null;
+  spendControlReached?: boolean | null;
+  rateLimitReachedType?: number | string | null;
+}
+
+export interface CodexAccountUsageSummary {
+  lifetimeTokens?: number | null;
+  peakDailyTokens?: number | null;
+  longestRunningTurnSec?: number | null;
+  currentStreakDays?: number | null;
+  longestStreakDays?: number | null;
+}
+
+export interface CodexUsageResetCredit {
+  id: string;
+  resetType?: string;
+  status: string;
+  grantedAt: number;
+  expiresAt?: number | null;
+  title?: string | null;
+  description?: string | null;
+}
+
+export type CodexResetCreditConsumeOutcome =
+  | "reset"
+  | "nothingToReset"
+  | "noCredit"
+  | "alreadyRedeemed"
+  | "unknown";
+
+export interface CodexUsageAccount {
+  homeId: string;
+  label: string;
+  available: boolean;
+  checkedAt: string;
+  quota?: {
+    ordinaryUsageAllowed?: boolean | null;
+    planType?: string | null;
+    buckets: CodexUsageLimitBucket[];
+    resetCreditsAvailableCount?: number | null;
+    resetCredits?: CodexUsageResetCredit[] | null;
+  };
+  tokenUsage?: {
+    summary?: CodexAccountUsageSummary;
+    dailyUsageBuckets?: Array<{ startDate: string; tokens: number }> | null;
+  };
+  errors?: {
+    quota?: string;
+    tokenUsage?: string;
+  };
+  stale?: {
+    quota?: boolean;
+    tokenUsage?: boolean;
+  };
+}
+
+export interface CodexResetCreditConsumeResponse {
+  outcome: CodexResetCreditConsumeOutcome;
+}
+
+export interface CodexUsageResponse {
+  generatedAt: string;
+  dataSource: "codex-app-server";
+  accounts: CodexUsageAccount[];
+}
+
 export interface CodexHistoryDetailResponse {
   home: CodexHistoryHome;
   thread: CodexThread;
   imageAttachments?: CodexHistoryTurnAttachments[];
+  models?: CodexHistoryModelOption[];
+  turnUsages?: CodexHistoryTurnUsageRecord[];
+}
+
+export type CodexHistoryReasoningEffort = string;
+
+export interface CodexHistoryModelOption {
+  model: string;
+  displayName: string;
+  description: string;
+  isDefault: boolean;
+  defaultReasoningEffort?: CodexHistoryReasoningEffort;
+  supportedReasoningEfforts: Array<{
+    reasoningEffort: CodexHistoryReasoningEffort;
+    description: string;
+  }>;
+}
+
+export interface CodexHistoryTurnUsage {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens?: number;
+}
+
+export interface CodexHistoryTurnUsageRecord {
+  turnIndex: number;
+  usage: CodexHistoryTurnUsage;
 }
 
 export interface CodexHistoryAttachment {
@@ -101,6 +219,7 @@ export interface CodexHistoryWriterStatus {
     userText: string;
     state: "running" | "cancelling";
     cursor: number;
+    turnIndex: number;
   };
 }
 
@@ -123,7 +242,7 @@ export interface CodexHistoryUpdateEvent {
   type: string;
   item?: unknown;
   message?: string;
-  usage?: unknown;
+  usage?: CodexHistoryTurnUsage;
 }
 
 export interface CodexHistoryUpdatesResponse {
@@ -133,6 +252,7 @@ export interface CodexHistoryUpdatesResponse {
   state: CodexHistoryRunState;
   cursor: number;
   events: CodexHistoryUpdateEvent[];
+  usage?: CodexHistoryTurnUsage;
   finalResponse?: string;
   error?: string;
   attachments?: CodexHistoryAttachment[];
@@ -147,6 +267,7 @@ export interface TaskInput {
 }
 
 export interface CreateTaskInput {
+  idempotencyKey?: string;
   description: string;
   projectKey: string;
   attachmentIds?: string[];
@@ -185,6 +306,32 @@ export interface TaskSummary {
   progress_event: string | null;
   progress_text: string | null;
   progress_updated_at: string | null;
+}
+
+export interface DirectTaskSummary {
+  source: "direct";
+  id: string;
+  text: string;
+  status: string;
+  thread_id: string | null;
+  attempt: number;
+  sender_name: string | null;
+  last_progress_text: string | null;
+  card_state: string;
+  final_response: string | null;
+  initial_final_response?: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DirectTaskDetailResponse {
+  task: DirectTaskSummary;
+  can_followup?: boolean;
+  inbound: { event_type: string; received_at: string; processed_at: string | null } | null;
+  followups: { items: Array<{ followup_id: string; text: string; status: string; final_response: string | null; error: string | null }>; total: number };
+  attachments: { items: Array<{ attachment_id: string; file_name: string | null; type: string; status: string; error: string | null }>; total: number };
+  events: { items: Array<{ id: number; event_type: string; created_at: string }>; total: number };
 }
 
 export interface StoredRun {
@@ -233,12 +380,12 @@ export interface OutboxEntry {
 }
 
 export interface TaskListResponse {
-  items: Array<TaskSummary & { latest_run: StoredRun | null }>;
+  items: Array<(TaskSummary & { source: "desk"; latest_run: StoredRun | null }) | DirectTaskSummary>;
   total: number;
   limit: number;
   offset: number;
   filters: {
-    states: TaskState[];
+    states: string[];
     projects: string[];
     modes: string[];
   };
@@ -246,6 +393,7 @@ export interface TaskListResponse {
 
 export interface TaskDetailResponse {
   task: TaskSummary;
+  can_followup?: boolean;
   runs: StoredRun[];
   attachments: TaskAttachment[];
   outbox: OutboxEntry[];

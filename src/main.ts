@@ -83,6 +83,8 @@ function dashboardTaskActions(dispatcher: Dispatcher) {
       ok: true,
       state: (await dispatcher.appendFeedback(taskGuid, details)).state,
     }),
+    appendWebFollowup: (taskGuid: string, details: string, idempotencyKey: string) =>
+      dispatcher.appendWebTaskFollowup(taskGuid, details, idempotencyKey),
   };
 }
 
@@ -94,6 +96,7 @@ function createCodexHistoryService(
   config: ReturnType<typeof loadConfig>,
   projectRoot: string,
   logger: Logger,
+  db: StateDatabase,
 ): CodexHistoryService {
   let executable = config.codex.cliPath;
   if (!isExecutableCodexPath(executable)) {
@@ -116,6 +119,8 @@ function createCodexHistoryService(
     executable,
     cwd: projectRoot,
     environment: buildCodexAppServerEnvironment(config),
+    listCacheStore: db,
+    threadHomePreferenceStore: db,
     logger,
   });
 }
@@ -135,7 +140,7 @@ async function runWebOnlyMode(
     db,
     auth,
     tmuxDashboard: tmuxDashboardApi,
-    codexHistory: createCodexHistoryService(config, resolveBridgeProjectRoot(import.meta.url), logger),
+    codexHistory: createCodexHistoryService(config, resolveBridgeProjectRoot(import.meta.url), logger, db),
     host: resolveDashboardListenHost(config.web.host),
     port,
     modes: Object.keys(config.modes),
@@ -355,7 +360,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         db,
         auth: auth!,
         tmuxDashboard: tmuxDashboardApi!,
-        codexHistory: createCodexHistoryService(config, projectRoot, logger),
+        codexHistory: createCodexHistoryService(config, projectRoot, logger, db),
         host: resolveDashboardListenHost(config.web.host),
         port: config.web.port,
         modes: Object.keys(config.modes),
@@ -368,6 +373,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             ok: true,
             state: (await dispatcher.appendFeedback(taskGuid, details)).state,
           }),
+          appendWebFollowup: (taskGuid, details, idempotencyKey) =>
+            dispatcher.appendWebTaskFollowup(taskGuid, details, idempotencyKey),
         },
         logger,
       })
@@ -469,12 +476,16 @@ async function runDirectMode(
       db,
       auth,
       tmuxDashboard: tmuxDashboardApi,
-      codexHistory: createCodexHistoryService(config, projectRoot, logger),
+      codexHistory: createCodexHistoryService(config, projectRoot, logger, db),
       host: resolveDashboardListenHost(config.web.host),
       port: config.web.port,
       modes: Object.keys(config.modes),
       taskAttachmentsDirectory: join(dirname(dbPath), "task-attachments"),
-      actions: dashboardTaskActions(dashboardDispatcher),
+      actions: {
+        ...dashboardTaskActions(dashboardDispatcher),
+        appendDirectFollowup: async (taskId, details, idempotencyKey) =>
+          db.appendWebDirectFollowup(taskId, details, idempotencyKey),
+      },
       logger,
     })
     : null;
@@ -616,7 +627,7 @@ async function runAampMode(
         db,
         auth: auth!,
         tmuxDashboard: tmuxDashboardApi!,
-        codexHistory: createCodexHistoryService(config, projectRoot, logger),
+        codexHistory: createCodexHistoryService(config, projectRoot, logger, db),
         host: resolveDashboardListenHost(config.web.host),
         port: config.web.port,
         modes: Object.keys(config.modes),

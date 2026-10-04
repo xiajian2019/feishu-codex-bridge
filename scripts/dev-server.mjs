@@ -191,6 +191,32 @@ async function start() {
   console.log(`Logs: ${STATE_DIRECTORY}`);
 }
 
+async function startWebOnly() {
+  const api = SERVICES.find((service) => service.id === "api");
+  const web = SERVICES.find((service) => service.id === "web");
+  if (!api || !web) throw new Error("Development API or Vite service is not configured.");
+  if (!await probe(api.probeUrl)) {
+    throw new Error(`Bridge Web API is not ready on port ${api.port}; start it before Vite.`);
+  }
+
+  await mkdir(STATE_DIRECTORY, { recursive: true, mode: 0o700 });
+  const startedThisRun = [];
+  try {
+    await startService(web, startedThisRun);
+  } catch (error) {
+    for (const service of [...startedThisRun].reverse()) {
+      await stopService(service).catch((stopError) => console.error(String(stopError)));
+    }
+    throw error;
+  }
+
+  console.log("Vite is detached and remains running after this command exits.");
+  console.log("Vite: http://0.0.0.0:5173/");
+  for (const url of networkUrls(web.port)) console.log(`LAN:  ${url}`);
+  console.log(`API:  http://127.0.0.1:${api.port}/`);
+  console.log(`Logs: ${STATE_DIRECTORY}`);
+}
+
 async function status() {
   for (const service of SERVICES) {
     const pid = await readPid(service.id);
@@ -206,6 +232,7 @@ async function status() {
 async function main() {
   const command = process.argv[2] ?? "start";
   if (command === "start") return start();
+  if (command === "web") return startWebOnly();
   if (command === "stop") {
     for (const service of [...SERVICES].reverse()) await stopService(service);
     return;
@@ -216,7 +243,7 @@ async function main() {
   }
   if (command === "status") return status();
   if (command === "--help" || command === "-h" || command === "help") {
-    console.log("Usage: bun run dev:start [start|status|stop|restart]");
+    console.log("Usage: bun run dev:start [start|web|status|stop|restart]");
     return;
   }
   throw new Error(`Unknown command: ${command}`);

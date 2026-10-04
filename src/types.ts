@@ -237,11 +237,62 @@ export interface TaskInput {
 }
 
 export interface WebTaskSubmission {
+  /** Optional for compatibility with older API clients. */
+  idempotencyKey?: string;
   summary?: string;
   description: string;
   projectKey: string;
   mode?: string;
   attachmentIds?: string[];
+}
+
+export type TmuxSessionActionType = "task_submit" | "terminal_command" | "shortcut" | "control_sequence";
+export type TmuxSessionActionStatus = "sending" | "sent" | "confirmed" | "unconfirmed" | "failed";
+
+export interface StoredTmuxSession {
+  record_id: string;
+  tmux_session_id: string;
+  session_name: string;
+  project_key: string | null;
+  working_directory: string;
+  tmux_created_at: number;
+  first_seen_at: string;
+  last_seen_at: string;
+  ended_at: string | null;
+  created_by_device_id: string | null;
+}
+
+export interface StoredTmuxSessionAction {
+  action_id: string;
+  session_record_id: string;
+  tmux_session_id: string;
+  session_name: string;
+  project_key: string | null;
+  working_directory: string;
+  session_ended_at: string | null;
+  device_id: string | null;
+  device_name: string | null;
+  action_type: TmuxSessionActionType;
+  request_id: string | null;
+  content: string;
+  status: TmuxSessionActionStatus;
+  error: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface TmuxSessionActionQuery {
+  search?: string;
+  tmuxSessionId?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export class WebTaskSubmissionConflictError extends Error {
+  constructor() {
+    super("相同幂等键已用于不同的任务内容，请刷新表单后重试。");
+    this.name = "WebTaskSubmissionConflictError";
+  }
 }
 
 export interface LarkCustomField {
@@ -437,6 +488,7 @@ export interface StoredBridgeTask {
   cancel_reason: string | null;
   recovery_count: number;
   last_recovered_at: string | null;
+  initial_final_response: string | null;
   final_response: string | null;
   error: string | null;
   created_at: string;

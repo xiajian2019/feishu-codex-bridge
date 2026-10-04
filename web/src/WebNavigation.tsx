@@ -4,14 +4,16 @@ import { NavLink, useLocation } from "react-router";
 import { useTheme, type ThemeMode } from "./theme.js";
 
 const PAGES = [
-  { to: "/", label: "Bridge", end: true },
+  { to: "/", label: "任务面板", end: true },
   { to: "/codex-history", label: "Codex 历史", end: true },
   { to: "/tmux-dashboard", label: "tmux Dashboard", end: false },
 ] as const;
 
 const SYSTEM_PAGES = [
   { to: "/system-management/devices", label: "设备管理" },
+  { to: "/system-management/projects", label: "项目管理" },
   { to: "/system-management/shortcuts", label: "快捷键管理" },
+  { to: "/system-management/usage", label: "Codex 用量" },
 ] as const;
 
 type SystemNavigationState = {

@@ -2,11 +2,15 @@ import type {
   DashboardChange,
   CodexHistoryAttachment,
   CodexHistoryDetailResponse,
+  CodexHistoryHome,
   CodexHistoryInterruptResponse,
   CodexHistoryListResponse,
   CodexHistoryMessageResponse,
+  CodexHistoryReasoningEffort,
   CodexHistoryUpdatesResponse,
   CodexHistoryWriterStatus,
+  CodexResetCreditConsumeResponse,
+  CodexUsageResponse,
   CreateTaskInput,
   CreateTaskResponse,
   ProjectRecord,
@@ -20,6 +24,7 @@ import { DEFAULT_COMPOSER_SHORTCUTS, type ShortcutDefinition, type ShortcutDispl
 export interface TaskQuery {
   q?: string;
   state?: string;
+  source?: string;
   project?: string;
   mode?: string;
   limit: number;
@@ -70,7 +75,7 @@ export function fetchTasks(query: TaskQuery, signal?: AbortSignal): Promise<Task
     if (key === "limit" || key === "offset" || !value) continue;
     params.set(key, value);
   }
-  return getJson<TaskListResponse>(`/api/tasks?${params.toString()}`, { signal });
+  return getJson<TaskListResponse>(`/api/task-panel?${params.toString()}`, { signal });
 }
 
 export function fetchCodexHistory(
@@ -86,6 +91,49 @@ export function fetchCodexHistory(
   if (query.q) params.set("q", query.q);
   if (query.status) params.set("status", query.status);
   return getJson<CodexHistoryListResponse>(`/api/codex/threads?${params.toString()}`, { signal });
+}
+
+export async function fetchCodexHistoryHomes(signal?: AbortSignal): Promise<CodexHistoryHome[]> {
+  const result = await getJson<{ homes: CodexHistoryHome[] }>("/api/codex/homes", { signal });
+  return result.homes;
+}
+
+export async function updateCodexThreadHomePreference(
+  threadId: string,
+  preferredHomeId: string,
+): Promise<{ threadId: string; preferredHomeId: string; updatedAt: string }> {
+  const token = await getActionToken();
+  return getJson<{ threadId: string; preferredHomeId: string; updatedAt: string }>(
+    `/api/codex/threads/${encodeURIComponent(threadId)}/home`,
+    {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Bridge-Action-Token": token,
+      },
+      body: JSON.stringify({ preferredHomeId }),
+    },
+  );
+}
+
+export function fetchCodexUsage(signal?: AbortSignal): Promise<CodexUsageResponse> {
+  return getJson<CodexUsageResponse>("/api/codex/usage", { signal });
+}
+
+export async function consumeCodexResetCredit(input: {
+  homeId: string;
+  creditId: string;
+  idempotencyKey: string;
+}): Promise<CodexResetCreditConsumeResponse> {
+  const token = await getActionToken();
+  return getJson<CodexResetCreditConsumeResponse>("/api/codex/usage/reset-credit/consume", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Action-Token": token,
+    },
+    body: JSON.stringify(input),
+  });
 }
 
 export function fetchCodexThreadDetail(
@@ -124,7 +172,13 @@ export async function deleteCodexHistoryAttachment(attachmentId: string): Promis
 export async function sendCodexThreadMessage(
   homeId: string,
   threadId: string,
-  input: { text: string; attachmentIds?: string[]; turnIndex: number },
+  input: {
+    text: string;
+    attachmentIds?: string[];
+    turnIndex: number;
+    model?: string;
+    reasoningEffort?: CodexHistoryReasoningEffort;
+  },
 ): Promise<CodexHistoryMessageResponse> {
   const token = await getActionToken();
   return getJson<CodexHistoryMessageResponse>(
@@ -403,6 +457,15 @@ export async function postTaskAction(
       "X-Bridge-Action-Token": token,
     },
     body: JSON.stringify(action === "feedback" ? { action, details } : { action }),
+  });
+}
+
+export async function postTaskFollowup(source: "desk" | "direct", taskId: string, text: string, idempotencyKey: string): Promise<{ ok: boolean; state: string }> {
+  const token = await getActionToken();
+  return getJson(`/api/task-panel/${source}/${encodeURIComponent(taskId)}/followups`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
+    body: JSON.stringify({ text, idempotencyKey }),
   });
 }
 

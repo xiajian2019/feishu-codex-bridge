@@ -1,7 +1,7 @@
-import { createReadStream } from "node:fs";
-import { link, lstat, mkdir, realpath, readdir, stat, unlink, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
-import { tmpdir } from "node:os";
+import { constants, createReadStream } from "node:fs";
+import { chmod, copyFile, link, lstat, mkdir, readFile, realpath, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { homedir, tmpdir } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -9,6 +9,7 @@ import type { Duplex } from "node:stream";
 
 import { getBunRuntime, type BunSubprocess, type BunTerminal } from "./bun-runtime.js";
 import type { StateDatabase } from "./db.js";
+import type { StoredTmuxSessionAction } from "./types.js";
 import * as tmux from "./tmux-dashboard.js";
 
 const API_PREFIX = "/tmux-dashboard/api";
@@ -125,7 +126,11 @@ const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.fre
   "tmux-resize-pane-5-left": "\u0002\u001b[1;3D",
   "tmux-resize-pane-5-right": "\u0002\u001b[1;3C",
 });
-const ATTACHMENT_DIRECTORY = join(tmpdir(), "feishu-codex-bridge", "tmux-dashboard-attachments");
+const ATTACHMENT_DIRECTORY = join(homedir(), ".feishu-codex-bridge", "tmux-dashboard-attachments");
+const LEGACY_ATTACHMENT_DIRECTORY = join(tmpdir(), "feishu-codex-bridge", "tmux-dashboard-attachments");
+const IMAGE_ATTACHMENT_FILENAME = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}\.(?:avif|bmp|gif|heic|heif|jpe?g|png|webp)$/i;
+const IMAGE_ATTACHMENT_TAG = /<image name=\[Image #(\d+)\] path="([^"\r\n]+)">/g;
+const SUBMISSION_ATTACHMENT_TAG = /<(?:image name=\[Image #\d+\]|file name="[^"\r\n]*") path="([^"\r\n]+)">/g;
 
 class DashboardBodyError extends Error {
   constructor(message: string, public readonly statusCode: number) {
@@ -135,6 +140,8 @@ class DashboardBodyError extends Error {
 
 interface TerminalData {
   sessionId: string;
+  sessionRecordId: string;
+  deviceId: string | null;
   cols: number;
   rows: number;
   terminal?: BunTerminal;
@@ -152,6 +159,7 @@ export class TmuxDashboardApi {
   private readonly websocketServer = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
   private readonly clients = new Set<WebSocket>();
   private stopped = false;
+  private attachmentStorageReady: Promise<void> | null = null;
 
   constructor(options: TmuxDashboardApiOptions) {
     if (!options.db) throw new Error("TmuxDashboardApi requires the Bridge state database.");
@@ -159,7 +167,11 @@ export class TmuxDashboardApi {
     this.operations = options.operations ?? tmux;
   }
 
-  public async handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  public async handleRequest(
+    request: IncomingMessage,
+    response: ServerResponse,
+    deviceId: string | null = null,
+  ): Promise<void> {
     const url = new URL(request.url ?? "/", "http://localhost");
     const apiPath = url.pathname.slice(API_PREFIX.length);
     if (request.method === "POST" && apiPath === "/scroll-diagnostics/export") {
@@ -206,6 +218,44 @@ export class TmuxDashboardApi {
       response.end(JSON.stringify(payload, null, 2));
       return;
     }
+    const imageMatch = /^\/attachments\/images\/([^/]+)$/.exec(apiPath);
+    if (request.method === "GET" && imageMatch) {
+      let fileName: string;
+      try {
+        fileName = decodeURIComponent(imageMatch[1]!);
+      } catch {
+        sendJson(response, 400, { error: "Invalid image attachment." });
+        return;
+      }
+      if (!IMAGE_ATTACHMENT_FILENAME.test(fileName)) {
+        sendJson(response, 400, { error: "Invalid image attachment." });
+        return;
+      }
+      try {
+        await this.ensureAttachmentStorage();
+        const filePath = await this.findImageAttachmentPath(fileName);
+        if (!filePath) {
+          sendJson(response, 404, { error: "Image attachment not found." });
+          return;
+        }
+        const fileInfo = await lstat(filePath);
+        response.setHeader("Cache-Control", "no-store");
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        response.setHeader("Referrer-Policy", "no-referrer");
+        response.setHeader("Content-Type", imageContentType(fileName));
+        response.setHeader("Content-Length", String(fileInfo.size));
+        response.setHeader("Content-Disposition", "inline");
+        const stream = createReadStream(filePath);
+        stream.on("error", () => {
+          if (!response.headersSent) sendJson(response, 404, { error: "Image attachment is no longer available." });
+          else response.destroy();
+        });
+        stream.pipe(response);
+      } catch {
+        sendJson(response, 500, { error: "Could not read the image attachment." });
+      }
+      return;
+    }
     if (request.method === "POST" && apiPath === "/attachments") {
       try {
         const attachment = await readBinaryBody(request, MAX_ATTACHMENT_BYTES, "Attachment must be 10 MB or smaller.");
@@ -219,8 +269,11 @@ export class TmuxDashboardApi {
           // Fall back to the raw header and still keep only its safe extension.
         }
         const requestedExtension = extname(basename(fileName)).toLowerCase();
-        const extension = /^\.[a-z0-9]{1,12}$/.test(requestedExtension) ? requestedExtension : ".bin";
-        await mkdir(ATTACHMENT_DIRECTORY, { recursive: true, mode: 0o700 });
+        const contentTypeHeader = request.headers["content-type"];
+        const contentType = (Array.isArray(contentTypeHeader) ? contentTypeHeader[0] : contentTypeHeader)?.split(";")[0]?.trim().toLowerCase() ?? "";
+        const extension = imageExtensionForContentType(contentType)
+          ?? (/^\.[a-z0-9]{1,12}$/.test(requestedExtension) ? requestedExtension : ".bin");
+        await this.ensureAttachmentStorage();
         const attachmentPath = join(ATTACHMENT_DIRECTORY, randomUUID() + extension);
         await writeFile(attachmentPath, attachment, { flag: "wx", mode: 0o600 });
         sendJson(response, 201, { path: attachmentPath });
@@ -331,9 +384,48 @@ export class TmuxDashboardApi {
       });
       return;
     }
+    if (request.method === "GET" && apiPath === "/history") {
+      const limit = Number(url.searchParams.get("limit") ?? 50);
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200
+        || !Number.isSafeInteger(offset) || offset < 0) {
+        sendJson(response, 400, { error: "limit must be 1..200 and offset a non-negative integer" });
+        return;
+      }
+      try {
+        this.db.syncTmuxSessions(await this.operations.listSessions());
+      } catch {
+        // Historical records remain readable while the tmux server is unavailable.
+      }
+      await this.ensureAttachmentStorage().catch(() => undefined);
+      const session = url.searchParams.get("session")?.trim();
+      const search = url.searchParams.get("q")?.trim();
+      const result = this.db.listTmuxSessionActions({
+        limit,
+        offset,
+        tmuxSessionId: session || undefined,
+        search: search || undefined,
+      });
+      const sessionInfo = session ? this.db.getLatestTmuxSession(session) : null;
+      sendJson(response, 200, {
+        ...result,
+        items: await Promise.all(result.items.map((item) => this.tmuxSessionActionView(item))),
+        session: sessionInfo ? {
+          session_name: sessionInfo.session_name,
+          project_key: sessionInfo.project_key,
+          working_directory: sessionInfo.working_directory,
+          ended_at: sessionInfo.ended_at,
+        } : null,
+        limit,
+        offset,
+      });
+      return;
+    }
     if (request.method === "GET" && apiPath === "/sessions") {
       try {
-        sendJson(response, 200, { sessions: await this.operations.listSessions() });
+        const sessions = await this.operations.listSessions();
+        this.db.syncTmuxSessions(sessions);
+        sendJson(response, 200, { sessions });
       } catch (error) {
         sendDashboardError(response, error);
       }
@@ -355,7 +447,9 @@ export class TmuxDashboardApi {
         const projectKey = typeof body.projectKey === "string" ? body.projectKey.trim() : "";
         const project = this.db.getAvailableProject(projectKey);
         if (!project) throw new Error("所选项目不可用，请刷新项目列表。");
-        sendJson(response, 201, { session: await this.operations.createSession(body.name.trim(), project.path) });
+        const session = await this.operations.createSession(body.name.trim(), project.path);
+        this.db.recordTmuxSession(session, { projectKey, createdByDeviceId: deviceId });
+        sendJson(response, 201, { session });
       } catch (error) {
         sendDashboardError(response, error);
       }
@@ -372,6 +466,7 @@ export class TmuxDashboardApi {
       }
       try {
         await this.operations.killSession(sessionId);
+        this.db.markTmuxSessionEnded(sessionId);
         sendEmpty(response, 204);
       } catch (error) {
         sendDashboardError(response, error);
@@ -381,7 +476,12 @@ export class TmuxDashboardApi {
     sendJson(response, 404, { error: "Not found." });
   }
 
-  public async handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+  public async handleUpgrade(
+    request: IncomingMessage,
+    socket: Duplex,
+    head: Buffer,
+    deviceId: string | null = null,
+  ): Promise<void> {
     const url = new URL(request.url ?? "/", "http://localhost");
     if (url.pathname !== "/tmux-dashboard/terminal") {
       socket.destroy();
@@ -399,15 +499,23 @@ export class TmuxDashboardApi {
     }
 
     const sessionId = url.searchParams.get("session") || "";
-    if (!tmux.isSessionId(sessionId) || !(await this.operations.findSession(sessionId))) {
+    const session = tmux.isSessionId(sessionId) ? await this.operations.findSession(sessionId) : undefined;
+    if (!session) {
       rejectUpgrade(socket, 404, "tmux session not found.");
       return;
     }
+    const storedSession = this.db.recordTmuxSession(session);
     const cols = clampDimension(Number(url.searchParams.get("cols")), 20, 400) || 80;
     const rows = clampDimension(Number(url.searchParams.get("rows")), 5, 200) || 24;
     this.websocketServer.handleUpgrade(request, socket, head, (client) => {
       this.clients.add(client);
-      this.openTerminal(client, { sessionId, cols, rows });
+      this.openTerminal(client, {
+        sessionId,
+        sessionRecordId: storedSession.record_id,
+        deviceId,
+        cols,
+        rows,
+      });
     });
   }
 
@@ -417,6 +525,77 @@ export class TmuxDashboardApi {
     for (const client of this.clients) client.close(1001, "Server shutting down");
     this.clients.clear();
     this.websocketServer.close();
+  }
+
+  private ensureAttachmentStorage(): Promise<void> {
+    if (!this.attachmentStorageReady) {
+      this.attachmentStorageReady = this.migrateAttachmentStorage().catch((error: unknown) => {
+        this.attachmentStorageReady = null;
+        throw error;
+      });
+    }
+    return this.attachmentStorageReady;
+  }
+
+  private async migrateAttachmentStorage(): Promise<void> {
+    const dataDirectory = join(homedir(), ".feishu-codex-bridge");
+    await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
+    await chmod(dataDirectory, 0o700);
+    await mkdir(ATTACHMENT_DIRECTORY, { recursive: true, mode: 0o700 });
+    await chmod(ATTACHMENT_DIRECTORY, 0o700);
+    if (LEGACY_ATTACHMENT_DIRECTORY === ATTACHMENT_DIRECTORY) return;
+
+    const legacyFiles = await readdir(LEGACY_ATTACHMENT_DIRECTORY).catch((error: unknown) => {
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? String((error as { code?: unknown }).code)
+        : "";
+      if (code === "ENOENT") return [];
+      throw error;
+    });
+    for (const fileName of legacyFiles) {
+      if (!/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}\.[a-z\d]{1,12}$/i.test(fileName)) continue;
+      const sourcePath = join(LEGACY_ATTACHMENT_DIRECTORY, fileName);
+      const sourceInfo = await lstat(sourcePath).catch(() => null);
+      if (!sourceInfo?.isFile() || sourceInfo.isSymbolicLink()) continue;
+      const targetPath = join(ATTACHMENT_DIRECTORY, fileName);
+      try {
+        await copyFile(sourcePath, targetPath, constants.COPYFILE_EXCL);
+        await chmod(targetPath, 0o600);
+      } catch (error) {
+        const code = typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+        if (code !== "EEXIST") throw error;
+      }
+    }
+  }
+
+  private async findImageAttachmentPath(fileName: string): Promise<string | null> {
+    for (const directory of [ATTACHMENT_DIRECTORY, LEGACY_ATTACHMENT_DIRECTORY]) {
+      const filePath = join(directory, fileName);
+      const fileInfo = await lstat(filePath).catch(() => null);
+      if (fileInfo?.isFile() && !fileInfo.isSymbolicLink() && fileInfo.size <= MAX_ATTACHMENT_BYTES) return filePath;
+    }
+    return null;
+  }
+
+  private async tmuxSessionActionView(item: StoredTmuxSessionAction): Promise<StoredTmuxSessionAction & {
+    imageAttachments: Array<{ name: string; url: string }>;
+  }> {
+    const candidates: Array<{ name: string; fileName: string }> = [];
+    const content = item.content.replace(IMAGE_ATTACHMENT_TAG, (_tag, index: string, path: string) => {
+      const fileName = basename(path);
+      if (IMAGE_ATTACHMENT_FILENAME.test(fileName)) candidates.push({ name: `Image #${index}`, fileName });
+      return "";
+    }).replace(/\n[\t ]*\n(?:[\t ]*\n)+/g, "\n\n").trim();
+    const imageAttachments = (await Promise.all(candidates.map(async (candidate) => {
+      if (!await this.findImageAttachmentPath(candidate.fileName)) return null;
+      return {
+        name: candidate.name,
+        url: `${API_PREFIX}/attachments/images/${encodeURIComponent(candidate.fileName)}`,
+      };
+    }))).filter((candidate): candidate is { name: string; url: string } => candidate !== null);
+    return { ...item, content, imageAttachments };
   }
 
   private async getSessionFileContext(sessionId: string, requestedPath: string): Promise<SessionFileContext> {
@@ -556,6 +735,34 @@ export class TmuxDashboardApi {
             }));
           }
         };
+        const beginHistory = (
+          actionType: "task_submit" | "terminal_command" | "shortcut" | "control_sequence",
+          content: string,
+        ): string | null => {
+          try {
+            return this.db.beginTmuxSessionAction({
+              sessionRecordId: data.sessionRecordId,
+              deviceId: data.deviceId,
+              actionType,
+              requestId: requestId || null,
+              content,
+            }).actionId;
+          } catch {
+            reply(false, "Could not save session operation history.");
+            return null;
+          }
+        };
+        const finishHistory = (
+          actionId: string,
+          status: "sent" | "confirmed" | "unconfirmed" | "failed",
+          error: string | null = null,
+        ): void => {
+          try {
+            this.db.finishTmuxSessionAction(actionId, status, error);
+          } catch {
+            // Keep the durable "sending" record when the outcome cannot be saved.
+          }
+        };
         if (control.type === "key") {
           const sequence = typeof control.key === "string" && Object.hasOwn(TERMINAL_SHORTCUT_SEQUENCES, control.key)
             ? TERMINAL_SHORTCUT_SEQUENCES[control.key]
@@ -568,10 +775,14 @@ export class TmuxDashboardApi {
             reply(false, "The tmux session is not attached.");
             return;
           }
+          const actionId = beginHistory("shortcut", String(control.key));
+          if (!actionId) return;
           try {
             data.terminal.write(sequence);
+            finishHistory(actionId, "sent");
             reply(true);
           } catch {
+            finishHistory(actionId, "failed", "Could not send the shortcut to the tmux session.");
             reply(false, "Could not send the shortcut to the tmux session.");
           }
           return;
@@ -590,10 +801,14 @@ export class TmuxDashboardApi {
             reply(false, "The tmux session is not attached.");
             return;
           }
+          const actionId = beginHistory("control_sequence", controlSequenceForHistory(sequence));
+          if (!actionId) return;
           try {
             data.terminal.write(sequence);
+            finishHistory(actionId, "sent");
             reply(true);
           } catch {
+            finishHistory(actionId, "failed", "Could not send the control-key sequence to the tmux session.");
             reply(false, "Could not send the control-key sequence to the tmux session.");
           }
           return;
@@ -618,18 +833,43 @@ export class TmuxDashboardApi {
           return;
         }
         if (control.type === "command") {
+          const actionId = beginHistory("terminal_command", text);
+          if (!actionId) return;
           try {
             flushOutput();
             immediateOutputFlushUntil = Date.now() + SUBMIT_FAST_FLUSH_WINDOW_MS;
             data.terminal.write("\u001b[200~" + text + "\u001b[201~\r");
+            finishHistory(actionId, "sent");
             reply(true);
           } catch {
+            finishHistory(actionId, "failed", "Could not send the command to the tmux session.");
             reply(false, "Could not send the command to the tmux session.");
           }
           return;
         }
-        const paneBefore = await tmux.capturePane(data.sessionId, data.rows).catch(() => null);
+        let actionId: string;
+        try {
+          const fingerprint = await submissionFingerprint(text);
+          const claim = this.db.beginTmuxSessionAction({
+            sessionRecordId: data.sessionRecordId,
+            deviceId: data.deviceId,
+            actionType: "task_submit",
+            requestId: requestId || null,
+            content: text,
+            submissionFingerprint: fingerprint,
+          });
+          if (claim.duplicate) {
+            reply(false, "相同消息近期已提交到此 Session，可能正在处理；请先查看终端或操作历史，避免重复发送。");
+            return;
+          }
+          actionId = claim.actionId;
+        } catch {
+          reply(false, "Could not save session operation history.");
+          return;
+        }
+        const paneBefore = await tmux.capturePane(data.sessionId, 200).catch(() => null);
         if (paneBefore === null) {
+          finishHistory(actionId, "failed", "无法读取 session 当前状态。");
           reply(false, "消息未发送：无法读取 session 当前状态，请稍后重试。");
           return;
         }
@@ -637,14 +877,20 @@ export class TmuxDashboardApi {
           flushOutput();
           immediateOutputFlushUntil = Date.now() + SUBMIT_FAST_FLUSH_WINDOW_MS;
           data.terminal.write("\u001b[200~" + text + "\u001b[201~\r");
-          const confirmed = await waitForPaneChange(data.sessionId, paneBefore, text, data.rows);
+          const confirmed = await waitForPaneChange(data.sessionId, paneBefore, text);
+          finishHistory(
+            actionId,
+            confirmed ? "confirmed" : "unconfirmed",
+            confirmed ? null : "未能从终端屏幕确认处理状态；消息可能已被接收。",
+          );
           reply(
             confirmed,
             confirmed
               ? undefined
-              : "消息已写入终端，但 session 未确认接收；输入已保留，请检查连接后重试。",
+              : "消息已写入终端，但无法从屏幕确认处理状态；可能已开始执行。请先查看 Session，避免直接重发。",
           );
         } catch {
+          finishHistory(actionId, "failed", "Could not send the message to the session.");
           reply(false, "Could not send the message to the tmux session.");
         }
         return;
@@ -733,28 +979,63 @@ async function captureInitialScreen(sessionId: string, rows: number): Promise<st
   return "\u001b[3J\u001b[2J\u001b[H" + screen;
 }
 
-async function waitForPaneChange(sessionId: string, before: string, submittedText: string, rows: number): Promise<boolean> {
-  const messageForEcho = submittedText.split(/<image\s+name=/i, 1)[0].trim() || "请打开并查看我附上的图片";
-  const expected = normalizePaneText(messageForEcho);
-  const expectedCompact = expected.replace(/\s+/g, "");
-  const expectedSnippet = expected.slice(0, 64);
-  const expectedCompactSnippet = expectedCompact.slice(0, 64);
+async function waitForPaneChange(sessionId: string, before: string, submittedText: string): Promise<boolean> {
   for (const delay of [120, 280, 560, 1_120, 2_240]) {
     await new Promise<void>((resolve) => setTimeout(resolve, delay));
     try {
-      const after = await tmux.capturePane(sessionId, rows);
-      if (
-        after !== before
-        && (
-          normalizePaneText(after).includes(expectedSnippet)
-          || normalizePaneText(after).replace(/\s+/g, "").includes(expectedCompactSnippet)
-        )
-      ) return true;
+      const after = await tmux.capturePane(sessionId, 200);
+      if (hasNewSubmissionEcho(before, after, submittedText)) return true;
     } catch {
       return false;
     }
   }
   return false;
+}
+
+export function hasNewSubmissionEcho(before: string, after: string, submittedText: string): boolean {
+  const messageForEcho = submittedText.split(/<image\s+name=/i, 1)[0].trim() || "请打开并查看我附上的图片";
+  const expected = normalizePaneText(messageForEcho);
+  const expectedCompact = expected.replace(/\s+/g, "");
+  const expectedSnippet = expected.slice(0, 32);
+  const expectedCompactSnippet = expectedCompact.slice(0, 32);
+  const beforeNormalized = normalizePaneText(before);
+  const beforeCompact = beforeNormalized.replace(/\s+/g, "");
+  const afterNormalized = normalizePaneText(after);
+  const afterCompact = afterNormalized.replace(/\s+/g, "");
+  return after !== before && (
+    countOccurrences(afterNormalized, expectedSnippet) > countOccurrences(beforeNormalized, expectedSnippet)
+    || countOccurrences(afterCompact, expectedCompactSnippet) > countOccurrences(beforeCompact, expectedCompactSnippet)
+  );
+}
+
+function countOccurrences(value: string, snippet: string): number {
+  if (!snippet) return 0;
+  return value.split(snippet).length - 1;
+}
+
+export async function submissionFingerprint(text: string): Promise<string> {
+  const hash = createHash("sha256");
+  let offset = 0;
+  for (const match of text.matchAll(SUBMISSION_ATTACHMENT_TAG)) {
+    const tag = match[0];
+    const path = match[1]!;
+    const index = match.index;
+    hash.update(text.slice(offset, index));
+    const fileName = basename(path);
+    const allowedDirectory = [ATTACHMENT_DIRECTORY, LEGACY_ATTACHMENT_DIRECTORY]
+      .find((directory) => path === join(directory, fileName));
+    let contentDigest: string | null = null;
+    if (allowedDirectory && /^[\da-f-]{36}\.[a-z0-9]{1,12}$/i.test(fileName)) {
+      const fileInfo = await lstat(path).catch(() => null);
+      if (fileInfo?.isFile() && !fileInfo.isSymbolicLink() && fileInfo.size <= MAX_ATTACHMENT_BYTES) {
+        contentDigest = createHash("sha256").update(await readFile(path)).digest("hex");
+      }
+    }
+    hash.update(contentDigest ? tag.replace(path, `sha256:${contentDigest}`) : tag);
+    offset = index + tag.length;
+  }
+  hash.update(text.slice(offset));
+  return hash.digest("hex");
 }
 
 function normalizePaneText(value: string): string {
@@ -870,6 +1151,45 @@ function sanitizeSessionFileName(value: string): string {
     throw new DashboardBodyError("The uploaded file name is invalid.", 400);
   }
   return fileName;
+}
+
+function controlSequenceForHistory(value: string): string {
+  return [...value].map((character) => {
+    const code = character.codePointAt(0) ?? 0;
+    return code < 0x20 || code === 0x7f
+      ? `\\u${code.toString(16).padStart(4, "0")}`
+      : character;
+  }).join("");
+}
+
+function imageContentType(fileName: string): string {
+  const extension = extname(fileName).toLowerCase();
+  const contentTypes: Record<string, string> = {
+    ".avif": "image/avif",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+  };
+  return contentTypes[extension] ?? "application/octet-stream";
+}
+
+function imageExtensionForContentType(contentType: string): string | null {
+  const extensions: Readonly<Record<string, string>> = {
+    "image/avif": ".avif",
+    "image/bmp": ".bmp",
+    "image/gif": ".gif",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+  };
+  return extensions[contentType] ?? null;
 }
 
 function sendSessionFileError(response: ServerResponse, error: unknown): void {

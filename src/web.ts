@@ -10,6 +10,7 @@ import { StateDatabase } from "./db.js";
 import {
   CODEX_HISTORY_DEFAULT_SOURCE_KINDS,
   CODEX_HISTORY_MAX_ATTACHMENT_BYTES,
+  isCodexHistoryReasoningEffort,
   CODEX_HISTORY_SOURCE_KINDS,
   CODEX_HISTORY_STATUS_TYPES,
   CodexHistoryService,
@@ -21,6 +22,10 @@ import { resolveBridgeProjectRoot } from "./portable-runtime.js";
 import { parseTaskInput } from "./fingerprint.js";
 import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import {
+  WebTaskSubmissionConflictError,
+  DIRECT_TASK_STATUSES,
+  type DirectTaskStatus,
+  type StoredBridgeTask,
   AAMP_TASK_STATUSES,
   PROJECT_STATUSES,
   SHORTCUT_DISPLAY_MODES,
@@ -86,6 +91,8 @@ export interface DashboardActions {
   createTask?(input: WebTaskSubmission): Promise<StoredTask>;
   interruptTask(taskGuid: string, reason?: string): Promise<{ ok: boolean; message?: string }>;
   appendFeedback(taskGuid: string, details: string): Promise<{ ok: boolean; state: string }>;
+  appendWebFollowup?(taskGuid: string, details: string, idempotencyKey: string): Promise<StoredTask>;
+  appendDirectFollowup?(taskId: string, details: string, idempotencyKey: string): Promise<StoredBridgeTask>;
 }
 
 export class DashboardServer {
@@ -253,7 +260,7 @@ export class DashboardServer {
         && /^\/tmux-dashboard\/api\/sessions\/[^/]+\/files\/upload$/.test(url.pathname)
         && !this.requireActionAuthorization(request, response)
       ) return;
-      await this.options.tmuxDashboard.handleRequest(request, response);
+      await this.options.tmuxDashboard.handleRequest(request, response, this.auth.currentDeviceId(request));
       return;
     }
     if (request.method === "GET" && isSpaRoute(url.pathname)) {
@@ -352,6 +359,47 @@ export class DashboardServer {
       sendJson(response, 200, { projects: this.listProjects() });
       return;
     }
+    if (request.method === "GET" && url.pathname === "/api/codex/usage") {
+      if (!this.options.codexHistory) {
+        sendJson(response, 501, { error: "Codex usage is not configured" });
+        return;
+      }
+      try {
+        sendJson(response, 200, await this.options.codexHistory.readUsage());
+      } catch {
+        sendJson(response, 502, { error: "Codex usage could not be loaded" });
+      }
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/codex/usage/reset-credit/consume") {
+      const history = this.options.codexHistory;
+      if (!history) {
+        sendJson(response, 501, { error: "Codex usage is not configured" });
+        return;
+      }
+      if (!this.requireActionAuthorization(request, response)) return;
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonBody(request);
+      } catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+        return;
+      }
+      const homeId = typeof body.homeId === "string" ? body.homeId.trim() : "";
+      const creditId = typeof body.creditId === "string" ? body.creditId.trim() : "";
+      const idempotencyKey = typeof body.idempotencyKey === "string" ? body.idempotencyKey.trim() : "";
+      if (!homeId || !creditId || !idempotencyKey || idempotencyKey.length > 200) {
+        sendJson(response, 400, { error: "homeId, creditId and idempotencyKey are required" });
+        return;
+      }
+      try {
+        const result = await history.consumeResetCredit(homeId, creditId, idempotencyKey);
+        sendJson(response, 200, result);
+      } catch {
+        sendJson(response, 502, { error: "重置卡消费结果未确认，请使用相同请求重试或刷新账户状态。" });
+      }
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/api/codex/homes") {
       if (!this.options.codexHistory) {
         sendJson(response, 501, { error: "Codex history is not configured" });
@@ -362,6 +410,11 @@ export class DashboardServer {
     }
     if (request.method === "POST" && url.pathname === "/api/codex/attachments") {
       await this.uploadCodexHistoryAttachment(request, response);
+      return;
+    }
+    const codexThreadHomePreferenceMatch = /^\/api\/codex\/threads\/([^/]+)\/home$/.exec(url.pathname);
+    if (request.method === "PATCH" && codexThreadHomePreferenceMatch) {
+      await this.updateCodexThreadHomePreference(codexThreadHomePreferenceMatch[1]!, request, response);
       return;
     }
     const codexAttachmentMatch = /^\/api\/codex\/attachments\/([^/]+)$/.exec(url.pathname);
@@ -515,6 +568,18 @@ export class DashboardServer {
       this.listTasks(url, response);
       return;
     }
+    if (request.method === "GET" && url.pathname === "/api/task-panel") {
+      this.listTaskPanel(url, response);
+      return;
+    }
+    const taskPanelFollowupMatch = /^\/api\/task-panel\/(desk|direct)\/([^/]+)\/followups$/.exec(url.pathname);
+    if (request.method === "POST" && taskPanelFollowupMatch) {
+      let taskId: string;
+      try { taskId = decodeURIComponent(taskPanelFollowupMatch[2]!); }
+      catch { sendJson(response, 400, { error: "invalid task selector" }); return; }
+      await this.appendTaskPanelFollowup(taskPanelFollowupMatch[1] as "desk" | "direct", taskId, request, response);
+      return;
+    }
     if (request.method === "POST" && url.pathname === "/api/tasks") {
       await this.createTask(request, response);
       return;
@@ -568,6 +633,18 @@ export class DashboardServer {
       } else {
         await this.downloadTaskFile(taskGuid, path, response);
       }
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/direct/tasks") {
+      this.listDirectTasks(url, response);
+      return;
+    }
+    const directTaskMatch = /^\/api\/direct\/tasks\/([^/]+)$/.exec(url.pathname);
+    if (directTaskMatch && request.method === "GET") {
+      let taskId: string;
+      try { taskId = decodeURIComponent(directTaskMatch[1]!); }
+      catch { sendJson(response, 400, { error: "invalid Direct task id" }); return; }
+      this.getDirectTask(taskId, url, response);
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/aamp/tasks") {
@@ -679,6 +756,55 @@ export class DashboardServer {
     });
   }
 
+  private listTaskPanel(url: URL, response: ServerResponse): void {
+    const rawStates = url.searchParams.getAll("state")
+      .flatMap((value) => value.split(","))
+      .filter(Boolean);
+    const states = rawStates.filter((state) => isTaskState(state) || DIRECT_TASK_STATUSES.includes(state as DirectTaskStatus));
+    if (states.length !== rawStates.length) {
+      sendJson(response, 400, { error: "invalid task state" });
+      return;
+    }
+    const limit = parseInteger(url.searchParams.get("limit"), 50, 1, 200);
+    const offset = parseInteger(url.searchParams.get("offset"), 0, 0, 1_000_000);
+    if (limit === null || offset === null) {
+      sendJson(response, 400, { error: "invalid pagination" });
+      return;
+    }
+    const source = url.searchParams.get("source") ?? "all";
+    if (source !== "all" && source !== "desk" && source !== "direct") {
+      sendJson(response, 400, { error: "invalid task source" });
+      return;
+    }
+    const result = this.options.db.queryTaskPanel({
+      source,
+      states,
+      projectKey: cleanParam(url.searchParams.get("project")),
+      mode: cleanParam(url.searchParams.get("mode")),
+      search: cleanParam(url.searchParams.get("q")),
+      limit,
+      offset,
+    });
+    sendJson(response, 200, {
+      items: result.items.map((entry) => entry.source === "direct"
+        ? directTaskView(entry.task)
+        : {
+          ...entry.task,
+          source: "desk" as const,
+          input: parseTaskInput(entry.task.input_text),
+          latest_run: this.options.db.getLatestRun(entry.task.task_guid),
+        }),
+      total: result.total,
+      limit,
+      offset,
+      filters: {
+        states: [...TASK_STATES, ...DIRECT_TASK_STATUSES.filter((state) => !TASK_STATES.includes(state as TaskState))],
+        projects: this.options.db.listAvailableProjects().map((project) => project.name),
+        modes: this.options.modes,
+      },
+    });
+  }
+
   private async listCodexThreads(url: URL, response: ServerResponse): Promise<void> {
     const history = this.options.codexHistory;
     if (!history) {
@@ -712,6 +838,38 @@ export class DashboardServer {
       });
     } catch (error) {
       sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid Codex history query" });
+    }
+  }
+
+  private async updateCodexThreadHomePreference(
+    encodedThreadId: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const history = this.options.codexHistory;
+    if (!history) {
+      sendJson(response, 501, { error: "Codex history is not configured" });
+      return;
+    }
+    if (!this.requireActionAuthorization(request, response)) return;
+    let threadId: string;
+    let body: Record<string, unknown>;
+    try {
+      threadId = decodeURIComponent(encodedThreadId);
+      body = await readJsonBody(request);
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request" });
+      return;
+    }
+    const preferredHomeId = typeof body.preferredHomeId === "string" ? body.preferredHomeId.trim() : "";
+    if (!threadId.trim() || !preferredHomeId) {
+      sendJson(response, 400, { error: "threadId and preferredHomeId are required" });
+      return;
+    }
+    try {
+      sendJson(response, 200, history.setThreadHomePreference(threadId, preferredHomeId));
+    } catch (error) {
+      sendJson(response, 422, { error: error instanceof Error ? error.message : "Codex Home preference could not be saved" });
     }
   }
 
@@ -959,6 +1117,16 @@ export class DashboardServer {
       sendJson(response, 400, { error: "text must be a string" });
       return;
     }
+    if (body.model !== undefined && typeof body.model !== "string") {
+      sendJson(response, 400, { error: "model must be a string" });
+      return;
+    }
+    if (body.reasoningEffort !== undefined
+      && (typeof body.reasoningEffort !== "string"
+        || !isCodexHistoryReasoningEffort(body.reasoningEffort))) {
+      sendJson(response, 400, { error: "reasoningEffort is invalid" });
+      return;
+    }
     if (body.turnIndex !== undefined && (!Number.isSafeInteger(body.turnIndex) || Number(body.turnIndex) < 0)) {
       sendJson(response, 400, { error: "turnIndex must be a non-negative integer" });
       return;
@@ -973,6 +1141,10 @@ export class DashboardServer {
         text: typeof body.text === "string" ? body.text : "",
         attachmentIds: attachmentIds as string[],
         ...(typeof body.turnIndex === "number" ? { turnIndex: body.turnIndex } : {}),
+        ...(typeof body.model === "string" ? { model: body.model } : {}),
+        ...(typeof body.reasoningEffort === "string"
+          ? { reasoningEffort: body.reasoningEffort }
+          : {}),
       });
       sendJson(response, 202, result);
     } catch (error) {
@@ -1014,6 +1186,61 @@ export class DashboardServer {
     }
   }
 
+  private listDirectTasks(url: URL, response: ServerResponse): void {
+    const status = url.searchParams.get("status") || "";
+    if (status && !DIRECT_TASK_STATUSES.includes(status as DirectTaskStatus)) {
+      sendJson(response, 400, { error: "invalid Direct task status" });
+      return;
+    }
+    const page = this.directPage(url, response);
+    if (!page) return;
+    const result = this.options.db.listBridgeTasks({
+      statuses: status ? [status as DirectTaskStatus] : undefined,
+      search: url.searchParams.get("q")?.trim().slice(0, 500), ...page,
+    });
+    sendJson(response, 200, { ...result, ...page, items: result.items.map(directTaskView) });
+  }
+
+  private getDirectTask(taskId: string, url: URL, response: ServerResponse): void {
+    const page = this.directPage(url, response);
+    if (!page) return;
+    const eventsParam = url.searchParams.get("events");
+    if (eventsParam !== null && eventsParam !== "0" && eventsParam !== "1") {
+      sendJson(response, 400, { error: "invalid events option" });
+      return;
+    }
+    const task = this.options.db.getBridgeTask(taskId);
+    if (!task) {
+      sendJson(response, 404, { error: "Direct task not found" });
+      return;
+    }
+    const related = this.options.db.readBridgeTaskPage(taskId, page.limit, page.offset, eventsParam !== "0");
+    const inbound = this.options.db.getInboundEvent(task.source_event_id);
+    sendJson(response, 200, {
+      task: directTaskView(task), ...page,
+      can_followup: Boolean(this.options.actions?.appendDirectFollowup && task.thread_id && task.status !== "CANCEL_REQUESTED"),
+      inbound: inbound ? { event_type: inbound.event_type, received_at: inbound.received_at, processed_at: inbound.processed_at } : null,
+      followups: related.followups,
+      attachments: { ...related.attachments, items: related.attachments.items.map((attachment) => ({
+        attachment_id: attachment.attachment_id, followup_id: attachment.followup_id,
+        file_name: attachment.file_name, type: attachment.type, status: attachment.status, error: attachment.error,
+      })) },
+      events: { ...related.events, items: related.events.items.map((event) => ({
+        id: event.id, event_type: event.event_type, created_at: event.created_at,
+      })) },
+    });
+  }
+
+  private directPage(url: URL, response: ServerResponse): { limit: number; offset: number } | null {
+    const limit = Number(url.searchParams.get("limit") ?? 30);
+    const offset = Number(url.searchParams.get("offset") ?? 0);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !Number.isSafeInteger(offset) || offset < 0) {
+      sendJson(response, 400, { error: "limit must be 1..100 and offset a non-negative integer" });
+      return null;
+    }
+    return { limit, offset };
+  }
+
   private async createTask(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const create = this.options.actions?.createTask;
     if (!create) {
@@ -1030,6 +1257,11 @@ export class DashboardServer {
     }
     if (typeof body.projectKey !== "string" || typeof body.description !== "string" || !body.description.trim()) {
       sendJson(response, 400, { error: "projectKey and non-empty description are required" });
+      return;
+    }
+    if (body.idempotencyKey !== undefined && (typeof body.idempotencyKey !== "string"
+      || !body.idempotencyKey.trim() || body.idempotencyKey.length > 200)) {
+      sendJson(response, 400, { error: "idempotencyKey must contain 1 to 200 characters" });
       return;
     }
     if (body.summary !== undefined && typeof body.summary !== "string") {
@@ -1054,6 +1286,7 @@ export class DashboardServer {
     }
     try {
       const input: WebTaskSubmission = {
+        idempotencyKey: typeof body.idempotencyKey === "string" ? body.idempotencyKey : undefined,
         summary: typeof body.summary === "string" ? body.summary : undefined,
         description: body.description,
         projectKey: body.projectKey,
@@ -1066,7 +1299,8 @@ export class DashboardServer {
         latest_run: this.options.db.getLatestRun(task.task_guid),
       });
     } catch (error) {
-      sendJson(response, 422, { error: error instanceof Error ? error.message : "task creation failed" });
+      sendJson(response, error instanceof WebTaskSubmissionConflictError ? 409 : 422,
+        { error: error instanceof Error ? error.message : "task creation failed" });
     }
   }
 
@@ -1308,6 +1542,9 @@ export class DashboardServer {
     }
     sendJson(response, 200, {
       task: { ...task, input: parseTaskInput(task.input_text) },
+      can_followup: task.origin === "web"
+        ? Boolean(this.options.actions?.appendWebFollowup && task.state !== "RUNNING" && task.state !== "QUEUED")
+        : Boolean(this.options.actions?.appendFeedback),
       runs: this.options.db.listRunsForTask(taskGuid).map((run) => ({
         ...run,
         events: this.options.db.listRunEvents(run.run_id),
@@ -1315,6 +1552,43 @@ export class DashboardServer {
       attachments: this.options.db.listWebTaskAttachments(taskGuid).map(publicWebTaskAttachment),
       outbox: this.options.db.listOutboxForTask(taskGuid),
     });
+  }
+
+  private async appendTaskPanelFollowup(
+    source: "desk" | "direct", taskId: string, request: IncomingMessage, response: ServerResponse,
+  ): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try { body = await readJsonBody(request); }
+    catch (error) { sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request" }); return; }
+    const details = typeof body.text === "string" ? body.text.trim() : "";
+    const key = typeof body.idempotencyKey === "string" ? body.idempotencyKey.trim() : "";
+    if (!details || details.length > 2000 || !key || key.length > 200) {
+      sendJson(response, 400, { error: "text and idempotencyKey are required; text is limited to 2000 characters" });
+      return;
+    }
+    try {
+      if (source === "direct") {
+        if (!this.options.actions?.appendDirectFollowup) { sendJson(response, 501, { error: "Direct 续问当前不可用" }); return; }
+        const task = await this.options.actions.appendDirectFollowup(taskId, details, key);
+        sendJson(response, 200, { ok: true, state: task.status });
+        return;
+      }
+      const task = this.options.db.getTask(taskId);
+      if (!task) { sendJson(response, 404, { error: "task not found" }); return; }
+      if (task.origin === "web") {
+        if (!this.options.actions?.appendWebFollowup) { sendJson(response, 501, { error: "Bridge 续问当前不可用" }); return; }
+        const updated = await this.options.actions.appendWebFollowup(taskId, details, key);
+        sendJson(response, 200, { ok: true, state: updated.state });
+      } else {
+        if (!this.options.actions?.appendFeedback) { sendJson(response, 501, { error: "飞书任务续问当前不可用" }); return; }
+        const result = await this.options.actions.appendFeedback(taskId, details);
+        sendJson(response, result.ok ? 200 : 409, result);
+      }
+    } catch (error) {
+      sendJson(response, error instanceof WebTaskSubmissionConflictError ? 409 : 422,
+        { error: error instanceof Error ? error.message : "追加信息失败" });
+    }
   }
 
   private listAampTasks(url: URL, response: ServerResponse): void {
@@ -1715,7 +1989,12 @@ export class DashboardServer {
     }
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
     if (pathname === "/tmux-dashboard/terminal" && this.options.tmuxDashboard) {
-      void this.options.tmuxDashboard.handleUpgrade(request, socket, head).catch((error: unknown) => {
+      void this.options.tmuxDashboard.handleUpgrade(
+        request,
+        socket,
+        head,
+        this.auth.currentDeviceId(request),
+      ).catch((error: unknown) => {
         this.options.logger?.warn("tmux dashboard websocket failed", {
           error: error instanceof Error ? error.message : String(error),
         });
@@ -1806,6 +2085,10 @@ function isSpaRoute(pathname: string): boolean {
     || pathname === "/system-management"
     || pathname === "/system-management/devices"
     || pathname === "/system-management/shortcuts"
+    || pathname === "/system-management/usage"
+    || pathname === "/direct-tasks"
+    || pathname === "/system-management/projects"
+    || /^\/tasks\/(?:desk|direct)\/[^/]+$/.test(pathname)
     || pathname === "/codex-history"
     || pathname === "/tmux-dashboard"
     || (pathname.startsWith("/tmux-dashboard/")
@@ -2274,4 +2557,15 @@ function findWebRoot(): string {
     resolve(projectRoot, "web"),
   ];
   return candidates.find((candidate) => existsSync(join(candidate, "index.html"))) ?? candidates[0];
+}
+
+function directTaskView(task: StoredBridgeTask) {
+  return {
+    source: "direct" as const, id: task.bridge_task_id, text: task.text, status: task.status,
+    thread_id: task.thread_id, attempt: task.attempt, sender_name: task.sender_name,
+    last_progress_text: task.last_progress_text, last_progress_at: task.last_progress_at,
+    card_state: task.card_state, final_response: task.final_response, error: task.error,
+    initial_final_response: task.initial_final_response,
+    created_at: task.created_at, updated_at: task.updated_at,
+  };
 }

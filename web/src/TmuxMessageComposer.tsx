@@ -694,7 +694,7 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
       }
 
       return {
-        content: [{ type: "text", text: result.ok ? "Delivered to the tmux session." : "The message was not delivered." }],
+        content: [{ type: "text", text: result.ok ? "Delivered to the tmux session." : "Delivery status is uncertain or the message was rejected." }],
       };
     },
   }), [props.sessionId]);

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { WebTaskSubmissionConflictError } from "./types.js";
 import { StateDatabase } from "./db.js";
 import { computeInputHash, parseTaskInput, serializeTaskInput } from "./fingerprint.js";
 import {
@@ -184,6 +185,24 @@ export class Dispatcher {
     if (attachmentIds.length > 10 || attachmentIds.length !== (input.attachmentIds?.length ?? 0)) {
       throw new Error("每个任务最多添加 10 个不同附件。");
     }
+    const idempotencyKey = input.idempotencyKey?.trim() || randomUUID();
+    if (input.idempotencyKey !== undefined && (!input.idempotencyKey.trim() || input.idempotencyKey.length > 200)) {
+      throw new Error("幂等键必须为 1 到 200 个字符。");
+    }
+    // Preserve the submitted intent, including an omitted default mode. Configuration
+    // changes must not prevent replaying a request the server already accepted.
+    const normalizedRequestJson = JSON.stringify({
+      summary, description, projectKey, mode: input.mode?.trim() || null, attachmentIds,
+    });
+    const previous = this.db.getWebTaskSubmission(idempotencyKey);
+    if (previous) {
+      if (previous.normalized_request_json !== normalizedRequestJson) throw new WebTaskSubmissionConflictError();
+      const task = this.db.getTask(previous.task_guid);
+      if (!task) throw new Error("已确认的任务记录不存在。");
+      this.enqueueWebRun(previous.run_id);
+      await this.pump();
+      return this.db.getTask(previous.task_guid)!;
+    }
     const attachments = this.db.getStagedWebTaskAttachments(attachmentIds);
     if (attachments.length !== attachmentIds.length) {
       throw new Error("部分附件已过期或已绑定其他任务，请重新添加。");
@@ -218,19 +237,66 @@ export class Dispatcher {
           "本次任务附带以下本地文件，请按需查看；图片会作为图像输入一并发送：",
           ...attachments.map((attachment) => `- ${attachment.file_name} (${attachment.mime_type})：${attachment.local_path}`),
         ].join("\n");
-    const claim = this.db.claimRun({
+    const submission = this.db.claimWebTaskSubmission({
+      idempotencyKey,
+      normalizedRequestJson,
       task: routedTask,
       inputText: serializeTaskInput(routedTask.input),
       promptText,
       attachmentIds,
     });
-    if (!claim) throw new Error("任务暂时无法排队，请稍后重试。");
-    this.queue.push(claim.runId);
-    this.queuedRunIds.add(claim.runId);
+    const runId = submission.status === "created" ? submission.claim.runId : submission.submission.run_id;
+    const taskGuid = submission.status === "created" ? submission.claim.taskGuid : submission.submission.task_guid;
+    this.enqueueWebRun(runId);
     await this.pump();
-    const task = this.db.getTask(claim.taskGuid);
+    const task = this.db.getTask(taskGuid);
     if (!task) throw new Error("任务已提交，但没有读取到本地任务记录。");
     return task;
+  }
+
+  public async appendWebTaskFollowup(taskGuid: string, details: string, idempotencyKey: string): Promise<StoredTask> {
+    const normalizedDetails = details.trim();
+    const key = idempotencyKey.trim();
+    if (!normalizedDetails || normalizedDetails.length > 2000) throw new Error("补充内容须为 1 到 2000 个字符。");
+    if (!key || key.length > 200) throw new Error("无效的幂等键。");
+    const normalizedRequestJson = JSON.stringify({ kind: "web-task-followup", taskGuid, details: normalizedDetails });
+    const previousSubmission = this.db.getWebTaskSubmission(key);
+    if (previousSubmission) {
+      if (previousSubmission.task_guid !== taskGuid || previousSubmission.normalized_request_json !== normalizedRequestJson) {
+        throw new WebTaskSubmissionConflictError();
+      }
+      this.enqueueWebRun(previousSubmission.run_id);
+      await this.pump();
+      return this.db.getTask(taskGuid)!;
+    }
+    const existing = this.db.getTask(taskGuid);
+    if (!existing || existing.origin !== "web") throw new Error("Bridge 网页任务不存在。");
+    if (existing.state === "RUNNING" || existing.state === "QUEUED") throw new Error("任务正在执行，请完成后再追加。");
+    const previousInput = parseTaskInput(existing.input_text);
+    if (!previousInput) throw new Error("原任务描述无法读取。");
+    const description = `${previousInput.description}\n\n补充信息：\n${normalizedDetails}`;
+    if (description.length > 20_000) throw new Error("追加后任务描述超过 20000 个字符。");
+    const project = this.db.getAvailableProject(existing.project_key);
+    if (!project || project.path !== existing.repo) throw new Error("原项目不可用或目录已变更，请新建任务。");
+    const { value: mode } = resolveWebMode(this.config, existing.mode);
+    const input = { ...previousInput, description };
+    const routedTask: RoutedTask = {
+      taskGuid, summary: input.summary, description,
+      projectKey: existing.project_key, mode: existing.mode, repo: existing.repo,
+      sandboxMode: mode.sandboxMode, inputHash: computeInputHash(input),
+      input, completed: false, origin: "web",
+    };
+    const submission = this.db.claimWebTaskSubmission({
+      idempotencyKey: key, normalizedRequestJson, task: routedTask,
+      inputText: serializeTaskInput(input),
+      promptText: existing.thread_id
+        ? `用户通过 Bridge 任务面板追加了信息：\n${normalizedDetails}\n\n请基于当前 thread 继续处理，完成后重新总结结果。`
+        : buildRunPrompt(input, previousInput, false),
+    });
+    const runId = submission.status === "created" ? submission.claim.runId : submission.submission.run_id;
+    this.enqueueWebRun(runId);
+    await this.pump();
+    return this.db.getTask(taskGuid)!;
   }
 
   public async flushOutbox(): Promise<void> {
@@ -319,6 +385,14 @@ export class Dispatcher {
     if (recovered.length > 0) {
       this.logger.warn("recovered interrupted Codex runs", { count: recovered.length });
     }
+    for (const runId of this.db.listQueuedWebRunIds()) this.enqueueWebRun(runId);
+    void this.pump();
+  }
+
+  private enqueueWebRun(runId: string): void {
+    if (this.queuedRunIds.has(runId) || this.active.has(runId) || this.db.getRun(runId)?.state !== "QUEUED") return;
+    this.queue.push(runId);
+    this.queuedRunIds.add(runId);
   }
 
   public async shutdown(): Promise<void> {

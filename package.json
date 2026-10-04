@@ -26,6 +26,7 @@
     "dev:status": "bun scripts/dev-server.mjs status",
     "dev:stop": "bun scripts/dev-server.mjs stop",
     "dev:restart": "bun scripts/dev-server.mjs restart",
+    "dev:web:start": "bun scripts/dev-server.mjs web",
     "dev:tmux-api": "FEISHU_CODEX_BRIDGE_LAN_BIND=1 bun --watch src/main.ts --web-only --web-port 17310 --config ./config.example.json --db ./runtime/bridge.db",
     "dev:web": "BRIDGE_WEB_API_TARGET=http://127.0.0.1:17310 bun run --bun vite --config web/vite.config.ts",
     "web:pair": "bun src/web-pair-cli.ts",
@@ -71,6 +72,7 @@
     "codex:doctor": "bun src/codex-cli.ts doctor",
     "codex:update": "bun src/codex-cli.ts update",
     "bridge:install": "bun src/install-cli.ts",
+    "backup": "bun src/backup-cli.ts",
     "test": "bun test",
     "test:watch": "bun test --watch",
     "typecheck": "bun run --bun tsc -p tsconfig.json --noEmit && bun run --bun tsc -p web/tsconfig.json --noEmit"

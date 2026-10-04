@@ -180,14 +180,19 @@ describe("CodexHistoryService", () => {
         threadId: "thread-1",
         options: {
           workingDirectory: normalizedDirectory,
-          additionalDirectories: [attachmentDirectory],
+          additionalDirectories: [realpathSync.native(attachmentDirectory)],
         },
       });
       expect(sent[0]!.input).toEqual([
         { type: "text", text: expect.stringContaining("请查看截图") },
         { type: "local_image", path: expect.stringContaining(".png") },
       ]);
-      await expect(readdir(attachmentDirectory)).resolves.toEqual([]);
+      await expect(readdir(attachmentDirectory)).resolves.toHaveLength(1);
+      expect(service.getRunAttachment(home.id, "thread-1", accepted.runId, attachment.attachmentId)).toMatchObject({
+        fileName: "截图.png",
+        mimeType: "image/png",
+        sizeBytes: Buffer.byteLength("fake-image"),
+      });
     } finally {
       await rm(directory, { recursive: true, force: true });
       await rm(attachmentDirectory, { recursive: true, force: true });

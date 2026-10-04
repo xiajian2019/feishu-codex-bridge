@@ -1118,10 +1118,10 @@ export class FeishuSqliteCodexRuntime {
     }
     const projectRoute = route.kind === "project" ? route : undefined;
 
-    this.scheduleMessageReaction(
-      followup?.message_id ?? task.message_id,
-      DIRECT_THINKING_REACTION,
-    );
+    const reactionMessageId = followup?.message_id ?? task.message_id;
+    if (!reactionMessageId.startsWith("web-task-followup:")) {
+      this.scheduleMessageReaction(reactionMessageId, DIRECT_THINKING_REACTION);
+    }
 
     const controller = new AbortController();
     this.activeAbortController = controller;

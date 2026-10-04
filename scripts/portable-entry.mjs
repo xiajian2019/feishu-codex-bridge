@@ -29,6 +29,11 @@ try {
       await runInstallCli(args);
       break;
     }
+    case "--bridge-backup": {
+      const { runBackupCli } = await import("../dist/backup-cli.js");
+      await runBackupCli(args);
+      break;
+    }
     case "--bridge-web-pair": {
       const { runWebPair } = await import("../dist/web-pair-cli.js");
       await runWebPair(args);
