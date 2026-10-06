@@ -38,6 +38,7 @@ export const CODEX_HISTORY_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 export const CODEX_HISTORY_MAX_ATTACHMENTS = 10;
 const CODEX_HISTORY_LIST_CACHE_MAX_AGE_MS = 10 * 60 * 1_000;
 const CODEX_HISTORY_LIST_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const CODEX_HISTORY_RECOVERY_CHECK_INTERVAL_MS = 2_000;
 export type CodexHistoryReasoningEffort = string;
 
 export interface CodexHistoryListCacheStore {
@@ -52,6 +53,54 @@ export interface CodexHistoryListCacheStore {
 export interface CodexHistoryThreadHomePreferenceStore {
   getCodexHistoryThreadHomePreferences(threadIds: string[]): Map<string, string>;
   saveCodexHistoryThreadHomePreference(threadId: string, preferredHomeId: string): string;
+}
+
+/** Bridge-owned, content-minimal metadata for one history continuation. */
+export interface CodexHistoryStoredRun {
+  runId: string;
+  homeId: string;
+  threadId: string;
+  requestFingerprint: string;
+  turnIndex: number;
+  attachments: CodexHistoryAttachment[];
+  model?: string;
+  reasoningEffort?: CodexHistoryReasoningEffort;
+  createdAt: number;
+  updatedAt: number;
+  finishedAt?: number;
+  state: CodexHistoryRunState;
+  cursor: number;
+  usage?: CodexHistoryTurnUsage;
+}
+
+export interface CodexHistoryRunStore {
+  listCodexHistoryRuns(limit: number): CodexHistoryStoredRun[];
+  findCodexHistoryRunByKey(homeId: string, threadId: string, keyHash: string): {
+    requestFingerprint: string;
+    runId: string;
+    run?: CodexHistoryStoredRun;
+  } | null;
+  createCodexHistoryRun(run: CodexHistoryStoredRun, keyHash?: string): {
+    kind: "created" | "existing" | "conflict" | "expired";
+    run?: CodexHistoryStoredRun;
+  };
+  saveCodexHistoryRun(run: CodexHistoryStoredRun): void;
+  /** Expire run metadata while keeping its idempotency receipt as a tombstone. */
+  expireCodexHistoryRun(runId: string): void;
+}
+
+export class CodexHistoryIdempotencyConflictError extends Error {
+  constructor() {
+    super("该幂等键已用于不同的历史会话消息，请为新提交生成新的幂等键。");
+    this.name = "CodexHistoryIdempotencyConflictError";
+  }
+}
+
+export class CodexHistoryIdempotencyExpiredError extends Error {
+  constructor() {
+    super("该幂等键对应的历史续聊回执已过期；为新的提交生成新的幂等键。");
+    this.name = "CodexHistoryIdempotencyExpiredError";
+  }
 }
 
 export function isCodexHistoryReasoningEffort(value: string): boolean {
@@ -170,6 +219,7 @@ export interface CodexHistoryMessageInput {
   turnIndex?: number;
   model?: string;
   reasoningEffort?: CodexHistoryReasoningEffort;
+  idempotencyKey?: string;
 }
 
 export type CodexHistoryWriterState = "available" | "busy" | "unknown";
@@ -205,7 +255,13 @@ export interface CodexHistoryAttachmentFile {
   localPath: string;
 }
 
-export type CodexHistoryRunState = "running" | "cancelling" | "completed" | "failed" | "cancelled";
+export type CodexHistoryRunState = "running" | "cancelling" | "completed" | "failed" | "cancelled" | "interrupted";
+
+export interface CodexHistoryRunRecoveryStatus {
+  checkedAt: string;
+  codexThreadStatus: string | null;
+  error?: string;
+}
 
 export interface CodexHistoryMessageResponse {
   runId: string;
@@ -236,6 +292,7 @@ export interface CodexHistoryUpdatesResponse {
   finalResponse?: string;
   error?: string;
   resetRequired?: boolean;
+  recovery?: CodexHistoryRunRecoveryStatus;
 }
 
 export interface CodexHistoryAgentThread {
@@ -268,6 +325,8 @@ export interface CodexHistoryServiceOptions {
   listCacheStore?: CodexHistoryListCacheStore;
   /** Optional Bridge DB preferences for the Home used to open each history thread. */
   threadHomePreferenceStore?: CodexHistoryThreadHomePreferenceStore;
+  /** Optional Bridge DB receipts and metadata for recoverable history continuations. */
+  runStore?: CodexHistoryRunStore;
   /** Injectable clock for deterministic attachment lifecycle tests. */
   now?: () => number;
 }
@@ -281,8 +340,10 @@ interface StagedCodexHistoryAttachment extends CodexHistoryAttachment {
 
 interface LiveCodexHistoryRun {
   runId: string;
+  homeId: string;
   threadKey: string;
   threadId: string;
+  requestFingerprint: string;
   userText: string;
   turnIndex: number;
   workingDirectory?: string;
@@ -291,6 +352,7 @@ interface LiveCodexHistoryRun {
   reasoningEffort?: CodexHistoryReasoningEffort;
   usage?: CodexHistoryTurnUsage;
   createdAt: number;
+  updatedAt: number;
   finishedAt?: number;
   expiryTimer?: ReturnType<typeof setTimeout>;
   abortController: AbortController;
@@ -299,6 +361,21 @@ interface LiveCodexHistoryRun {
   events: CodexHistoryUpdateEvent[];
   finalResponse?: string;
   error?: string;
+  recovered: boolean;
+  recovery?: CodexHistoryRunRecoveryStatus;
+  lastReconciledAt?: number;
+}
+
+interface PreparedCodexHistoryMessage {
+  home: ResolvedCodexHistoryHome;
+  threadId: string;
+  text: string;
+  attachmentIds: string[];
+  turnIndex: number;
+  model?: string;
+  reasoningEffort?: CodexHistoryReasoningEffort;
+  requestFingerprint: string;
+  idempotencyKeyHash?: string;
 }
 
 /**
@@ -329,7 +406,12 @@ export class CodexHistoryService {
   }>();
   private readonly latestRunByThread = new Map<string, string>();
   private readonly pendingThreadKeys = new Set<string>();
+  private readonly pendingIdempotentMessages = new Map<string, {
+    requestFingerprint: string;
+    promise: Promise<CodexHistoryMessageResponse>;
+  }>();
   private readonly listRefreshes = new Map<string, Promise<CodexThread[]>>();
+  private readonly recoveryChecks = new Map<string, Promise<CodexHistoryRunRecoveryStatus>>();
 
   constructor(options: CodexHistoryServiceOptions) {
     this.options = options;
@@ -342,6 +424,166 @@ export class CodexHistoryService {
       24 * 60 * 60 * 1_000,
     );
     this.now = options.now ?? Date.now;
+    this.restorePersistedRuns();
+  }
+
+  private restorePersistedRuns(): void {
+    const store = this.options.runStore;
+    if (!store) return;
+    let persistedRuns: CodexHistoryStoredRun[];
+    try {
+      persistedRuns = store.listCodexHistoryRuns(1_000);
+    } catch (error) {
+      this.options.logger?.warn("failed to restore Codex history run metadata", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+    for (const persisted of persistedRuns) {
+      if (!isCodexHistoryStoredRun(persisted)) continue;
+      const run = this.restoreStoredRun(persisted);
+      this.registerRun(run);
+      if (run.state === "interrupted" || run.finishedAt !== persisted.finishedAt) this.persistRun(run);
+      this.scheduleStoredRunExpiry(run);
+    }
+  }
+
+  private restoreStoredRun(persisted: CodexHistoryStoredRun): LiveCodexHistoryRun {
+    const wasActive = persisted.state === "running" || persisted.state === "cancelling";
+    const state: CodexHistoryRunState = wasActive ? "interrupted" : persisted.state;
+    const finishedAt = persisted.finishedAt ?? (wasActive || !isActiveRun(state) ? this.now() : undefined);
+    let restoredAttachmentRoot = this.attachmentsDirectory;
+    try {
+      restoredAttachmentRoot = realpathSync.native(this.attachmentsDirectory);
+      this.attachmentRootRealPath = restoredAttachmentRoot;
+    } catch {
+      // The attachment root is created lazily when the first attachment is staged.
+    }
+    const attachments = persisted.attachments.flatMap((attachment) => {
+      if (!isValidAttachmentId(attachment.attachmentId)) return [];
+      const fileName = sanitizeAttachmentFileName(attachment.fileName);
+      if (!fileName) return [];
+      return [{
+        attachmentId: attachment.attachmentId,
+        fileName,
+        mimeType: normalizeAttachmentMimeType(attachment.mimeType),
+        sizeBytes: Math.max(0, Math.trunc(attachment.sizeBytes)),
+        localPath: join(
+          restoredAttachmentRoot,
+          `${attachment.attachmentId}${attachmentFileExtension(fileName, attachment.mimeType)}`,
+        ),
+        inUse: false,
+        createdAt: persisted.createdAt,
+      } satisfies StagedCodexHistoryAttachment];
+    });
+    return {
+      runId: persisted.runId,
+      homeId: persisted.homeId,
+      threadKey: makeThreadKey(persisted.homeId, persisted.threadId),
+      threadId: persisted.threadId,
+      requestFingerprint: persisted.requestFingerprint,
+      // Message content is intentionally re-read from official thread/read when needed.
+      userText: "",
+      turnIndex: persisted.turnIndex,
+      attachments,
+      ...(persisted.model ? { model: persisted.model } : {}),
+      ...(persisted.reasoningEffort ? { reasoningEffort: persisted.reasoningEffort } : {}),
+      ...(persisted.usage ? { usage: persisted.usage } : {}),
+      createdAt: persisted.createdAt,
+      updatedAt: persisted.updatedAt,
+      ...(finishedAt === undefined ? {} : { finishedAt }),
+      abortController: new AbortController(),
+      state,
+      cursor: persisted.cursor,
+      events: [],
+      ...(wasActive
+        ? { error: "Bridge 在 Codex turn 结束前重启；请求没有自动重发，请核对 Codex 历史后再提交。" }
+        : {}),
+      recovered: true,
+    };
+  }
+
+  private registerRun(run: LiveCodexHistoryRun): void {
+    this.liveRuns.set(run.runId, run);
+    const currentRunId = this.latestRunByThread.get(run.threadKey);
+    const currentRun = currentRunId ? this.liveRuns.get(currentRunId) : undefined;
+    if (!currentRun || run.createdAt >= currentRun.createdAt) {
+      this.latestRunByThread.set(run.threadKey, run.runId);
+    }
+  }
+
+  private persistRun(run: LiveCodexHistoryRun): void {
+    const store = this.options.runStore;
+    if (!store) return;
+    run.updatedAt = this.now();
+    try {
+      store.saveCodexHistoryRun(toStoredCodexHistoryRun(run));
+    } catch (error) {
+      this.options.logger?.warn("failed to persist Codex history run metadata", {
+        runId: run.runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private scheduleStoredRunExpiry(run: LiveCodexHistoryRun): void {
+    if (run.finishedAt === undefined || isActiveRun(run.state)) return;
+    if (run.expiryTimer) clearTimeout(run.expiryTimer);
+    const remainingMs = Math.max(0, this.attachmentRetentionMs - (this.now() - run.finishedAt));
+    run.expiryTimer = setTimeout(() => {
+      void this.cleanupExpiredAttachments();
+    }, remainingMs);
+    run.expiryTimer.unref?.();
+  }
+
+  private async reconcileRecoveredRun(run: LiveCodexHistoryRun): Promise<CodexHistoryRunRecoveryStatus> {
+    const now = this.now();
+    if (run.recovery && run.lastReconciledAt !== undefined
+      && now - run.lastReconciledAt < CODEX_HISTORY_RECOVERY_CHECK_INTERVAL_MS) {
+      return run.recovery;
+    }
+    const currentCheck = this.recoveryChecks.get(run.runId);
+    if (currentCheck) return currentCheck;
+    const check = (async (): Promise<CodexHistoryRunRecoveryStatus> => {
+      const checkedAt = new Date(this.now()).toISOString();
+      let status: string | null = null;
+      let error: string | undefined;
+      const home = this.resolveHomes().find((candidate) => candidate.id === run.homeId);
+      if (!home?.available) {
+        error = "Codex home 当前不可用，稍后可重新核验。";
+      } else {
+        let client: CodexAppServerQueryClient | null = null;
+        try {
+          client = this.createClient(home);
+          if (!client.readThread) throw new Error("thread/read unavailable");
+          const result = await client.readThread(run.threadId, false);
+          status = typeof result.thread.status?.type === "string" ? result.thread.status.type : null;
+          if (result.thread.id !== run.threadId) status = null;
+        } catch (cause) {
+          error = "无法通过 Codex app-server 核验线程状态，稍后可重试。";
+          this.options.logger?.warn("failed to reconcile recovered Codex history run", {
+            runId: run.runId,
+            error: cause instanceof Error ? cause.message : String(cause),
+          });
+        } finally {
+          await client?.close().catch(() => undefined);
+        }
+      }
+      const recovery: CodexHistoryRunRecoveryStatus = {
+        checkedAt,
+        codexThreadStatus: status,
+        ...(error ? { error } : {}),
+      };
+      run.recovery = recovery;
+      run.lastReconciledAt = this.now();
+      return recovery;
+    })();
+    this.recoveryChecks.set(run.runId, check);
+    try {
+      return await check;
+    } finally {
+      if (this.recoveryChecks.get(run.runId) === check) this.recoveryChecks.delete(run.runId);
+    }
   }
 
   public listHomes(): CodexHistoryHome[] {
@@ -597,21 +839,47 @@ export class CodexHistoryService {
     return true;
   }
 
-  public async sendMessage(
+  public sendMessage(
     homeId: string,
     threadId: string,
     input: CodexHistoryMessageInput,
   ): Promise<CodexHistoryMessageResponse> {
-    await this.cleanupExpiredAttachments();
+    const prepared = this.prepareMessage(homeId, threadId, input);
+    const keyHash = prepared.idempotencyKeyHash;
+    if (keyHash) {
+      const pending = this.pendingIdempotentMessages.get(keyHash);
+      if (pending) {
+        if (pending.requestFingerprint !== prepared.requestFingerprint) {
+          return Promise.reject(new CodexHistoryIdempotencyConflictError());
+        }
+        return pending.promise;
+      }
+    }
+
+    const promise = this.submitPreparedMessage(prepared);
+    if (keyHash) {
+      this.pendingIdempotentMessages.set(keyHash, {
+        requestFingerprint: prepared.requestFingerprint,
+        promise,
+      });
+      void promise.then(
+        () => this.clearPendingIdempotentMessage(keyHash, promise),
+        () => this.clearPendingIdempotentMessage(keyHash, promise),
+      );
+    }
+    return promise;
+  }
+
+  private prepareMessage(homeId: string, threadId: string, input: CodexHistoryMessageInput): PreparedCodexHistoryMessage {
     const home = this.resolveHomes().find((candidate) => candidate.id === homeId);
     if (!home) throw new Error(`找不到 Codex home：${homeId}`);
     if (!home.available) throw new Error(`Codex home 不可用：${home.path}`);
     const normalizedThreadId = threadId.trim();
     if (!normalizedThreadId) throw new Error("threadId is required");
-    const text = input.text.trim();
     if (input.model !== undefined && typeof input.model !== "string") {
       throw new Error("model must be a string");
     }
+    const text = input.text.trim();
     const model = input.model?.trim();
     if (model && (model.length > 128 || /[\r\n]/.test(model))) {
       throw new Error("model must be a single line of at most 128 characters");
@@ -622,103 +890,190 @@ export class CodexHistoryService {
     if (input.turnIndex !== undefined && (!Number.isSafeInteger(input.turnIndex) || input.turnIndex < 0)) {
       throw new Error("turnIndex must be a non-negative integer");
     }
+    if (input.idempotencyKey !== undefined
+      && (typeof input.idempotencyKey !== "string" || !input.idempotencyKey.trim() || input.idempotencyKey.trim().length > 200)) {
+      throw new Error("idempotencyKey must contain 1 to 200 characters");
+    }
     const attachmentIds = [...new Set(input.attachmentIds ?? [])];
+    if (attachmentIds.some((attachmentId) => typeof attachmentId !== "string" || !attachmentId.trim())) {
+      throw new Error("attachmentIds must contain non-empty strings");
+    }
     if (attachmentIds.length > CODEX_HISTORY_MAX_ATTACHMENTS) {
       throw new Error(`一次最多发送 ${CODEX_HISTORY_MAX_ATTACHMENTS} 个附件。`);
     }
     if (!text && attachmentIds.length === 0) {
       throw new Error("请输入消息或选择附件。");
     }
-    const threadKey = makeThreadKey(home.id, normalizedThreadId);
-    const latestRun = this.latestRunByThread.get(threadKey);
-    if (this.pendingThreadKeys.has(threadKey) || (latestRun && isActiveRun(this.liveRuns.get(latestRun)?.state))) {
-      throw new Error("当前 Codex session 正在处理上一条消息，请等待本轮完成。");
+    const turnIndex = input.turnIndex ?? 0;
+    const requestFingerprint = fingerprintCodexHistoryMessage({
+      text,
+      attachmentIds,
+      turnIndex,
+      model: model || undefined,
+      reasoningEffort: input.reasoningEffort,
+    });
+    const idempotencyKey = input.idempotencyKey?.trim();
+    if (idempotencyKey && !this.options.runStore) {
+      throw new Error("历史续聊幂等存储尚未配置。");
     }
-    const writerStatus = await this.getWriterStatus(homeId, normalizedThreadId);
-    if (writerStatus.state === "busy") {
-      throw new Error("该 Codex session 正在其他位置使用，请先在原窗口结束或关闭此 session 后再发送。");
-    }
-    const currentRunId = this.latestRunByThread.get(threadKey);
-    if (this.pendingThreadKeys.has(threadKey)
-      || (currentRunId && isActiveRun(this.liveRuns.get(currentRunId)?.state))) {
-      throw new Error("当前 Codex session 正在处理上一条消息，请等待本轮完成。");
-    }
-    this.pendingThreadKeys.add(threadKey);
-    let workingDirectory: string | undefined;
-    let currentModel: string | undefined;
-    try {
-      const currentThread = await this.readThread(homeId, normalizedThreadId, false);
-      if (currentThread.thread.cwd?.trim()) workingDirectory = resolve(currentThread.thread.cwd);
-      if (currentThread.thread.model?.trim()) currentModel = currentThread.thread.model.trim();
-    } finally {
-      this.pendingThreadKeys.delete(threadKey);
-    }
-    const catalog = this.modelCatalogCache.get(home.id);
-    const usableCatalog = catalog && catalog.expiresAt > Date.now() ? catalog.models : undefined;
-    if (model && usableCatalog && !usableCatalog.some((candidate) => candidate.model === model)) {
-      throw new Error("所选模型已不在当前账户的可用列表中，请刷新会话后重试。");
-    }
-    if (input.reasoningEffort) {
-      const targetModel = model || currentModel;
-      const selectedModel = usableCatalog && targetModel
-        ? usableCatalog.find((candidate) => candidate.model === targetModel)
-        : undefined;
-      if (selectedModel
-        && !selectedModel.supportedReasoningEfforts.some((effort) => effort.reasoningEffort === input.reasoningEffort)) {
-        throw new Error("所选推理强度不受当前模型支持，请重新选择。");
-      }
-    }
-    const attachments = attachmentIds.map((attachmentId) => this.stagedAttachments.get(attachmentId));
-    if (attachments.some((attachment) => !attachment)) {
-      throw new Error("历史会话附件已失效，请重新选择附件。");
-    }
-    const resolvedAttachments = attachments as StagedCodexHistoryAttachment[];
-    if (resolvedAttachments.some((attachment) => attachment.inUse)) {
-      throw new Error("历史会话附件已被另一轮 Codex 消息使用，请重新选择附件。");
-    }
-    for (const attachment of resolvedAttachments) {
-      attachment.inUse = true;
-      if (attachment.expiryTimer) clearTimeout(attachment.expiryTimer);
-    }
-
-    const run: LiveCodexHistoryRun = {
-      runId: randomUUID(),
-      threadKey,
+    const idempotencyKeyHash = idempotencyKey
+      ? createHash("sha256").update(JSON.stringify([home.id, normalizedThreadId, idempotencyKey])).digest("hex")
+      : undefined;
+    return {
+      home,
       threadId: normalizedThreadId,
-      userText: text,
-      turnIndex: Number.isSafeInteger(input.turnIndex) && (input.turnIndex ?? -1) >= 0 ? input.turnIndex! : 0,
-      ...(workingDirectory ? { workingDirectory } : {}),
-      attachments: resolvedAttachments,
+      text,
+      attachmentIds,
+      turnIndex,
       ...(model ? { model } : {}),
       ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
-      createdAt: this.now(),
-      abortController: new AbortController(),
-      state: "running",
-      cursor: 0,
-      events: [],
-    };
-    this.liveRuns.set(run.runId, run);
-    this.latestRunByThread.set(threadKey, run.runId);
-    await this.cleanupExpiredAttachments();
-    void this.runMessage(home, run, resolvedAttachments).catch((error) => {
-      this.finishLiveRunWithError(run, error);
-    });
-    return {
-      runId: run.runId,
-      threadId: normalizedThreadId,
-      state: run.state,
-      cursor: run.cursor,
-      turnIndex: run.turnIndex,
-      attachments: resolvedAttachments.map(publicAttachment),
+      requestFingerprint,
+      ...(idempotencyKeyHash ? { idempotencyKeyHash } : {}),
     };
   }
 
-  public getMessageUpdates(
+  private clearPendingIdempotentMessage(keyHash: string, promise: Promise<CodexHistoryMessageResponse>): void {
+    if (this.pendingIdempotentMessages.get(keyHash)?.promise === promise) {
+      this.pendingIdempotentMessages.delete(keyHash);
+    }
+  }
+
+  private async submitPreparedMessage(prepared: PreparedCodexHistoryMessage): Promise<CodexHistoryMessageResponse> {
+    await this.cleanupExpiredAttachments();
+    const { home, threadId, text, attachmentIds, turnIndex, model, reasoningEffort } = prepared;
+    const threadKey = makeThreadKey(home.id, threadId);
+    const store = this.options.runStore;
+    const keyHash = prepared.idempotencyKeyHash;
+    if (keyHash && store) {
+      const receipt = store.findCodexHistoryRunByKey(home.id, threadId, keyHash);
+      if (receipt) {
+        if (receipt.requestFingerprint !== prepared.requestFingerprint) {
+          throw new CodexHistoryIdempotencyConflictError();
+        }
+        if (!receipt.run) throw new CodexHistoryIdempotencyExpiredError();
+        const run = this.liveRuns.get(receipt.runId) ?? this.restoreStoredRun(receipt.run);
+        this.registerRun(run);
+        return messageResponseForRun(run);
+      }
+    }
+
+    if (this.pendingThreadKeys.has(threadKey)) {
+      throw new Error("当前 Codex session 正在处理上一条消息，请等待本轮完成。");
+    }
+    const latestRun = this.latestRunByThread.get(threadKey);
+    if (latestRun && isActiveRun(this.liveRuns.get(latestRun)?.state)) {
+      throw new Error("当前 Codex session 正在处理上一条消息，请等待本轮完成。");
+    }
+
+    this.pendingThreadKeys.add(threadKey);
+    let resolvedAttachments: StagedCodexHistoryAttachment[] = [];
+    let attachmentsReserved = false;
+    let registered = false;
+    try {
+      const writerStatus = await this.getWriterStatus(home.id, threadId);
+      if (writerStatus.state === "busy") {
+        throw new Error("该 Codex session 正在其他位置使用，请先在原窗口结束或关闭此 session 后再发送。");
+      }
+      const currentRunId = this.latestRunByThread.get(threadKey);
+      if (currentRunId && isActiveRun(this.liveRuns.get(currentRunId)?.state)) {
+        throw new Error("当前 Codex session 正在处理上一条消息，请等待本轮完成。");
+      }
+
+      const currentThread = await this.readThread(home.id, threadId, false);
+      const workingDirectory = currentThread.thread.cwd?.trim()
+        ? resolve(currentThread.thread.cwd)
+        : undefined;
+      const currentModel = currentThread.thread.model?.trim() || undefined;
+      const catalog = this.modelCatalogCache.get(home.id);
+      const usableCatalog = catalog && catalog.expiresAt > Date.now() ? catalog.models : undefined;
+      if (model && usableCatalog && !usableCatalog.some((candidate) => candidate.model === model)) {
+        throw new Error("所选模型已不在当前账户的可用列表中，请刷新会话后重试。");
+      }
+      if (reasoningEffort) {
+        const targetModel = model || currentModel;
+        const selectedModel = usableCatalog && targetModel
+          ? usableCatalog.find((candidate) => candidate.model === targetModel)
+          : undefined;
+        if (selectedModel
+          && !selectedModel.supportedReasoningEfforts.some((effort) => effort.reasoningEffort === reasoningEffort)) {
+          throw new Error("所选推理强度不受当前模型支持，请重新选择。");
+        }
+      }
+      const attachments = attachmentIds.map((attachmentId) => this.stagedAttachments.get(attachmentId));
+      if (attachments.some((attachment) => !attachment)) {
+        throw new Error("历史会话附件已失效，请重新选择附件。");
+      }
+      resolvedAttachments = attachments as StagedCodexHistoryAttachment[];
+      if (resolvedAttachments.some((attachment) => attachment.inUse)) {
+        throw new Error("历史会话附件已被另一轮 Codex 消息使用，请重新选择附件。");
+      }
+      for (const attachment of resolvedAttachments) {
+        attachment.inUse = true;
+        if (attachment.expiryTimer) clearTimeout(attachment.expiryTimer);
+      }
+      attachmentsReserved = true;
+
+      const now = this.now();
+      const run: LiveCodexHistoryRun = {
+        runId: randomUUID(),
+        homeId: home.id,
+        threadKey,
+        threadId,
+        requestFingerprint: prepared.requestFingerprint,
+        userText: text,
+        turnIndex,
+        ...(workingDirectory ? { workingDirectory } : {}),
+        attachments: resolvedAttachments,
+        ...(model ? { model } : {}),
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        createdAt: now,
+        updatedAt: now,
+        abortController: new AbortController(),
+        state: "running",
+        cursor: 0,
+        events: [],
+        recovered: false,
+      };
+      if (store) {
+        const created = store.createCodexHistoryRun(toStoredCodexHistoryRun(run), keyHash);
+        if (created.kind === "conflict") throw new CodexHistoryIdempotencyConflictError();
+        if (created.kind === "expired") throw new CodexHistoryIdempotencyExpiredError();
+        if (created.kind === "existing") {
+          if (!created.run) throw new CodexHistoryIdempotencyExpiredError();
+          for (const attachment of resolvedAttachments) {
+            attachment.inUse = false;
+            this.scheduleStagedAttachmentExpiry(attachment);
+          }
+          attachmentsReserved = false;
+          const existing = this.liveRuns.get(created.run.runId) ?? this.restoreStoredRun(created.run);
+          this.registerRun(existing);
+          return messageResponseForRun(existing);
+        }
+      }
+      this.registerRun(run);
+      registered = true;
+      await this.cleanupExpiredAttachments();
+      void this.runMessage(home, run, resolvedAttachments).catch((error) => {
+        this.finishLiveRunWithError(run, error);
+      });
+      return messageResponseForRun(run);
+    } finally {
+      if (attachmentsReserved && !registered) {
+        for (const attachment of resolvedAttachments) {
+          attachment.inUse = false;
+          this.scheduleStagedAttachmentExpiry(attachment);
+        }
+      }
+      this.pendingThreadKeys.delete(threadKey);
+    }
+  }
+
+  public async getMessageUpdates(
     homeId: string,
     threadId: string,
     runId: string | undefined,
     afterCursor: number,
-  ): CodexHistoryUpdatesResponse {
+  ): Promise<CodexHistoryUpdatesResponse> {
     const normalizedThreadId = threadId.trim();
     const threadKey = makeThreadKey(homeId, normalizedThreadId);
     const selectedRunId = runId?.trim() || this.latestRunByThread.get(threadKey);
@@ -726,8 +1081,9 @@ export class CodexHistoryService {
     if (!run || run.threadKey !== threadKey) {
       throw new Error("找不到正在运行或刚刚完成的 Codex turn。");
     }
+    if (run.recovered) await this.reconcileRecoveredRun(run);
     const firstCursor = run.events[0]?.cursor;
-    const resetRequired = firstCursor !== undefined && afterCursor < firstCursor - 1;
+    const resetRequired = run.recovered || (firstCursor !== undefined && afterCursor < firstCursor - 1);
     return {
       runId: run.runId,
       threadId: run.threadId,
@@ -740,6 +1096,7 @@ export class CodexHistoryService {
       ...(run.error ? { error: run.error } : {}),
       attachments: run.attachments.map(publicAttachment),
       ...(resetRequired ? { resetRequired: true } : {}),
+      ...(run.recovery ? { recovery: run.recovery } : {}),
     };
   }
 
@@ -755,6 +1112,7 @@ export class CodexHistoryService {
     if (run.state === "cancelling") return { ok: true, state: "cancelling" };
     if (run.state !== "running") return { ok: false, state: run.state };
     run.state = "cancelling";
+    this.persistRun(run);
     run.abortController.abort();
     return { ok: true, state: "cancelling" };
   }
@@ -768,9 +1126,9 @@ export class CodexHistoryService {
     const run = this.liveRuns.get(runId);
     if (!run || run.threadKey !== makeThreadKey(homeId, threadId)) return null;
     const attachment = run.attachments.find((item) => item.attachmentId === attachmentId);
-    const root = this.attachmentRootRealPath;
-    if (!attachment || !root) return null;
+    if (!attachment) return null;
     try {
+      const root = this.attachmentRootRealPath ?? realpathSync.native(this.attachmentsDirectory);
       if (realpathSync.native(dirname(attachment.localPath)) !== root) return null;
       const fileInfo = lstatSync(attachment.localPath);
       if (!fileInfo.isFile() || fileInfo.isSymbolicLink()) return null;
@@ -852,15 +1210,17 @@ export class CodexHistoryService {
 
   private resolveHomes(): ResolvedCodexHistoryHome[] {
     const homeDirectory = homedir();
-    const primaryHome = normalizePath(
+    const configuredHome = normalizePath(
       this.options.environment?.CODEX_HOME || join(homeDirectory, ".codex"),
       homeDirectory,
     );
+    const primaryHome = codexAccountsRoot(configuredHome, homeDirectory);
     const configuredHomes = this.options.homePaths?.length
       ? this.options.homePaths
       : discoverCodexHomePaths(this.options.environment, homeDirectory);
     const paths = uniquePaths([
       primaryHome,
+      configuredHome,
       ...configuredHomes.map((path) => normalizePath(path, homeDirectory)),
     ]);
     return paths.map((path) => buildHome(path, primaryHome));
@@ -1151,6 +1511,9 @@ export class CodexHistoryService {
         ? error.message
         : typeof record.message === "string" ? record.message : "Codex turn failed";
     }
+    if (run.state === "completed" || run.state === "failed" || this.now() - run.updatedAt >= 1_000) {
+      this.persistRun(run);
+    }
   }
 
   private finishLiveRunWithError(run: LiveCodexHistoryRun, error: unknown): void {
@@ -1161,10 +1524,12 @@ export class CodexHistoryService {
       threadId: run.threadId,
       error: run.error,
     });
+    this.persistRun(run);
   }
 
   private scheduleRunExpiry(run: LiveCodexHistoryRun): void {
     run.finishedAt = this.now();
+    this.persistRun(run);
     run.expiryTimer = setTimeout(() => {
       void this.cleanupExpiredAttachments();
     }, this.attachmentRetentionMs);
@@ -1228,6 +1593,17 @@ export class CodexHistoryService {
     this.liveRuns.delete(run.runId);
     if (run.expiryTimer) clearTimeout(run.expiryTimer);
     if (this.latestRunByThread.get(run.threadKey) === run.runId) this.latestRunByThread.delete(run.threadKey);
+    try {
+      this.options.runStore?.expireCodexHistoryRun(run.runId);
+    } catch (error) {
+      this.options.logger?.warn("failed to expire Codex history run metadata", {
+        runId: run.runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (run.attachments.length > 0 && !this.attachmentRootRealPath) {
+      await this.ensureAttachmentRoot().catch(() => undefined);
+    }
     for (const attachment of run.attachments) await this.unlinkOwnedAttachment(attachment);
   }
 
@@ -1252,17 +1628,42 @@ export function discoverCodexHomePaths(
   environment: Record<string, string | undefined> = process.env,
   homeDirectory = homedir(),
 ): string[] {
-  const primaryHome = normalizePath(
+  const configuredHome = normalizePath(
     environment.CODEX_HOME || join(homeDirectory, ".codex"),
     homeDirectory,
   );
+  const primaryHome = codexAccountsRoot(configuredHome, homeDirectory);
   const explicitHomes = [
     environment.FEISHU_CODEX_HISTORY_HOMES,
     environment.CODEX_HISTORY_HOMES,
   ].flatMap((value) => value ? value.split(delimiter) : [])
     .map((value) => normalizePath(value, homeDirectory));
   const accountHomes = readAccountHomes(primaryHome);
-  return uniquePaths([primaryHome, ...accountHomes, ...explicitHomes]);
+  return uniquePaths([primaryHome, configuredHome, ...accountHomes, ...explicitHomes]);
+}
+
+export function discoverCodexHistoryHomes(
+  environment: Record<string, string | undefined> = process.env,
+  homeDirectory = homedir(),
+): CodexHistoryHome[] {
+  const configuredHome = normalizePath(
+    environment.CODEX_HOME || join(homeDirectory, ".codex"),
+    homeDirectory,
+  );
+  const primaryHome = codexAccountsRoot(configuredHome, homeDirectory);
+  return discoverCodexHomePaths(environment, homeDirectory)
+    .map((path) => toPublicHome(buildHome(normalizePath(path, homeDirectory), primaryHome)));
+}
+
+function codexAccountsRoot(configuredHome: string, homeDirectory: string): string {
+  const defaultHome = normalizePath(join(homeDirectory, ".codex"), homeDirectory);
+  const relativeToDefaultAccounts = relative(join(defaultHome, "accounts"), configuredHome);
+  const firstSegment = relativeToDefaultAccounts.split(/[\\/]/, 1)[0];
+  return relativeToDefaultAccounts === ""
+    || relativeToDefaultAccounts === "."
+    || firstSegment !== ".."
+    ? defaultHome
+    : configuredHome;
 }
 
 function buildListParams(
@@ -1550,6 +1951,67 @@ function isActiveRun(state: CodexHistoryRunState | undefined): state is "running
   return state === "running" || state === "cancelling";
 }
 
+function fingerprintCodexHistoryMessage(input: {
+  text: string;
+  attachmentIds: string[];
+  turnIndex: number;
+  model?: string;
+  reasoningEffort?: string;
+}): string {
+  return createHash("sha256").update(JSON.stringify({
+    text: input.text,
+    attachmentIds: input.attachmentIds,
+    turnIndex: input.turnIndex,
+    model: input.model ?? "",
+    reasoningEffort: input.reasoningEffort ?? "",
+  })).digest("hex");
+}
+
+function toStoredCodexHistoryRun(run: LiveCodexHistoryRun): CodexHistoryStoredRun {
+  return {
+    runId: run.runId,
+    homeId: run.homeId,
+    threadId: run.threadId,
+    requestFingerprint: run.requestFingerprint,
+    turnIndex: run.turnIndex,
+    attachments: run.attachments.map(publicAttachment),
+    ...(run.model ? { model: run.model } : {}),
+    ...(run.reasoningEffort ? { reasoningEffort: run.reasoningEffort } : {}),
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    ...(run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt }),
+    state: run.state,
+    cursor: run.cursor,
+    ...(run.usage ? { usage: run.usage } : {}),
+  };
+}
+
+function isCodexHistoryStoredRun(value: unknown): value is CodexHistoryStoredRun {
+  const run = value as Partial<CodexHistoryStoredRun> | null;
+  return !!run && typeof run === "object"
+    && typeof run.runId === "string" && run.runId.length > 0
+    && typeof run.homeId === "string" && run.homeId.length > 0
+    && typeof run.threadId === "string" && run.threadId.length > 0
+    && typeof run.requestFingerprint === "string" && /^[0-9a-f]{64}$/i.test(run.requestFingerprint)
+    && Number.isSafeInteger(run.turnIndex) && Number(run.turnIndex) >= 0
+    && Array.isArray(run.attachments)
+    && Number.isFinite(run.createdAt) && Number.isFinite(run.updatedAt)
+    && Number.isSafeInteger(run.cursor) && Number(run.cursor) >= 0
+    && (run.state === "running" || run.state === "cancelling" || run.state === "completed"
+      || run.state === "failed" || run.state === "cancelled" || run.state === "interrupted");
+}
+
+function messageResponseForRun(run: LiveCodexHistoryRun): CodexHistoryMessageResponse {
+  return {
+    runId: run.runId,
+    threadId: run.threadId,
+    state: run.state,
+    cursor: run.cursor,
+    turnIndex: run.turnIndex,
+    attachments: run.attachments.map(publicAttachment),
+  };
+}
+
 function buildCodexInput(text: string, attachments: StagedCodexHistoryAttachment[]): Input {
   const imageAttachments = attachments.filter((attachment) => attachment.mimeType.startsWith("image/"));
   const fileAttachments = attachments.filter((attachment) => !attachment.mimeType.startsWith("image/"));
@@ -1589,6 +2051,10 @@ function escapePromptAttribute(value: string): string {
 function sanitizeAttachmentFileName(value: string): string {
   const safeBaseName = value.replaceAll("\\", "/").split("/").pop() ?? "";
   return safeBaseName.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 180);
+}
+
+function isValidAttachmentId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
 function normalizeAttachmentMimeType(value: string): string {

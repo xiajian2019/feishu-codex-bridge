@@ -159,14 +159,20 @@ describe("Phase one HTTP contracts", () => {
     expect(starts).toHaveLength(1);
   });
 
-  it("serves only Direct records with bounded pages, authentication, and no mutation endpoint", async () => {
+  it("lists Web, Direct, and AAMP tasks with source filters, read-only detail, and deep links", async () => {
     const { db, dispatcher } = fixture();
-    await dispatcher.submitWebTask(input);
-    db.initializeAampTask({ aampTaskId: "aamp-only", chatId: "fixture", userText: "not direct" });
+    const webTask = await dispatcher.submitWebTask(input);
+    db.finishRun(webTask.active_run_id!, { status: "failed", error: "desk failure" });
+    db.initializeAampTask({ aampTaskId: "aamp-only", chatId: "private-chat-id", userText: "aamp-only-needle",
+      imageLocalPaths: ["/private/aamp-photo.png"], lastDeltaText: "AAMP progress text",
+      sessionSnapshot: { credential: "private-aamp-snapshot" }, relayStatus: { token: "private-relay-token" },
+      event: { secret: "private-aamp-event" } });
+    db.initializeAampTask({ aampTaskId: "aamp-failed", chatId: "fixture", userText: "failed AAMP task", status: "failed" });
     const message = { sourceEventId: "event-direct", eventType: "im.message.receive_v1", messageId: "direct-msg",
       chatId: "fixture", chatType: "p2p" as const, senderId: "sender", text: "direct-only-needle", sessionKey: "fixture:direct",
       payload: { credential: "must-not-be-exposed" }, attachments: [{ type: "file" as const, fileKey: "private-file-key", fileName: "fixture.txt" }] };
     const direct = db.ingestDirectMessage(message).task;
+    db.markBridgeCardDeliveryFailed(direct.bridge_task_id, "Direct card delivery failure");
     db.ingestDirectMessage({ ...message, sourceEventId: "event-other", messageId: "other-msg", sessionKey: "fixture:other", text: "other", attachments: [] });
     const continuation = db.ingestDirectMessage({ ...message, sourceEventId: "event-follow", messageId: "follow-msg",
       replyToMessageId: "direct-msg", text: "follow up", attachments: [] });
@@ -180,16 +186,41 @@ describe("Phase one HTTP contracts", () => {
     const url = await server.start();
     const headers = { Cookie: `bridge_session=${token}` };
     expect((await fetch(`${url}/api/task-panel`, { headers: {} })).status).toBe(401);
-    const panel = await (await fetch(`${url}/api/task-panel?limit=2`, { headers })).json() as any;
-    expect(panel.total).toBe(3);
-    expect(panel.items).toHaveLength(2);
-    const nextPanel = await (await fetch(`${url}/api/task-panel?limit=2&offset=2`, { headers })).json() as any;
-    expect(nextPanel.items).toHaveLength(1);
-    expect([...panel.items, ...nextPanel.items].map((item: any) => item.source).sort()).toEqual(["desk", "direct", "direct"]);
+    const panel = await (await fetch(`${url}/api/task-panel?limit=3`, { headers })).json() as any;
+    expect(panel.total).toBe(5);
+    expect(panel.items).toHaveLength(3);
+    const nextPanel = await (await fetch(`${url}/api/task-panel?limit=3&offset=3`, { headers })).json() as any;
+    expect(nextPanel.items).toHaveLength(2);
+    expect([...panel.items, ...nextPanel.items].map((item: any) => item.source).sort()).toEqual(["aamp", "aamp", "desk", "direct", "direct"]);
     const directPanel = await (await fetch(`${url}/api/task-panel?source=direct&q=direct-only-needle`, { headers })).json() as any;
     expect(directPanel.total).toBe(1);
     expect(directPanel.items[0]).toMatchObject({ source: "direct", id: direct.bridge_task_id });
     expect(JSON.stringify(directPanel)).not.toContain("private-file-key");
+    const aampPanel = await (await fetch(`${url}/api/task-panel?source=aamp&state=pending&q=aamp-only-needle`, { headers })).json() as any;
+    expect(aampPanel.total).toBe(1);
+    expect(aampPanel.items[0]).toMatchObject({ source: "aamp", id: "aamp-only", status: "pending", image_count: 1,
+      last_progress_text: "AAMP progress text" });
+    expect(aampPanel.filters.states).toContain("pending");
+    expect(aampPanel.filters.states).toContain("ATTENTION");
+    expect(JSON.stringify(aampPanel)).not.toContain("/private/aamp-photo.png");
+    expect((await (await fetch(`${url}/api/task-panel?state=pending`, { headers })).json() as any).items.map((item: any) => item.source)).toEqual(["aamp"]);
+    const attentionPanel = await (await fetch(`${url}/api/task-panel?state=ATTENTION`, { headers })).json() as any;
+    expect(attentionPanel.total).toBe(3);
+    expect(attentionPanel.items.map((item: any) => item.source).sort()).toEqual(["aamp", "desk", "direct"]);
+    expect((await (await fetch(`${url}/api/task-panel?source=direct&state=ATTENTION`, { headers })).json() as any).items.map((item: any) => item.id)).toEqual([direct.bridge_task_id]);
+    expect((await (await fetch(`${url}/api/task-panel?source=aamp&state=FAILED`, { headers })).json() as any).total).toBe(0);
+    expect((await (await fetch(`${url}/api/task-panel?source=aamp&project=fixture`, { headers })).json() as any).total).toBe(0);
+    const aampDetailResponse = await fetch(`${url}/api/task-panel/aamp/aamp-only`, { headers });
+    expect(aampDetailResponse.status).toBe(200);
+    const aampDetailText = await aampDetailResponse.text();
+    expect(aampDetailText).not.toContain("private-chat-id");
+    expect(aampDetailText).not.toContain("private-aamp-snapshot");
+    expect(aampDetailText).not.toContain("private-relay-token");
+    expect(aampDetailText).not.toContain("private-aamp-event");
+    expect(aampDetailText).not.toContain("/private/aamp-photo.png");
+    expect(JSON.parse(aampDetailText)).toMatchObject({ can_followup: false, task: { source: "aamp", id: "aamp-only" } });
+    expect((await fetch(`${url}/api/task-panel/aamp/aamp-only/followups`, { method: "POST", headers })).status).toBe(404);
+    expect((await fetch(`${url}/api/task-panel/aamp/missing`, { headers })).status).toBe(404);
     expect((await fetch(`${url}/api/task-panel?source=invalid`, { headers })).status).toBe(400);
     expect((await (await fetch(`${url}/api/tasks`, { headers })).json() as any).total).toBe(1);
     expect((await fetch(`${url}/api/direct/tasks`)).status).toBe(401);
@@ -200,7 +231,7 @@ describe("Phase one HTTP contracts", () => {
     const page = await fetch(`${url}/direct-tasks?task=${direct.bridge_task_id}`, { headers });
     expect(page.status).toBe(200);
     expect(await page.text()).toContain('id="root"');
-    for (const path of [`/tasks/direct/${direct.bridge_task_id}`, "/system-management/projects"]) {
+    for (const path of [`/tasks/direct/${direct.bridge_task_id}`, "/tasks/aamp/aamp-only", "/system-management/projects"]) {
       expect((await fetch(`${url}${path}`, { headers })).status).toBe(200);
     }
     const list = await (await fetch(`${url}/api/direct/tasks?limit=1`, { headers })).json() as any;

@@ -20,6 +20,7 @@ import type {
   TaskListResponse,
 } from "./types.js";
 import { DEFAULT_COMPOSER_SHORTCUTS, type ShortcutDefinition, type ShortcutDisplayMode, type ShortcutGroup, type ShortcutKind, type ShortcutStore, type ShortcutSurface } from "./tmux-shortcuts.js";
+import { invalidateShortcutConfigCache, observeShortcutConfigServerRevision, readShortcutConfigRevision, recordShortcutConfigServerRevision, writeShortcutConfigCache } from "./shortcut-config-cache.js";
 
 export interface TaskQuery {
   q?: string;
@@ -176,6 +177,7 @@ export async function sendCodexThreadMessage(
     text: string;
     attachmentIds?: string[];
     turnIndex: number;
+    idempotencyKey: string;
     model?: string;
     reasoningEffort?: CodexHistoryReasoningEffort;
   },
@@ -282,7 +284,9 @@ export async function updateProject(
 }
 
 export async function fetchShortcutConfig(): Promise<ShortcutStore> {
-  const result = await getJson<{ groups: ShortcutGroup[]; shortcuts: ShortcutDefinition[] }>("/api/shortcut-config");
+  const revisionAtStart = readShortcutConfigRevision();
+  const result = await getJson<{ groups: ShortcutGroup[]; shortcuts: ShortcutDefinition[]; revision?: string }>("/api/shortcut-config");
+  if (result.revision) recordShortcutConfigServerRevision(result.revision);
   const composerDefaults = new Map(DEFAULT_COMPOSER_SHORTCUTS.map((shortcut) => [shortcut.id, shortcut]));
   const shortcuts = Array.isArray(result.shortcuts)
     ? result.shortcuts.map((shortcut) => {
@@ -294,11 +298,35 @@ export async function fetchShortcutConfig(): Promise<ShortcutStore> {
         : shortcut;
     })
     : [];
-  return {
+  const store: ShortcutStore = {
     groups: Array.isArray(result.groups)
       ? result.groups.map((group) => group.id === "composer" && group.surface !== "composer" ? { ...group, surface: "composer" } : group)
       : [],
     shortcuts,
+  };
+  if (revisionAtStart === readShortcutConfigRevision()) writeShortcutConfigCache(store);
+  return store;
+}
+
+/** Polls the small server revision while the page is visible so other devices' edits appear. */
+export function watchRemoteShortcutConfig(onChanged?: () => void): () => void {
+  let active = true;
+  const check = async (): Promise<void> => {
+    if (!active || document.visibilityState === "hidden") return;
+    try {
+      const response = await getJson<{ revision: string }>("/api/shortcut-config/revision");
+      if (active && observeShortcutConfigServerRevision(response.revision)) onChanged?.();
+    } catch {
+      // Keep the last valid configuration while the device is offline.
+    }
+  };
+  const onVisibility = (): void => { if (document.visibilityState === "visible") void check(); };
+  document.addEventListener("visibilitychange", onVisibility);
+  const timer = window.setInterval(() => void check(), 30_000);
+  return () => {
+    active = false;
+    window.clearInterval(timer);
+    document.removeEventListener("visibilitychange", onVisibility);
   };
 }
 
@@ -315,6 +343,7 @@ export async function createShortcutGroup(input: {
     headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
     body: JSON.stringify(input),
   });
+  invalidateShortcutConfigCache();
   return result.group;
 }
 
@@ -328,6 +357,7 @@ export async function updateShortcutGroup(
     headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
     body: JSON.stringify(input),
   });
+  invalidateShortcutConfigCache();
   return result.group;
 }
 
@@ -337,6 +367,7 @@ export async function deleteShortcutGroup(id: string): Promise<void> {
     method: "DELETE",
     headers: { "X-Bridge-Action-Token": token },
   });
+  invalidateShortcutConfigCache();
 }
 
 export async function createShortcut(input: {
@@ -356,6 +387,7 @@ export async function createShortcut(input: {
     headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
     body: JSON.stringify(input),
   });
+  invalidateShortcutConfigCache();
   return result.shortcut;
 }
 
@@ -369,6 +401,7 @@ export async function updateShortcut(
     headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
     body: JSON.stringify(input),
   });
+  invalidateShortcutConfigCache();
   return result.shortcut;
 }
 
@@ -382,6 +415,7 @@ export async function moveShortcutToEdge(
     headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
     body: JSON.stringify({ position }),
   });
+  invalidateShortcutConfigCache();
   return result.shortcut;
 }
 
@@ -391,6 +425,7 @@ export async function deleteShortcut(id: string): Promise<void> {
     method: "DELETE",
     headers: { "X-Bridge-Action-Token": token },
   });
+  invalidateShortcutConfigCache();
 }
 
 export async function recordShortcutUse(id: string): Promise<ShortcutDefinition> {

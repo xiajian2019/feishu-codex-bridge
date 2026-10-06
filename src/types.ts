@@ -254,6 +254,7 @@ export interface StoredTmuxSession {
   tmux_session_id: string;
   session_name: string;
   project_key: string | null;
+  codex_home_id: string | null;
   working_directory: string;
   tmux_created_at: number;
   first_seen_at: string;

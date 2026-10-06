@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent, type ReactElement } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
 
 import {
   createShortcut,
@@ -7,8 +7,10 @@ import {
   moveShortcutToEdge,
   updateShortcut,
   updateShortcutGroup,
+  watchRemoteShortcutConfig,
 } from "./api.js";
 import { COMPOSER_ACTION_OPTIONS, parseTerminalSequence, type ShortcutDefinition, type ShortcutDisplayMode, type ShortcutGroup, type ShortcutKind, type ShortcutStore, type ShortcutSurface } from "./tmux-shortcuts.js";
+import { readShortcutConfigCache, subscribeShortcutConfigInvalidation } from "./shortcut-config-cache.js";
 
 type GroupDraft = {
   title: string;
@@ -34,7 +36,7 @@ const EMPTY_GROUP: GroupDraft = { title: "", icon: "⌘", description: "", surfa
 const EMPTY_SHORTCUT: ShortcutDraft = { groupId: "", title: "", detail: "", kind: "send", value: "", actionKey: "", displayMode: "closed", enabled: true, dangerous: false };
 
 export function ShortcutManagement(): ReactElement {
-  const [store, setStore] = useState<ShortcutStore>({ groups: [], shortcuts: [] });
+  const [store, setStore] = useState<ShortcutStore>(() => readShortcutConfigCache() ?? { groups: [], shortcuts: [] });
   const [selectedGroupId, setSelectedGroupId] = useState("");
   const [groupDraft, setGroupDraft] = useState<GroupDraft>(EMPTY_GROUP);
   const [shortcutDraft, setShortcutDraft] = useState<ShortcutDraft>(EMPTY_SHORTCUT);
@@ -45,23 +47,35 @@ export function ShortcutManagement(): ReactElement {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const loadGeneration = useRef(0);
 
   const load = async (): Promise<void> => {
+    const generation = ++loadGeneration.current;
     setLoading(true);
     setError(null);
     try {
       const next = await fetchShortcutConfig();
+      if (generation !== loadGeneration.current) return;
       setStore(next);
       setSelectedGroupId((current) => current && next.groups.some((group) => group.id === current) ? current : next.groups[0]?.id ?? "");
       setShortcutDraft((current) => ({ ...current, groupId: current.groupId || next.groups[0]?.id || "" }));
     } catch (loadError) {
+      if (generation !== loadGeneration.current) return;
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
-      setLoading(false);
+      if (generation === loadGeneration.current) setLoading(false);
     }
   };
 
-  useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    void load();
+    const unsubscribeLocal = subscribeShortcutConfigInvalidation(() => {
+      setStore(readShortcutConfigCache() ?? { groups: [], shortcuts: [] });
+      void load();
+    }, false);
+    const unsubscribeRemote = watchRemoteShortcutConfig(() => void load());
+    return () => { unsubscribeLocal(); unsubscribeRemote(); };
+  }, []);
 
   const groups = useMemo(
     () => store.groups.slice().sort((left, right) => left.sortOrder - right.sortOrder || left.id.localeCompare(right.id)),

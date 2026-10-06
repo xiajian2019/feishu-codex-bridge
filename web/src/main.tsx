@@ -16,6 +16,8 @@ const ShortcutManagement = lazy(() => import("./ShortcutManagement.js").then((mo
 const CodexUsage = lazy(() => import("./CodexUsage.js").then((module) => ({ default: module.CodexUsage })));
 const ProjectManagement = lazy(() => import("./ProjectManagement.js").then((module) => ({ default: module.ProjectManagement })));
 const TaskDetailPage = lazy(() => import("./TaskDetailPage.js").then((module) => ({ default: module.TaskDetailPage })));
+const SystemHealth = lazy(() => import("./SystemHealth.js").then((module) => ({ default: module.SystemHealth })));
+const SystemBackups = lazy(() => import("./SystemBackups.js").then((module) => ({ default: module.SystemBackups })));
 
 function LegacyDirectTasksRedirect() {
   const location = useLocation();
@@ -181,6 +183,8 @@ async function mountApp(): Promise<void> {
                   <Route path="/system-management/projects" element={<ProjectManagement />} />
                   <Route path="/system-management/shortcuts" element={<ShortcutManagement />} />
                   <Route path="/system-management/usage" element={<CodexUsage />} />
+                  <Route path="/system-management/health" element={<SystemHealth />} />
+                  <Route path="/system-management/backups" element={<SystemBackups />} />
                   <Route path="/pair-admin" element={<Navigate to="/system-management/devices" replace />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>

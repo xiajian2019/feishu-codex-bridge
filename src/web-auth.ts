@@ -26,6 +26,7 @@ export interface WebAuthSessionRecord {
 }
 
 export interface WebAuthDatabase {
+  getOrCreateDraftInstallationId?(): string;
   getWebAuthPairing(): WebAuthPairingRecord | null;
   saveWebAuthPairing(record: WebAuthPairingRecord): void;
   clearWebAuthPairing(): void;
@@ -74,6 +75,7 @@ export interface PairingStatus {
   activeSessionCount: number | null;
   pairingAvailable: boolean;
   pairingExpiresAt: number | null;
+  draftScope: string | null;
 }
 
 export class PairingRateLimitError extends Error {
@@ -92,6 +94,7 @@ export class WebPairingAuth {
   private readonly allowLocalRequests: boolean;
   private readonly localAddresses = collectLocalAddresses();
   private readonly memorySessions = new Map<string, WebAuthSessionRecord>();
+  private readonly draftInstallationId: string;
   private memoryPairing: PairingState | null = null;
 
   constructor(options: {
@@ -102,6 +105,7 @@ export class WebPairingAuth {
     this.db = options.db;
     this.now = options.now ?? (() => Date.now());
     this.allowLocalRequests = options.allowLocalRequests ?? false;
+    this.draftInstallationId = this.db?.getOrCreateDraftInstallationId?.() ?? randomUUID();
   }
 
   public isLocalRequest(request: IncomingMessage): boolean {
@@ -138,12 +142,18 @@ export class WebPairingAuth {
   public status(request: IncomingMessage): PairingStatus {
     const pairing = this.getPairing();
     const authenticated = this.isAuthorized(request);
+    const deviceId = authenticated
+      ? this.currentDeviceId(request) ?? (this.allowLocalRequests && this.isLocalRequest(request) ? "local" : null)
+      : null;
     return {
       authenticated,
       local: this.isLocalRequest(request),
       activeSessionCount: authenticated ? this.listActiveSessions().length : null,
       pairingAvailable: pairing !== null && pairing.expiresAt > this.now(),
       pairingExpiresAt: pairing && pairing.expiresAt > this.now() ? pairing.expiresAt : null,
+      draftScope: deviceId
+        ? createHash("sha256").update(JSON.stringify([this.draftInstallationId, deviceId])).digest("base64url")
+        : null,
     };
   }
 

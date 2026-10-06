@@ -26,8 +26,23 @@ import {
   type TaskListResponse,
 } from "./types.js";
 import { directTaskTitle } from "./task-title.js";
+import {
+  clearTaskCreateDraft,
+  loadLastTaskCreateProjectKey,
+  loadTaskCreateDraft,
+  rememberLastTaskCreateProjectKey,
+  saveTaskCreateDraft,
+} from "./task-create-draft-store.js";
 
 const PAGE_SIZE = 50;
+const AAMP_STATUS_LABELS: Record<string, string> = {
+  ATTENTION: "待处理",
+  pending: "等待派发",
+  running: "执行中",
+  done: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
 
 interface Filters {
   q: string;
@@ -83,12 +98,24 @@ export function App(): ReactElement {
   const [createError, setCreateError] = useState<string | null>(null);
   const [newDescription, setNewDescription] = useState("");
   const [newAttachments, setNewAttachments] = useState<SelectedTaskAttachment[]>([]);
+  const [attachmentRestoreNotice, setAttachmentRestoreNotice] = useState(false);
   const [attachmentsBusy, setAttachmentsBusy] = useState(false);
   const [newProjectKey, setNewProjectKey] = useState("");
 
   const listAbortRef = useRef<AbortController | null>(null);
   const listRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previewUrlsRef = useRef(new Set<string>());
+  const createDraftSnapshotRef = useRef<{ projectKey: string; description: string; hadStagedAttachments: boolean } | null>(null);
+
+  if (createOpen && newProjectKey) {
+    createDraftSnapshotRef.current = {
+      projectKey: newProjectKey,
+      description: newDescription,
+      hadStagedAttachments: newAttachments.length > 0 || attachmentRestoreNotice,
+    };
+  } else if (!createOpen) {
+    createDraftSnapshotRef.current = null;
+  }
 
   useEffect(() => () => {
     for (const previewUrl of previewUrlsRef.current) URL.revokeObjectURL(previewUrl);
@@ -146,6 +173,7 @@ export function App(): ReactElement {
       ...change.task,
       source: "desk",
       latest_run: change.latest_run,
+      latest_review: null,
     };
     setItems((previous) => {
       const index = previous.findIndex((item) => item.source === "desk" && item.task_guid === nextItem.task_guid);
@@ -179,6 +207,31 @@ export function App(): ReactElement {
     return () => clearInterval(timer);
   }, [appliedFilters.source, loadTasks, streamStatus]);
 
+  useEffect(() => {
+    if (!createOpen || !newProjectKey) return;
+    const timeout = window.setTimeout(() => {
+      saveTaskCreateDraft(newProjectKey, newDescription, newAttachments.length > 0 || attachmentRestoreNotice);
+    }, 250);
+    return () => window.clearTimeout(timeout);
+  }, [attachmentRestoreNotice, createOpen, newAttachments.length, newDescription, newProjectKey]);
+
+  useEffect(() => {
+    const flushDraft = (): void => {
+      const draft = createDraftSnapshotRef.current;
+      if (draft) saveTaskCreateDraft(draft.projectKey, draft.description, draft.hadStagedAttachments);
+    };
+    const flushWhenHidden = (): void => {
+      if (document.visibilityState === "hidden") flushDraft();
+    };
+    window.addEventListener("pagehide", flushDraft);
+    document.addEventListener("visibilitychange", flushWhenHidden);
+    return () => {
+      window.removeEventListener("pagehide", flushDraft);
+      document.removeEventListener("visibilitychange", flushWhenHidden);
+      flushDraft();
+    };
+  }, []);
+
   const openDetail = useCallback((taskGuid: string): void => {
     navigate(`/tasks/desk/${encodeURIComponent(taskGuid)}`, { state: { returnTo: `${location.pathname}${location.search}` } });
   }, [location.pathname, location.search, navigate]);
@@ -187,11 +240,21 @@ export function App(): ReactElement {
     navigate(`/tasks/direct/${encodeURIComponent(taskId)}`, { state: { returnTo: `${location.pathname}${location.search}` } });
   }, [location.pathname, location.search, navigate]);
 
+  const openAampDetail = useCallback((taskId: string): void => {
+    navigate(`/tasks/aamp/${encodeURIComponent(taskId)}`, { state: { returnTo: `${location.pathname}${location.search}` } });
+  }, [location.pathname, location.search, navigate]);
+
   const openCreateTask = (): void => {
     setCreateError(null);
-    setNewDescription("");
     setNewAttachments([]);
-    setNewProjectKey(filterOptions.projects[0] ?? "");
+    const preferredProjectKey = loadLastTaskCreateProjectKey();
+    const projectKey = filterOptions.projects.includes(preferredProjectKey)
+      ? preferredProjectKey
+      : filterOptions.projects[0] ?? "";
+    const draft = loadTaskCreateDraft(projectKey);
+    setNewProjectKey(projectKey);
+    setNewDescription(draft?.description ?? "");
+    setAttachmentRestoreNotice(draft?.hadStagedAttachments ?? false);
     setCreateOpen(true);
   };
 
@@ -203,12 +266,32 @@ export function App(): ReactElement {
 
   const closeCreateTask = (): void => {
     if (createBusy || attachmentsBusy) return;
+    const hadStagedAttachments = newAttachments.length > 0 || attachmentRestoreNotice;
+    saveTaskCreateDraft(newProjectKey, newDescription, hadStagedAttachments);
     setCreateOpen(false);
+    setAttachmentRestoreNotice(hadStagedAttachments);
     for (const attachment of newAttachments) {
       releasePreviewUrl(attachment.previewUrl);
       void deleteTaskAttachment(attachment.attachment_id).catch(() => undefined);
     }
     setNewAttachments([]);
+  };
+
+  const selectCreateProject = (projectKey: string): void => {
+    if (projectKey === newProjectKey) return;
+    const discardedSelectedAttachments = newAttachments.length > 0;
+    saveTaskCreateDraft(newProjectKey, newDescription, newAttachments.length > 0 || attachmentRestoreNotice);
+    const draft = loadTaskCreateDraft(projectKey);
+    for (const attachment of newAttachments) {
+      releasePreviewUrl(attachment.previewUrl);
+      void deleteTaskAttachment(attachment.attachment_id).catch(() => undefined);
+    }
+    rememberLastTaskCreateProjectKey(projectKey);
+    setCreateError(discardedSelectedAttachments ? "已移除上一个项目的暂存附件；如需提交文件，请为当前项目重新选择。" : null);
+    setNewAttachments([]);
+    setNewProjectKey(projectKey);
+    setNewDescription(draft?.description ?? "");
+    setAttachmentRestoreNotice(draft?.hadStagedAttachments ?? false);
   };
 
   const handleAttachmentSelection = async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
@@ -226,6 +309,7 @@ export function App(): ReactElement {
         const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
         if (previewUrl) previewUrlsRef.current.add(previewUrl);
         setNewAttachments((current) => [...current, { ...attachment, ...(previewUrl ? { previewUrl } : {}) }]);
+        setAttachmentRestoreNotice(false);
       }
     } catch (error) {
       setCreateError(error instanceof Error ? error.message : String(error));
@@ -249,6 +333,7 @@ export function App(): ReactElement {
   const handleCreateTask = useCallback(async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     if (submittingRef.current) return;
+    const submittedProjectKey = newProjectKey;
     submittingRef.current = true;
     setCreateBusy(true);
     setCreateError(null);
@@ -265,26 +350,44 @@ export function App(): ReactElement {
       input.idempotencyKey = submissionRef.current.key;
       const result = await createTask(input);
       submissionRef.current = null;
+      clearTaskCreateDraft(submittedProjectKey);
+      createDraftSnapshotRef.current = null;
       for (const attachment of newAttachments) releasePreviewUrl(attachment.previewUrl);
       setNewAttachments([]);
+      setNewDescription("");
+      setAttachmentRestoreNotice(false);
       setCreateOpen(false);
       setDraftFilters(EMPTY_FILTERS);
       setAppliedFilters(EMPTY_FILTERS);
       setOffset(0);
       setItems((current) => [
-        { ...result.task, source: "desk" as const, latest_run: result.latest_run },
+        { ...result.task, source: "desk" as const, latest_run: result.latest_run, latest_review: null },
         ...current.filter((item) => item.source !== "desk" || item.task_guid !== result.task.task_guid),
       ].slice(0, PAGE_SIZE));
       setTotal((current) => current + 1);
       setLastUpdated(new Date());
       openDetail(result.task.task_guid);
     } catch (error) {
-      setCreateError(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("部分附件已过期或已绑定其他任务")) {
+        for (const attachment of newAttachments) {
+          releasePreviewUrl(attachment.previewUrl);
+          void deleteTaskAttachment(attachment.attachment_id).catch(() => undefined);
+        }
+        setNewAttachments([]);
+        setAttachmentRestoreNotice(true);
+        const notice = "有附件已过期或已绑定到其他任务，请重新选择附件。项目和任务描述已保留。";
+        saveTaskCreateDraft(submittedProjectKey, newDescription, true);
+        setCreateError(notice);
+      } else {
+        saveTaskCreateDraft(submittedProjectKey, newDescription, newAttachments.length > 0 || attachmentRestoreNotice);
+        setCreateError(message);
+      }
     } finally {
       submittingRef.current = false;
       setCreateBusy(false);
     }
-  }, [createBusy, newAttachments, newDescription, newProjectKey, openDetail]);
+  }, [attachmentRestoreNotice, createBusy, newAttachments, newDescription, newProjectKey, openDetail]);
 
   const submitFilters = useCallback((event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault();
@@ -318,10 +421,11 @@ export function App(): ReactElement {
             value={draftFilters.state}
             placeholder="全部状态"
             options={filterOptions.states}
+            formatOption={(state) => AAMP_STATUS_LABELS[state] ?? state}
             onChange={(value) => setDraftFilters((current) => ({ ...current, state: value }))}
           />
-          <select aria-label="来源" value={draftFilters.source} onChange={(event) => setDraftFilters((current) => ({ ...current, source: event.target.value, state: "", ...(event.target.value === "direct" ? { project: "", mode: "" } : {}) }))}>
-            <option value="">全部来源</option><option value="desk">Bridge</option><option value="direct">飞书 Direct</option>
+          <select aria-label="来源" value={draftFilters.source} onChange={(event) => setDraftFilters((current) => ({ ...current, source: event.target.value, state: "", ...(event.target.value !== "desk" ? { project: "", mode: "" } : {}) }))}>
+            <option value="">全部来源</option><option value="desk">Bridge</option><option value="direct">飞书 Direct</option><option value="aamp">飞书 AAMP + Relay</option>
           </select>
           <Select
             ariaLabel="项目"
@@ -329,6 +433,7 @@ export function App(): ReactElement {
             placeholder="全部项目"
             options={filterOptions.projects}
             onChange={(value) => setDraftFilters((current) => ({ ...current, project: value }))}
+            disabled={draftFilters.source === "direct" || draftFilters.source === "aamp"}
           />
           <Select
             ariaLabel="模式"
@@ -336,6 +441,7 @@ export function App(): ReactElement {
             placeholder="全部模式"
             options={filterOptions.modes}
             onChange={(value) => setDraftFilters((current) => ({ ...current, mode: value }))}
+            disabled={draftFilters.source === "direct" || draftFilters.source === "aamp"}
           />
           <button className="primary" type="submit">查询</button>
           <button className="task-panel-create" type="button" onClick={openCreateTask}>新建任务</button>
@@ -358,7 +464,7 @@ export function App(): ReactElement {
               <tr><th>任务</th><th>状态 / 进展</th><th>项目 / 模式</th><th>执行方式</th><th>最近运行</th><th>Thread</th><th>更新时间</th></tr>
             </thead>
             <tbody>
-              {items.map((item) => <TaskRow key={item.source === "direct" ? `direct:${item.id}` : `desk:${item.task_guid}`} item={item} onOpen={openDetail} onOpenDirect={openDirectDetail} />)}
+              {items.map((item) => <TaskRow key={taskItemKey(item)} item={item} onOpen={openDetail} onOpenDirect={openDirectDetail} onOpenAamp={openAampDetail} />)}
             </tbody>
           </table>
           {listError ? <div className="error">{listError}</div> : !listLoading && items.length === 0 ? <div className="empty">没有符合条件的任务</div> : null}
@@ -373,18 +479,19 @@ export function App(): ReactElement {
               <button type="button" onClick={closeCreateTask} aria-label="关闭" disabled={createBusy || attachmentsBusy}>×</button>
             </div>
             <form className="task-create-form dialog-body" onSubmit={(event) => void handleCreateTask(event)}>
-              <label>项目<Select ariaLabel="任务项目" value={newProjectKey} placeholder="选择项目" options={filterOptions.projects} onChange={setNewProjectKey} /></label>
-              <label>任务描述<textarea value={newDescription} onChange={(event) => setNewDescription(event.target.value)} maxLength={20_000} rows={7} required autoFocus placeholder="输入任务内容，Codex 会根据描述推断执行方式。" /></label>
-              <label>图片和附件<input type="file" multiple disabled={attachmentsBusy || newAttachments.length >= 10} onChange={(event) => void handleAttachmentSelection(event)} /></label>
+              <label>项目<Select ariaLabel="任务项目" value={newProjectKey} placeholder="选择项目" options={filterOptions.projects} onChange={selectCreateProject} disabled={createBusy || attachmentsBusy} /></label>
+              <label>任务描述<textarea value={newDescription} onChange={(event) => setNewDescription(event.target.value)} maxLength={20_000} rows={7} required autoFocus disabled={createBusy} placeholder="输入任务内容，Codex 会根据描述推断执行方式。" /></label>
+              <label>图片和附件<input type="file" multiple disabled={createBusy || attachmentsBusy || newAttachments.length >= 10} onChange={(event) => void handleAttachmentSelection(event)} /></label>
               <div className="task-attachment-staging">
                 {newAttachments.map((attachment) => (
                   <div className="task-attachment-staged" key={attachment.attachment_id}>
                     {attachment.previewUrl ? <img src={attachment.previewUrl} alt={attachment.file_name} /> : <span className="task-attachment-file-icon">FILE</span>}
                     <span title={attachment.file_name}>{attachment.file_name}<small>{formatBytes(attachment.size_bytes)}</small></span>
-                    <button type="button" onClick={() => void removeSelectedAttachment(attachment)} disabled={attachmentsBusy} aria-label={`移除 ${attachment.file_name}`}>移除</button>
+                    <button type="button" onClick={() => void removeSelectedAttachment(attachment)} disabled={createBusy || attachmentsBusy} aria-label={`移除 ${attachment.file_name}`}>移除</button>
                   </div>
                 ))}
                 {attachmentsBusy ? <span className="muted">附件正在保存到本机…</span> : null}
+                {attachmentRestoreNotice && newAttachments.length === 0 ? <span className="muted" role="status">暂存附件不会跨项目切换或刷新保留，请重新选择需要的文件。</span> : null}
                 <span className="muted">单个附件最大 25 MiB，每个任务最多 10 个；文件保存在本机，可在任务详情查看。</span>
               </div>
               {createError ? <div className="error" role="alert">{createError}</div> : null}
@@ -406,21 +513,24 @@ interface SelectProps {
   placeholder: string;
   options: string[];
   onChange: (value: string) => void;
+  formatOption?: (option: string) => string;
+  disabled?: boolean;
 }
 
-function Select({ ariaLabel, value, placeholder, options, onChange }: SelectProps): ReactElement {
+function Select({ ariaLabel, value, placeholder, options, onChange, formatOption, disabled }: SelectProps): ReactElement {
   return (
-    <select aria-label={ariaLabel} value={value} onChange={(event) => onChange(event.target.value)}>
+    <select aria-label={ariaLabel} value={value} onChange={(event) => onChange(event.target.value)} disabled={disabled}>
       <option value="">{placeholder}</option>
-      {options.map((option) => <option key={option} value={option}>{option}</option>)}
+      {options.map((option) => <option key={option} value={option}>{formatOption?.(option) ?? option}</option>)}
     </select>
   );
 }
 
-const TaskRow = memo(function TaskRow({ item, onOpen, onOpenDirect }: {
+const TaskRow = memo(function TaskRow({ item, onOpen, onOpenDirect, onOpenAamp }: {
   item: TaskListItem;
   onOpen: (guid: string) => void;
   onOpenDirect: (taskId: string) => void;
+  onOpenAamp: (taskId: string) => void;
 }): ReactElement {
   if (item.source === "direct") {
     const project = item.text.match(/^[ \t]*(?:项目|project)[ \t]*[:：=][ \t]*(\S+)[ \t]*$/imu)?.[1];
@@ -436,6 +546,22 @@ const TaskRow = memo(function TaskRow({ item, onOpen, onOpenDirect }: {
       <td>{formatTime(item.updated_at)}</td>
     </tr>;
   }
+  if (item.source === "aamp") {
+    const title = item.text?.trim()
+      ? directTaskTitle(item.text, 180)
+      : item.image_count > 0 ? "（图片任务）" : "（无标题）";
+    return <tr className="task-row" tabIndex={0} onClick={() => onOpenAamp(item.id)} onKeyDown={(event) => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onOpenAamp(item.id); }
+    }}>
+      <td><div className="title">{title}</div><div className="guid">{item.id}</div></td>
+      <td><Badge state={item.status} label={AAMP_STATUS_LABELS[item.status] ?? item.status} /><ProgressText text={item.last_progress_text} /></td>
+      <td>—<div className="muted">飞书 AAMP + Relay</div><small>只读记录</small></td>
+      <td>官方 AAMP Agent</td>
+      <td>{item.image_count ? `${item.image_count} 个图片附件` : "—"}</td>
+      <td className="guid">—</td>
+      <td>{formatTime(item.updated_at)}</td>
+    </tr>;
+  }
   return (
     <tr className="task-row" tabIndex={0} onClick={() => onOpen(item.task_guid)} onKeyDown={(event) => {
       if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onOpen(item.task_guid); }
@@ -446,6 +572,7 @@ const TaskRow = memo(function TaskRow({ item, onOpen, onOpenDirect }: {
       </td>
       <td>
         <Badge state={item.state} />
+        {item.latest_review ? <div className="muted">人工验收：{item.latest_review.decision === "accepted" ? "已通过" : "需要修改"}</div> : null}
         <ProgressText text={item.progress_text} />
       </td>
       <td>{item.project_key}<div className="muted">{item.mode}</div><small>{item.origin === "web" ? "Bridge 看板" : "飞书任务"}</small></td>
@@ -462,8 +589,8 @@ const TaskRow = memo(function TaskRow({ item, onOpen, onOpenDirect }: {
   );
 });
 
-function Badge({ state }: { state: string }): ReactElement {
-  return <span className={`badge badge-${state}`}>{state}</span>;
+function Badge({ state, label = state }: { state: string; label?: string }): ReactElement {
+  return <span className={`badge badge-${state}`}>{label}</span>;
 }
 
 function ProgressText({ text }: { text: string | null }): ReactElement | null {
@@ -481,19 +608,29 @@ function formatBytes(sizeBytes: number): string {
 }
 
 function mergeTaskItems(previous: TaskListItem[], incoming: TaskListResponse["items"]): TaskListItem[] {
-  const previousByGuid = new Map(previous.map((item) => [item.source === "direct" ? `direct:${item.id}` : `desk:${item.task_guid}`, item]));
+  const previousByGuid = new Map(previous.map((item) => [taskItemKey(item), item]));
   return incoming.map((item) => {
-    const previousItem = previousByGuid.get(item.source === "direct" ? `direct:${item.id}` : `desk:${item.task_guid}`);
+    const previousItem = previousByGuid.get(taskItemKey(item));
     return previousItem && taskItemEqual(previousItem, item) ? previousItem : item;
   });
 }
 
+function taskItemKey(item: TaskListItem): string {
+  return item.source === "desk" ? `desk:${item.task_guid}` : `${item.source}:${item.id}`;
+}
+
 function taskItemEqual(left: TaskListItem, right: TaskListItem): boolean {
-  if (left.source === "direct" || right.source === "direct") {
-    return left.source === "direct" && right.source === "direct"
-      && left.id === right.id && left.updated_at === right.updated_at
+  if (left.source !== right.source) return false;
+  if (left.source === "direct" && right.source === "direct") {
+    return left.id === right.id && left.updated_at === right.updated_at
       && left.status === right.status && left.last_progress_text === right.last_progress_text;
   }
+  if (left.source === "aamp" && right.source === "aamp") {
+    return left.id === right.id && left.updated_at === right.updated_at
+      && left.status === right.status && left.last_progress_text === right.last_progress_text
+      && left.error === right.error && left.image_count === right.image_count;
+  }
+  if (left.source !== "desk" || right.source !== "desk") return false;
   return left.task_guid === right.task_guid
     && left.origin === right.origin
     && left.state === right.state
@@ -509,7 +646,9 @@ function taskItemEqual(left: TaskListItem, right: TaskListItem): boolean {
     && left.latest_run?.execution_backend === right.latest_run?.execution_backend
     && left.latest_run?.tmux_session_id === right.latest_run?.tmux_session_id
     && left.latest_run?.progress_text === right.latest_run?.progress_text
-    && left.latest_run?.finished_at === right.latest_run?.finished_at;
+    && left.latest_run?.finished_at === right.latest_run?.finished_at
+    && left.latest_review?.decision === right.latest_review?.decision
+    && left.latest_review?.reviewed_at === right.latest_review?.reviewed_at;
 }
 
 function createWebSubmissionKey(): string {

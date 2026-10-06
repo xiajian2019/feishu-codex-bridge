@@ -39,7 +39,7 @@
 
 ## 数据备份与恢复演练
 
-使用 `bun run backup create --db <源数据库> --out <新备份目录>` 创建备份，`bun run backup verify --backup <备份目录>` 校验，再用 `bun run backup restore --backup <备份目录> --out <新恢复目录>` 演练恢复。Portable 使用 `feishu-codex-bridge backup`；源 DB 必须显式指定，已有目标目录一律拒绝覆盖。备份包含 Bridge 数据库和它引用的 Web/Direct/AAMP 附件，不自动切换服务。安装根目录与自定义附件目录参数、限制及验证记录见 [第一阶段清单](doc/phase-one-checklist.md#命令与使用边界)。
+使用 `bun run backup create --db <源数据库> --out <新备份目录>` 创建备份，`bun run backup verify --backup <备份目录>` 校验，再用 `bun run backup restore --backup <备份目录> --out <新恢复目录>` 演练恢复。也可在系统管理的“数据备份”页面创建、校验、检查升级兼容性并恢复到新的隔离目录；页面不会覆盖或切换运行服务。当前清单包含数据库引用的 Web/Direct/AAMP 附件和 tmux 任务提交记录中引用且文件仍存在的附件；旧版清单不含 tmux 附件引用。Portable 使用 `feishu-codex-bridge backup`；源 DB 必须显式指定，已有目标目录一律拒绝覆盖。安装根目录与自定义附件目录参数、限制及验证记录见 [第一阶段清单](doc/phase-one-checklist.md#命令与使用边界)。
 
 ## Codex 历史会话
 

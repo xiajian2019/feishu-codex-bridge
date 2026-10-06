@@ -150,7 +150,7 @@ function resolveMarkdownFileTarget(
   return { path: pathParts.join("/"), ...(lineNumber ? { lineNumber } : {}) };
 }
 
-export function TaskFileBrowser({ taskGuid }: { taskGuid: string }): ReactElement {
+export function TaskFileBrowser({ taskGuid, initialFilePath }: { taskGuid: string; initialFilePath?: string }): ReactElement {
   const [currentPath, setCurrentPath] = useState("");
   const [listing, setListing] = useState<TaskFileListing | null>(null);
   const [loading, setLoading] = useState(true);
@@ -277,6 +277,10 @@ export function TaskFileBrowser({ taskGuid }: { taskGuid: string }): ReactElemen
       setError(requestError instanceof Error ? requestError.message : "无法打开 Markdown 链接。");
     }
   };
+
+  useEffect(() => {
+    if (initialFilePath) void openMarkdownTarget({ path: initialFilePath });
+  }, [initialFilePath, taskGuid]);
 
   const closePreview = (): void => {
     previewRequestRef.current += 1;

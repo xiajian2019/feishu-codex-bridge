@@ -551,8 +551,16 @@ function formatCreditExpiry(expiresAt?: number | null): string {
   });
   const difference = date.getTime() - Date.now();
   if (difference <= 0) return `已于 ${dateLabel} 到期`;
-  const days = Math.ceil(difference / 86_400_000);
-  return days <= 7 ? `${dateLabel}（${days < 1 ? "24 小时内" : `${days} 天后`}到期）` : `${dateLabel} 到期`;
+  const remainingMinutes = Math.max(1, Math.ceil(difference / 60_000));
+  const days = Math.floor(remainingMinutes / (24 * 60));
+  const hours = Math.floor((remainingMinutes % (24 * 60)) / 60);
+  const minutes = remainingMinutes % 60;
+  const remaining = days > 0
+    ? `剩余 ${days} 天${hours > 0 ? ` ${hours} 小时` : ""}`
+    : hours > 0
+      ? `剩余 ${hours} 小时${minutes > 0 ? ` ${minutes} 分钟` : ""}`
+      : `剩余 ${minutes} 分钟`;
+  return `${dateLabel}（${remaining}）`;
 }
 
 function formatTimestampFromSeconds(timestamp: number): string {

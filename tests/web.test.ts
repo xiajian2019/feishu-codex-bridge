@@ -463,9 +463,11 @@ describe("DashboardServer", () => {
     temporaryDirectories.push(directory);
     const db = new StateDatabase(":memory:");
     openDatabases.push(db);
+    let historySdkRuns = 0;
     const history = new CodexHistoryService({
       executable: "unused-in-test",
       environment: { CODEX_HOME: directory },
+      runStore: db,
       createClient: () => ({
         listThreads: async () => ({ data: [], nextCursor: null, backwardsCursor: null }),
         readThread: async (threadId) => ({ thread: { id: threadId, cwd: directory, turns: [] } }),
@@ -476,6 +478,7 @@ describe("DashboardServer", () => {
           id: threadId,
           runStreamed: async () => ({
             events: (async function* () {
+              historySdkRuns += 1;
               yield { type: "item.completed", item: { id: "answer", type: "agent_message", text: "后台回复" } };
               yield { type: "turn.completed", usage: { output_tokens: 2 } };
             })(),
@@ -515,7 +518,7 @@ describe("DashboardServer", () => {
         "Content-Type": "application/json",
         "X-Bridge-Action-Token": actionToken as string,
       },
-      body: JSON.stringify({ text: "继续处理", attachmentIds: [uploaded.attachment.attachmentId] }),
+      body: JSON.stringify({ text: "继续处理", attachmentIds: [uploaded.attachment.attachmentId], idempotencyKey: "history-http-key" }),
     });
     expect(sendResponse.status).toBe(202);
     const accepted = await sendResponse.json() as { runId: string; cursor: number };
@@ -528,6 +531,20 @@ describe("DashboardServer", () => {
     }
     expect(updates.state).toBe("completed");
     expect(updates.events.map((event) => event.type)).toContain("item.completed");
+    const replayResponse = await fetch(`${url}/api/codex/threads/${encodeURIComponent(homeId)}/thread-web/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": actionToken as string },
+      body: JSON.stringify({ text: "继续处理", attachmentIds: [uploaded.attachment.attachmentId], idempotencyKey: "history-http-key" }),
+    });
+    expect(replayResponse.status).toBe(202);
+    expect((await replayResponse.json() as { runId: string }).runId).toBe(accepted.runId);
+    expect(historySdkRuns).toBe(1);
+    const conflictResponse = await fetch(`${url}/api/codex/threads/${encodeURIComponent(homeId)}/thread-web/messages`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": actionToken as string },
+      body: JSON.stringify({ text: "另一条消息", attachmentIds: [uploaded.attachment.attachmentId], idempotencyKey: "history-http-key" }),
+    });
+    expect(conflictResponse.status).toBe(409);
   });
 
 });

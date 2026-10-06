@@ -25,6 +25,20 @@ export default defineConfig({
         changeOrigin: true,
         configure: (proxy) => {
           proxy.on("proxyReq", (proxyRequest, request) => {
+            const forwardedHostHeader = request.headers["x-forwarded-host"] ?? request.headers.host;
+            const forwardedHost = Array.isArray(forwardedHostHeader) ? forwardedHostHeader[0] : forwardedHostHeader;
+            if (forwardedHost) proxyRequest.setHeader("X-Forwarded-Host", forwardedHost.split(",", 1)[0]!.trim());
+
+            const forwardedProtoHeader = request.headers["x-forwarded-proto"];
+            const forwardedProto = (Array.isArray(forwardedProtoHeader) ? forwardedProtoHeader[0] : forwardedProtoHeader)
+              ?.split(",", 1)[0]
+              ?.trim();
+            proxyRequest.setHeader("X-Forwarded-Proto", forwardedProto || "http");
+
+            const forwardedPortHeader = request.headers["x-forwarded-port"];
+            const forwardedPort = Array.isArray(forwardedPortHeader) ? forwardedPortHeader[0] : forwardedPortHeader;
+            if (forwardedPort) proxyRequest.setHeader("X-Forwarded-Port", forwardedPort.split(",", 1)[0]!.trim());
+
             const address = request.socket.remoteAddress;
             if (address) proxyRequest.setHeader("X-Forwarded-For", address);
           });

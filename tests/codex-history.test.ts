@@ -166,16 +166,16 @@ describe("CodexHistoryService", () => {
       });
       expect(accepted).toMatchObject({ threadId: "thread-1", state: "running", cursor: 0 });
 
-      let updates = service.getMessageUpdates(home.id, "thread-1", accepted.runId, 0);
+      let updates = await service.getMessageUpdates(home.id, "thread-1", accepted.runId, 0);
       for (let attempt = 0; attempt < 20 && updates.state === "running"; attempt += 1) {
         await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
-        updates = service.getMessageUpdates(home.id, "thread-1", accepted.runId, updates.cursor);
+        updates = await service.getMessageUpdates(home.id, "thread-1", accepted.runId, updates.cursor);
       }
-      const allUpdates = service.getMessageUpdates(home.id, "thread-1", accepted.runId, 0);
+      const allUpdates = await service.getMessageUpdates(home.id, "thread-1", accepted.runId, 0);
       expect(allUpdates.state).toBe("completed");
       expect(allUpdates.events.map((event) => event.type)).toContain("item.completed");
       expect(allUpdates.finalResponse).toBe("增量回复");
-      expect(service.getMessageUpdates(home.id, "thread-1", accepted.runId, allUpdates.cursor).events).toEqual([]);
+      expect((await service.getMessageUpdates(home.id, "thread-1", accepted.runId, allUpdates.cursor)).events).toEqual([]);
       expect(sent[0]).toMatchObject({
         threadId: "thread-1",
         options: {

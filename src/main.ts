@@ -1,4 +1,4 @@
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -10,9 +10,11 @@ import { CodexHistoryService } from "./codex-history.js";
 import { isExecutableCodexPath, resolveCodexCliPath } from "./codex-path.js";
 import { LocalCodexNotificationInbox } from "./codex-notification-inbox.js";
 import { StateDatabase } from "./db.js";
+import { defaultBridgeAttachmentRoots } from "./bridge-backup.js";
 import { initializeProjectRegistry, writeProjectRegistrySnapshot } from "./project-registry.js";
 import { TmuxDashboardApi } from "./tmux-dashboard-api.js";
 import { Dispatcher } from "./dispatcher.js";
+import { captureGitWorkspaceSnapshot } from "./run-artifacts.js";
 import { LarkCliClient } from "./lark.js";
 import { LocalCodexNotificationWatcher } from "./local-codex-notifications.js";
 import { Poller } from "./poller.js";
@@ -66,6 +68,7 @@ function createDashboardTaskDispatcher(
     lark: new LarkCliClient(config, { logger }),
     config,
     workerRunner: codexWorker,
+    captureWorkspaceSnapshot: captureGitWorkspaceSnapshot,
     larkOutboxEnabled: false,
     logger,
   });
@@ -73,9 +76,30 @@ function createDashboardTaskDispatcher(
   return dispatcher;
 }
 
+function dashboardBackupOptions(databasePathInput: string, taskAttachmentsDirectoryInput: string): {
+  backupRoot: string;
+  backupAttachmentRoots: ReturnType<typeof defaultBridgeAttachmentRoots>;
+} {
+  const databasePath = resolve(databasePathInput);
+  let canonicalDatabasePath = databasePath;
+  try { canonicalDatabasePath = realpathSync.native(databasePath); } catch { /* Dashboard startup validates the database separately. */ }
+  const dataRoot = resolveBridgeDataRoot(import.meta.url);
+  const attachmentRoots = defaultBridgeAttachmentRoots(canonicalDatabasePath, dataRoot);
+  attachmentRoots.web = [...new Set([
+    ...attachmentRoots.web,
+    resolve(taskAttachmentsDirectoryInput),
+    join(dirname(databasePath), "task-attachments"),
+  ])];
+  return {
+    backupRoot: join(dirname(canonicalDatabasePath), "backups"),
+    backupAttachmentRoots: attachmentRoots,
+  };
+}
+
 function dashboardTaskActions(dispatcher: Dispatcher) {
   return {
     createTask: (input: Parameters<Dispatcher["submitWebTask"]>[0]) => dispatcher.submitWebTask(input),
+    retryWebTask: (taskGuid: string, idempotencyKey: string) => dispatcher.retryWebTask(taskGuid, idempotencyKey),
     interruptTask: async (taskGuid: string, reason?: string) => ({
       ok: await dispatcher.interruptTask(taskGuid, reason),
     }),
@@ -121,6 +145,7 @@ function createCodexHistoryService(
     environment: buildCodexAppServerEnvironment(config),
     listCacheStore: db,
     threadHomePreferenceStore: db,
+    runStore: db,
     logger,
   });
 }
@@ -138,6 +163,10 @@ async function runWebOnlyMode(
   const dispatcher = createDashboardTaskDispatcher(config, args, db, logger);
   const dashboard = new DashboardServer({
     db,
+    databasePath: resolve(args.dbPath),
+    ...dashboardBackupOptions(resolve(args.dbPath), join(dirname(resolve(args.dbPath)), "task-attachments")),
+    executionMode: "web-only",
+    codexCliPath: config.codex.cliPath,
     auth,
     tmuxDashboard: tmuxDashboardApi,
     codexHistory: createCodexHistoryService(config, resolveBridgeProjectRoot(import.meta.url), logger, db),
@@ -358,6 +387,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const dashboard = config.web.enabled
       ? new DashboardServer({
         db,
+        databasePath: resolve(args.dbPath),
+        ...dashboardBackupOptions(resolve(args.dbPath), join(dirname(resolve(args.dbPath)), "task-attachments")),
+        executionMode: config.execution.mode,
+        codexCliPath: config.codex.cliPath,
         auth: auth!,
         tmuxDashboard: tmuxDashboardApi!,
         codexHistory: createCodexHistoryService(config, projectRoot, logger, db),
@@ -474,6 +507,10 @@ async function runDirectMode(
   const dashboard = auth && tmuxDashboardApi && dashboardDispatcher
     ? new DashboardServer({
       db,
+      databasePath: dbPath,
+      ...dashboardBackupOptions(dbPath, join(dirname(dbPath), "task-attachments")),
+      executionMode: config.execution.mode,
+      codexCliPath: config.codex.cliPath,
       auth,
       tmuxDashboard: tmuxDashboardApi,
       codexHistory: createCodexHistoryService(config, projectRoot, logger, db),
@@ -625,6 +662,10 @@ async function runAampMode(
   const dashboard = config.web.enabled
     ? new DashboardServer({
         db,
+        databasePath: dbPath,
+        ...dashboardBackupOptions(dbPath, join(dirname(dbPath), "task-attachments")),
+        executionMode: config.execution.mode,
+        codexCliPath: config.codex.cliPath,
         auth: auth!,
         tmuxDashboard: tmuxDashboardApi!,
         codexHistory: createCodexHistoryService(config, projectRoot, logger, db),

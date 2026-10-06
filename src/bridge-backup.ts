@@ -1,28 +1,32 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, type BigIntStats } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, opendir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
+import { StateDatabase } from "./db.js";
 import { DatabaseSync, type SqliteDatabase } from "./sqlite.js";
 import { resolveBridgeProjectRoot } from "./portable-runtime.js";
 
 const BACKUP_FORMAT = "feishu-codex-bridge-backup";
-const BACKUP_FORMAT_VERSION = 1;
+const BACKUP_FORMAT_VERSION = 2;
 const DATABASE_FILE = "bridge.db";
 const MANIFEST_FILE = "manifest.json";
 const MAX_MANIFEST_BYTES = 20 * 1024 * 1024;
 const MAX_ATTACHMENT_FILES = 10_000;
 const MAX_ATTACHMENT_BYTES = 250 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_BACKUP_LIST_ENTRIES = 1_000;
 const READ_CHUNK_BYTES = 64 * 1024;
 
-export type BridgeAttachmentKind = "web" | "direct" | "aamp";
+export type BridgeAttachmentKind = "web" | "direct" | "aamp" | "tmux";
 
 export interface BridgeAttachmentRoots {
   web: string[];
   direct: string[];
   aamp: string[];
+  tmux: string[];
 }
 
 export interface BridgeBackupOptions {
@@ -42,12 +46,33 @@ export interface BridgeBackupSummary {
 
 export interface BridgeBackupVerification {
   backupDirectory: string;
+  formatVersion: number;
   programVersion: string;
   createdAt: string;
   databaseBytes: number;
   attachmentCount: number;
   attachmentBytes: number;
+  attachmentCountsByKind: Record<BridgeAttachmentKind, number>;
   schemaFingerprint: string;
+}
+
+export interface BridgeBackupMetadata extends BridgeBackupVerification {
+  /** Manifest metadata only; call verifyBridgeBackup before relying on artifact contents. */
+  contentHashesVerified: false;
+}
+
+export type BridgeBackupListEntry =
+  | { backupDirectory: string; status: "metadata"; metadata: BridgeBackupMetadata }
+  | { backupDirectory: string; status: "invalid"; error: string };
+
+export interface BridgeBackupUpgradeCheck {
+  verification: BridgeBackupVerification;
+  backupDirectory: string;
+  sourceProgramVersion: string;
+  targetProgramVersion: string;
+  sourceSchemaFingerprint: string;
+  migratedSchemaFingerprint: string;
+  compatible: true;
 }
 
 export interface BridgeRestoreOptions {
@@ -61,6 +86,7 @@ export interface BridgeRestoreSummary {
   attachmentCount: number;
   attachmentBytes: number;
   schemaFingerprint: string;
+  verification: BridgeBackupVerification;
 }
 
 interface AttachmentReference {
@@ -139,6 +165,11 @@ export function defaultBridgeAttachmentRoots(databasePath: string, bridgeDataRoo
       join(dataRoot, "runtime", "aamp", "attachments"),
       join(databaseDirectory, "attachments", "aamp"),
     ],
+    tmux: [
+      join(homedir(), ".feishu-codex-bridge", "tmux-dashboard-attachments"),
+      join(tmpdir(), "feishu-codex-bridge", "tmux-dashboard-attachments"),
+      join(databaseDirectory, "attachments", "tmux"),
+    ],
   };
 }
 
@@ -210,8 +241,127 @@ export async function verifyBridgeBackup(backupDirectory: string): Promise<Bridg
   return (await loadAndVerifyBackup(backupDirectory)).verification;
 }
 
+/** Reads only a bounded, validated manifest. Artifact hashes are intentionally not checked here. */
+export async function inspectBridgeBackupMetadata(backupDirectory: string): Promise<BridgeBackupMetadata> {
+  const root = await resolveBackupRoot(backupDirectory);
+  const manifest = await readBackupManifest(root);
+  return {
+    backupDirectory: root,
+    formatVersion: manifest.formatVersion,
+    programVersion: manifest.programVersion,
+    createdAt: manifest.createdAt,
+    databaseBytes: manifest.database.bytes,
+    attachmentCount: manifest.attachments.length,
+    attachmentBytes: manifest.attachments.reduce((total, attachment) => total + attachment.bytes, 0),
+    attachmentCountsByKind: countAttachmentsByKind(manifest.attachments),
+    schemaFingerprint: manifest.database.schemaFingerprint,
+    contentHashesVerified: false,
+  };
+}
+
+function countAttachmentsByKind(attachments: ManifestAttachment[]): Record<BridgeAttachmentKind, number> {
+  const counts: Record<BridgeAttachmentKind, number> = { web: 0, direct: 0, aamp: 0, tmux: 0 };
+  for (const attachment of attachments) counts[attachment.kind] += 1;
+  return counts;
+}
+
+/** Lists direct child backup directories. Invalid backup manifests are returned as per-entry errors. */
+export async function listBridgeBackups(parentDirectory: string): Promise<BridgeBackupListEntry[]> {
+  const requestedRoot = resolve(parentDirectory);
+  const parentStat = await lstat(requestedRoot).catch(() => null);
+  if (!parentStat || parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+    throw new Error("backup list path must be an existing directory and cannot be a symlink");
+  }
+  const parent = await realpath(requestedRoot);
+  const candidates: string[] = [];
+  const directory = await opendir(parent);
+  let entriesSeen = 0;
+  try {
+    for await (const entry of directory) {
+      entriesSeen += 1;
+      if (entriesSeen > MAX_BACKUP_LIST_ENTRIES) {
+        throw new Error(`backup list directory exceeds the ${MAX_BACKUP_LIST_ENTRIES} entry limit`);
+      }
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const candidate = join(parent, entry.name);
+      if (await lstat(join(candidate, MANIFEST_FILE)).catch(() => null)) candidates.push(candidate);
+    }
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+  candidates.sort((left, right) => basename(left).localeCompare(basename(right), "en"));
+  const result: BridgeBackupListEntry[] = [];
+  for (const candidate of candidates) {
+    try {
+      result.push({
+        backupDirectory: candidate,
+        status: "metadata",
+        metadata: await inspectBridgeBackupMetadata(candidate),
+      });
+    } catch (error) {
+      result.push({
+        backupDirectory: candidate,
+        status: "invalid",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return result;
+}
+
+/**
+ * Tests whether this program's StateDatabase migrations can open a backup. All migration
+ * work happens on a verified copy in a private temporary directory; the backup and live DB
+ * are never opened writable.
+ */
+export async function checkBridgeBackupUpgradeCompatibility(
+  backupDirectory: string,
+): Promise<BridgeBackupUpgradeCheck> {
+  const source = await loadAndVerifyBackup(backupDirectory);
+  const scratch = await mkdtemp(join(tmpdir(), "bridge-backup-upgrade-check-"));
+  try {
+    await chmod(scratch, 0o700);
+    const migratedPath = join(scratch, "migrated.db");
+    await copyVerifiedArtifact(source.databasePath, migratedPath, source.manifest.database, Number.MAX_SAFE_INTEGER);
+
+    const migrated = new StateDatabase(migratedPath);
+    migrated.close();
+
+    const migratedDatabase = openReadonlyDatabase(migratedPath);
+    let migratedSchemaFingerprint: string;
+    try {
+      assertDatabaseHealthy(migratedDatabase, "migrated backup database");
+      assertBridgeDatabaseIdentity(migratedDatabase, "migrated backup database");
+      migratedSchemaFingerprint = schemaFingerprint(migratedDatabase);
+    } finally {
+      migratedDatabase.close();
+    }
+    return {
+      verification: source.verification,
+      backupDirectory: source.root,
+      sourceProgramVersion: source.manifest.programVersion,
+      targetProgramVersion: await readBridgeProgramVersion(),
+      sourceSchemaFingerprint: source.manifest.database.schemaFingerprint,
+      migratedSchemaFingerprint,
+      compatible: true,
+    };
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
 export async function restoreBridgeBackup(options: BridgeRestoreOptions): Promise<BridgeRestoreSummary> {
   const source = await loadAndVerifyBackup(options.backupDirectory);
+  if (source.manifest.formatVersion < 2) {
+    const database = openReadonlyDatabase(source.databasePath);
+    try {
+      if (collectAttachmentReferences(database, true).some((reference) => reference.kind === "tmux")) {
+        throw new Error("此旧版备份没有保存 tmux 附件；请创建新版备份后再恢复。");
+      }
+    } finally {
+      database.close();
+    }
+  }
   const destination = resolve(options.outputDirectory);
   if (pathContains(source.root, destination) || source.root === destination) {
     throw new Error("restore output must be a new directory outside the backup directory");
@@ -239,7 +389,8 @@ export async function restoreBridgeBackup(options: BridgeRestoreOptions): Promis
       attachmentBytes += attachment.bytes;
     }
 
-    rewriteRestoredAttachmentPaths(stagedDatabase, rewrittenPaths, source.manifest.database.schemaFingerprint);
+    const includeTmux = source.manifest.formatVersion >= 2;
+    rewriteRestoredAttachmentPaths(stagedDatabase, rewrittenPaths, source.manifest.database.schemaFingerprint, includeTmux);
     const postRestoreDatabase = openReadonlyDatabase(stagedDatabase);
     try {
       assertDatabaseHealthy(postRestoreDatabase, "restored database");
@@ -247,7 +398,7 @@ export async function restoreBridgeBackup(options: BridgeRestoreOptions): Promis
       if (schemaFingerprint(postRestoreDatabase) !== source.manifest.database.schemaFingerprint) {
         throw new Error("restored database schema fingerprint changed during path relocation");
       }
-      assertRestoredAttachmentPaths(postRestoreDatabase, destination, source.manifest.attachments);
+      assertRestoredAttachmentPaths(postRestoreDatabase, destination, source.manifest.attachments, includeTmux);
     } finally {
       postRestoreDatabase.close();
     }
@@ -259,6 +410,7 @@ export async function restoreBridgeBackup(options: BridgeRestoreOptions): Promis
       attachmentCount: source.manifest.attachments.length,
       attachmentBytes,
       schemaFingerprint: source.manifest.database.schemaFingerprint,
+      verification: source.verification,
     };
   } catch (error) {
     await output.cleanup();
@@ -267,17 +419,8 @@ export async function restoreBridgeBackup(options: BridgeRestoreOptions): Promis
 }
 
 async function loadAndVerifyBackup(backupDirectory: string): Promise<VerifiedBackup> {
-  const requestedRoot = resolve(backupDirectory);
-  const rootStat = await lstat(requestedRoot).catch(() => null);
-  if (!rootStat || rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-    throw new Error("backup path must be an existing directory and cannot be a symlink");
-  }
-  const root = await realpath(requestedRoot);
-  const manifestPath = join(root, MANIFEST_FILE);
-  await assertContainedRegularFile(root, manifestPath, "backup manifest");
-  const manifestStat = await stat(manifestPath);
-  if (manifestStat.size > MAX_MANIFEST_BYTES) throw new Error("backup manifest exceeds the size limit");
-  const manifest = parseBackupManifest(JSON.parse(await readFile(manifestPath, "utf8")) as unknown);
+  const root = await resolveBackupRoot(backupDirectory);
+  const manifest = await readBackupManifest(root);
 
   const databasePath = join(root, DATABASE_FILE);
   await assertContainedRegularFile(root, databasePath, "backup database");
@@ -316,7 +459,7 @@ async function loadAndVerifyBackup(backupDirectory: string): Promise<VerifiedBac
     if (actualFingerprint !== manifest.database.schemaFingerprint) {
       throw new Error("backup schema fingerprint does not match the manifest");
     }
-    assertManifestReferencesMatchDatabase(database, manifest.attachments);
+    assertManifestReferencesMatchDatabase(database, manifest.attachments, manifest.formatVersion >= 2);
   } finally {
     database.close();
   }
@@ -328,14 +471,40 @@ async function loadAndVerifyBackup(backupDirectory: string): Promise<VerifiedBac
     entries,
     verification: {
       backupDirectory: root,
+      formatVersion: manifest.formatVersion,
       programVersion: manifest.programVersion,
       createdAt: manifest.createdAt,
       databaseBytes: manifest.database.bytes,
       attachmentCount: manifest.attachments.length,
       attachmentBytes,
+      attachmentCountsByKind: countAttachmentsByKind(manifest.attachments),
       schemaFingerprint: manifest.database.schemaFingerprint,
     },
   };
+}
+
+async function resolveBackupRoot(backupDirectory: string): Promise<string> {
+  const requestedRoot = resolve(backupDirectory);
+  const rootStat = await lstat(requestedRoot).catch(() => null);
+  if (!rootStat || rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error("backup path must be an existing directory and cannot be a symlink");
+  }
+  return realpath(requestedRoot);
+}
+
+async function readBackupManifest(root: string): Promise<BackupManifest> {
+  const manifestPath = join(root, MANIFEST_FILE);
+  await assertContainedRegularFile(root, manifestPath, "backup manifest");
+  const manifestStat = await stat(manifestPath);
+  if (manifestStat.size > MAX_MANIFEST_BYTES) throw new Error("backup manifest exceeds the size limit");
+  const manifest = parseBackupManifest(JSON.parse(await readFile(manifestPath, "utf8")) as unknown);
+  const artifactPaths = new Set([DATABASE_FILE, MANIFEST_FILE]);
+  for (const attachment of manifest.attachments) {
+    validateManifestAttachment(attachment);
+    if (artifactPaths.has(attachment.file)) throw new Error(`backup manifest repeats artifact path: ${attachment.file}`);
+    artifactPaths.add(attachment.file);
+  }
+  return manifest;
 }
 
 function openReadonlyDatabase(path: string, queryOnly = true): SqliteDatabase {
@@ -400,7 +569,7 @@ function schemaFingerprint(database: SqliteDatabase): string {
   return createHash("sha256").update(JSON.stringify(objects)).digest("hex");
 }
 
-function collectAttachmentReferences(database: SqliteDatabase): AttachmentReference[] {
+function collectAttachmentReferences(database: SqliteDatabase, includeTmux = true): AttachmentReference[] {
   const result: AttachmentReference[] = [];
   if (hasTable(database, "web_task_attachments") && hasColumn(database, "web_task_attachments", "local_path")) {
     const rows = database.prepare(
@@ -446,7 +615,52 @@ function collectAttachmentReferences(database: SqliteDatabase): AttachmentRefere
       });
     }
   }
+
+  if (includeTmux && hasTable(database, "tmux_session_actions")
+    && hasColumn(database, "tmux_session_actions", "action_id")
+    && hasColumn(database, "tmux_session_actions", "action_type")
+    && hasColumn(database, "tmux_session_actions", "content")) {
+    const rows = database.prepare(
+      "SELECT action_id, content FROM tmux_session_actions WHERE action_type = 'task_submit' ORDER BY action_id",
+    ).all() as Array<Record<string, unknown>>;
+    for (const row of rows) {
+      const actionId = requireReferenceKey(row.action_id, "tmux action id");
+      const content = typeof row.content === "string" ? row.content : "";
+      for (const attachment of parseTmuxAttachmentTags(content)) {
+        if (!isManagedTmuxAttachmentPath(attachment.path)) continue;
+        result.push({
+          kind: "tmux",
+          key: actionId,
+          index: attachment.index,
+          sourcePath: requireReferencePath(attachment.path, "tmux attachment path"),
+        });
+      }
+    }
+  }
   return result;
+}
+
+function parseTmuxAttachmentTags(content: string): Array<{ index: number; path: string }> {
+  const tags = /<(?:image name=\[Image #\d+\]|file name="[^"\r\n]*") path="([^"\r\n]+)">/g;
+  const result: Array<{ index: number; path: string }> = [];
+  let index = 0;
+  for (const match of content.matchAll(tags)) {
+    result.push({ index, path: match[1]! });
+    index += 1;
+  }
+  return result;
+}
+
+function isManagedTmuxAttachmentPath(path: string): boolean {
+  if (!isAbsolute(path) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-z0-9]{1,12}$/i.test(basename(path))) {
+    return false;
+  }
+  const parent = basename(dirname(path));
+  if (parent === "tmux-dashboard-attachments") {
+    return basename(dirname(dirname(path))) === ".feishu-codex-bridge"
+      || basename(dirname(dirname(path))) === "feishu-codex-bridge";
+  }
+  return parent === "tmux" && basename(dirname(dirname(path))) === "attachments";
 }
 
 async function copyReferencedAttachments(
@@ -605,7 +819,12 @@ async function copyVerifiedArtifact(
   }
 }
 
-function rewriteRestoredAttachmentPaths(databasePath: string, rewrittenPaths: Map<string, string>, expectedSchemaFingerprint: string): void {
+function rewriteRestoredAttachmentPaths(
+  databasePath: string,
+  rewrittenPaths: Map<string, string>,
+  expectedSchemaFingerprint: string,
+  includeTmux: boolean,
+): void {
   const database = openWritableDatabase(databasePath);
   try {
     if (schemaFingerprint(database) !== expectedSchemaFingerprint) throw new Error("backup schema changed before restore path relocation");
@@ -648,6 +867,22 @@ function rewriteRestoredAttachmentPaths(databasePath: string, rewrittenPaths: Ma
           if (changed) update.run(JSON.stringify(paths), key);
         }
       }
+
+      if (includeTmux && hasTable(database, "tmux_session_actions")
+        && hasColumn(database, "tmux_session_actions", "action_id")
+        && hasColumn(database, "tmux_session_actions", "action_type")
+        && hasColumn(database, "tmux_session_actions", "content")) {
+        const rows = database.prepare(
+          "SELECT action_id, content FROM tmux_session_actions WHERE action_type = 'task_submit'",
+        ).all() as Array<Record<string, unknown>>;
+        const update = database.prepare("UPDATE tmux_session_actions SET content = ? WHERE action_id = ?");
+        for (const row of rows) {
+          const actionId = requireReferenceKey(row.action_id, "tmux action id");
+          const content = typeof row.content === "string" ? row.content : "";
+          const rewritten = rewriteTmuxAttachmentPaths(content, actionId, remaining);
+          if (rewritten !== content) update.run(rewritten, actionId);
+        }
+      }
       if (remaining.size > 0) throw new Error("backup manifest contains attachment references absent from its database");
       database.exec("COMMIT");
     } catch (error) {
@@ -659,13 +894,40 @@ function rewriteRestoredAttachmentPaths(databasePath: string, rewrittenPaths: Ma
   }
 }
 
-function assertRestoredAttachmentPaths(database: SqliteDatabase, destination: string, attachments: ManifestAttachment[]): void {
+function rewriteTmuxAttachmentPaths(content: string, actionId: string, remaining: Map<string, string>): string {
+  const tags = /<(?:image name=\[Image #\d+\]|file name="[^"\r\n]*") path="([^"\r\n]+)">/g;
+  let tagIndex = 0;
+  let offset = 0;
+  let result = "";
+  let changed = false;
+  for (const match of content.matchAll(tags)) {
+    const index = tagIndex;
+    tagIndex += 1;
+    const sourcePath = match[1]!;
+    if (!isManagedTmuxAttachmentPath(sourcePath)) continue;
+    const relocated = remaining.get(manifestReferenceIdentity({ kind: "tmux", key: actionId, index }));
+    if (!relocated) continue;
+    const start = match.index!;
+    result += content.slice(offset, start) + match[0].replace(sourcePath, relocated);
+    offset = start + match[0].length;
+    remaining.delete(manifestReferenceIdentity({ kind: "tmux", key: actionId, index }));
+    changed = true;
+  }
+  return changed ? result + content.slice(offset) : content;
+}
+
+function assertRestoredAttachmentPaths(
+  database: SqliteDatabase,
+  destination: string,
+  attachments: ManifestAttachment[],
+  includeTmux: boolean,
+): void {
   const expected = new Map<string, string>();
   for (const attachment of attachments) {
     const filePath = join(destination, ...validateArtifactPath(attachment.file));
     for (const reference of attachment.references) expected.set(manifestReferenceIdentity(reference), filePath);
   }
-  const actualReferences = collectAttachmentReferences(database);
+  const actualReferences = collectAttachmentReferences(database, includeTmux);
   if (actualReferences.length !== expected.size) throw new Error("restored database attachment references do not match the backup manifest");
   for (const reference of actualReferences) {
     const identity = manifestReferenceIdentity(reference);
@@ -678,7 +940,11 @@ function assertRestoredAttachmentPaths(database: SqliteDatabase, destination: st
   if (expected.size > 0) throw new Error("restored database is missing attachment path rewrites");
 }
 
-function assertManifestReferencesMatchDatabase(database: SqliteDatabase, attachments: ManifestAttachment[]): void {
+function assertManifestReferencesMatchDatabase(
+  database: SqliteDatabase,
+  attachments: ManifestAttachment[],
+  includeTmux: boolean,
+): void {
   const expected = new Set<string>();
   for (const attachment of attachments) {
     for (const reference of attachment.references) {
@@ -688,7 +954,7 @@ function assertManifestReferencesMatchDatabase(database: SqliteDatabase, attachm
       expected.add(identity);
     }
   }
-  const actual = collectAttachmentReferences(database);
+  const actual = collectAttachmentReferences(database, includeTmux);
   if (actual.length !== expected.size) throw new Error("backup manifest does not describe every database attachment reference");
   for (const reference of actual) {
     if (!expected.delete(manifestReferenceIdentity(reference))) throw new Error("backup manifest does not match database attachment references");
@@ -697,8 +963,8 @@ function assertManifestReferencesMatchDatabase(database: SqliteDatabase, attachm
 }
 
 function manifestReferenceIdentity(reference: ManifestReference): string {
-  return reference.kind === "aamp"
-    ? `aamp\0${reference.key}\0${reference.index}`
+  return reference.kind === "aamp" || reference.kind === "tmux"
+    ? `${reference.kind}\0${reference.key}\0${reference.index}`
     : `${reference.kind}\0${reference.key}`;
 }
 
@@ -743,6 +1009,7 @@ function normalizeAttachmentRoots(roots: BridgeAttachmentRoots): BridgeAttachmen
     web: roots.web.map((root) => resolve(root)),
     direct: roots.direct.map((root) => resolve(root)),
     aamp: roots.aamp.map((root) => resolve(root)),
+    tmux: roots.tmux.map((root) => resolve(root)),
   };
 }
 
@@ -764,7 +1031,7 @@ function validateArtifactPath(value: string): string[] {
 function parseBackupManifest(value: unknown): BackupManifest {
   if (!isRecord(value)
     || value.format !== BACKUP_FORMAT
-    || value.formatVersion !== BACKUP_FORMAT_VERSION
+    || (value.formatVersion !== 1 && value.formatVersion !== BACKUP_FORMAT_VERSION)
     || typeof value.createdAt !== "string"
     || !Number.isFinite(Date.parse(value.createdAt))
     || typeof value.programVersion !== "string"
@@ -772,6 +1039,7 @@ function parseBackupManifest(value: unknown): BackupManifest {
     || !isRecord(value.database)
     || !Array.isArray(value.attachments)
     || !isRecord(value.checks)) throw new Error("backup manifest is invalid or unsupported");
+  const formatVersion = value.formatVersion as 1 | 2;
   if (value.database.file !== DATABASE_FILE
     || !isSha256(value.database.sha256)
     || !Number.isSafeInteger(value.database.bytes)
@@ -785,7 +1053,8 @@ function parseBackupManifest(value: unknown): BackupManifest {
     if (!isRecord(raw)
       || typeof raw.id !== "string"
       || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(raw.id)
-      || (raw.kind !== "web" && raw.kind !== "direct" && raw.kind !== "aamp")
+      || (raw.kind !== "web" && raw.kind !== "direct" && raw.kind !== "aamp" && raw.kind !== "tmux")
+      || (raw.kind === "tmux" && formatVersion < 2)
       || typeof raw.file !== "string"
       || !isSha256(raw.sha256)
       || !Number.isSafeInteger(raw.bytes)
@@ -794,15 +1063,16 @@ function parseBackupManifest(value: unknown): BackupManifest {
       || !Array.isArray(raw.references)) throw new Error("backup manifest contains an invalid attachment record");
     const references = raw.references.map((reference): ManifestReference => {
       if (!isRecord(reference)
-        || (reference.kind !== "web" && reference.kind !== "direct" && reference.kind !== "aamp")
+        || (reference.kind !== "web" && reference.kind !== "direct" && reference.kind !== "aamp" && reference.kind !== "tmux")
+        || (reference.kind === "tmux" && formatVersion < 2)
         || typeof reference.key !== "string"
         || reference.key.length === 0
         || reference.key.length > 512) throw new Error("backup manifest contains an invalid attachment reference");
-      if (reference.kind === "aamp") {
+      if (reference.kind === "aamp" || reference.kind === "tmux") {
         if (!Number.isSafeInteger(reference.index) || (reference.index as number) < 0) {
-          throw new Error("backup manifest contains an invalid AAMP attachment index");
+          throw new Error("backup manifest contains an invalid attachment reference index");
         }
-        return { kind: "aamp", key: reference.key, index: reference.index as number };
+        return { kind: reference.kind, key: reference.key, index: reference.index as number };
       }
       if (reference.index !== undefined) throw new Error("backup manifest contains an unexpected attachment index");
       return { kind: reference.kind, key: reference.key };
@@ -813,7 +1083,7 @@ function parseBackupManifest(value: unknown): BackupManifest {
   if (attachmentBytes > MAX_TOTAL_ATTACHMENT_BYTES) throw new Error("backup manifest exceeds total attachment size limit");
   return {
     format: BACKUP_FORMAT,
-    formatVersion: BACKUP_FORMAT_VERSION,
+    formatVersion,
     createdAt: value.createdAt,
     programVersion: value.programVersion,
     database: {

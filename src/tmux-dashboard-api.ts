@@ -8,6 +8,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 
 import { getBunRuntime, type BunSubprocess, type BunTerminal } from "./bun-runtime.js";
+import { discoverCodexHistoryHomes, type CodexHistoryHome } from "./codex-history.js";
 import type { StateDatabase } from "./db.js";
 import type { StoredTmuxSessionAction } from "./types.js";
 import * as tmux from "./tmux-dashboard.js";
@@ -150,7 +151,8 @@ interface TerminalData {
 
 export interface TmuxDashboardApiOptions {
   db: StateDatabase;
-  operations?: Pick<typeof tmux, "createSession" | "findSession" | "killSession" | "listSessions">;
+  operations?: Pick<typeof tmux, "createSession" | "findSession" | "killSession" | "listSessions">
+    & Partial<Pick<typeof tmux, "inspectCodexHome" | "setCodexHomeForSession">>;
 }
 
 export class TmuxDashboardApi {
@@ -164,7 +166,7 @@ export class TmuxDashboardApi {
   constructor(options: TmuxDashboardApiOptions) {
     if (!options.db) throw new Error("TmuxDashboardApi requires the Bridge state database.");
     this.db = options.db;
-    this.operations = options.operations ?? tmux;
+    this.operations = { ...tmux, ...options.operations };
   }
 
   public async handleRequest(
@@ -425,7 +427,94 @@ export class TmuxDashboardApi {
       try {
         const sessions = await this.operations.listSessions();
         this.db.syncTmuxSessions(sessions);
-        sendJson(response, 200, { sessions });
+        sendJson(response, 200, {
+          sessions: sessions.map((session) => ({
+            ...session,
+            codexHomeId: this.db.getLatestTmuxSession(session.id)?.codex_home_id ?? null,
+          })),
+          codexHomes: this.codexHomeOptions().map(({ id, label, available }) => ({ id, label, available })),
+        });
+      } catch (error) {
+        sendDashboardError(response, error);
+      }
+      return;
+    }
+    const codexAccountCheckMatch = /^\/sessions\/([^/]+)\/codex-account\/check$/.exec(apiPath);
+    if (request.method === "POST" && codexAccountCheckMatch) {
+      let sessionId: string;
+      try {
+        sessionId = decodeURIComponent(codexAccountCheckMatch[1]!);
+      } catch {
+        sendJson(response, 400, { error: "Invalid tmux session id." });
+        return;
+      }
+      try {
+        const session = await this.operations.findSession(sessionId);
+        if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        const inspection = this.operations.inspectCodexHome
+          ? await this.operations.inspectCodexHome(sessionId)
+          : { status: "unavailable" as const };
+        if (inspection.status !== "running" || !inspection.path) {
+          sendJson(response, 200, { status: inspection.status, home: null });
+          return;
+        }
+        const home = this.codexHomeOptions().find((candidate) => resolve(candidate.path) === resolve(inspection.path!));
+        if (!home || !home.available) {
+          sendJson(response, 200, { status: "unmatched", home: null });
+          return;
+        }
+        await this.operations.setCodexHomeForSession?.(sessionId, home.path);
+        this.db.recordTmuxSession(session);
+        const saved = this.db.setTmuxSessionCodexHome(sessionId, home.id);
+        sendJson(response, 200, {
+          status: "matched",
+          home: { id: home.id, label: home.label },
+          session: saved ? { id: session.id, codexHomeId: saved.codex_home_id } : null,
+        });
+      } catch (error) {
+        sendDashboardError(response, error);
+      }
+      return;
+    }
+    const codexAccountMatch = /^\/sessions\/([^/]+)\/codex-account$/.exec(apiPath);
+    if (request.method === "POST" && codexAccountMatch) {
+      let sessionId: string;
+      try {
+        sessionId = decodeURIComponent(codexAccountMatch[1]!);
+      } catch {
+        sendJson(response, 400, { error: "Invalid tmux session id." });
+        return;
+      }
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonBody(request);
+      } catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : "Expected a JSON request body." });
+        return;
+      }
+      const homeId = body.homeId === null || body.homeId === ""
+        ? null
+        : typeof body.homeId === "string" ? body.homeId.trim() : undefined;
+      if (homeId === undefined || (homeId !== null && !homeId)) {
+        sendJson(response, 400, { error: "Choose a Codex account or clear the account marker." });
+        return;
+      }
+      const home = homeId === null ? null : this.codexHomeOptions().find((candidate) => candidate.id === homeId);
+      if (homeId !== null && (!home || !home.available)) {
+        sendJson(response, 400, { error: "The selected Codex Home is unavailable." });
+        return;
+      }
+      try {
+        const session = await this.operations.findSession(sessionId);
+        if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        await this.operations.setCodexHomeForSession?.(sessionId, home?.path ?? null);
+        this.db.recordTmuxSession(session);
+        const saved = this.db.setTmuxSessionCodexHome(sessionId, homeId);
+        if (!saved) throw new tmux.SessionNotFoundError("tmux session record not found.");
+        sendJson(response, 200, {
+          session: { id: session.id, codexHomeId: saved.codex_home_id },
+          home: home ? { id: home.id, label: home.label } : null,
+        });
       } catch (error) {
         sendDashboardError(response, error);
       }
@@ -449,7 +538,7 @@ export class TmuxDashboardApi {
         if (!project) throw new Error("所选项目不可用，请刷新项目列表。");
         const session = await this.operations.createSession(body.name.trim(), project.path);
         this.db.recordTmuxSession(session, { projectKey, createdByDeviceId: deviceId });
-        sendJson(response, 201, { session });
+        sendJson(response, 201, { session: { ...session, codexHomeId: null } });
       } catch (error) {
         sendDashboardError(response, error);
       }
@@ -577,6 +666,10 @@ export class TmuxDashboardApi {
       if (fileInfo?.isFile() && !fileInfo.isSymbolicLink() && fileInfo.size <= MAX_ATTACHMENT_BYTES) return filePath;
     }
     return null;
+  }
+
+  private codexHomeOptions(): CodexHistoryHome[] {
+    return discoverCodexHistoryHomes();
   }
 
   private async tmuxSessionActionView(item: StoredTmuxSessionAction): Promise<StoredTmuxSessionAction & {

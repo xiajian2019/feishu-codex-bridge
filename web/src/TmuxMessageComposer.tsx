@@ -20,7 +20,8 @@ import {
   logDebugDiagnostic,
   subscribeDebugLogCapture,
 } from "./debug-log-capture.js";
-import { fetchShortcutConfig, recordShortcutUse } from "./api.js";
+import { fetchShortcutConfig, recordShortcutUse, watchRemoteShortcutConfig } from "./api.js";
+import { readShortcutConfigCache, subscribeShortcutConfigInvalidation } from "./shortcut-config-cache.js";
 import {
   type ShortcutCategory,
   DEFAULT_COMPOSER_SHORTCUTS,
@@ -194,7 +195,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
   const aui = useAui();
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [shortcutCategory, setShortcutCategory] = useState<ShortcutCategory>("favorites");
-  const [shortcutStore, setShortcutStore] = useState<ShortcutStore>({ groups: [], shortcuts: [] });
+  const [shortcutStore, setShortcutStore] = useState<ShortcutStore>(() => readShortcutConfigCache() ?? { groups: [], shortcuts: [] });
   const [previewFile, setPreviewFile] = useState<File | null>(null);
   const [debugLogActive, setDebugLogActive] = useState(() => isDebugLogCaptureActive());
   const [debugLogBusy, setDebugLogBusy] = useState(false);
@@ -204,8 +205,11 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
   const diagnosticActiveRef = useRef(diagnosticSessionActive);
   diagnosticActiveRef.current = diagnosticSessionActive;
   const composerShortcuts = useMemo(() => {
-    const composerGroupIds = new Set(shortcutStore.groups.filter((group) => group.surface === "composer").map((group) => group.id));
-    const hasServerConfig = composerGroupIds.size > 0;
+    const hasComposerGroup = shortcutStore.groups.some((group) => group.surface === "composer");
+    const composerGroupIds = new Set(shortcutStore.groups
+      .filter((group) => group.surface === "composer" && group.enabled)
+      .map((group) => group.id));
+    const hasServerConfig = hasComposerGroup;
     const source = hasServerConfig
       ? shortcutStore.shortcuts.filter((shortcut) => composerGroupIds.has(shortcut.groupId))
       : [...DEFAULT_COMPOSER_SHORTCUTS];
@@ -218,14 +222,28 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
 
   useEffect(() => {
     let cancelled = false;
-    void fetchShortcutConfig()
-      .then((nextStore) => {
-        if (!cancelled) setShortcutStore(nextStore);
-      })
-      .catch(() => {
-        // The keyboard panel remains empty until the server becomes available.
-      });
-    return () => { cancelled = true; };
+    let requestId = 0;
+    const refresh = (): void => {
+      const currentRequest = ++requestId;
+      void fetchShortcutConfig()
+        .then((nextStore) => {
+          if (!cancelled && currentRequest === requestId) setShortcutStore(nextStore);
+        })
+        .catch(() => {
+          // Keep a valid cached configuration; an empty store selects built-in defaults.
+        });
+    };
+    const unsubscribe = subscribeShortcutConfigInvalidation(() => {
+      setShortcutStore(readShortcutConfigCache() ?? { groups: [], shortcuts: [] });
+      refresh();
+    });
+    const unsubscribeRemote = watchRemoteShortcutConfig();
+    refresh();
+    return () => {
+      cancelled = true;
+      unsubscribe();
+      unsubscribeRemote();
+    };
   }, []);
 
   useEffect(() => {

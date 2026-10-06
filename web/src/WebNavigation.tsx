@@ -10,6 +10,8 @@ const PAGES = [
 ] as const;
 
 const SYSTEM_PAGES = [
+  { to: "/system-management/health", label: "运行状态" },
+  { to: "/system-management/backups", label: "数据备份" },
   { to: "/system-management/devices", label: "设备管理" },
   { to: "/system-management/projects", label: "项目管理" },
   { to: "/system-management/shortcuts", label: "快捷键管理" },

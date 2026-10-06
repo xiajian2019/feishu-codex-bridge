@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { WebTaskSubmissionConflictError } from "./types.js";
 import { StateDatabase } from "./db.js";
 import { computeInputHash, parseTaskInput, serializeTaskInput } from "./fingerprint.js";
+import type { GitWorkspaceSnapshot } from "./run-artifacts.js";
 import {
   buildRunPrompt,
   formatBlockedComment,
@@ -43,6 +44,7 @@ export interface DispatcherOptions {
   larkOutboxEnabled?: boolean;
   serviceInstanceId?: string;
   logger?: Logger;
+  captureWorkspaceSnapshot?: (directory: string) => Promise<GitWorkspaceSnapshot>;
 }
 
 export class Dispatcher {
@@ -53,6 +55,7 @@ export class Dispatcher {
   private readonly larkOutboxEnabled: boolean;
   private readonly serviceInstanceId: string;
   private readonly logger: Logger;
+  private readonly captureWorkspaceSnapshot?: (directory: string) => Promise<GitWorkspaceSnapshot>;
   private readonly queue: string[] = [];
   private readonly queuedRunIds = new Set<string>();
   private readonly active = new Map<string, ActiveRun>();
@@ -68,6 +71,7 @@ export class Dispatcher {
     this.larkOutboxEnabled = options.larkOutboxEnabled ?? true;
     this.serviceInstanceId = options.serviceInstanceId ?? randomUUID();
     this.logger = options.logger ?? consoleLogger;
+    this.captureWorkspaceSnapshot = options.captureWorkspaceSnapshot;
   }
 
   public async observe(task: LarkTask): Promise<void> {
@@ -254,6 +258,90 @@ export class Dispatcher {
     return task;
   }
 
+  /** Explicitly retries one failed or canceled Web task; each new retry needs its own idempotency key. */
+  public async retryWebTask(taskGuid: string, idempotencyKey: string): Promise<StoredTask> {
+    const key = idempotencyKey.trim();
+    if (!key || idempotencyKey.length > 200) throw new Error("幂等键必须为 1 到 200 个字符。");
+    const normalizedRequestJson = JSON.stringify({ kind: "web-task-retry", taskGuid });
+
+    // Resolve an accepted retry first so replay remains idempotent even after the
+    // retry itself has finished and the task is terminal again.
+    const previousSubmission = this.db.getWebTaskSubmission(key);
+    if (previousSubmission) {
+      if (
+        previousSubmission.task_guid !== taskGuid ||
+        previousSubmission.normalized_request_json !== normalizedRequestJson
+      ) {
+        throw new WebTaskSubmissionConflictError();
+      }
+      this.enqueueWebRun(previousSubmission.run_id);
+      await this.pump();
+      const task = this.db.getTask(taskGuid);
+      if (!task) throw new Error("已确认的重试记录不存在对应任务。");
+      return task;
+    }
+
+    const existing = this.db.getTask(taskGuid);
+    if (!existing || existing.origin !== "web") throw new Error("Bridge 网页任务不存在。");
+    if (existing.state !== "FAILED" && existing.state !== "CANCELED") {
+      throw new Error("任务只有在失败或已取消时才能显式重试。");
+    }
+    const input = parseTaskInput(existing.input_text);
+    if (!input) throw new Error("原任务描述无法读取，不能重试。");
+    const project = this.db.getAvailableProject(existing.project_key);
+    if (!project || project.path !== existing.repo) {
+      throw new Error("原项目不可用或目录已变更，请检查配置后再重试。");
+    }
+    const { value: mode } = resolveWebMode(this.config, existing.mode);
+    const previousRun = this.db.getLatestRun(taskGuid);
+    if (!previousRun) throw new Error("原任务没有可重试的运行记录。");
+
+    const attachments = this.db.listWebTaskAttachments(taskGuid);
+    const basePrompt = buildRunPrompt(input, null, false);
+    const originalPrompt = attachments.length === 0
+      ? basePrompt
+      : [
+          basePrompt,
+          "",
+          "本次任务附带以下本地文件，请按需查看；图片会作为图像输入一并发送：",
+          ...attachments.map((attachment) => `- ${attachment.file_name} (${attachment.mime_type})：${attachment.local_path}`),
+        ].join("\n");
+    const promptText = [
+      "用户通过 Bridge 任务面板明确请求重试上一次未完成的任务。",
+      existing.thread_id
+        ? "请复用当前 Codex thread 继续完成原任务，并保留已经完成的工作。"
+        : "请按原始任务重新执行。",
+      "",
+      originalPrompt,
+    ].join("\n");
+    const routedTask: RoutedTask = {
+      taskGuid,
+      summary: input.summary,
+      description: input.description,
+      projectKey: existing.project_key,
+      mode: existing.mode,
+      repo: existing.repo,
+      sandboxMode: mode.sandboxMode,
+      inputHash: existing.input_hash,
+      input,
+      completed: false,
+      origin: "web",
+    };
+    const submission = this.db.claimWebTaskSubmission({
+      idempotencyKey: key,
+      normalizedRequestJson,
+      task: routedTask,
+      inputText: existing.input_text,
+      promptText,
+    });
+    const runId = submission.status === "created" ? submission.claim.runId : submission.submission.run_id;
+    this.enqueueWebRun(runId);
+    await this.pump();
+    const task = this.db.getTask(taskGuid);
+    if (!task) throw new Error("任务已重试，但没有读取到本地任务记录。");
+    return task;
+  }
+
   public async appendWebTaskFollowup(taskGuid: string, details: string, idempotencyKey: string): Promise<StoredTask> {
     const normalizedDetails = details.trim();
     const key = idempotencyKey.trim();
@@ -432,6 +520,10 @@ export class Dispatcher {
         this.queuedRunIds.delete(runId);
         const run = this.db.getRun(runId);
         if (!run || run.state !== "QUEUED") continue;
+        const task = this.db.getTask(run.task_guid);
+        if (task?.origin === "web" && this.captureWorkspaceSnapshot) {
+          await this.recordWorkspaceSnapshot(runId, "before", task.repo);
+        }
 
         let handle: WorkerHandle;
         try {
@@ -516,6 +608,9 @@ export class Dispatcher {
     const run = this.db.getRun(active.runId);
     const task = this.db.getTask(active.taskGuid);
     if (run && task) {
+      if (task.origin === "web" && this.captureWorkspaceSnapshot) {
+        await this.recordWorkspaceSnapshot(active.runId, "after", task.repo);
+      }
       if (result.status === "succeeded") {
         const threadId = result.threadId ?? run.thread_id ?? task.thread_id;
         const comment = formatCompletedComment({
@@ -553,6 +648,15 @@ export class Dispatcher {
 
     this.active.delete(active.runId);
     await this.pump();
+  }
+
+  private async recordWorkspaceSnapshot(runId: string, stage: "before" | "after", repo: string): Promise<void> {
+    if (!this.captureWorkspaceSnapshot) return;
+    try {
+      this.db.saveRunWorkspaceSnapshot(runId, stage, await this.captureWorkspaceSnapshot(repo));
+    } catch (error) {
+      this.logger.warn("could not capture Web run workspace metadata", { runId, stage, error: safeErrorMessage(error) });
+    }
   }
 
   private async blockTask(

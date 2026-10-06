@@ -42,7 +42,8 @@ describe("SQLite shortcut configuration", () => {
     const baseUrl = await server.start();
     const session = await fetch(baseUrl + "/api/session").then((response) => response.json()) as { actionToken: string };
     const headers = { "Content-Type": "application/json", "X-Bridge-Action-Token": session.actionToken };
-    const initialConfig = await fetch(baseUrl + "/api/shortcut-config").then((response) => response.json()) as { groups: Array<{ id: string; surface: string }>; shortcuts: Array<{ id: string; groupId: string; sortOrder: number }> };
+    const initialConfig = await fetch(baseUrl + "/api/shortcut-config").then((response) => response.json()) as { revision: string; groups: Array<{ id: string; surface: string }>; shortcuts: Array<{ id: string; groupId: string; sortOrder: number }> };
+    expect(initialConfig.revision).toMatch(/^[0-9a-f]{64}$/);
     const composerGroup = initialConfig.groups.find((group) => group.surface === "composer")!;
     const composerShortcutResponse = await fetch(baseUrl + "/api/shortcuts", {
       method: "POST",
@@ -50,6 +51,9 @@ describe("SQLite shortcut configuration", () => {
       body: JSON.stringify({ groupId: composerGroup.id, title: "自定义文件", detail: "custom", kind: "insert", value: "", actionKey: "session-files", displayMode: "closed" }),
     });
     expect(composerShortcutResponse.status).toBe(201);
+    const revisionAfterCreate = await fetch(baseUrl + "/api/shortcut-config/revision")
+      .then((response) => response.json()) as { revision: string };
+    expect(revisionAfterCreate.revision).not.toBe(initialConfig.revision);
 
     const groupResponse = await fetch(baseUrl + "/api/shortcut-groups", {
       method: "POST",
@@ -99,7 +103,9 @@ describe("SQLite shortcut configuration", () => {
     expect(useResponse.status).toBe(200);
     expect((await useResponse.json() as { shortcut: { operationCount: number } }).shortcut.operationCount).toBe(1);
 
-    const config = await fetch(baseUrl + "/api/shortcut-config").then((response) => response.json()) as { groups: Array<{ id: string }>; shortcuts: Array<{ id: string }> };
+    const config = await fetch(baseUrl + "/api/shortcut-config").then((response) => response.json()) as { revision: string; groups: Array<{ id: string }>; shortcuts: Array<{ id: string }> };
+    expect(config.revision).toBe((await fetch(baseUrl + "/api/shortcut-config/revision")
+      .then((response) => response.json()) as { revision: string }).revision);
     expect(config.groups.some((item) => item.id === group.id)).toBe(true);
     expect(config.shortcuts.some((item) => item.id === shortcut.id)).toBe(true);
   });

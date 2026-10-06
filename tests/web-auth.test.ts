@@ -27,6 +27,7 @@ describe("WebPairingAuth", () => {
       authenticated: false,
       local: false,
       pairingAvailable: true,
+      draftScope: null,
     });
 
     const secondDb = new StateDatabase(statePath);
@@ -42,6 +43,12 @@ describe("WebPairingAuth", () => {
 
     expect(second.isAuthorized(authenticatedRequest)).toBe(true);
     expect(second.listDevices(authenticatedRequest)).toHaveLength(1);
+    const draftScope = first.status(authenticatedRequest).draftScope;
+    expect(draftScope).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(second.status(authenticatedRequest).draftScope).toBe(draftScope);
+    const deviceId = second.listDevices(authenticatedRequest)![0]!.sessionId;
+    expect(second.revokeDevice(authenticatedRequest, deviceId)).toBe(true);
+    expect(second.status(authenticatedRequest).draftScope).toBeNull();
     firstDb.close();
     secondDb.close();
   });

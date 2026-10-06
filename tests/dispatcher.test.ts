@@ -3,7 +3,9 @@ import { describe, expect, it } from "bun:test";
 import { parseConfig } from "../src/config.js";
 import { StateDatabase } from "../src/db.js";
 import { Dispatcher } from "../src/dispatcher.js";
+import type { DispatcherOptions } from "../src/dispatcher.js";
 import type { LarkClient } from "../src/lark.js";
+import type { GitWorkspaceSnapshot } from "../src/run-artifacts.js";
 import type {
   BridgeConfig,
   LarkTask,
@@ -118,7 +120,7 @@ class FakeRunner implements WorkerRunner {
   }
 }
 
-function createHarness() {
+function createHarness(options: Pick<DispatcherOptions, "captureWorkspaceSnapshot"> = {}) {
   const db = new StateDatabase(":memory:");
   db.createProject({ name: "food", path: process.cwd() });
   const lark = new FakeLark();
@@ -130,6 +132,7 @@ function createHarness() {
     workerRunner: runner,
     serviceInstanceId: "test-service",
     logger: { info() {}, warn() {}, error() {} },
+    ...(options.captureWorkspaceSnapshot ? { captureWorkspaceSnapshot: options.captureWorkspaceSnapshot } : {}),
   });
   return { db, lark, runner, dispatcher };
 }
@@ -178,6 +181,73 @@ describe("Dispatcher", () => {
     await dispatcher.waitForIdle();
     expect(db.getTask(taskRecord.task_guid)?.state).toBe("WAITING_REVIEW");
     expect(lark.comments).toHaveLength(0);
+    db.close();
+  });
+
+  it("records before and after Git workspace snapshots for a Web run", async () => {
+    const snapshots: GitWorkspaceSnapshot[] = [];
+    const { db, runner, dispatcher } = createHarness({
+      captureWorkspaceSnapshot: async (directory) => {
+        expect(directory).toBe(process.cwd());
+        const snapshot: GitWorkspaceSnapshot = {
+          capturedAt: new Date(Date.UTC(2026, 9, 5, 0, 0, snapshots.length)).toISOString(),
+          isGitRepository: true,
+          headCommit: "a".repeat(40),
+          dirtyPaths: snapshots.length === 0 ? ["before.ts"] : ["after.ts"],
+          untrackedPaths: [],
+          truncated: false,
+          taskAttribution: "unattributed-shared-workspace",
+          attributionNote: "This is a shared-workspace snapshot; changed paths cannot be attributed to one task.",
+        };
+        snapshots.push(snapshot);
+        return snapshot;
+      },
+    });
+
+    const taskRecord = await dispatcher.submitWebTask({
+      summary: "检查工作区产物基线",
+      description: "保存执行前后 Git 状态",
+      projectKey: "food",
+      mode: "implement",
+    });
+    const runId = runner.starts[0];
+    expect(snapshots).toHaveLength(1);
+    expect(db.listRunWorkspaceSnapshots(taskRecord.task_guid)).toMatchObject([
+      { run_id: runId, stage: "before", snapshot: { capturedAt: snapshots[0]?.capturedAt, dirtyPaths: ["before.ts"] } },
+    ]);
+
+    runner.finish(runId, { status: "succeeded", finalResponse: "完成" });
+    await dispatcher.waitForIdle();
+
+    expect(snapshots).toHaveLength(2);
+    expect(db.listRunWorkspaceSnapshots(taskRecord.task_guid)).toMatchObject([
+      { run_id: runId, stage: "after", snapshot: { capturedAt: snapshots[1]?.capturedAt, dirtyPaths: ["after.ts"] } },
+      { run_id: runId, stage: "before", snapshot: { capturedAt: snapshots[0]?.capturedAt, dirtyPaths: ["before.ts"] } },
+    ]);
+    expect(db.listRunWorkspaceSnapshots(taskRecord.task_guid).every((item) => item.snapshot.taskAttribution === "unattributed-shared-workspace")).toBe(true);
+    expect(db.getTask(taskRecord.task_guid)?.state).toBe("WAITING_REVIEW");
+    db.close();
+  });
+
+  it("continues Web task execution when workspace snapshot capture fails", async () => {
+    const { db, runner, dispatcher } = createHarness({
+      captureWorkspaceSnapshot: async () => { throw new Error("git metadata unavailable"); },
+    });
+
+    const taskRecord = await dispatcher.submitWebTask({
+      summary: "继续执行",
+      description: "快照采集失败时仍启动 worker",
+      projectKey: "food",
+      mode: "implement",
+    });
+    expect(runner.starts).toHaveLength(1);
+    expect(db.getTask(taskRecord.task_guid)?.state).toBe("RUNNING");
+
+    runner.finish(runner.starts[0]!, { status: "succeeded", finalResponse: "仍然完成" });
+    await dispatcher.waitForIdle();
+
+    expect(db.getTask(taskRecord.task_guid)?.state).toBe("WAITING_REVIEW");
+    expect(db.listRunWorkspaceSnapshots(taskRecord.task_guid)).toHaveLength(0);
     db.close();
   });
 

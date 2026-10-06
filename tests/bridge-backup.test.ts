@@ -5,11 +5,15 @@ import { join } from "node:path";
 
 import { StateDatabase } from "../src/db.js";
 import {
+  checkBridgeBackupUpgradeCompatibility,
   createBridgeBackup,
   defaultBridgeAttachmentRoots,
+  inspectBridgeBackupMetadata,
+  listBridgeBackups,
   restoreBridgeBackup,
   verifyBridgeBackup,
 } from "../src/bridge-backup.js";
+import { runBackupCli } from "../src/backup-cli.js";
 import { DatabaseSync } from "../src/sqlite.js";
 
 const temporaryDirectories: string[] = [];
@@ -24,6 +28,7 @@ describe("Bridge backup", () => {
     const manifest = JSON.parse(readFileSync(join(fixture.backupDirectory, "manifest.json"), "utf8"));
     writeFileSync(join(fixture.backupDirectory, manifest.attachments[0].file), "two");
     await expect(verifyBridgeBackup(fixture.backupDirectory)).rejects.toThrow("does not match manifest");
+    await expect(checkBridgeBackupUpgradeCompatibility(fixture.backupDirectory)).rejects.toThrow("does not match manifest");
     const outputDirectory = join(fixture.root, "restore-tampered");
     await expect(restoreBridgeBackup({ backupDirectory: fixture.backupDirectory, outputDirectory })).rejects.toThrow("does not match manifest");
     expect(existsSync(outputDirectory)).toBe(false);
@@ -188,6 +193,73 @@ describe("Bridge backup", () => {
     rmSync(attachmentPath);
     symlinkSync(outsidePath, attachmentPath);
     await expect(verifyBridgeBackup(second.backupDirectory)).rejects.toThrow(/symlink/);
+  });
+
+  it("lists and inspects manifest metadata without claiming artifact hash verification", async () => {
+    const fixture = await makeSimpleBackup();
+    const unrelatedDirectory = join(fixture.root, "unrelated");
+    mkdirSync(unrelatedDirectory);
+    const invalidDirectory = join(fixture.root, "broken-backup");
+    mkdirSync(invalidDirectory);
+    writeFileSync(join(invalidDirectory, "manifest.json"), "not json");
+
+    const metadata = await inspectBridgeBackupMetadata(fixture.backupDirectory);
+    expect(metadata).toMatchObject({
+      programVersion: "test-version",
+      attachmentCount: 1,
+      attachmentBytes: 3,
+      contentHashesVerified: false,
+    });
+    const entries = await listBridgeBackups(fixture.root);
+    expect(entries).toHaveLength(2);
+    expect(entries.find((entry) => entry.status === "metadata")?.metadata).toMatchObject(metadata);
+    expect(entries.find((entry) => entry.status === "invalid")?.error).toContain("JSON");
+
+    const logged: string[] = [];
+    const originalLog = console.log;
+    console.log = (...values: unknown[]) => logged.push(values.join(" "));
+    try {
+      await runBackupCli(["inspect", "--backup", fixture.backupDirectory]);
+      await runBackupCli(["list", "--dir", fixture.root]);
+      await runBackupCli(["check-upgrade", "--backup", fixture.backupDirectory]);
+    } finally {
+      console.log = originalLog;
+    }
+    expect(JSON.parse(logged[0] ?? "{}")).toMatchObject({ contentHashesVerified: false });
+    expect(JSON.parse(logged[1] ?? "[]")).toHaveLength(2);
+    expect(JSON.parse(logged[2] ?? "{}")).toMatchObject({ compatible: true });
+  });
+
+  it("rejects backup list directories with more than the bounded entry limit", async () => {
+    const root = makeTemporaryDirectory();
+    for (let index = 0; index <= 1_000; index += 1) mkdirSync(join(root, `entry-${index}`));
+    await expect(listBridgeBackups(root)).rejects.toThrow("1000 entry limit");
+  });
+
+  it("checks current migration compatibility only on an isolated backup copy", async () => {
+    const fixture = await makeSimpleBackup();
+    const databasePath = join(fixture.root, "runtime", "bridge.db");
+    const oldSchemaDatabase = new DatabaseSync(databasePath);
+    oldSchemaDatabase.exec("ALTER TABLE tasks DROP COLUMN worker_pid");
+    oldSchemaDatabase.close();
+    const oldSchemaBackup = join(fixture.root, "old-schema-backup");
+    await createBridgeBackup({
+      databasePath,
+      outputDirectory: oldSchemaBackup,
+      attachmentRoots: defaultBridgeAttachmentRoots(databasePath, fixture.root),
+      programVersion: "old-version",
+    });
+    const backupDatabasePath = join(oldSchemaBackup, "bridge.db");
+    const originalBackupDatabase = readFileSync(backupDatabasePath);
+
+    const compatibility = await checkBridgeBackupUpgradeCompatibility(oldSchemaBackup);
+    expect(compatibility).toMatchObject({
+      sourceProgramVersion: "old-version",
+      compatible: true,
+      sourceSchemaFingerprint: (await verifyBridgeBackup(oldSchemaBackup)).schemaFingerprint,
+    });
+    expect(compatibility.sourceSchemaFingerprint).not.toBe(compatibility.migratedSchemaFingerprint);
+    expect(readFileSync(backupDatabasePath)).toEqual(originalBackupDatabase);
   });
 });
 

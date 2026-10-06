@@ -72,7 +72,7 @@ async function waitForRun(
   runId: string,
 ): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const updates = service.getMessageUpdates(homeId, threadId, runId, 0);
+    const updates = await service.getMessageUpdates(homeId, threadId, runId, 0);
     if (updates.state !== "running" && updates.state !== "cancelling") return;
     await Promise.resolve();
   }
@@ -116,7 +116,7 @@ describe("Codex History attachment lifecycle", () => {
         expect(service.getRunAttachment(homeId, "terminal", run.runId, attachment.attachmentId)).not.toBeNull();
         release();
         await waitForRun(service, homeId, "terminal", run.runId);
-        expect(service.getMessageUpdates(homeId, "terminal", run.runId, 0).state).toBe(terminal);
+        expect((await service.getMessageUpdates(homeId, "terminal", run.runId, 0)).state).toBe(terminal);
         expect(service.getRunAttachment(homeId, "terminal", run.runId, attachment.attachmentId)).not.toBeNull();
         now = 600;
         await service.cleanupExpiredAttachments();

@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import * as QRCode from "qrcode";
+import { clearLocalDraftsAfterDeviceRevocation } from "./local-draft-cleanup.js";
+import { setLocalDraftScope } from "./local-draft-scope.js";
 
 const PAIRING_COMMAND = "feishu-codex-bridge web:pair";
 
@@ -9,6 +11,7 @@ interface AuthStatus {
   activeSessionCount: number | null;
   pairingAvailable: boolean;
   pairingExpiresAt: number | null;
+  draftScope?: string | null;
 }
 
 interface ApiError {
@@ -65,8 +68,10 @@ async function loadAuthStatus(
   });
   const statusBody = await statusResponse.json() as AuthStatus & ApiError;
   if (!statusResponse.ok) {
+    setLocalDraftScope(null);
     throw new Error("鉴权状态读取失败（" + statusResponse.status + "）");
   }
+  setLocalDraftScope(statusBody.authenticated ? statusBody.draftScope : null);
   if (statusBody.authenticated) return statusBody;
 
   const code = readPairingCodeFromHash();
@@ -324,6 +329,7 @@ export function PairingAdmin(): ReactElement {
       });
       const body = await response.json() as ApiError;
       if (!response.ok) throw new Error(body.error || "撤销失败（" + response.status + "）");
+      await clearLocalDraftsAfterDeviceRevocation();
       window.location.assign("/");
     } catch (requestError: unknown) {
       setError(requestError instanceof Error ? requestError.message : String(requestError));
@@ -351,6 +357,7 @@ export function PairingAdmin(): ReactElement {
         throw new Error(body.error || "设备撤销失败（" + response.status + "）");
       }
       if (current) {
+        await clearLocalDraftsAfterDeviceRevocation();
         window.location.assign("/");
         return;
       }

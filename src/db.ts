@@ -9,6 +9,7 @@ import {
   WebTaskSubmissionConflictError,
   DIRECT_FOLLOWUP_STATUSES,
   DIRECT_TASK_STATUSES,
+  AAMP_TASK_STATUSES,
   SHORTCUT_DISPLAY_MODES,
   SHORTCUT_GROUP_LAYOUTS,
   SHORTCUT_KINDS,
@@ -16,6 +17,8 @@ import {
   TASK_STATES,
 } from "./types.js";
 import type { WebAuthPairingRecord, WebAuthSessionRecord } from "./web-auth.js";
+import type { GitWorkspaceSnapshot } from "./run-artifacts.js";
+import type { CodexHistoryStoredRun } from "./codex-history.js";
 import type {
   DatabaseChange,
   DirectMessageInput,
@@ -53,6 +56,11 @@ import type {
 } from "./types.js";
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS bridge_instance_identity (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    installation_id TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS projects (
     name TEXT PRIMARY KEY,
     path TEXT NOT NULL,
@@ -168,6 +176,27 @@ CREATE TABLE IF NOT EXISTS run_events (
     FOREIGN KEY(task_guid) REFERENCES tasks(task_guid)
 );
 
+-- Human review belongs to one Web run and never rewrites the execution state.
+CREATE TABLE IF NOT EXISTS web_run_reviews (
+    run_id TEXT PRIMARY KEY,
+    task_guid TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('accepted', 'changes_requested')),
+    note TEXT NOT NULL DEFAULT '',
+    reviewed_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE CASCADE,
+    FOREIGN KEY(task_guid) REFERENCES tasks(task_guid) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_run_reviews_task ON web_run_reviews(task_guid, reviewed_at DESC);
+
+CREATE TABLE IF NOT EXISTS run_workspace_snapshots (
+    run_id TEXT NOT NULL,
+    stage TEXT NOT NULL CHECK (stage IN ('before', 'after')),
+    snapshot_json TEXT NOT NULL,
+    PRIMARY KEY(run_id, stage),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_guid TEXT NOT NULL,
@@ -265,6 +294,24 @@ CREATE TABLE IF NOT EXISTS codex_history_thread_home_preferences (
 
 CREATE INDEX IF NOT EXISTS idx_codex_history_thread_home_preferences_home
   ON codex_history_thread_home_preferences(preferred_home_id, updated_at DESC);
+
+-- Keep accepted historical send receipts even after bounded run detail expires.
+-- Only a scoped hash of the client key is stored, never the raw key.
+CREATE TABLE IF NOT EXISTS codex_history_runs (
+    run_id TEXT PRIMARY KEY,
+    home_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    idempotency_key_hash TEXT,
+    request_fingerprint TEXT NOT NULL,
+    payload_json TEXT,
+    state TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(home_id, thread_id, idempotency_key_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_codex_history_runs_updated
+  ON codex_history_runs(updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS bridge_task_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -396,6 +443,7 @@ CREATE TABLE IF NOT EXISTS tmux_sessions (
     tmux_session_id TEXT NOT NULL,
     session_name TEXT NOT NULL,
     project_key TEXT,
+    codex_home_id TEXT,
     working_directory TEXT NOT NULL,
     tmux_created_at INTEGER NOT NULL,
     first_seen_at TEXT NOT NULL,
@@ -535,6 +583,20 @@ export interface OutboxSummary {
   delivered: number;
 }
 
+export interface StoredWebRunReview {
+  run_id: string;
+  task_guid: string;
+  decision: "accepted" | "changes_requested";
+  note: string;
+  reviewed_at: string;
+}
+
+export interface StoredRunWorkspaceSnapshot {
+  run_id: string;
+  stage: "before" | "after";
+  snapshot: GitWorkspaceSnapshot;
+}
+
 export interface RunClaim {
   runId: string;
   taskGuid: string;
@@ -579,7 +641,7 @@ export interface TaskQuery {
 }
 
 export interface TaskPanelQuery {
-  source?: "all" | "desk" | "direct";
+  source?: "all" | "desk" | "direct" | "aamp";
   states?: string[];
   projectKey?: string;
   mode?: string;
@@ -607,6 +669,16 @@ export class StateDatabase {
     this.db.exec(SCHEMA);
     this.runMigrations();
     this.seedShortcutDefaults();
+  }
+
+  public getOrCreateDraftInstallationId(): string {
+    this.db.prepare(
+      "INSERT OR IGNORE INTO bridge_instance_identity (id, installation_id) VALUES (1, ?)",
+    ).run(randomUUID());
+    const row = this.db.prepare(
+      "SELECT installation_id FROM bridge_instance_identity WHERE id = 1",
+    ).get() as { installation_id: string };
+    return row.installation_id;
   }
 
   public transaction<T>(callback: () => T): T {
@@ -1072,6 +1144,73 @@ export class StateDatabase {
       payloadJson: String(row.payload_json),
       refreshedAt: String(row.refreshed_at),
     } : null;
+  }
+
+  public listCodexHistoryRuns(limit: number): CodexHistoryStoredRun[] {
+    const boundedLimit = Math.min(1_000, Math.max(1, Math.trunc(limit) || 1));
+    const rows = this.db.prepare(
+      `SELECT payload_json FROM codex_history_runs
+       WHERE payload_json IS NOT NULL ORDER BY updated_at DESC LIMIT ?`,
+    ).all(boundedLimit) as Array<{ payload_json: string }>;
+    return rows.map((row) => JSON.parse(row.payload_json) as CodexHistoryStoredRun);
+  }
+
+  public findCodexHistoryRunByKey(homeId: string, threadId: string, keyHash: string): {
+    requestFingerprint: string;
+    runId: string;
+    run?: CodexHistoryStoredRun;
+  } | null {
+    const row = this.db.prepare(
+      `SELECT run_id, request_fingerprint, payload_json FROM codex_history_runs
+       WHERE home_id = ? AND thread_id = ? AND idempotency_key_hash = ?`,
+    ).get(homeId, threadId, keyHash) as {
+      run_id: string; request_fingerprint: string; payload_json: string | null;
+    } | undefined;
+    if (!row) return null;
+    return {
+      requestFingerprint: row.request_fingerprint,
+      runId: row.run_id,
+      ...(row.payload_json ? { run: JSON.parse(row.payload_json) as CodexHistoryStoredRun } : {}),
+    };
+  }
+
+  public createCodexHistoryRun(run: CodexHistoryStoredRun, keyHash?: string): {
+    kind: "created" | "existing" | "conflict" | "expired";
+    run?: CodexHistoryStoredRun;
+  } {
+    return this.transaction(() => {
+      if (keyHash) {
+        const receipt = this.findCodexHistoryRunByKey(run.homeId, run.threadId, keyHash);
+        if (receipt) {
+          if (receipt.requestFingerprint !== run.requestFingerprint) return { kind: "conflict" };
+          return receipt.run ? { kind: "existing", run: receipt.run } : { kind: "expired" };
+        }
+      }
+      this.db.prepare(
+        `INSERT INTO codex_history_runs
+           (run_id, home_id, thread_id, idempotency_key_hash, request_fingerprint,
+            payload_json, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        run.runId, run.homeId, run.threadId, keyHash ?? null,
+        run.requestFingerprint, JSON.stringify(run), run.state, run.createdAt, run.updatedAt,
+      );
+      return { kind: "created", run };
+    });
+  }
+
+  public saveCodexHistoryRun(run: CodexHistoryStoredRun): void {
+    this.db.prepare(
+      `UPDATE codex_history_runs SET payload_json = ?, state = ?, updated_at = ?
+       WHERE run_id = ? AND home_id = ? AND thread_id = ? AND payload_json IS NOT NULL`,
+    ).run(JSON.stringify(run), run.state, run.updatedAt, run.runId, run.homeId, run.threadId);
+  }
+
+  public expireCodexHistoryRun(runId: string): void {
+    this.db.prepare(
+      `UPDATE codex_history_runs SET payload_json = NULL, state = 'expired', updated_at = ?
+       WHERE run_id = ?`,
+    ).run(this.now().getTime(), runId);
   }
 
   public saveCodexHistoryListCache(
@@ -2582,16 +2721,28 @@ export class StateDatabase {
   }
 
   public queryTaskPanel(query: TaskPanelQuery = {}): {
-    items: Array<{ source: "desk"; task: StoredTask } | { source: "direct"; task: StoredBridgeTask }>;
+    items: Array<{ source: "desk"; task: StoredTask } | { source: "direct"; task: StoredBridgeTask } | { source: "aamp"; task: StoredAampTask }>;
     total: number;
   } {
     const candidates: string[] = [];
     const params: Array<string | number> = [];
-    const deskStates = query.states?.filter((state) => TASK_STATES.includes(state as TaskState)) ?? [];
-    const directStates = query.states?.filter((state) => DIRECT_TASK_STATUSES.includes(state as DirectTaskStatus)) ?? [];
-    if (query.source !== "direct" && (!query.states?.length || deskStates.length)) {
+    const needsAttention = query.states?.includes("ATTENTION") ?? false;
+    const requestedStates = query.states?.filter((state) => state !== "ATTENTION") ?? [];
+    const deskStates = requestedStates.filter((state) => TASK_STATES.includes(state as TaskState));
+    const directStates = requestedStates.filter((state) => DIRECT_TASK_STATUSES.includes(state as DirectTaskStatus));
+    const aampStates = requestedStates.filter((state) => AAMP_TASK_STATUSES.includes(state as AampTaskStatus));
+    const deskAttention = `(state IN ('BLOCKED_CONFIG', 'FAILED') OR (state = 'WAITING_REVIEW' AND NOT EXISTS (
+      SELECT 1 FROM web_run_reviews review WHERE review.run_id = (
+        SELECT run_id FROM runs WHERE task_guid = tasks.task_guid ORDER BY started_at DESC LIMIT 1
+      ) AND review.decision = 'accepted'
+    )))`;
+    if (query.source !== "direct" && query.source !== "aamp" && (!requestedStates.length || deskStates.length || needsAttention)) {
       const clauses: string[] = [];
-      if (deskStates.length) { clauses.push(`state IN (${deskStates.map(() => "?").join(", ")})`); params.push(...deskStates); }
+      if (deskStates.length && needsAttention) {
+        clauses.push(`(state IN (${deskStates.map(() => "?").join(", ")}) OR ${deskAttention})`);
+        params.push(...deskStates);
+      } else if (deskStates.length) { clauses.push(`state IN (${deskStates.map(() => "?").join(", ")})`); params.push(...deskStates); }
+      else if (needsAttention) clauses.push(deskAttention);
       if (query.projectKey) { clauses.push("project_key = ?"); params.push(query.projectKey); }
       if (query.mode) { clauses.push("mode = ?"); params.push(query.mode); }
       if (query.search) {
@@ -2600,15 +2751,33 @@ export class StateDatabase {
       }
       candidates.push(`SELECT 'desk' AS source, task_guid AS id, updated_at FROM tasks${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""}`);
     }
-    if (query.source !== "desk" && !query.projectKey && !query.mode
-      && (!query.states?.length || directStates.length)) {
+    if (query.source !== "desk" && query.source !== "aamp" && !query.projectKey && !query.mode
+      && (!requestedStates.length || directStates.length || needsAttention)) {
       const clauses: string[] = [];
-      if (directStates.length) { clauses.push(`status IN (${directStates.map(() => "?").join(", ")})`); params.push(...directStates); }
+      if (directStates.length && needsAttention) {
+        clauses.push(`(status IN (${directStates.map(() => "?").join(", ")}) OR status IN ('FAILED', 'CANCEL_REQUESTED') OR card_state = 'DELIVERY_FAILED')`);
+        params.push(...directStates);
+      } else if (directStates.length) { clauses.push(`status IN (${directStates.map(() => "?").join(", ")})`); params.push(...directStates); }
+      else if (needsAttention) clauses.push("(status IN ('FAILED', 'CANCEL_REQUESTED') OR card_state = 'DELIVERY_FAILED')");
       if (query.search) {
         clauses.push("(bridge_task_id LIKE ? OR text LIKE ? OR COALESCE(thread_id, '') LIKE ? OR COALESCE(error, '') LIKE ?)");
         params.push(...Array(4).fill(`%${query.search}%`));
       }
       candidates.push(`SELECT 'direct' AS source, bridge_task_id AS id, updated_at FROM bridge_tasks${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""}`);
+    }
+    if (query.source !== "desk" && query.source !== "direct" && !query.projectKey && !query.mode
+      && (!requestedStates.length || aampStates.length || needsAttention)) {
+      const clauses: string[] = [];
+      if (aampStates.length && needsAttention) {
+        clauses.push(`(status IN (${aampStates.map(() => "?").join(", ")}) OR status = 'failed')`);
+        params.push(...aampStates);
+      } else if (aampStates.length) { clauses.push(`status IN (${aampStates.map(() => "?").join(", ")})`); params.push(...aampStates); }
+      else if (needsAttention) clauses.push("status = 'failed'");
+      if (query.search) {
+        clauses.push("(aamp_task_id LIKE ? OR chat_id LIKE ? OR COALESCE(user_text, '') LIKE ? OR COALESCE(last_delta_text, '') LIKE ? OR COALESCE(error_msg, '') LIKE ?)");
+        params.push(...Array(5).fill(`%${query.search}%`));
+      }
+      candidates.push(`SELECT 'aamp' AS source, aamp_task_id AS id, updated_at FROM aamp_tasks${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""}`);
     }
     if (!candidates.length) return { items: [], total: 0 };
     const union = candidates.join(" UNION ALL ");
@@ -2616,15 +2785,18 @@ export class StateDatabase {
     const limit = Math.min(200, Math.max(1, query.limit ?? 50));
     const offset = Math.max(0, query.offset ?? 0);
     const rows = this.db.prepare(`SELECT source, id FROM (${union}) ORDER BY updated_at DESC, source, id DESC LIMIT ? OFFSET ?`)
-      .all(...params, limit, offset) as Array<{ source: "desk" | "direct"; id: string }>;
-    const items: Array<{ source: "desk"; task: StoredTask } | { source: "direct"; task: StoredBridgeTask }> = [];
+      .all(...params, limit, offset) as Array<{ source: "desk" | "direct" | "aamp"; id: string }>;
+    const items: Array<{ source: "desk"; task: StoredTask } | { source: "direct"; task: StoredBridgeTask } | { source: "aamp"; task: StoredAampTask }> = [];
     for (const row of rows) {
       if (row.source === "desk") {
         const task = this.getTask(row.id);
         if (task) items.push({ source: "desk", task });
-      } else {
+      } else if (row.source === "direct") {
         const task = this.getBridgeTask(row.id);
         if (task) items.push({ source: "direct", task });
+      } else {
+        const task = this.getAampTask(row.id);
+        if (task) items.push({ source: "aamp", task });
       }
     }
     return { total, items };
@@ -2649,6 +2821,67 @@ export class StateDatabase {
       .prepare("SELECT * FROM runs WHERE task_guid = ? ORDER BY started_at DESC")
       .all(taskGuid) as Record<string, unknown>[];
     return rows.map(mapRun);
+  }
+
+  public listWebRunReviews(taskGuid: string): StoredWebRunReview[] {
+    return this.db.prepare("SELECT * FROM web_run_reviews WHERE task_guid = ? ORDER BY reviewed_at DESC")
+      .all(taskGuid) as unknown as StoredWebRunReview[];
+  }
+
+  public getWebRunReview(runId: string): StoredWebRunReview | null {
+    const row = this.db.prepare("SELECT * FROM web_run_reviews WHERE run_id = ?").get(runId) as unknown as StoredWebRunReview | undefined;
+    return row ?? null;
+  }
+
+  public getLatestWebRunReview(taskGuid: string): StoredWebRunReview | null {
+    const row = this.db.prepare(`SELECT * FROM web_run_reviews WHERE run_id = (
+      SELECT run_id FROM runs WHERE task_guid = ? ORDER BY started_at DESC LIMIT 1
+    )`).get(taskGuid) as unknown as StoredWebRunReview | undefined;
+    return row ?? null;
+  }
+
+  public saveRunWorkspaceSnapshot(runId: string, stage: "before" | "after", snapshot: GitWorkspaceSnapshot): void {
+    const run = this.getRun(runId);
+    if (!run || this.getTask(run.task_guid)?.origin !== "web") return;
+    this.db.prepare(`INSERT INTO run_workspace_snapshots (run_id, stage, snapshot_json) VALUES (?, ?, ?)
+      ON CONFLICT(run_id, stage) DO UPDATE SET snapshot_json = excluded.snapshot_json`)
+      .run(runId, stage, JSON.stringify(snapshot));
+    this.noteChange({ kind: "task", taskGuid: run.task_guid, runId, at: this.timestamp() });
+  }
+
+  public listRunWorkspaceSnapshots(taskGuid: string): StoredRunWorkspaceSnapshot[] {
+    const rows = this.db.prepare(`SELECT snapshots.run_id, snapshots.stage, snapshots.snapshot_json
+      FROM run_workspace_snapshots snapshots JOIN runs ON runs.run_id = snapshots.run_id
+      WHERE runs.task_guid = ? ORDER BY runs.started_at DESC, snapshots.stage`)
+      .all(taskGuid) as Array<{ run_id: string; stage: "before" | "after"; snapshot_json: string }>;
+    return rows.flatMap((row) => {
+      try { return [{ run_id: row.run_id, stage: row.stage, snapshot: JSON.parse(row.snapshot_json) as GitWorkspaceSnapshot }]; }
+      catch { return []; }
+    });
+  }
+
+  public saveWebRunReview(
+    taskGuid: string,
+    runId: string,
+    decision: "accepted" | "changes_requested",
+    note: string,
+  ): StoredWebRunReview {
+    const normalizedNote = note.trim();
+    if (normalizedNote.length > 1000) throw new Error("验收备注不能超过 1000 个字符。");
+    if (decision === "changes_requested" && !normalizedNote) throw new Error("需要修改时请填写验收意见。");
+    const task = this.getTask(taskGuid);
+    const run = this.getRun(runId);
+    if (!task || task.origin !== "web" || !run || run.task_guid !== taskGuid) throw new Error("Bridge 网页任务或运行不存在。");
+    if (run.state !== "WAITING_REVIEW") throw new Error("仅能验收已完成的成功运行。");
+    const latest = this.getLatestRun(taskGuid);
+    if (latest?.run_id !== runId) throw new Error("只能验收当前最新一轮运行。");
+    const now = this.timestamp();
+    this.db.prepare(`INSERT INTO web_run_reviews (run_id, task_guid, decision, note, reviewed_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(run_id) DO UPDATE SET decision = excluded.decision, note = excluded.note, reviewed_at = excluded.reviewed_at`)
+      .run(runId, taskGuid, decision, normalizedNote, now);
+    this.noteChange({ kind: "task", taskGuid, runId, at: now });
+    return this.db.prepare("SELECT * FROM web_run_reviews WHERE run_id = ?").get(runId) as unknown as StoredWebRunReview;
   }
 
   public listRunEvents(runId: string, limit = 500): StoredRunEvent[] {
@@ -3515,6 +3748,16 @@ export class StateDatabase {
     return this.getTmuxSession(recordId)!;
   }
 
+  public setTmuxSessionCodexHome(tmuxSessionId: string, codexHomeId: string | null): StoredTmuxSession | null {
+    const session = this.db.prepare(`SELECT record_id FROM tmux_sessions
+      WHERE tmux_session_id = ? AND ended_at IS NULL
+      ORDER BY first_seen_at DESC LIMIT 1`).get(tmuxSessionId) as { record_id: string } | undefined;
+    if (!session) return null;
+    this.db.prepare("UPDATE tmux_sessions SET codex_home_id = ? WHERE record_id = ?")
+      .run(codexHomeId, session.record_id);
+    return this.getTmuxSession(session.record_id);
+  }
+
   public syncTmuxSessions(sessions: Array<{ id: string; name: string; cwd: string; createdAt: number }>): void {
     const currentKeys = new Set(sessions.map((session) => `${session.id}\u0000${session.createdAt}`));
     const endedAt = this.timestamp();
@@ -3788,6 +4031,7 @@ export class StateDatabase {
     addColumnIfMissing(this.db, "tmux_session_actions", "project_key", "TEXT");
     addColumnIfMissing(this.db, "tmux_session_actions", "working_directory", "TEXT NOT NULL DEFAULT ''");
     addColumnIfMissing(this.db, "tmux_session_actions", "submission_fingerprint", "TEXT");
+    addColumnIfMissing(this.db, "tmux_sessions", "codex_home_id", "TEXT");
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tmux_session_actions_fingerprint
       ON tmux_session_actions(session_record_id, submission_fingerprint, created_at DESC)`);
     this.db.exec(`UPDATE tmux_session_actions
@@ -4019,7 +4263,7 @@ function migrateBridgeTaskStatusConstraint(db: SqliteDatabase): void {
 
 function addColumnIfMissing(
   db: SqliteDatabase,
-  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts" | "shortcut_groups" | "tmux_session_actions",
+  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts" | "shortcut_groups" | "tmux_sessions" | "tmux_session_actions",
   column: string,
   definition: string,
 ): void {
@@ -4339,6 +4583,7 @@ function mapTmuxSession(row: Record<string, unknown>): StoredTmuxSession {
     tmux_session_id: String(row.tmux_session_id),
     session_name: String(row.session_name),
     project_key: nullableString(row.project_key),
+    codex_home_id: nullableString(row.codex_home_id),
     working_directory: String(row.working_directory),
     tmux_created_at: Number(row.tmux_created_at),
     first_seen_at: String(row.first_seen_at),

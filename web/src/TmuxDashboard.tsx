@@ -10,6 +10,7 @@ import { isDebugLogCaptureActive, logDebugDiagnostic } from "./debug-log-capture
 
 import { bindMobileTerminalTouch, downloadTerminalScrollDiagnostics, type TerminalSelectionDisplay } from "./terminal-touch.js";
 import { TmuxMessageComposer, type TerminalShortcut } from "./TmuxMessageComposer.js";
+import { getActionToken } from "./api.js";
 import { useSystemNavigation } from "./WebNavigation.js";
 
 type TmuxSession = {
@@ -19,11 +20,45 @@ type TmuxSession = {
   attachedClients: number;
   cwd: string;
   createdAt: number;
+  codexHomeId: string | null;
 };
 
 type ProjectOption = { name: string; root: string };
+type CodexHomeOption = { id: string; label: string; available: boolean };
 type Toast = { message: string; isError: boolean };
 type SubmissionResult = { ok: boolean; message?: string };
+
+function CodexHomeSelect({
+  session,
+  homes,
+  disabled,
+  onChange,
+}: {
+  session: TmuxSession;
+  homes: CodexHomeOption[];
+  disabled?: boolean;
+  onChange: (session: TmuxSession, homeId: string | null) => void;
+}): ReactElement {
+  const known = homes.some((home) => home.id === session.codexHomeId);
+  return (
+    <select
+      className="dashboard-codex-home-select"
+      aria-label={`${session.name} Codex 账号`}
+      title="选择此 Session 的 Codex 账号；新启动的 Codex 进程使用此 Home"
+      value={session.codexHomeId ?? ""}
+      disabled={disabled}
+      onChange={(event) => onChange(session, event.target.value || null)}
+    >
+      <option value="">未标记</option>
+      {session.codexHomeId && !known ? <option value={session.codexHomeId}>已保存账号（不可用）</option> : null}
+      {homes.map((home) => (
+        <option key={home.id} value={home.id} disabled={!home.available}>
+          {home.label}{home.available ? "" : "（不可用）"}
+        </option>
+      ))}
+    </select>
+  );
+}
 
 const API_ROOT = "/tmux-dashboard/api";
 const SESSION_REFRESH_INTERVAL_MS = 5_000;
@@ -31,6 +66,9 @@ const SESSION_REFRESH_INTERVAL_MS = 5_000;
 async function requestApi<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
   if (options.body) headers.set("content-type", "application/json");
+  if (options.method?.toUpperCase() === "POST" && path.includes("/codex-account")) {
+    headers.set("X-Bridge-Action-Token", await getActionToken());
+  }
   const response = await fetch(API_ROOT + path, { ...options, headers });
   if (response.status === 204) return undefined as T;
   const payload = await response.json() as T & { error?: string };
@@ -77,6 +115,7 @@ function normalizeTmuxSession(value: unknown): TmuxSession | null {
   const attachedClients = Number(record.attachedClients ?? record.attached_clients ?? record.session_attached);
   const cwd = record.cwd ?? record.sessionPath ?? record.session_path;
   const createdAt = Number(record.createdAt ?? record.created_at ?? record.session_created);
+  const codexHomeId = record.codexHomeId ?? record.codex_home_id ?? null;
 
   if (
     id
@@ -86,7 +125,15 @@ function normalizeTmuxSession(value: unknown): TmuxSession | null {
     && typeof cwd === "string"
     && Number.isFinite(createdAt)
   ) {
-    return { id, name, windows, attachedClients, cwd, createdAt };
+    return {
+      id,
+      name,
+      windows,
+      attachedClients,
+      cwd,
+      createdAt,
+      codexHomeId: typeof codexHomeId === "string" ? codexHomeId : null,
+    };
   }
 
   const composite = /^(\$\d+)[_\t](.+?)[_\t](\d+)[_\t](\d+)[_\t](.+)[_\t](\d+)$/.exec(id);
@@ -98,6 +145,7 @@ function normalizeTmuxSession(value: unknown): TmuxSession | null {
     attachedClients: Number(composite[4]),
     cwd: composite[5],
     createdAt: Number(composite[6]),
+    codexHomeId: null,
   };
 }
 
@@ -109,7 +157,8 @@ function tmuxSessionsEqual(left: TmuxSession[], right: TmuxSession[]): boolean {
       && next.windows === session.windows
       && next.attachedClients === session.attachedClients
       && next.cwd === session.cwd
-      && next.createdAt === session.createdAt;
+      && next.createdAt === session.createdAt
+      && next.codexHomeId === session.codexHomeId;
   });
 }
 
@@ -156,6 +205,9 @@ export function TmuxDashboard(): ReactElement {
   const { collapsed: navigationCollapsed, setCollapsed: setNavigationCollapsed } = useSystemNavigation();
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
+  const [codexHomes, setCodexHomes] = useState<CodexHomeOption[]>([]);
+  const [savingCodexHomeId, setSavingCodexHomeId] = useState<string | null>(null);
+  const [checkingCodexHomeId, setCheckingCodexHomeId] = useState<string | null>(null);
   const [mobileView, setMobileView] = useState<"sessions" | "terminal">("sessions");
   const [selectedId, setSelectedId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("session"));
   const [search, setSearch] = useState("");
@@ -186,13 +238,20 @@ export function TmuxDashboard(): ReactElement {
     if (mobileView === "terminal") return bindMobileTerminalViewport(window);
   }, [mobileView]);
 
+  useLayoutEffect(() => {
+    const detailClass = "tmux-terminal-detail";
+    const mobileDetailRequested = restoreSessionDetailRef.current && window.matchMedia("(max-width: 760px)").matches;
+    document.documentElement.classList.toggle(detailClass, mobileView === "terminal" || mobileDetailRequested);
+    return () => document.documentElement.classList.remove(detailClass);
+  }, [mobileView]);
+
   const loadSessions = useCallback(async (): Promise<void> => {
     try {
       const response = await fetch(API_ROOT + "/sessions", { headers: { Accept: "application/json" } });
       const rawResponse = await response.text();
       sessionApiResponseRef.current = rawResponse;
       sessionApiStatusRef.current = response.status;
-      let result: { sessions?: unknown[]; error?: string };
+      let result: { sessions?: unknown[]; codexHomes?: unknown[]; error?: string };
       try {
         result = JSON.parse(rawResponse) as typeof result;
       } catch {
@@ -205,6 +264,21 @@ export function TmuxDashboard(): ReactElement {
         throw new Error("The sessions API returned an unrecognized session record.");
       }
       const sessionList = normalizedSessions as TmuxSession[];
+      const homeOptions = Array.isArray(result.codexHomes)
+        ? result.codexHomes.flatMap((value): CodexHomeOption[] => {
+          if (typeof value !== "object" || value === null) return [];
+          const home = value as Record<string, unknown>;
+          return typeof home.id === "string" && typeof home.label === "string"
+            ? [{ id: home.id, label: home.label, available: home.available === true }]
+            : [];
+        })
+        : [];
+      setCodexHomes((current) => current.length === homeOptions.length
+        && current.every((home, index) => home.id === homeOptions[index]?.id
+          && home.label === homeOptions[index]?.label
+          && home.available === homeOptions[index]?.available)
+        ? current
+        : homeOptions);
       setSessions((current) => tmuxSessionsEqual(current, sessionList) ? current : sessionList);
       setBackendStatus("online");
       setError(null);
@@ -328,6 +402,10 @@ export function TmuxDashboard(): ReactElement {
   }, [projectQuery, projects]);
   const selectedProject = projects.find((project) => project.name === newProjectName) ?? null;
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? null;
+  const selectedCodexHomeLabel = selectedSession
+    ? codexHomes.find((home) => home.id === selectedSession.codexHomeId)?.label
+      ?? (selectedSession.codexHomeId ? "账号不可用" : "未标记")
+    : "";
   const selectSession = (sessionId: string): void => {
     setSelectedId(sessionId);
     if (window.matchMedia("(max-width: 760px)").matches) {
@@ -956,6 +1034,54 @@ export function TmuxDashboard(): ReactElement {
     }
   };
 
+  const updateCodexHome = async (session: TmuxSession, homeId: string | null): Promise<void> => {
+    setSavingCodexHomeId(session.id);
+    try {
+      await requestApi(`/sessions/${encodeURIComponent(session.id)}/codex-account`, {
+        method: "POST",
+        body: JSON.stringify({ homeId }),
+      });
+      await loadSessions();
+      setToast({
+        message: homeId
+          ? `已将「${session.name}」设为该 Codex 账号；只影响此 Session 后续启动的 Codex。`
+          : `已清除「${session.name}」的 Codex 账号标记。`,
+        isError: false,
+      });
+    } catch (saveError) {
+      setToast({ message: saveError instanceof Error ? saveError.message : "无法更新 Codex 账号。", isError: true });
+    } finally {
+      setSavingCodexHomeId(null);
+    }
+  };
+
+  const checkCodexHome = async (session: TmuxSession): Promise<void> => {
+    setCheckingCodexHomeId(session.id);
+    try {
+      const result = await requestApi<{
+        status: "matched" | "unmatched" | "running" | "not-running" | "unavailable";
+        home: { id: string; label: string } | null;
+      }>(`/sessions/${encodeURIComponent(session.id)}/codex-account/check`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      if (result.status === "matched" && result.home) {
+        await loadSessions();
+        setToast({ message: `检测到当前 pane 使用「${result.home.label}」，账号标记已同步。`, isError: false });
+      } else if (result.status === "not-running") {
+        setToast({ message: `「${session.name}」当前 pane 没有运行中的 Codex。`, isError: true });
+      } else if (result.status === "unmatched") {
+        setToast({ message: "检测到 Codex，但当前 Home 不在已发现的账号列表中；请手动选择账号。", isError: true });
+      } else {
+        setToast({ message: "无法读取当前 pane 的 Codex Home；请手动选择账号标记。", isError: true });
+      }
+    } catch (checkError) {
+      setToast({ message: checkError instanceof Error ? checkError.message : "检查 Codex 账号失败。", isError: true });
+    } finally {
+      setCheckingCodexHomeId(null);
+    }
+  };
+
   const connectionMessage = terminalStatus === "OFFLINE"
     ? "当前网络不可用，消息不会发送，输入内容会保留。"
     : terminalStatus === "RECONNECTING"
@@ -1020,10 +1146,14 @@ export function TmuxDashboard(): ReactElement {
                   <span className="dashboard-session-meta">{session.windows} {session.windows === 1 ? "window" : "windows"}<span>{session.attachedClients > 0 ? `${session.attachedClients} attached` : "detached"}</span></span>
                 </button>
                 <div className="dashboard-session-actions" aria-label={`${session.name} 操作`}>
+                  <CodexHomeSelect
+                    session={session}
+                    homes={codexHomes}
+                    disabled={savingCodexHomeId === session.id}
+                    onChange={(target, homeId) => { void updateCodexHome(target, homeId); }}
+                  />
                   <button type="button" onClick={() => selectSession(session.id)}>详情</button>
-                  <span className="dashboard-session-action-divider" aria-hidden="true" />
                   <button type="button" onClick={() => navigate(`/tmux-dashboard/history?session=${encodeURIComponent(session.id)}`)}>历史</button>
-                  <span className="dashboard-session-action-divider" aria-hidden="true" />
                   <button className="dashboard-session-end" type="button" onClick={() => void endSession(session)}>终结</button>
                 </div>
               </div>
@@ -1035,7 +1165,30 @@ export function TmuxDashboard(): ReactElement {
           <div className="dashboard-workspace-toolbar">
             <button className="dashboard-mobile-back" type="button" onClick={showSessionsOnMobile} aria-label="Back to sessions">‹</button>
             <div className="dashboard-active-session"><span className="dashboard-terminal-glyph">⌘</span><div><strong>{selectedSession?.name ?? "No session selected"}</strong><span title={selectedSession?.cwd}>{selectedSession?.cwd ?? "Choose a session to open its terminal"}</span></div></div>
-            <div className="dashboard-terminal-actions"><span className={terminalStatus === "ATTACHED" ? "is-connected" : ""}>{selectedSession ? terminalStatus : "IDLE"}</span><button type="button" onClick={() => void refreshSelectedSession()} disabled={!selectedSession}>Refresh session</button><button className="dashboard-session-end" type="button" onClick={() => void endSession()} disabled={!selectedSession}>终结</button></div>
+            {selectedSession ? (
+              <div className="dashboard-codex-inline" aria-label="Session 账号与操作">
+                <span className="dashboard-codex-home-label" title={selectedCodexHomeLabel}>{selectedCodexHomeLabel}</span>
+                <details className="dashboard-codex-actions">
+                  <summary aria-label="Session 操作" title="Session 操作">⌄</summary>
+                  <div className="dashboard-codex-actions-panel">
+                    <button type="button" onClick={() => navigate(`/tmux-dashboard/history?session=${encodeURIComponent(selectedSession.id)}`)}>
+                      查看历史（当前 Session）
+                    </button>
+                    <CodexHomeSelect
+                      session={selectedSession}
+                      homes={codexHomes}
+                      disabled={savingCodexHomeId === selectedSession.id}
+                      onChange={(target, homeId) => { void updateCodexHome(target, homeId); }}
+                    />
+                    <button type="button" disabled={checkingCodexHomeId === selectedSession.id} onClick={() => void checkCodexHome(selectedSession)}>
+                      {checkingCodexHomeId === selectedSession.id ? "检查中…" : "刷新账号"}
+                    </button>
+                    <button type="button" onClick={() => void refreshSelectedSession()}>刷新 Session</button>
+                    <button className="dashboard-session-end" type="button" onClick={() => void endSession(selectedSession)}>终结 Session</button>
+                  </div>
+                </details>
+              </div>
+            ) : null}
           </div>
           {showConnectionBanner ? (
             <div className={`dashboard-connection-banner is-${terminalStatus.toLowerCase()}`} role="alert">

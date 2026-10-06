@@ -1,4 +1,4 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { lstat, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
@@ -7,6 +7,17 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { Duplex } from "node:stream";
 
 import { StateDatabase } from "./db.js";
+import {
+  checkBridgeBackupUpgradeCompatibility,
+  createBridgeBackup,
+  inspectBridgeBackupMetadata,
+  listBridgeBackups,
+  restoreBridgeBackup,
+  verifyBridgeBackup,
+  type BridgeBackupMetadata,
+  type BridgeBackupVerification,
+  type BridgeAttachmentRoots,
+} from "./bridge-backup.js";
 import {
   CODEX_HISTORY_DEFAULT_SOURCE_KINDS,
   CODEX_HISTORY_MAX_ATTACHMENT_BYTES,
@@ -19,6 +30,7 @@ import {
 import { writeProjectRegistrySnapshot } from "./project-registry.js";
 import type { TmuxDashboardApi } from "./tmux-dashboard-api.js";
 import { resolveBridgeProjectRoot } from "./portable-runtime.js";
+import { readSystemHealth } from "./system-health.js";
 import { parseTaskInput } from "./fingerprint.js";
 import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import {
@@ -47,6 +59,7 @@ import {
   type StoredProject,
   type StoredWebTaskAttachment,
   type StoredTask,
+  type StoredAampTask,
   type WebTaskSubmission,
 } from "./types.js";
 
@@ -73,6 +86,11 @@ class TaskFileRequestError extends Error {
 
 export interface DashboardServerOptions {
   db: StateDatabase;
+  databasePath?: string;
+  backupRoot?: string;
+  backupAttachmentRoots?: BridgeAttachmentRoots;
+  executionMode?: string;
+  codexCliPath?: string;
   host: string;
   port: number;
   modes: string[];
@@ -89,6 +107,7 @@ export interface DashboardServerOptions {
 
 export interface DashboardActions {
   createTask?(input: WebTaskSubmission): Promise<StoredTask>;
+  retryWebTask?(taskGuid: string, idempotencyKey: string): Promise<StoredTask>;
   interruptTask(taskGuid: string, reason?: string): Promise<{ ok: boolean; message?: string }>;
   appendFeedback(taskGuid: string, details: string): Promise<{ ok: boolean; state: string }>;
   appendWebFollowup?(taskGuid: string, details: string, idempotencyKey: string): Promise<StoredTask>;
@@ -257,7 +276,8 @@ export class DashboardServer {
       if (!this.requireAuthorization(request, response)) return;
       if (
         request.method === "POST"
-        && /^\/tmux-dashboard\/api\/sessions\/[^/]+\/files\/upload$/.test(url.pathname)
+        && (/^\/tmux-dashboard\/api\/sessions\/[^/]+\/files\/upload$/.test(url.pathname)
+          || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/codex-account(?:\/check)?$/.test(url.pathname))
         && !this.requireActionAuthorization(request, response)
       ) return;
       await this.options.tmuxDashboard.handleRequest(request, response, this.auth.currentDeviceId(request));
@@ -272,6 +292,7 @@ export class DashboardServer {
         && url.pathname !== "/system-management"
         && url.pathname !== "/system-management/devices"
         && url.pathname !== "/system-management/shortcuts"
+        && url.pathname !== "/system-management/backups"
       ) {
         sendJson(response, 401, { error: "pairing required" });
         return;
@@ -291,6 +312,10 @@ export class DashboardServer {
     }
     if (request.method === "GET" && url.pathname === "/api/shortcut-config") {
       this.sendShortcutConfig(response);
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/shortcut-config/revision") {
+      sendJson(response, 200, { revision: this.shortcutConfigRevision() });
       return;
     }
     if (request.method === "POST" && url.pathname === "/api/shortcut-groups") {
@@ -564,12 +589,58 @@ export class DashboardServer {
       sendJson(response, 200, { ok: true });
       return;
     }
+    if (request.method === "GET" && url.pathname === "/api/system/health") {
+      if (!this.options.databasePath) {
+        sendJson(response, 503, { error: "运行状态暂不可用" });
+        return;
+      }
+      try {
+        sendJson(response, 200, await readSystemHealth({
+          databasePath: this.options.databasePath,
+          mode: this.options.executionMode ?? "unknown",
+          codexCliPath: this.options.codexCliPath,
+        }));
+      } catch (error) {
+        this.options.logger?.warn("could not read system health", { error: error instanceof Error ? error.message : String(error) });
+        sendJson(response, 503, { error: "运行状态暂不可用" });
+      }
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/system/backups") {
+      await this.listSystemBackups(response);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/system/backups/create") {
+      await this.createSystemBackup(request, response);
+      return;
+    }
+    const systemBackupMatch = /^\/api\/system\/backups\/([^/]+)\/(verify|check-upgrade|restore)$/.exec(url.pathname);
+    if (systemBackupMatch && request.method === "POST") {
+      let backupId: string;
+      try { backupId = decodeURIComponent(systemBackupMatch[1]!); }
+      catch { sendJson(response, 400, { error: "无效的备份标识" }); return; }
+      await this.runSystemBackupAction(
+        backupId,
+        systemBackupMatch[2] as "verify" | "check-upgrade" | "restore",
+        request,
+        response,
+      );
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/api/tasks") {
       this.listTasks(url, response);
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/task-panel") {
       this.listTaskPanel(url, response);
+      return;
+    }
+    const taskPanelAampMatch = /^\/api\/task-panel\/aamp\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "GET" && taskPanelAampMatch) {
+      let taskId: string;
+      try { taskId = decodeURIComponent(taskPanelAampMatch[1]!); }
+      catch { sendJson(response, 400, { error: "invalid AAMP task selector" }); return; }
+      this.getTaskPanelAampTask(taskId, response);
       return;
     }
     const taskPanelFollowupMatch = /^\/api\/task-panel\/(desk|direct)\/([^/]+)\/followups$/.exec(url.pathname);
@@ -635,6 +706,28 @@ export class DashboardServer {
       }
       return;
     }
+    const runReviewMatch = /^\/api\/tasks\/([^/]+)\/runs\/([^/]+)\/review$/.exec(url.pathname);
+    if (request.method === "PUT" && runReviewMatch) {
+      let taskGuid: string;
+      let runId: string;
+      try {
+        taskGuid = decodeURIComponent(runReviewMatch[1]!);
+        runId = decodeURIComponent(runReviewMatch[2]!);
+      } catch {
+        sendJson(response, 400, { error: "invalid run selector" });
+        return;
+      }
+      await this.saveWebRunReview(taskGuid, runId, request, response);
+      return;
+    }
+    const webRetryMatch = /^\/api\/tasks\/([^/]+)\/retry$/.exec(url.pathname);
+    if (request.method === "POST" && webRetryMatch) {
+      let taskGuid: string;
+      try { taskGuid = decodeURIComponent(webRetryMatch[1]!); }
+      catch { sendJson(response, 400, { error: "invalid task selector" }); return; }
+      await this.retryWebTask(taskGuid, request, response);
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/api/direct/tasks") {
       this.listDirectTasks(url, response);
       return;
@@ -672,8 +765,8 @@ export class DashboardServer {
       await this.serveAsset(url.pathname, response);
       return;
     }
-    if (request.method !== "GET" && request.method !== "POST" && request.method !== "PATCH" && request.method !== "DELETE") {
-      response.setHeader("Allow", "GET, POST, PATCH, DELETE");
+    if (request.method !== "GET" && request.method !== "POST" && request.method !== "PUT" && request.method !== "PATCH" && request.method !== "DELETE") {
+      response.setHeader("Allow", "GET, POST, PUT, PATCH, DELETE");
       sendJson(response, 405, { error: "method not allowed" });
       return;
     }
@@ -760,7 +853,7 @@ export class DashboardServer {
     const rawStates = url.searchParams.getAll("state")
       .flatMap((value) => value.split(","))
       .filter(Boolean);
-    const states = rawStates.filter((state) => isTaskState(state) || DIRECT_TASK_STATUSES.includes(state as DirectTaskStatus));
+    const states = rawStates.filter((state) => state === "ATTENTION" || isTaskState(state) || DIRECT_TASK_STATUSES.includes(state as DirectTaskStatus) || isAampTaskStatus(state));
     if (states.length !== rawStates.length) {
       sendJson(response, 400, { error: "invalid task state" });
       return;
@@ -772,7 +865,7 @@ export class DashboardServer {
       return;
     }
     const source = url.searchParams.get("source") ?? "all";
-    if (source !== "all" && source !== "desk" && source !== "direct") {
+    if (source !== "all" && source !== "desk" && source !== "direct" && source !== "aamp") {
       sendJson(response, 400, { error: "invalid task source" });
       return;
     }
@@ -788,17 +881,20 @@ export class DashboardServer {
     sendJson(response, 200, {
       items: result.items.map((entry) => entry.source === "direct"
         ? directTaskView(entry.task)
-        : {
+        : entry.source === "aamp"
+          ? aampTaskView(entry.task)
+          : {
           ...entry.task,
           source: "desk" as const,
           input: parseTaskInput(entry.task.input_text),
           latest_run: this.options.db.getLatestRun(entry.task.task_guid),
+          latest_review: this.options.db.getLatestWebRunReview(entry.task.task_guid),
         }),
       total: result.total,
       limit,
       offset,
       filters: {
-        states: [...TASK_STATES, ...DIRECT_TASK_STATUSES.filter((state) => !TASK_STATES.includes(state as TaskState))],
+        states: ["ATTENTION", ...TASK_STATES, ...DIRECT_TASK_STATUSES.filter((state) => !TASK_STATES.includes(state as TaskState)), ...AAMP_TASK_STATUSES],
         projects: this.options.db.listAvailableProjects().map((project) => project.name),
         modes: this.options.modes,
       },
@@ -1131,6 +1227,12 @@ export class DashboardServer {
       sendJson(response, 400, { error: "turnIndex must be a non-negative integer" });
       return;
     }
+    if (body.idempotencyKey !== undefined
+      && (typeof body.idempotencyKey !== "string" || body.idempotencyKey.trim().length < 1
+        || body.idempotencyKey.length > 200)) {
+      sendJson(response, 400, { error: "idempotencyKey must contain 1 to 200 characters" });
+      return;
+    }
     const attachmentIds = body.attachmentIds ?? [];
     if (!Array.isArray(attachmentIds) || attachmentIds.some((id) => typeof id !== "string")) {
       sendJson(response, 400, { error: "attachmentIds must be an array of strings" });
@@ -1145,12 +1247,15 @@ export class DashboardServer {
         ...(typeof body.reasoningEffort === "string"
           ? { reasoningEffort: body.reasoningEffort }
           : {}),
+        ...(typeof body.idempotencyKey === "string"
+          ? { idempotencyKey: body.idempotencyKey.trim() }
+          : {}),
       });
       sendJson(response, 202, result);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const status = message.startsWith("找不到 Codex home") ? 404
-        : message.includes("正在处理") ? 409
+        : message.includes("正在处理") || message.includes("幂等") || message.includes("冲突") ? 409
           : 422;
       sendJson(response, status, { error: message });
     }
@@ -1173,7 +1278,7 @@ export class DashboardServer {
       return;
     }
     try {
-      const result = history.getMessageUpdates(
+      const result = await history.getMessageUpdates(
         homeId,
         threadId,
         cleanParam(url.searchParams.get("runId")),
@@ -1545,13 +1650,56 @@ export class DashboardServer {
       can_followup: task.origin === "web"
         ? Boolean(this.options.actions?.appendWebFollowup && task.state !== "RUNNING" && task.state !== "QUEUED")
         : Boolean(this.options.actions?.appendFeedback),
+      can_retry: task.origin === "web" && (task.state === "FAILED" || task.state === "CANCELED")
+        && Boolean(this.options.actions?.retryWebTask),
       runs: this.options.db.listRunsForTask(taskGuid).map((run) => ({
         ...run,
         events: this.options.db.listRunEvents(run.run_id),
       })),
       attachments: this.options.db.listWebTaskAttachments(taskGuid).map(publicWebTaskAttachment),
       outbox: this.options.db.listOutboxForTask(taskGuid),
+      reviews: task.origin === "web" ? this.options.db.listWebRunReviews(taskGuid) : [],
+      workspace_snapshots: task.origin === "web" ? this.options.db.listRunWorkspaceSnapshots(taskGuid) : [],
     });
+  }
+
+  private async saveWebRunReview(taskGuid: string, runId: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try { body = await readJsonBody(request); }
+    catch (error) { sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" }); return; }
+    if (body.decision !== "accepted" && body.decision !== "changes_requested") {
+      sendJson(response, 400, { error: "decision must be accepted or changes_requested" });
+      return;
+    }
+    if (body.note !== undefined && typeof body.note !== "string") {
+      sendJson(response, 400, { error: "note must be text" });
+      return;
+    }
+    try {
+      const review = this.options.db.saveWebRunReview(taskGuid, runId, body.decision, body.note ?? "");
+      sendJson(response, 200, { review });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "could not save review";
+      sendJson(response, message.includes("不存在") ? 404 : message.includes("1000") ? 400 : 409, { error: message });
+    }
+  }
+
+  private async retryWebTask(taskGuid: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    if (!this.options.actions?.retryWebTask) { sendJson(response, 501, { error: "Web 任务重试当前不可用" }); return; }
+    let body: Record<string, unknown>;
+    try { body = await readJsonBody(request); }
+    catch (error) { sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" }); return; }
+    const key = typeof body.idempotencyKey === "string" ? body.idempotencyKey.trim() : "";
+    if (!key || key.length > 200) { sendJson(response, 400, { error: "idempotencyKey must contain 1 to 200 characters" }); return; }
+    try {
+      const task = await this.options.actions.retryWebTask(taskGuid, key);
+      sendJson(response, 200, { task: { ...task, input: parseTaskInput(task.input_text) }, latest_run: this.options.db.getLatestRun(taskGuid) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "could not retry task";
+      sendJson(response, error instanceof WebTaskSubmissionConflictError ? 409 : 422, { error: message });
+    }
   }
 
   private async appendTaskPanelFollowup(
@@ -1589,6 +1737,158 @@ export class DashboardServer {
       sendJson(response, error instanceof WebTaskSubmissionConflictError ? 409 : 422,
         { error: error instanceof Error ? error.message : "追加信息失败" });
     }
+  }
+
+  private backupRootPath(): string {
+    if (!this.options.backupRoot || !this.options.databasePath || !this.options.backupAttachmentRoots) {
+      throw new Error("系统备份未配置");
+    }
+    return resolve(this.options.backupRoot);
+  }
+
+  private async ensureBackupDirectory(path: string, create: boolean): Promise<boolean> {
+    const requested = resolve(path);
+    let info = await lstat(requested).catch(() => null);
+    if (!info && create) {
+      await mkdir(requested, { recursive: true, mode: 0o700 });
+      info = await lstat(requested).catch(() => null);
+    }
+    if (!info) return false;
+    if (info.isSymbolicLink() || !info.isDirectory() || await realpath(requested) !== requested) {
+      throw new Error("备份目录必须是本机目录，不能是符号链接");
+    }
+    return true;
+  }
+
+  private async listSystemBackups(response: ServerResponse): Promise<void> {
+    try {
+      const root = this.backupRootPath();
+      if (!await this.ensureBackupDirectory(root, false)) {
+        sendJson(response, 200, { backups: [], restoreDirectory: "restores/" });
+        return;
+      }
+      const entries = await listBridgeBackups(root);
+      sendJson(response, 200, {
+        backups: entries.map((entry) => entry.status === "metadata"
+          ? { backupId: basename(entry.backupDirectory), status: entry.status, metadata: publicBackupMetadata(entry.metadata) }
+          : { backupId: basename(entry.backupDirectory), status: entry.status, error: "无法读取此备份的清单" }),
+        restoreDirectory: "restores/",
+      });
+    } catch (error) {
+      this.logBackupFailure("list", error);
+      sendJson(response, 503, { error: "无法读取备份列表，请检查备份目录状态" });
+    }
+  }
+
+  private async createSystemBackup(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    try {
+      const root = this.backupRootPath();
+      await this.ensureBackupDirectory(root, true);
+      const backupId = `backup-${new Date().toISOString().replaceAll(/[-:.]/g, "")}-${randomUUID().slice(0, 8)}`;
+      await createBridgeBackup({
+        databasePath: this.options.databasePath!,
+        outputDirectory: join(root, backupId),
+        attachmentRoots: this.options.backupAttachmentRoots!,
+      });
+      const metadata = await inspectBridgeBackupMetadata(join(root, backupId));
+      sendJson(response, 201, {
+        backup: {
+          backupId,
+          status: "metadata",
+          metadata: publicBackupMetadata(metadata),
+        },
+      });
+    } catch (error) {
+      this.logBackupFailure("create", error);
+      sendJson(response, 422, { error: this.publicBackupError(error) });
+    }
+  }
+
+  private async runSystemBackupAction(
+    backupId: string,
+    action: "verify" | "check-upgrade" | "restore",
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    if (!isSafeBackupId(backupId)) {
+      sendJson(response, 400, { error: "无效的备份标识" });
+      return;
+    }
+    try {
+      const root = this.backupRootPath();
+      await this.ensureBackupDirectory(root, false);
+      const backupDirectory = join(root, backupId);
+      if (action === "verify") {
+        const verification = await verifyBridgeBackup(backupDirectory);
+        sendJson(response, 200, { backupId, verification: publicBackupMetadata(verification) });
+        return;
+      }
+      if (action === "check-upgrade") {
+        const compatibility = await checkBridgeBackupUpgradeCompatibility(backupDirectory);
+        sendJson(response, 200, {
+          backupId,
+          verification: publicBackupMetadata(compatibility.verification),
+          compatibility: {
+            sourceProgramVersion: compatibility.sourceProgramVersion,
+            targetProgramVersion: compatibility.targetProgramVersion,
+            sourceSchemaFingerprint: compatibility.sourceSchemaFingerprint,
+            migratedSchemaFingerprint: compatibility.migratedSchemaFingerprint,
+            compatible: compatibility.compatible,
+          },
+        });
+        return;
+      }
+
+      const restoreRoot = join(root, "restores");
+      await this.ensureBackupDirectory(restoreRoot, true);
+      const restoreId = `restore-${new Date().toISOString().replaceAll(/[-:.]/g, "")}-${randomUUID().slice(0, 8)}`;
+      const restored = await restoreBridgeBackup({
+        backupDirectory,
+        outputDirectory: join(restoreRoot, restoreId),
+      });
+      sendJson(response, 201, {
+        verification: publicBackupMetadata(restored.verification),
+        restore: {
+          restoreId,
+          location: `restores/${restoreId}/`,
+          attachmentCount: restored.attachmentCount,
+          attachmentBytes: restored.attachmentBytes,
+          schemaFingerprint: restored.schemaFingerprint,
+        },
+      });
+    } catch (error) {
+      this.logBackupFailure(action, error);
+      sendJson(response, 422, { error: this.publicBackupError(error) });
+    }
+  }
+
+  private publicBackupError(error: unknown): string {
+    let message = error instanceof Error ? error.message : "备份操作失败";
+    const privatePaths = [
+      this.options.backupRoot,
+      this.options.databasePath,
+      ...(this.options.backupAttachmentRoots ? Object.values(this.options.backupAttachmentRoots).flat() : []),
+    ].filter((value): value is string => Boolean(value));
+    for (const path of privatePaths) message = message.replaceAll(path, "[Bridge 数据目录]");
+    return message.slice(0, 500);
+  }
+
+  private logBackupFailure(action: string, error: unknown): void {
+    this.options.logger?.warn("system backup operation failed", {
+      action,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  private getTaskPanelAampTask(taskId: string, response: ServerResponse): void {
+    const task = this.options.db.getAampTask(taskId);
+    if (!task) {
+      sendJson(response, 404, { error: "AAMP task not found" });
+      return;
+    }
+    sendJson(response, 200, { task: aampTaskView(task), can_followup: false });
   }
 
   private listAampTasks(url: URL, response: ServerResponse): void {
@@ -1633,7 +1933,15 @@ export class DashboardServer {
     sendJson(response, 200, {
       groups: config.groups.map(publicShortcutGroup),
       shortcuts: config.shortcuts.map(publicShortcut),
+      revision: this.shortcutConfigRevision(config),
     });
+  }
+
+  private shortcutConfigRevision(config = this.options.db.getShortcutConfig()): string {
+    return createHash("sha256").update(JSON.stringify({
+      groups: config.groups.map(publicShortcutGroup),
+      shortcuts: config.shortcuts.map(publicShortcut),
+    })).digest("hex");
   }
 
   private async createShortcutGroup(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -1765,7 +2073,7 @@ export class DashboardServer {
       return false;
     }
     const origin = request.headers.origin;
-    if (origin && !this.isSameOrigin(origin, request)) {
+    if (origin && !this.isSameOriginAction(origin, request)) {
       sendJson(response, 403, { error: "cross-origin action rejected" });
       return false;
     }
@@ -1896,7 +2204,7 @@ export class DashboardServer {
       return;
     }
     const origin = request.headers.origin;
-    if (origin && !this.isSameOrigin(origin, request)) {
+    if (origin && !this.isSameOriginAction(origin, request)) {
       sendJson(response, 403, { error: "cross-origin action rejected" });
       return;
     }
@@ -2069,12 +2377,27 @@ export class DashboardServer {
     const forwardedProtocol = firstHeaderValue(request.headers["x-forwarded-proto"]);
     if (requestHost) {
       const expectedProtocol = forwardedProtocol?.toLowerCase() === "https" ? "https:" : "http:";
-      return parsedOrigin.host === requestHost && parsedOrigin.protocol === expectedProtocol;
+      try {
+        const requestOrigin = new URL(`${expectedProtocol}//${requestHost}/`);
+        const forwardedPort = firstHeaderValue(request.headers["x-forwarded-port"]);
+        if (forwardedPort) {
+          if (!/^\d{1,5}$/.test(forwardedPort) || Number(forwardedPort) > 65_535) return false;
+          if (!requestOrigin.port) requestOrigin.port = forwardedPort;
+        }
+        return parsedOrigin.origin === requestOrigin.origin;
+      } catch {
+        return false;
+      }
     }
     const server = this.server;
     const address = server?.address();
     const port = typeof address === "object" && address ? address.port : this.options.port;
     return parsedOrigin.origin === `http://${this.options.host}:${port}`;
+  }
+
+  private isSameOriginAction(origin: string, request: IncomingMessage): boolean {
+    if (this.isSameOrigin(origin, request)) return true;
+    return firstHeaderValue(request.headers["sec-fetch-site"])?.toLowerCase() === "same-origin";
   }
 }
 
@@ -2086,9 +2409,11 @@ function isSpaRoute(pathname: string): boolean {
     || pathname === "/system-management/devices"
     || pathname === "/system-management/shortcuts"
     || pathname === "/system-management/usage"
+    || pathname === "/system-management/health"
+    || pathname === "/system-management/backups"
     || pathname === "/direct-tasks"
     || pathname === "/system-management/projects"
-    || /^\/tasks\/(?:desk|direct)\/[^/]+$/.test(pathname)
+    || /^\/tasks\/(?:desk|direct|aamp)\/[^/]+$/.test(pathname)
     || pathname === "/codex-history"
     || pathname === "/tmux-dashboard"
     || (pathname.startsWith("/tmux-dashboard/")
@@ -2488,6 +2813,25 @@ function publicWebTaskAttachment(attachment: StoredWebTaskAttachment) {
   };
 }
 
+function publicBackupMetadata(metadata: BridgeBackupMetadata | BridgeBackupVerification) {
+  return {
+    formatVersion: metadata.formatVersion,
+    programVersion: metadata.programVersion,
+    createdAt: metadata.createdAt,
+    databaseBytes: metadata.databaseBytes,
+    attachmentCount: metadata.attachmentCount,
+    attachmentBytes: metadata.attachmentBytes,
+    attachmentCountsByKind: metadata.attachmentCountsByKind,
+    schemaFingerprint: metadata.schemaFingerprint,
+    contentHashesVerified: "contentHashesVerified" in metadata ? metadata.contentHashesVerified : true,
+  };
+}
+
+function isSafeBackupId(value: string): boolean {
+  return value.length > 0 && value.length <= 160 && value !== "." && value !== ".."
+    && !/[\\/\u0000-\u001f\u007f]/u.test(value);
+}
+
 function setSecurityHeaders(response: ServerResponse): void {
   response.setHeader("Cache-Control", "no-store");
   response.setHeader("X-Content-Type-Options", "nosniff");
@@ -2567,5 +2911,19 @@ function directTaskView(task: StoredBridgeTask) {
     card_state: task.card_state, final_response: task.final_response, error: task.error,
     initial_final_response: task.initial_final_response,
     created_at: task.created_at, updated_at: task.updated_at,
+  };
+}
+
+function aampTaskView(task: StoredAampTask) {
+  return {
+    source: "aamp" as const,
+    id: task.aamp_task_id,
+    text: task.user_text,
+    status: task.status,
+    last_progress_text: task.last_delta_text || null,
+    error: task.error_msg,
+    image_count: task.image_local_paths.length,
+    created_at: task.created_at,
+    updated_at: task.updated_at,
   };
 }

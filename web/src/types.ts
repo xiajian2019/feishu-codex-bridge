@@ -208,7 +208,7 @@ export interface CodexHistoryTurnAttachments {
   attachments: CodexHistoryAttachment[];
 }
 
-export type CodexHistoryRunState = "running" | "cancelling" | "completed" | "failed" | "cancelled";
+export type CodexHistoryRunState = "running" | "cancelling" | "completed" | "failed" | "cancelled" | "interrupted";
 
 export interface CodexHistoryWriterStatus {
   state: "available" | "busy" | "unknown";
@@ -257,6 +257,7 @@ export interface CodexHistoryUpdatesResponse {
   error?: string;
   attachments?: CodexHistoryAttachment[];
   resetRequired?: boolean;
+  recovery?: { checkedAt: string; codexThreadStatus: string | null; error?: string };
 }
 
 export interface TaskInput {
@@ -325,6 +326,25 @@ export interface DirectTaskSummary {
   updated_at: string;
 }
 
+export type AampTaskStatus = "pending" | "running" | "done" | "failed" | "cancelled";
+
+export interface AampTaskSummary {
+  source: "aamp";
+  id: string;
+  text: string | null;
+  status: AampTaskStatus;
+  last_progress_text: string | null;
+  error: string | null;
+  image_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AampTaskDetailResponse {
+  task: AampTaskSummary;
+  can_followup: false;
+}
+
 export interface DirectTaskDetailResponse {
   task: DirectTaskSummary;
   can_followup?: boolean;
@@ -357,6 +377,31 @@ export interface StoredRun {
   events?: StoredRunEvent[];
 }
 
+export interface WebRunReview {
+  run_id: string;
+  task_guid: string;
+  decision: "accepted" | "changes_requested";
+  note: string;
+  reviewed_at: string;
+}
+
+export interface GitWorkspaceSnapshot {
+  capturedAt: string;
+  isGitRepository: boolean;
+  headCommit: string | null;
+  dirtyPaths: string[];
+  untrackedPaths: string[];
+  truncated: boolean;
+  taskAttribution: "unattributed-shared-workspace";
+  attributionNote: string;
+}
+
+export interface RunWorkspaceSnapshot {
+  run_id: string;
+  stage: "before" | "after";
+  snapshot: GitWorkspaceSnapshot;
+}
+
 export interface StoredRunEvent {
   id: number;
   run_id: string;
@@ -380,7 +425,7 @@ export interface OutboxEntry {
 }
 
 export interface TaskListResponse {
-  items: Array<(TaskSummary & { source: "desk"; latest_run: StoredRun | null }) | DirectTaskSummary>;
+  items: Array<(TaskSummary & { source: "desk"; latest_run: StoredRun | null; latest_review: WebRunReview | null }) | DirectTaskSummary | AampTaskSummary>;
   total: number;
   limit: number;
   offset: number;
@@ -394,9 +439,12 @@ export interface TaskListResponse {
 export interface TaskDetailResponse {
   task: TaskSummary;
   can_followup?: boolean;
+  can_retry?: boolean;
   runs: StoredRun[];
   attachments: TaskAttachment[];
   outbox: OutboxEntry[];
+  reviews: WebRunReview[];
+  workspace_snapshots: RunWorkspaceSnapshot[];
 }
 
 export interface DashboardChange {

@@ -6,6 +6,17 @@ import type {
   CodexHistoryReasoningEffort,
 } from "./types.js";
 import { deleteCodexHistoryAttachment, uploadCodexHistoryAttachment } from "./api.js";
+import {
+  clearCodexHistoryDraft,
+  loadCodexHistoryDraft,
+  saveCodexHistoryDraft,
+  type CodexHistoryDraftFile,
+} from "./codex-history-draft-store.js";
+import {
+  clearPendingCodexHistorySubmission,
+  loadPendingCodexHistorySubmission,
+  savePendingCodexHistorySubmission,
+} from "./codex-history-submission-store.js";
 
 export interface CodexHistoryComposerResult {
   ok: boolean;
@@ -24,11 +35,18 @@ export interface CodexHistoryMessageComposerProps {
   cancelling: boolean;
   placeholder: string;
   settingsScopeKey: string;
+  turnIndex: number;
   models: CodexHistoryModelOption[];
   modelCatalogAvailable: boolean;
   currentModel?: string | null;
   currentReasoningEffort?: string | null;
-  onSubmit: (text: string, attachmentIds: string[], settings: CodexHistoryComposerSettings) => Promise<CodexHistoryComposerResult>;
+  onSubmit: (
+    text: string,
+    attachmentIds: string[],
+    settings: CodexHistoryComposerSettings,
+    idempotencyKey: string,
+    turnIndex: number,
+  ) => Promise<CodexHistoryComposerResult>;
   onInterrupt: () => void;
   onAttachmentError: (message: string) => void;
   onScrollToTop: () => void;
@@ -97,6 +115,7 @@ export function CodexHistoryMessageComposer({
   cancelling,
   placeholder,
   settingsScopeKey,
+  turnIndex,
   models,
   modelCatalogAvailable,
   currentModel,
@@ -108,14 +127,23 @@ export function CodexHistoryMessageComposer({
   onScrollToBottom,
 }: CodexHistoryMessageComposerProps): ReactElement {
   const [text, setText] = useState("");
-  const [files, setFiles] = useState<File[]>([]);
+  const [files, setFiles] = useState<CodexHistoryDraftFile[]>([]);
+  const [draftScope, setDraftScope] = useState("");
+  const [draftReady, setDraftReady] = useState(false);
   const [preparing, setPreparing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [model, setModel] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
-  const controlsDisabled = disabled || preparing;
+  const currentScopeRef = useRef(settingsScopeKey);
+  currentScopeRef.current = settingsScopeKey;
+  const latestReadyDraftRef = useRef<{ scopeKey: string; text: string; files: CodexHistoryDraftFile[] } | null>(null);
+  const currentDraftReady = draftReady && draftScope === settingsScopeKey;
+  if (currentDraftReady) latestReadyDraftRef.current = { scopeKey: settingsScopeKey, text, files };
+  const visibleText = currentDraftReady ? text : "";
+  const visibleFiles = currentDraftReady ? files : [];
+  const controlsDisabled = disabled || preparing || !currentDraftReady || !settingsScopeKey;
   const submitDisabled = controlsDisabled || sendDisabled || sending || cancelling;
   const normalizedCurrentModel = currentModel?.trim() ?? "";
   const currentModelOption = normalizedCurrentModel
@@ -147,6 +175,53 @@ export function CodexHistoryMessageComposer({
     setReasoningEffort("");
   }, [settingsScopeKey]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setDraftReady(false);
+    setDraftScope("");
+    setText("");
+    setFiles([]);
+    void loadCodexHistoryDraft(settingsScopeKey)
+      .then(({ draft, files: restoredFiles }) => {
+        if (cancelled) return;
+        setText(draft?.text ?? "");
+        setFiles(restoredFiles);
+        setDraftScope(settingsScopeKey);
+        setDraftReady(true);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setDraftScope(settingsScopeKey);
+        setDraftReady(true);
+      });
+    return () => { cancelled = true; };
+  }, [settingsScopeKey]);
+
+  useEffect(() => {
+    if (!currentDraftReady) return;
+    const timeout = window.setTimeout(() => {
+      void saveCodexHistoryDraft(settingsScopeKey, text, files);
+    }, 250);
+    return () => window.clearTimeout(timeout);
+  }, [currentDraftReady, settingsScopeKey, text, files]);
+
+  useEffect(() => {
+    const flush = (): void => {
+      const draft = latestReadyDraftRef.current;
+      if (draft?.scopeKey === settingsScopeKey) void saveCodexHistoryDraft(draft.scopeKey, draft.text, draft.files);
+    };
+    const flushWhenHidden = (): void => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    window.addEventListener("pagehide", flush);
+    document.addEventListener("visibilitychange", flushWhenHidden);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      document.removeEventListener("visibilitychange", flushWhenHidden);
+      flush();
+    };
+  }, [settingsScopeKey]);
+
   const addFiles = (event: ChangeEvent<HTMLInputElement>): void => {
     const selected = Array.from(event.currentTarget.files ?? []);
     event.currentTarget.value = "";
@@ -157,7 +232,9 @@ export function CodexHistoryMessageComposer({
       return;
     }
     setFiles((current) => {
-      const additions = selected.filter((file) => !current.some((item) => sameFile(item, file)));
+      const additions = selected
+        .filter((file) => !current.some((item) => sameFile(item.file, file)))
+        .map((file) => ({ id: createDraftAttachmentId(), file }));
       if (current.length + additions.length > MAX_ATTACHMENTS) {
         onAttachmentError(`一次最多选择 ${MAX_ATTACHMENTS} 个文件。`);
         return current;
@@ -168,27 +245,60 @@ export function CodexHistoryMessageComposer({
 
   const send = async (): Promise<void> => {
     if (submitDisabled || (!text.trim() && files.length === 0)) return;
+    const submittedScopeKey = settingsScopeKey;
+    const submittedFiles = files;
+    const submittedText = text.trim();
+    const settings: CodexHistoryComposerSettings = {
+      ...(model.trim() ? { model: model.trim() } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+    };
+    const signature = JSON.stringify({
+      text: submittedText,
+      files: submittedFiles.map(({ id, file }) => [id, file.name, file.type, file.size, file.lastModified]),
+      model: settings.model ?? "",
+      reasoningEffort: settings.reasoningEffort ?? "",
+    });
     setPreparing(true);
     const staged: CodexHistoryAttachment[] = [];
+    let submissionStarted = false;
     try {
-      for (const file of files) {
-        const uploaded = await uploadCodexHistoryAttachment(file);
-        staged.push(uploaded);
+      const prior = loadPendingCodexHistorySubmission(submittedScopeKey);
+      const reusable = prior?.signature === signature && prior.attachmentIds.length === submittedFiles.length
+        ? prior : null;
+      if (!reusable) {
+        clearPendingCodexHistorySubmission(submittedScopeKey);
+        for (const { file } of submittedFiles) {
+          const uploaded = await uploadCodexHistoryAttachment(file);
+          staged.push(uploaded);
+        }
       }
-      const result = await onSubmit(text.trim(), staged.map((item) => item.attachmentId), {
-        ...(model.trim() ? { model: model.trim() } : {}),
-        ...(reasoningEffort ? { reasoningEffort } : {}),
-      });
+      const pending = reusable ?? {
+        version: 1 as const,
+        signature,
+        idempotencyKey: crypto.randomUUID(),
+        attachmentIds: staged.map((item) => item.attachmentId),
+        turnIndex,
+        updatedAt: Date.now(),
+      };
+      savePendingCodexHistorySubmission(submittedScopeKey, pending);
+      submissionStarted = true;
+      const result = await onSubmit(submittedText, pending.attachmentIds, settings, pending.idempotencyKey, pending.turnIndex);
       if (!result.ok) {
-        await Promise.all(staged.map(({ attachmentId }) => deleteCodexHistoryAttachment(attachmentId).catch(() => undefined)));
         if (result.message) onAttachmentError(result.message);
         return;
       }
-      setText("");
-      setFiles([]);
-      if (textAreaRef.current) textAreaRef.current.style.height = "";
+      clearPendingCodexHistorySubmission(submittedScopeKey);
+      clearCodexHistoryDraft(submittedScopeKey);
+      if (currentScopeRef.current === submittedScopeKey) {
+        latestReadyDraftRef.current = { scopeKey: submittedScopeKey, text: "", files: [] };
+        setText("");
+        setFiles([]);
+        if (textAreaRef.current) textAreaRef.current.style.height = "";
+      }
     } catch (error) {
-      await Promise.all(staged.map(({ attachmentId }) => deleteCodexHistoryAttachment(attachmentId).catch(() => undefined)));
+      if (!submissionStarted) {
+        await Promise.all(staged.map(({ attachmentId }) => deleteCodexHistoryAttachment(attachmentId).catch(() => undefined)));
+      }
       onAttachmentError(error instanceof Error ? error.message : "附件上传失败。");
     } finally {
       setPreparing(false);
@@ -219,12 +329,12 @@ export function CodexHistoryMessageComposer({
         aria-label="选择图片或文件"
       />
       <div className="dashboard-composer-images" aria-label="待发送附件">
-        {files.map((file, index) => (
+        {visibleFiles.map(({ id, file }, index) => (
           <PendingAttachment
-            key={`${file.name}:${file.size}:${file.lastModified}:${index}`}
+            key={`${id}:${index}`}
             file={file}
             disabled={controlsDisabled}
-            onRemove={() => setFiles((current) => current.filter((_, fileIndex) => fileIndex !== index))}
+            onRemove={() => setFiles((current) => current.filter((attachment) => attachment.id !== id))}
           />
         ))}
       </div>
@@ -278,7 +388,7 @@ export function CodexHistoryMessageComposer({
         placeholder={placeholder}
         maxLength={8_000}
         rows={2}
-        value={text}
+        value={visibleText}
         disabled={controlsDisabled}
         enterKeyHint="send"
         onChange={(event) => {
@@ -360,4 +470,10 @@ function reasoningEffortLabel(value: string, description = ""): string {
 
 function sameFile(left: File, right: File): boolean {
   return left.name === right.name && left.size === right.size && left.lastModified === right.lastModified;
+}
+
+function createDraftAttachmentId(): string {
+  return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }

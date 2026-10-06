@@ -21,6 +21,7 @@ import {
 import { useNavigate, useParams, useSearchParams } from "react-router";
 
 import { CodeTextViewer } from "./CodeTextViewer.js";
+import { getLocalDraftScope } from "./local-draft-scope.js";
 import {
   codexHistoryRunAttachmentUrl,
   fetchCodexHistory,
@@ -645,7 +646,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
         if (next.resetRequired) {
           liveCursorRef.current = 0;
           setLiveRun((current) => current?.runId === next.runId
-            ? { ...current, items: [], ...(next.usage ? { usage: next.usage } : {}) }
+            ? { ...current, state: next.state, cursor: next.cursor, items: [], ...(next.usage ? { usage: next.usage } : {}) }
             : current);
         } else {
           setLiveRun((current) => current?.runId === next.runId
@@ -659,9 +660,13 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
             : current);
         }
         liveCursorRef.current = next.cursor;
-        if (next.state === "completed" || next.state === "failed" || next.state === "cancelled") {
+        if (next.state === "completed" || next.state === "failed" || next.state === "cancelled" || next.state === "interrupted") {
           if (next.state === "failed") setError(next.error || "Codex turn 执行失败。");
           if (next.state === "cancelled") setRunNotice("Codex 执行已中断。");
+          if (next.state === "interrupted") {
+            setRunNotice(next.recovery?.error
+              ?? "Bridge 已重启，无法继续跟踪上一轮；请核对 Codex 历史后再提交。");
+          }
           const refreshed = await fetchCodexThreadDetail(homeId, threadId, controller.signal);
           if (cancelled || controller.signal.aborted) return;
           setDetail(refreshed);
@@ -724,12 +729,15 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
     text: string,
     attachmentIds: string[],
     settings: CodexHistoryComposerSettings,
+    idempotencyKey: string,
+    turnIndex: number,
   ): Promise<{ ok: boolean; message?: string }> => {
     try {
       const result = await sendCodexThreadMessage(homeId, threadId, {
         text,
         attachmentIds,
-        turnIndex: turns.length,
+        turnIndex,
+        idempotencyKey,
         ...(settings.model ? { model: settings.model } : {}),
         ...(settings.reasoningEffort ? { reasoningEffort: settings.reasoningEffort } : {}),
       });
@@ -743,6 +751,18 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
         }));
       if (previews.length > 0) {
         setImagePreviews((current) => ({ ...current, [result.turnIndex]: previews }));
+      }
+      if (!isLiveRunActive(result.state)) {
+        const refreshed = await fetchCodexThreadDetail(homeId, threadId);
+        setDetail(refreshed);
+        setImagePreviews(buildTurnImagePreviews(homeId, threadId, refreshed.imageAttachments ?? []));
+        writeCodexHistoryDetailCache(refreshed);
+        setLiveRun(null);
+        setRunNotice(result.state === "interrupted"
+          ? "Bridge 已重启，无法继续跟踪上一轮；请核对 Codex 历史后再提交。"
+          : null);
+        setError(null);
+        return { ok: true };
       }
       liveCursorRef.current = result.cursor;
       setLiveRun({
@@ -765,7 +785,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
       setError(message);
       return { ok: false, message };
     }
-  }, [homeId, threadId, turns.length]);
+  }, [homeId, threadId]);
 
   const interruptRun = useCallback(async (): Promise<void> => {
     if (!liveRun || liveRun.state !== "running") return;
@@ -843,7 +863,8 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
             sending={isLiveRunActive(liveRun?.state)}
             cancelling={liveRun?.state === "cancelling"}
             placeholder="发送消息到当前 Codex session…"
-            settingsScopeKey={`${homeId}:${threadId}`}
+            settingsScopeKey={getLocalDraftScope() ? `${getLocalDraftScope()}|${JSON.stringify([homeId, threadId])}` : ""}
+            turnIndex={turns.length}
             models={detail?.models ?? []}
             modelCatalogAvailable={detail?.models !== undefined}
             currentModel={thread.model}
