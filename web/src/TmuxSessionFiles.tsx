@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { useNavigate, useParams } from "react-router";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import { getActionToken, getJson } from "./api.js";
 import { CodeTextViewer } from "./CodeTextViewer.js";
@@ -12,7 +14,7 @@ const COMPACT_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, { month: "nume
 const IMAGE_EXTENSIONS = new Set(["apng", "avif", "bmp", "gif", "jpeg", "jpg", "png", "webp"]);
 const TEXT_EXTENSIONS = new Set([
   "c", "cc", "conf", "cpp", "css", "csv", "go", "h", "hpp", "html", "ini", "java", "js", "json", "jsx",
-  "log", "lua", "md", "mjs", "py", "rb", "rs", "sh", "sql", "svg", "toml", "ts", "tsx", "txt", "xml", "yaml", "yml",
+  "log", "lua", "md", "markdown", "mjs", "py", "rb", "rs", "sh", "sql", "svg", "toml", "ts", "tsx", "txt", "xml", "yaml", "yml",
 ]);
 
 interface SessionFileEntry {
@@ -29,7 +31,31 @@ interface SessionFileListing {
   entries: SessionFileEntry[];
 }
 
-type FilePreview = { name: string; type: "image"; url: string } | { name: string; type: "text"; text: string };
+type FilePreview =
+  | { name: string; relativePath: string; size: number; type: "image"; url: string; blob: Blob }
+  | { name: string; relativePath: string; size: number; type: "markdown" | "text"; text: string };
+
+type SessionFileAction = "view" | "download" | "copy" | "forward";
+
+function SessionFileActionIcon({ action }: { action: SessionFileAction }): ReactElement {
+  if (action === "view") {
+    return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" /><circle cx="12" cy="12" r="2.5" /></svg>;
+  }
+  if (action === "download") {
+    return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5v11m0 0 4-4m-4 4-4-4M4 16.5v3h16v-3" /></svg>;
+  }
+  if (action === "copy") {
+    return <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" /></svg>;
+  }
+  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m13 4 7 7-7 7" /><path d="M20 11H9a5 5 0 0 0-5 5v2" /></svg>;
+}
+
+const SESSION_FILE_MARKDOWN_COMPONENTS: Components = {
+  table: ({ node, ...props }) => {
+    void node;
+    return <div className="codex-markdown-table-scroll"><table {...props} /></div>;
+  },
+};
 
 function sessionFilesUrl(sessionId: string, action: "list" | "upload" | "download", path: string): string {
   const suffix = action === "list" ? "" : `/${action}`;
@@ -82,6 +108,50 @@ function formatCompactModifiedAt(value: number): string {
 async function responseError(response: Response): Promise<string> {
   const payload = await response.json().catch(() => null) as { error?: string } | null;
   return payload?.error || `Request failed (${response.status}).`;
+}
+
+async function copyTextToClipboard(value: string): Promise<void> {
+  const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const field = document.createElement("textarea");
+  field.value = value;
+  field.setAttribute("readonly", "");
+  field.style.position = "fixed";
+  field.style.left = "0";
+  field.style.top = "0";
+  field.style.width = "1px";
+  field.style.height = "1px";
+  field.style.padding = "0";
+  field.style.border = "0";
+  field.style.opacity = "0.01";
+  field.style.fontSize = "16px";
+  document.body.append(field);
+  let copied = false;
+  try {
+    field.focus({ preventScroll: true });
+    field.select();
+    field.setSelectionRange(0, field.value.length);
+    copied = document.execCommand("copy");
+  } finally {
+    field.remove();
+    if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
+  }
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // The synchronous fallback above keeps working on HTTP LAN pages and iOS Safari.
+    }
+  }
+  if (!copied) throw new Error("此浏览器无法访问剪贴板。");
+}
+
+async function copyImageToClipboard(blob: Blob): Promise<void> {
+  if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined" || !blob.type.startsWith("image/")) {
+    throw new Error("此浏览器不支持复制图片。");
+  }
+  await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
 }
 
 export function TmuxSessionFiles(): ReactElement {
@@ -150,6 +220,59 @@ export function TmuxSessionFiles(): ReactElement {
     navigate(`/tmux-dashboard?session=${encodeURIComponent(sessionId)}`);
   };
 
+  const forwardFileToSession = (relativePath: string): void => {
+    navigate(`/tmux-dashboard?session=${encodeURIComponent(sessionId)}`, {
+      state: {
+        sessionFileForward: {
+          id: `${Date.now()}-${Math.random()}`,
+          sessionId,
+          text: relativePath,
+        },
+      },
+    });
+  };
+
+  const copyFileName = async (relativePath: string): Promise<void> => {
+    setError("");
+    setNotice("");
+    try {
+      await copyTextToClipboard(relativePath);
+      setNotice(`已复制文件名：${relativePath}`);
+    } catch (copyError) {
+      setError(copyError instanceof Error ? copyError.message : "复制文件失败。");
+    }
+  };
+
+  const copyPreview = async (file: FilePreview): Promise<void> => {
+    if (file.type === "image") {
+      try {
+        await copyImageToClipboard(file.blob);
+        setError("");
+        setNotice(`已复制图片：${file.relativePath}`);
+        return;
+      } catch {
+        // Fall through to copying the relative file name.
+      }
+    } else {
+      try {
+        await copyTextToClipboard(file.text);
+        setError("");
+        setNotice(`已复制文件内容：${file.relativePath}`);
+        return;
+      } catch (copyError) {
+        setError(copyError instanceof Error ? copyError.message : "复制文件失败。");
+        return;
+      }
+    }
+    try {
+      await copyTextToClipboard(file.relativePath);
+      setError("");
+      setNotice(`已复制文件名：${file.relativePath}`);
+    } catch (copyError) {
+      setError(copyError instanceof Error ? copyError.message : "复制文件失败。");
+    }
+  };
+
   const uploadFiles = useCallback(async (files: FileList | File[]): Promise<void> => {
     const selectedFiles = Array.from(files);
     if (selectedFiles.length === 0) return;
@@ -187,14 +310,17 @@ export function TmuxSessionFiles(): ReactElement {
 
   const openPreview = async (entry: SessionFileEntry): Promise<void> => {
     setPreview(null);
+    setError("");
+    setNotice("");
+    const relativePath = fileRelativePath(currentPath, entry.name);
     const extension = fileExtension(entry.name);
     if (IMAGE_EXTENSIONS.has(extension)) {
-      setError("");
       try {
-        const response = await fetch(sessionFilesUrl(sessionId, "download", fileRelativePath(currentPath, entry.name)));
+        const response = await fetch(sessionFilesUrl(sessionId, "download", relativePath));
         if (!response.ok) throw new Error(await responseError(response));
-        const url = URL.createObjectURL(await response.blob());
-        setPreview({ name: entry.name, type: "image", url });
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        setPreview({ name: entry.name, relativePath, size: entry.size, type: "image", url, blob });
       } catch (previewError) {
         setError(previewError instanceof Error ? previewError.message : "Could not preview this image.");
       }
@@ -208,11 +334,10 @@ export function TmuxSessionFiles(): ReactElement {
       setError("文件超过 2 MB，请下载后查看。");
       return;
     }
-    setError("");
     try {
-      const response = await fetch(sessionFilesUrl(sessionId, "download", fileRelativePath(currentPath, entry.name)));
+      const response = await fetch(sessionFilesUrl(sessionId, "download", relativePath));
       if (!response.ok) throw new Error(await responseError(response));
-      setPreview({ name: entry.name, type: "text", text: await response.text() });
+      setPreview({ name: entry.name, relativePath, size: entry.size, type: extension === "md" || extension === "markdown" ? "markdown" : "text", text: await response.text() });
     } catch (previewError) {
       setError(previewError instanceof Error ? previewError.message : "Could not preview this file.");
     }
@@ -292,7 +417,7 @@ export function TmuxSessionFiles(): ReactElement {
             <p className="tmux-files-empty">{filenameQuery.trim() ? "没有匹配的文件。" : "这个目录为空。"}</p>
           ) : null}
           {!loading && visibleEntries.map((entry) => (
-            <div className="tmux-files-row" key={entry.name}>
+            <div className={`tmux-files-row${entry.type === "file" ? " has-actions" : ""}`} key={entry.name}>
               <div className="tmux-files-row-content">
                 <div className={`tmux-files-name${entry.type === "directory" ? " is-directory" : ""}`}>
                   <span aria-hidden="true">{entry.type === "directory" ? "▰" : "▤"}</span><span>{entry.name}</span>
@@ -311,23 +436,84 @@ export function TmuxSessionFiles(): ReactElement {
               />
               <div className="tmux-files-row-actions">
                 {entry.type === "file" && (IMAGE_EXTENSIONS.has(fileExtension(entry.name)) || TEXT_EXTENSIONS.has(fileExtension(entry.name))) ? (
-                  <button type="button" onClick={() => void openPreview(entry)}>预览</button>
+                  <button type="button" aria-label={`查看 ${entry.name}`} title="查看" onClick={() => void openPreview(entry)}>
+                    <SessionFileActionIcon action="view" />
+                  </button>
                 ) : null}
                 {entry.type === "file" ? (
-                  <a href={sessionFilesUrl(sessionId, "download", fileRelativePath(currentPath, entry.name))} download={entry.name}>下载</a>
+                  <a
+                    href={sessionFilesUrl(sessionId, "download", fileRelativePath(currentPath, entry.name))}
+                    download={entry.name}
+                    aria-label={`下载 ${entry.name}`}
+                    title="下载"
+                  >
+                    <SessionFileActionIcon action="download" />
+                  </a>
+                ) : null}
+                {entry.type === "file" ? (
+                  <button
+                    type="button"
+                    aria-label={`复制 ${entry.name}`}
+                    title="复制文件名"
+                    onClick={() => void copyFileName(fileRelativePath(currentPath, entry.name))}
+                  >
+                    <SessionFileActionIcon action="copy" />
+                  </button>
+                ) : null}
+                {entry.type === "file" ? (
+                  <button
+                    type="button"
+                    aria-label={`转发 ${entry.name} 到 Session 聊天框`}
+                    title="转发到 Session 聊天框"
+                    onClick={() => forwardFileToSession(fileRelativePath(currentPath, entry.name))}
+                  >
+                    <SessionFileActionIcon action="forward" />
+                  </button>
                 ) : null}
               </div>
             </div>
           ))}
         </div>
-        <p className="tmux-files-footnote">上传会写入当前目录；下载位置由浏览器的下载设置决定。文件访问限制在 session 工作目录内。</p>
+        <p className="tmux-files-footnote">上传会写入当前目录；下载位置由浏览器的下载设置决定。列表复制文件名，预览复制内容；转发会把相对文件名追加到对应 Session 的聊天框。文件访问限制在 session 工作目录内。</p>
       </section>
 
       {preview ? (
         <div className="tmux-files-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreview(null); }}>
           <section className="tmux-files-preview" role="dialog" aria-modal="true" aria-label={`预览 ${preview.name}`}>
-            <header><strong title={preview.name}>{preview.name}</strong><button type="button" onClick={() => setPreview(null)} aria-label="关闭预览">×</button></header>
-            {preview.type === "image" ? <img src={preview.url} alt={preview.name} /> : <CodeTextViewer fileName={preview.name} text={preview.text} />}
+            <header>
+              <strong title={preview.name}>{preview.name}</strong>
+              <div className="tmux-files-preview-actions">
+                <a
+                  href={sessionFilesUrl(sessionId, "download", preview.relativePath)}
+                  download={preview.name}
+                  aria-label={`下载 ${preview.name}`}
+                  title="下载"
+                >
+                  <SessionFileActionIcon action="download" />
+                </a>
+                <button type="button" aria-label={`复制 ${preview.name}`} title="复制内容" onClick={() => void copyPreview(preview)}>
+                  <SessionFileActionIcon action="copy" />
+                </button>
+                <button
+                  type="button"
+                  aria-label={`转发 ${preview.name} 到 Session 聊天框`}
+                  title="转发到 Session 聊天框"
+                  onClick={() => forwardFileToSession(preview.relativePath)}
+                >
+                  <SessionFileActionIcon action="forward" />
+                </button>
+                <button type="button" onClick={() => setPreview(null)} aria-label="关闭预览" title="关闭预览">×</button>
+              </div>
+            </header>
+            {error ? <div className="tmux-files-message tmux-files-preview-feedback is-error" role="alert">{error}</div> : null}
+            {notice ? <div className="tmux-files-message tmux-files-preview-feedback" role="status">{notice}</div> : null}
+            {preview.type === "image" ? <img src={preview.url} alt={preview.name} /> : preview.type === "markdown" ? (
+              <div className="tmux-files-markdown codex-assistant-markdown">
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={SESSION_FILE_MARKDOWN_COMPONENTS}>
+                  {preview.text}
+                </ReactMarkdown>
+              </div>
+            ) : <CodeTextViewer fileName={preview.name} text={preview.text} />}
           </section>
         </div>
       ) : null}

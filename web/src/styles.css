@@ -1017,12 +1017,13 @@ pre {
 .tmux-files-message.is-error { border-color: #efb4b9; color: #9f1239; background: #fff1f2; }
 .tmux-files-upload-status { border-color: #c7d6f4; color: #315ea8; background: #f1f5ff; }
 .tmux-files-list { overflow: hidden; border: 1px solid #dce3de; border-radius: 9px; background: #fff; }
-.tmux-files-list-heading { display: grid; grid-template-columns: minmax(0, 1fr) 90px 160px 112px; align-items: center; gap: 8px; min-height: 32px; padding: 0 11px; border-bottom: 1px solid #e5ebe6; color: #68726c; background: #f8faf8; font-size: 9px; font-weight: 800; }
-.tmux-files-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 112px; align-items: center; gap: 8px; min-height: 42px; padding: 3px 11px; border-bottom: 1px solid #edf1ee; }
+.tmux-files-list-heading { display: grid; grid-template-columns: minmax(0, 1fr) 90px 160px 132px; align-items: center; gap: 8px; min-height: 32px; padding: 0 11px; border-bottom: 1px solid #e5ebe6; color: #68726c; background: #f8faf8; font-size: 9px; font-weight: 800; }
+.tmux-files-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 132px; align-items: center; gap: 8px; min-height: 42px; padding: 3px 11px; border-bottom: 1px solid #edf1ee; }
 .tmux-files-row:last-child { border-bottom: 0; }
 .tmux-files-row:hover { background: #f8faf8; }
 .tmux-files-row-content { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) 90px 160px; align-items: center; gap: 8px; pointer-events: none; }
-.tmux-files-row-open { position: absolute; inset: 0; z-index: 1; width: 100%; min-width: 0; height: 100%; min-height: 0; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.tmux-files-row-open { position: absolute; inset: 0; z-index: 1; width: auto; min-width: 0; height: 100%; min-height: 0; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.tmux-files-row.has-actions .tmux-files-row-open { right: 152px; }
 .tmux-files-row-open:focus-visible { outline: 2px solid #4e806b; outline-offset: -2px; }
 .tmux-files-name { display: flex; min-width: 0; min-height: 30px; align-items: center; gap: 7px; overflow: hidden; color: #17211b; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .tmux-files-name > span:first-child { flex: 0 0 auto; color: #6c8c74; }
@@ -1031,16 +1032,24 @@ pre {
 .tmux-files-name.is-directory:hover { color: #166534; text-decoration: underline; }
 .tmux-files-size, .tmux-files-date { color: #68726c; font-size: 10px; }
 .tmux-files-date-compact { display: none; }
-.tmux-files-row-actions { position: relative; z-index: 2; display: flex; justify-content: flex-end; gap: 4px; }
-.tmux-files-row-actions button, .tmux-files-row-actions a { min-height: 27px; padding: 0 7px; font-size: 10px; }
+.tmux-files-row-actions { position: relative; z-index: 2; display: flex; justify-content: flex-end; gap: 2px; }
+.tmux-files-row-actions button, .tmux-files-row-actions a { display: grid; width: 30px; min-width: 30px; height: 30px; min-height: 30px; place-items: center; padding: 0; border-color: transparent; border-radius: 6px; color: #315b43; background: transparent; }
+.tmux-files-row-actions svg, .tmux-files-preview-actions svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.tmux-files-row-actions button:focus-visible, .tmux-files-row-actions a:focus-visible, .tmux-files-preview-actions button:focus-visible, .tmux-files-preview-actions a:focus-visible { outline: 2px solid #4e806b; outline-offset: 2px; }
 .tmux-files-empty { margin: 0; padding: 28px 14px; color: #68726c; text-align: center; font-size: 12px; }
 .tmux-files-footnote { margin: 0; color: #68726c; font-size: 10px; }
 .tmux-files-preview-backdrop { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; padding: 16px; background: #0b1114bb; backdrop-filter: blur(4px); }
 .tmux-files-preview { display: flex; width: min(100%, 1000px); max-height: min(90dvh, 900px); flex-direction: column; overflow: hidden; border: 1px solid #dce3de; border-radius: 14px; background: #fff; box-shadow: 0 24px 80px #0007; }
 .tmux-files-preview header { display: flex; min-height: 48px; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 12px 7px 16px; border-bottom: 1px solid #dce3de; }
-.tmux-files-preview header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tmux-files-preview header button { display: grid; width: 34px; min-width: 34px; min-height: 34px; place-items: center; padding: 0; font-size: 22px; }
+.tmux-files-preview header strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tmux-files-preview-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 5px; }
+.tmux-files-preview-actions a, .tmux-files-preview-actions button { display: grid; width: 28px; min-width: 28px; height: 28px; min-height: 28px; place-items: center; padding: 0; border: 1px solid #cad4cc; border-radius: 7px; color: #315b43; background: #fff; text-decoration: none; }
+.tmux-files-preview-actions button:last-child { font-size: 20px; }
+.tmux-files-preview-actions a:hover, .tmux-files-preview-actions button:hover { background: #eef5ef; }
+.tmux-files-preview-feedback { margin: 8px 12px 0; }
 .tmux-files-preview img { display: block; max-width: 100%; max-height: calc(90dvh - 64px); margin: auto; object-fit: contain; }
+.tmux-files-markdown { min-width: 0; min-height: 0; flex: 1; overflow: auto; padding: 14px; }
+.tmux-files-markdown .codex-markdown-table-scroll { max-width: 100%; }
 .tmux-code-editor { width: 100%; height: min(76dvh, 760px); min-height: 220px; overflow: hidden; }
 .tmux-code-editor .cm-editor { height: 100%; }
 .tmux-code-editor .cm-content { user-select: text !important; -webkit-user-select: text !important; }
@@ -1076,8 +1085,12 @@ pre {
   .tmux-files-date { justify-self: end; white-space: nowrap; font-size: 9px; }
   .tmux-files-date-full { display: none; }
   .tmux-files-date-compact { display: inline; }
-  .tmux-files-row-actions { grid-column: 2; grid-row: 1; }
-  .tmux-files-row-actions button, .tmux-files-row-actions a { min-height: 25px; padding: 0 6px; font-size: 9px; }
+  .tmux-files-row-actions { grid-column: 2; grid-row: 1; gap: 3px; }
+  .tmux-files-row.has-actions .tmux-files-row-open { right: 154px; }
+  .tmux-files-row-actions button, .tmux-files-row-actions a { width: 32px; min-width: 32px; height: 32px; min-height: 32px; }
+  .tmux-files-preview header { gap: 7px; padding-right: 8px; padding-left: 11px; }
+  .tmux-files-preview-actions { gap: 3px; }
+  .tmux-files-preview-actions a, .tmux-files-preview-actions button { width: 28px; min-width: 28px; height: 28px; min-height: 28px; }
   .tmux-files-footnote { line-height: 1.6; }
   .dashboard-page { height: auto; min-height: calc(100svh - 49px); overflow: visible; -webkit-text-size-adjust: 100%; }
   .dashboard-page.is-navigation-collapsed { height: auto; min-height: 100svh; }
@@ -1497,6 +1510,10 @@ pre {
 :root[data-theme="dark"] .tmux-files-actions button,
 :root[data-theme="dark"] .tmux-files-row-actions button,
 :root[data-theme="dark"] .tmux-files-row-actions a { border-color: #35404d; color: #d8dee9; background: #202832; }
+:root[data-theme="dark"] .tmux-files-row-actions button,
+:root[data-theme="dark"] .tmux-files-row-actions a { border-color: transparent; background: transparent; }
+:root[data-theme="dark"] .tmux-files-row-actions button:hover,
+:root[data-theme="dark"] .tmux-files-row-actions a:hover { background: #293542; }
 :root[data-theme="dark"] .tmux-files-back { color: #c5f3d8; }
 :root[data-theme="dark"] .tmux-files-actions button.is-upload { border-color: #4e806b; color: #e0f5e9; background: #24533f; }
 :root[data-theme="dark"] .tmux-files-actions button.is-upload:hover:not(:disabled) { background: #2c684f; }
@@ -1528,7 +1545,10 @@ pre {
 :root[data-theme="dark"] .tmux-files-empty { color: #8995a3; }
 :root[data-theme="dark"] .tmux-files-preview { border-color: #303b48; background: #171e27; }
 :root[data-theme="dark"] .tmux-files-preview header { border-color: #303b48; }
-:root[data-theme="dark"] .tmux-files-preview header button { border-color: #35404d; color: #d8dee9; background: #202832; }
+:root[data-theme="dark"] .tmux-files-preview-actions a,
+:root[data-theme="dark"] .tmux-files-preview-actions button { border-color: #35404d; color: #d8dee9; background: #202832; }
+:root[data-theme="dark"] .tmux-files-preview-actions a:hover,
+:root[data-theme="dark"] .tmux-files-preview-actions button:hover { background: #293542; }
 
 .pairing-eyebrow {
   margin: 0 0 7px;

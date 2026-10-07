@@ -46,9 +46,12 @@ const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
 export type ComposerSubmissionResult = { ok: boolean; message?: string };
 export type { TerminalShortcut };
+export type SessionFileForwardRequest = { id: string; sessionId: string; text: string };
 
 type TmuxMessageComposerProps = {
   sessionId: string | null;
+  sessionFileForward: SessionFileForwardRequest | null;
+  onSessionFileForwardConsumed: (requestId: string) => void;
   diagnosticSessionActive: boolean;
   disabled: boolean;
   sending: boolean;
@@ -610,8 +613,11 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
   const runtimeRef = useRef<AssistantRuntime | null>(null);
   const submitRef = useRef(props.onSubmit);
   const attachmentErrorRef = useRef(props.onAttachmentError);
+  const forwardConsumedRef = useRef(props.onSessionFileForwardConsumed);
+  const processedForwardIdRef = useRef<string | null>(null);
   submitRef.current = props.onSubmit;
   attachmentErrorRef.current = props.onAttachmentError;
+  forwardConsumedRef.current = props.onSessionFileForwardConsumed;
 
   const attachmentAdapter = useMemo<AttachmentAdapter>(() => ({
     accept: "*",
@@ -762,24 +768,41 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
     document.addEventListener("visibilitychange", flushWhenHidden);
     const restore = async (): Promise<void> => {
       const draft = loadDraftMetadata(sessionId);
-      if (!draft || cancelled) {
-        restored = true;
-        persist();
-        return;
-      }
+      if (cancelled) return;
 
-      if (!composer.getState().text && draft.text) composer.setText(draft.text);
-      if (composer.getState().attachments.length === 0) {
-        for (const attachment of draft.attachments) {
-          const file = await loadDraftAttachment(sessionId, attachment.id);
-          if (cancelled || !file) continue;
-          if (composer.getState().attachments.some((current) => current.name === file.name && current.file?.size === file.size)) continue;
-          try {
-            await composer.addAttachment(file);
-          } catch (error) {
-            attachmentErrorRef.current(error instanceof Error ? error.message : "Could not restore the image draft.");
+      if (draft) {
+        if (!composer.getState().text && draft.text) composer.setText(draft.text);
+        if (composer.getState().attachments.length === 0) {
+          for (const attachment of draft.attachments) {
+            const file = await loadDraftAttachment(sessionId, attachment.id);
+            if (cancelled || !file) continue;
+            if (composer.getState().attachments.some((current) => current.name === file.name && current.file?.size === file.size)) continue;
+            try {
+              await composer.addAttachment(file);
+            } catch (error) {
+              attachmentErrorRef.current(error instanceof Error ? error.message : "Could not restore the image draft.");
+            }
           }
         }
+      }
+      if (cancelled) return;
+      if (
+        props.sessionFileForward?.sessionId === sessionId
+        && processedForwardIdRef.current !== props.sessionFileForward.id
+      ) {
+        processedForwardIdRef.current = props.sessionFileForward.id;
+        const currentText = composer.getState().text;
+        const trimmedEnd = currentText.replace(/\n+$/, "");
+        const lines = trimmedEnd.split("\n");
+        let removedMatchingLines = false;
+        while (lines[lines.length - 1] === props.sessionFileForward.text) {
+          lines.pop();
+          removedMatchingLines = true;
+        }
+        const baseText = removedMatchingLines ? lines.join("\n") : currentText;
+        const separator = baseText && !baseText.endsWith("\n") ? "\n" : "";
+        composer.setText(`${baseText}${separator}${props.sessionFileForward.text}`);
+        forwardConsumedRef.current(props.sessionFileForward.id);
       }
       if (!cancelled) {
         restored = true;
@@ -789,13 +812,14 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
     void restore();
 
     return () => {
-      cancelled = true;
       window.clearTimeout(saveTimer);
+      flushDraft();
+      cancelled = true;
       unsubscribe();
       window.removeEventListener("pagehide", flushBeforePageHide);
       document.removeEventListener("visibilitychange", flushWhenHidden);
     };
-  }, [props.sessionId, runtime]);
+  }, [props.sessionFileForward, props.sessionId, runtime]);
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>

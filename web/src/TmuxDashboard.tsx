@@ -3,13 +3,13 @@ import { CanvasAddon } from "@xterm/addon-canvas";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
-import { useNavigate } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 
 import { bindMobileTerminalViewport } from "./mobile-terminal-viewport.js";
 import { isDebugLogCaptureActive, logDebugDiagnostic } from "./debug-log-capture.js";
 
 import { bindMobileTerminalTouch, downloadTerminalScrollDiagnostics, type TerminalSelectionDisplay } from "./terminal-touch.js";
-import { TmuxMessageComposer, type TerminalShortcut } from "./TmuxMessageComposer.js";
+import { TmuxMessageComposer, type SessionFileForwardRequest, type TerminalShortcut } from "./TmuxMessageComposer.js";
 import { getActionToken } from "./api.js";
 import { useSystemNavigation } from "./WebNavigation.js";
 
@@ -201,6 +201,7 @@ function summarizeUnicodeText(value: string): Record<string, number> {
 }
 
 export function TmuxDashboard(): ReactElement {
+  const location = useLocation();
   const navigate = useNavigate();
   const { collapsed: navigationCollapsed, setCollapsed: setNavigationCollapsed } = useSystemNavigation();
   const [projects, setProjects] = useState<ProjectOption[]>([]);
@@ -210,6 +211,17 @@ export function TmuxDashboard(): ReactElement {
   const [checkingCodexHomeId, setCheckingCodexHomeId] = useState<string | null>(null);
   const [mobileView, setMobileView] = useState<"sessions" | "terminal">("sessions");
   const [selectedId, setSelectedId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("session"));
+  const [sessionFileForward, setSessionFileForward] = useState<SessionFileForwardRequest | null>(() => {
+    const state = location.state as { sessionFileForward?: unknown } | null;
+    const request = state?.sessionFileForward;
+    if (typeof request !== "object" || request === null) return null;
+    const candidate = request as Record<string, unknown>;
+    return typeof candidate.id === "string"
+      && typeof candidate.sessionId === "string"
+      && typeof candidate.text === "string"
+      ? { id: candidate.id, sessionId: candidate.sessionId, text: candidate.text }
+      : null;
+  });
   const [search, setSearch] = useState("");
   const [backendStatus, setBackendStatus] = useState<"connecting" | "online" | "offline">("connecting");
   const [terminalStatus, setTerminalStatus] = useState("IDLE");
@@ -233,6 +245,12 @@ export function TmuxDashboard(): ReactElement {
   const sessionApiResponseRef = useRef("");
   const sessionApiStatusRef = useRef<number | null>(null);
   const restoreSessionDetailRef = useRef(new URLSearchParams(window.location.search).has("session"));
+
+  useEffect(() => {
+    const state = location.state as { sessionFileForward?: unknown } | null;
+    if (!state?.sessionFileForward) return;
+    navigate(`${location.pathname}${location.search}${location.hash}`, { replace: true, state: null });
+  }, [location.hash, location.pathname, location.search, location.state, navigate]);
 
   useLayoutEffect(() => {
     if (mobileView === "terminal") return bindMobileTerminalViewport(window);
@@ -1213,6 +1231,10 @@ export function TmuxDashboard(): ReactElement {
           <TmuxMessageComposer
             key={selectedSession?.id ?? "no-session"}
             sessionId={selectedSession?.id ?? null}
+            sessionFileForward={selectedSession?.id === sessionFileForward?.sessionId ? sessionFileForward : null}
+            onSessionFileForwardConsumed={(requestId) => {
+              setSessionFileForward((current) => current?.id === requestId ? null : current);
+            }}
             diagnosticSessionActive={Boolean(selectedSession) && mobileView === "terminal" && terminalStatus === "ATTACHED"}
             disabled={!selectedSession || terminalStatus !== "ATTACHED"}
             sending={sendingMessage}
