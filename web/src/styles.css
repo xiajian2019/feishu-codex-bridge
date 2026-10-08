@@ -2303,7 +2303,13 @@ button.secondary,
 .codex-usage-modal { display: grid; width: min(620px, 100%); max-height: min(820px, calc(100dvh - 32px)); grid-template-rows: auto minmax(0, 1fr); overflow: hidden; border: 1px solid var(--line); border-radius: 17px; color: var(--ink); background: var(--card); box-shadow: 0 24px 90px #0009; }
 .codex-usage-details-modal { width: min(820px, 100%); }
 .codex-usage-details-body { min-height: 0; overflow: auto; padding: 14px 18px 18px; }
-.codex-usage-details-body > .codex-usage-account { box-shadow: none; }
+.codex-usage-details-body > .codex-usage-account.is-embedded { padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.codex-usage-account.is-embedded .codex-usage-account-header { padding: 0; border: 0; }
+.codex-usage-account.is-embedded .codex-usage-account-title { gap: 7px; }
+.codex-usage-account-name { color: var(--ink); font-size: 14px; }
+.codex-usage-account.is-embedded .codex-usage-section { padding-top: 13px; }
+.codex-usage-account.is-embedded .codex-usage-bucket { padding: 0; border: 0; border-radius: 0; background: transparent; }
+.codex-usage-account.is-embedded .codex-usage-bucket-title { margin-bottom: 7px; }
 .codex-usage-modal-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 17px 18px 13px; border-bottom: 1px solid var(--line); }
 .codex-usage-modal-title { min-width: 0; }
 .codex-usage-modal-header h2 { font-size: 20px; }

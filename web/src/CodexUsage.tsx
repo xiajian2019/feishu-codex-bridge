@@ -111,7 +111,7 @@ export function CodexUsageDialog({
       <section className="codex-usage-modal codex-usage-details-modal" role="dialog" aria-modal="true" aria-labelledby="codex-usage-details-title">
         <header className="codex-usage-modal-header">
           <div className="codex-usage-modal-title">
-            <h2 id="codex-usage-details-title">{account ? `${account.label} · Codex 用量` : `${accountLabel} · Codex 用量`}</h2>
+            <h2 id="codex-usage-details-title">{account ? "Codex 用量" : `${accountLabel} · Codex 用量`}</h2>
           </div>
           <div className="codex-usage-modal-header-actions">
             <button
@@ -133,7 +133,7 @@ export function CodexUsageDialog({
         <div className="codex-usage-details-body">
           {error ? <div className="codex-usage-error" role="alert">{error}</div> : null}
           {loading && !account ? <div className="codex-usage-empty">正在读取 Codex 账户用量…</div> : null}
-          {account ? <UsageAccountCard account={account} onRefresh={onRefresh} showResetCredits={false} /> : null}
+          {account ? <UsageAccountCard account={account} onRefresh={onRefresh} showResetCredits={false} embedded /> : null}
           {!loading && !account && !error ? <div className="codex-usage-empty">暂无可显示的 Codex 账户用量。</div> : null}
         </div>
       </section>
@@ -165,10 +165,11 @@ export function getCodexUsageRemainingPercentages(account: CodexUsageAccount | n
   return [percentages[0] ?? "—", percentages[1] ?? "—"];
 }
 
-function UsageAccountCard({ account, onRefresh, showResetCredits = true }: {
+function UsageAccountCard({ account, onRefresh, showResetCredits = true, embedded = false }: {
   account: CodexUsageAccount;
   onRefresh: () => Promise<void>;
   showResetCredits?: boolean;
+  embedded?: boolean;
 }): ReactElement {
   const [resetCreditsOpen, setResetCreditsOpen] = useState(false);
   const [confirmingCredit, setConfirmingCredit] = useState<CodexUsageResetCredit | null>(null);
@@ -193,11 +194,11 @@ function UsageAccountCard({ account, onRefresh, showResetCredits = true }: {
     : { label: "账户目录不可用", state: "unavailable" };
 
   return (
-    <article className="codex-usage-account">
+    <article className={`codex-usage-account${embedded ? " is-embedded" : ""}`}>
       <header className="codex-usage-account-header">
         <div className="codex-usage-account-heading">
           <div className="codex-usage-account-title">
-            <h2>{account.label}</h2>
+            {embedded ? <strong className="codex-usage-account-name">{account.label}</strong> : <h2>{account.label}</h2>}
             <div className="codex-usage-account-badges">
               {planType ? <span className="codex-usage-plan">{formatPlanType(planType)}</span> : null}
               <span className={`codex-usage-status is-${status.state}`}>{status.label}</span>
@@ -241,8 +242,7 @@ function UsageAccountCard({ account, onRefresh, showResetCredits = true }: {
 
       <section className="codex-usage-section codex-usage-token-section">
         <div className="codex-usage-section-heading">
-          <h3>账户 Token 统计</h3>
-          <span className="codex-usage-muted">每日统计</span>
+          <h3>Token 统计</h3>
         </div>
         {account.stale?.tokenUsage ? <p className="codex-usage-stale">本次读取失败，以下为上次成功结果。</p> : null}
         {account.errors?.tokenUsage && !account.stale?.tokenUsage ? <p className="codex-usage-inline-error">{account.errors.tokenUsage}</p> : null}

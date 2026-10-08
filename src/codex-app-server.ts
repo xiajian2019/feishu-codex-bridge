@@ -288,6 +288,7 @@ export class CodexAppServerClient implements CodexAppServerQueryClient {
   private stderr = "";
   private processError: Error | null = null;
   private initialized = false;
+  private initialization: Promise<void> | null = null;
   private closed = false;
 
   constructor(options: CodexAppServerClientOptions) {
@@ -324,13 +325,21 @@ export class CodexAppServerClient implements CodexAppServerQueryClient {
     });
   }
 
-  public async initialize(): Promise<void> {
-    if (this.initialized) return;
-    await this.request("initialize", {
-      clientInfo: this.clientInfo,
-    });
-    this.sendNotification("initialized", {});
-    this.initialized = true;
+  public initialize(): Promise<void> {
+    if (this.initialized) return Promise.resolve();
+    if (!this.initialization) {
+      const initialization = this.request("initialize", {
+        clientInfo: this.clientInfo,
+      }).then(() => {
+        this.sendNotification("initialized", {});
+        this.initialized = true;
+      });
+      this.initialization = initialization;
+      void initialization.catch(() => {
+        if (this.initialization === initialization) this.initialization = null;
+      });
+    }
+    return this.initialization;
   }
 
   public async listThreads(
