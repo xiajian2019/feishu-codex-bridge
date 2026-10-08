@@ -119,12 +119,13 @@ describe("config validation", () => {
     expect(config.codex.env).toEqual({});
   });
 
-  it("rejects direct defaults that are not in the task registries", () => {
-    expect(() => parseConfig({
+  it("defers direct project validation to SQLite and still validates modes", () => {
+    const config = parseConfig({
       ...base,
       execution: { mode: "feishu-sqlite-codex" },
       direct: { projectKey: "missing", mode: "review", feishu: {} },
-    }, { checkRepositories: false })).toThrow(/direct\.projectKey/);
+    }, { checkRepositories: false });
+    expect(config.direct.projectKey).toBe("missing");
     expect(() => parseConfig({
       ...base,
       execution: { mode: "feishu-sqlite-codex" },

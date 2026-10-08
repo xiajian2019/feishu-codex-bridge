@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-
+import { WebTaskSubmissionConflictError } from "./types.js";
 import { StateDatabase } from "./db.js";
 import { computeInputHash, parseTaskInput, serializeTaskInput } from "./fingerprint.js";
+import type { GitWorkspaceSnapshot } from "./run-artifacts.js";
 import {
   buildRunPrompt,
   formatBlockedComment,
@@ -17,10 +18,13 @@ import type {
   BridgeConfig,
   LarkTask,
   Logger,
+  ModeConfig,
+  RoutedTask,
   StoredTask,
   WorkerHandle,
   WorkerResult,
   WorkerRunner,
+  WebTaskSubmission,
 } from "./types.js";
 
 interface ActiveRun {
@@ -37,8 +41,10 @@ export interface DispatcherOptions {
   lark: LarkClient;
   config: BridgeConfig;
   workerRunner: WorkerRunner;
+  larkOutboxEnabled?: boolean;
   serviceInstanceId?: string;
   logger?: Logger;
+  captureWorkspaceSnapshot?: (directory: string) => Promise<GitWorkspaceSnapshot>;
 }
 
 export class Dispatcher {
@@ -46,8 +52,10 @@ export class Dispatcher {
   private readonly lark: LarkClient;
   private readonly config: BridgeConfig;
   private readonly workerRunner: WorkerRunner;
+  private readonly larkOutboxEnabled: boolean;
   private readonly serviceInstanceId: string;
   private readonly logger: Logger;
+  private readonly captureWorkspaceSnapshot?: (directory: string) => Promise<GitWorkspaceSnapshot>;
   private readonly queue: string[] = [];
   private readonly queuedRunIds = new Set<string>();
   private readonly active = new Map<string, ActiveRun>();
@@ -60,8 +68,10 @@ export class Dispatcher {
     this.lark = options.lark;
     this.config = options.config;
     this.workerRunner = options.workerRunner;
+    this.larkOutboxEnabled = options.larkOutboxEnabled ?? true;
     this.serviceInstanceId = options.serviceInstanceId ?? randomUUID();
     this.logger = options.logger ?? consoleLogger;
+    this.captureWorkspaceSnapshot = options.captureWorkspaceSnapshot;
   }
 
   public async observe(task: LarkTask): Promise<void> {
@@ -168,8 +178,217 @@ export class Dispatcher {
     await this.pump();
   }
 
+  public async submitWebTask(input: WebTaskSubmission): Promise<StoredTask> {
+    const description = input.description.trim();
+    const summary = input.summary?.trim() || summarizeTaskDescription(description);
+    if (summary.length > 300) throw new Error("任务标题不能超过 300 个字符。");
+    if (!description) throw new Error("任务描述不能为空。");
+    if (description.length > 20_000) throw new Error("任务描述不能超过 20000 个字符。");
+    const projectKey = input.projectKey.trim();
+    const attachmentIds = [...new Set(input.attachmentIds ?? [])];
+    if (attachmentIds.length > 10 || attachmentIds.length !== (input.attachmentIds?.length ?? 0)) {
+      throw new Error("每个任务最多添加 10 个不同附件。");
+    }
+    const idempotencyKey = input.idempotencyKey?.trim() || randomUUID();
+    if (input.idempotencyKey !== undefined && (!input.idempotencyKey.trim() || input.idempotencyKey.length > 200)) {
+      throw new Error("幂等键必须为 1 到 200 个字符。");
+    }
+    // Preserve the submitted intent, including an omitted default mode. Configuration
+    // changes must not prevent replaying a request the server already accepted.
+    const normalizedRequestJson = JSON.stringify({
+      summary, description, projectKey, mode: input.mode?.trim() || null, attachmentIds,
+    });
+    const previous = this.db.getWebTaskSubmission(idempotencyKey);
+    if (previous) {
+      if (previous.normalized_request_json !== normalizedRequestJson) throw new WebTaskSubmissionConflictError();
+      const task = this.db.getTask(previous.task_guid);
+      if (!task) throw new Error("已确认的任务记录不存在。");
+      this.enqueueWebRun(previous.run_id);
+      await this.pump();
+      return this.db.getTask(previous.task_guid)!;
+    }
+    const attachments = this.db.getStagedWebTaskAttachments(attachmentIds);
+    if (attachments.length !== attachmentIds.length) {
+      throw new Error("部分附件已过期或已绑定其他任务，请重新添加。");
+    }
+    const project = this.db.getAvailableProject(projectKey);
+    if (!project) throw new Error("所选项目不存在、未启用或路径不可用。");
+    const { key: modeKey, value: mode } = resolveWebMode(this.config, input.mode);
+    const routedTask: RoutedTask = {
+      taskGuid: `web-${randomUUID()}`,
+      summary,
+      description,
+      projectKey,
+      mode: modeKey,
+      repo: project.path,
+      sandboxMode: mode.sandboxMode,
+      inputHash: computeInputHash({
+        projectKey,
+        mode: modeKey,
+        summary,
+        description,
+      }),
+      input: { projectKey, mode: modeKey, summary, description },
+      completed: false,
+      origin: "web",
+    };
+    const basePrompt = buildRunPrompt(routedTask.input, null, false);
+    const promptText = attachments.length === 0
+      ? basePrompt
+      : [
+          basePrompt,
+          "",
+          "本次任务附带以下本地文件，请按需查看；图片会作为图像输入一并发送：",
+          ...attachments.map((attachment) => `- ${attachment.file_name} (${attachment.mime_type})：${attachment.local_path}`),
+        ].join("\n");
+    const submission = this.db.claimWebTaskSubmission({
+      idempotencyKey,
+      normalizedRequestJson,
+      task: routedTask,
+      inputText: serializeTaskInput(routedTask.input),
+      promptText,
+      attachmentIds,
+    });
+    const runId = submission.status === "created" ? submission.claim.runId : submission.submission.run_id;
+    const taskGuid = submission.status === "created" ? submission.claim.taskGuid : submission.submission.task_guid;
+    this.enqueueWebRun(runId);
+    await this.pump();
+    const task = this.db.getTask(taskGuid);
+    if (!task) throw new Error("任务已提交，但没有读取到本地任务记录。");
+    return task;
+  }
+
+  /** Explicitly retries one failed or canceled Web task; each new retry needs its own idempotency key. */
+  public async retryWebTask(taskGuid: string, idempotencyKey: string): Promise<StoredTask> {
+    const key = idempotencyKey.trim();
+    if (!key || idempotencyKey.length > 200) throw new Error("幂等键必须为 1 到 200 个字符。");
+    const normalizedRequestJson = JSON.stringify({ kind: "web-task-retry", taskGuid });
+
+    // Resolve an accepted retry first so replay remains idempotent even after the
+    // retry itself has finished and the task is terminal again.
+    const previousSubmission = this.db.getWebTaskSubmission(key);
+    if (previousSubmission) {
+      if (
+        previousSubmission.task_guid !== taskGuid ||
+        previousSubmission.normalized_request_json !== normalizedRequestJson
+      ) {
+        throw new WebTaskSubmissionConflictError();
+      }
+      this.enqueueWebRun(previousSubmission.run_id);
+      await this.pump();
+      const task = this.db.getTask(taskGuid);
+      if (!task) throw new Error("已确认的重试记录不存在对应任务。");
+      return task;
+    }
+
+    const existing = this.db.getTask(taskGuid);
+    if (!existing || existing.origin !== "web") throw new Error("Bridge 网页任务不存在。");
+    if (existing.state !== "FAILED" && existing.state !== "CANCELED") {
+      throw new Error("任务只有在失败或已取消时才能显式重试。");
+    }
+    const input = parseTaskInput(existing.input_text);
+    if (!input) throw new Error("原任务描述无法读取，不能重试。");
+    const project = this.db.getAvailableProject(existing.project_key);
+    if (!project || project.path !== existing.repo) {
+      throw new Error("原项目不可用或目录已变更，请检查配置后再重试。");
+    }
+    const { value: mode } = resolveWebMode(this.config, existing.mode);
+    const previousRun = this.db.getLatestRun(taskGuid);
+    if (!previousRun) throw new Error("原任务没有可重试的运行记录。");
+
+    const attachments = this.db.listWebTaskAttachments(taskGuid);
+    const basePrompt = buildRunPrompt(input, null, false);
+    const originalPrompt = attachments.length === 0
+      ? basePrompt
+      : [
+          basePrompt,
+          "",
+          "本次任务附带以下本地文件，请按需查看；图片会作为图像输入一并发送：",
+          ...attachments.map((attachment) => `- ${attachment.file_name} (${attachment.mime_type})：${attachment.local_path}`),
+        ].join("\n");
+    const promptText = [
+      "用户通过 Bridge 任务面板明确请求重试上一次未完成的任务。",
+      existing.thread_id
+        ? "请复用当前 Codex thread 继续完成原任务，并保留已经完成的工作。"
+        : "请按原始任务重新执行。",
+      "",
+      originalPrompt,
+    ].join("\n");
+    const routedTask: RoutedTask = {
+      taskGuid,
+      summary: input.summary,
+      description: input.description,
+      projectKey: existing.project_key,
+      mode: existing.mode,
+      repo: existing.repo,
+      sandboxMode: mode.sandboxMode,
+      inputHash: existing.input_hash,
+      input,
+      completed: false,
+      origin: "web",
+    };
+    const submission = this.db.claimWebTaskSubmission({
+      idempotencyKey: key,
+      normalizedRequestJson,
+      task: routedTask,
+      inputText: existing.input_text,
+      promptText,
+    });
+    const runId = submission.status === "created" ? submission.claim.runId : submission.submission.run_id;
+    this.enqueueWebRun(runId);
+    await this.pump();
+    const task = this.db.getTask(taskGuid);
+    if (!task) throw new Error("任务已重试，但没有读取到本地任务记录。");
+    return task;
+  }
+
+  public async appendWebTaskFollowup(taskGuid: string, details: string, idempotencyKey: string): Promise<StoredTask> {
+    const normalizedDetails = details.trim();
+    const key = idempotencyKey.trim();
+    if (!normalizedDetails || normalizedDetails.length > 2000) throw new Error("补充内容须为 1 到 2000 个字符。");
+    if (!key || key.length > 200) throw new Error("无效的幂等键。");
+    const normalizedRequestJson = JSON.stringify({ kind: "web-task-followup", taskGuid, details: normalizedDetails });
+    const previousSubmission = this.db.getWebTaskSubmission(key);
+    if (previousSubmission) {
+      if (previousSubmission.task_guid !== taskGuid || previousSubmission.normalized_request_json !== normalizedRequestJson) {
+        throw new WebTaskSubmissionConflictError();
+      }
+      this.enqueueWebRun(previousSubmission.run_id);
+      await this.pump();
+      return this.db.getTask(taskGuid)!;
+    }
+    const existing = this.db.getTask(taskGuid);
+    if (!existing || existing.origin !== "web") throw new Error("Bridge 网页任务不存在。");
+    if (existing.state === "RUNNING" || existing.state === "QUEUED") throw new Error("任务正在执行，请完成后再追加。");
+    const previousInput = parseTaskInput(existing.input_text);
+    if (!previousInput) throw new Error("原任务描述无法读取。");
+    const description = `${previousInput.description}\n\n补充信息：\n${normalizedDetails}`;
+    if (description.length > 20_000) throw new Error("追加后任务描述超过 20000 个字符。");
+    const project = this.db.getAvailableProject(existing.project_key);
+    if (!project || project.path !== existing.repo) throw new Error("原项目不可用或目录已变更，请新建任务。");
+    const { value: mode } = resolveWebMode(this.config, existing.mode);
+    const input = { ...previousInput, description };
+    const routedTask: RoutedTask = {
+      taskGuid, summary: input.summary, description,
+      projectKey: existing.project_key, mode: existing.mode, repo: existing.repo,
+      sandboxMode: mode.sandboxMode, inputHash: computeInputHash(input),
+      input, completed: false, origin: "web",
+    };
+    const submission = this.db.claimWebTaskSubmission({
+      idempotencyKey: key, normalizedRequestJson, task: routedTask,
+      inputText: serializeTaskInput(input),
+      promptText: existing.thread_id
+        ? `用户通过 Bridge 任务面板追加了信息：\n${normalizedDetails}\n\n请基于当前 thread 继续处理，完成后重新总结结果。`
+        : buildRunPrompt(input, previousInput, false),
+    });
+    const runId = submission.status === "created" ? submission.claim.runId : submission.submission.run_id;
+    this.enqueueWebRun(runId);
+    await this.pump();
+    return this.db.getTask(taskGuid)!;
+  }
+
   public async flushOutbox(): Promise<void> {
-    if (this.flushingOutbox) return;
+    if (!this.larkOutboxEnabled || this.flushingOutbox) return;
     this.flushingOutbox = true;
     try {
       for (const entry of this.db.getDueOutbox()) {
@@ -221,6 +440,9 @@ export class Dispatcher {
     if (!existing) {
       throw new Error(`本地没有任务记录 ${taskGuid}。`);
     }
+    if (existing.origin === "web") {
+      throw new Error("该任务由 Bridge 看板创建；请新建任务提交补充内容。");
+    }
 
     const current = await this.lark.getTask(taskGuid);
     if (isLarkTaskCompleted(current)) {
@@ -251,6 +473,14 @@ export class Dispatcher {
     if (recovered.length > 0) {
       this.logger.warn("recovered interrupted Codex runs", { count: recovered.length });
     }
+    for (const runId of this.db.listQueuedWebRunIds()) this.enqueueWebRun(runId);
+    void this.pump();
+  }
+
+  private enqueueWebRun(runId: string): void {
+    if (this.queuedRunIds.has(runId) || this.active.has(runId) || this.db.getRun(runId)?.state !== "QUEUED") return;
+    this.queue.push(runId);
+    this.queuedRunIds.add(runId);
   }
 
   public async shutdown(): Promise<void> {
@@ -290,6 +520,10 @@ export class Dispatcher {
         this.queuedRunIds.delete(runId);
         const run = this.db.getRun(runId);
         if (!run || run.state !== "QUEUED") continue;
+        const task = this.db.getTask(run.task_guid);
+        if (task?.origin === "web" && this.captureWorkspaceSnapshot) {
+          await this.recordWorkspaceSnapshot(runId, "before", task.repo);
+        }
 
         let handle: WorkerHandle;
         try {
@@ -299,7 +533,9 @@ export class Dispatcher {
           this.db.finishRun(runId, {
             status: "failed",
             error: message,
-            comment: formatFailedComment(message),
+            comment: this.db.getTask(run.task_guid)?.origin === "web"
+              ? undefined
+              : formatFailedComment(message),
           });
           this.logger.error("failed to start Codex worker", {
             runId,
@@ -372,6 +608,9 @@ export class Dispatcher {
     const run = this.db.getRun(active.runId);
     const task = this.db.getTask(active.taskGuid);
     if (run && task) {
+      if (task.origin === "web" && this.captureWorkspaceSnapshot) {
+        await this.recordWorkspaceSnapshot(active.runId, "after", task.repo);
+      }
       if (result.status === "succeeded") {
         const threadId = result.threadId ?? run.thread_id ?? task.thread_id;
         const comment = formatCompletedComment({
@@ -385,13 +624,13 @@ export class Dispatcher {
           status: "succeeded",
           finalResponse: result.finalResponse,
           usage: result.usage,
-          comment,
+          comment: task.origin === "web" ? undefined : comment,
         });
       } else if (result.status === "canceled") {
         this.db.finishRun(active.runId, {
           status: "canceled",
           error: result.error,
-          comment: active.cancelRequested
+          comment: task.origin === "web" ? undefined : active.cancelRequested
             ? formatCanceledComment(result.error ?? "用户取消了本轮执行。", active.runId)
             : undefined,
         });
@@ -400,13 +639,24 @@ export class Dispatcher {
         this.db.finishRun(active.runId, {
           status: "failed",
           error,
-          comment: formatFailedComment(error, result.errorKind === "proxy"),
+          comment: task.origin === "web"
+            ? undefined
+            : formatFailedComment(error, result.errorKind === "proxy"),
         });
       }
     }
 
     this.active.delete(active.runId);
     await this.pump();
+  }
+
+  private async recordWorkspaceSnapshot(runId: string, stage: "before" | "after", repo: string): Promise<void> {
+    if (!this.captureWorkspaceSnapshot) return;
+    try {
+      this.db.saveRunWorkspaceSnapshot(runId, stage, await this.captureWorkspaceSnapshot(repo));
+    } catch (error) {
+      this.logger.warn("could not capture Web run workspace metadata", { runId, stage, error: safeErrorMessage(error) });
+    }
   }
 
   private async blockTask(
@@ -458,7 +708,7 @@ export class Dispatcher {
     if (active) {
       active.cancelRequested = true;
       await active.handle.terminate();
-    } else if (runId) {
+    } else if (runId && task?.origin !== "web") {
       // A queued run has no monitor to emit the cancellation comment.
       this.db.enqueueComment(taskGuid, formatCanceledComment(reason, runId));
     }
@@ -489,4 +739,31 @@ function safeErrorMessage(error: unknown): string {
   return message
     .replace(/(access[_-]?token|app[_-]?secret|api[_-]?key|authorization)(\s*[:=]\s*)[^\s,;]+/gi, "$1$2[REDACTED]")
     .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [REDACTED]");
+}
+
+function summarizeTaskDescription(description: string): string {
+  const firstLine = description.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  return (firstLine || "Codex 任务").replace(/\s+/g, " ").slice(0, 300);
+}
+
+function resolveWebMode(
+  config: BridgeConfig,
+  requestedMode?: string,
+): { key: string; value: ModeConfig } {
+  const requested = requestedMode?.trim();
+  if (requested) {
+    const configured = config.modes[requested];
+    if (!configured) throw new Error("所选执行模式不在本地配置中。");
+    return { key: requested, value: configured };
+  }
+  const defaultKey = config.direct.mode && config.modes[config.direct.mode]
+    ? config.direct.mode
+    : config.modes.implement
+      ? "implement"
+      : Object.keys(config.modes).sort()[0];
+  if (defaultKey) return { key: defaultKey, value: config.modes[defaultKey] };
+  return {
+    key: "implement",
+    value: { optionGuid: "web-default-implement", sandboxMode: "workspace-write" },
+  };
 }

@@ -1,36 +1,53 @@
 # Feishu Codex Bridge
 
-这个项目保留三种启动模式，使用 `execution.mode` 选择；未填写该字段时继续兼容旧配置：`aamp.enabled=true` 仍默认进入 AAMP，否则进入已禁用的旧轮询路径。
+功能评审与后续计划见 [功能评审与路线图](doc/product-review-roadmap.md)，第一阶段的历史验证记录见 [交付清单](doc/phase-one-checklist.md)。
 
-- 旧兼容模式：原先轮询飞书 `Codex 工作台` 任务清单的代码仍保留，当前启动入口已禁用，不会创建 Poller/Dispatcher。
+运行时当前有 AAMP + Relay 和原生直连两种活动模式，由 `execution.mode` 选择。未设置时按旧配置兼容回退：`aamp.enabled=true` 进入 AAMP；否则进入已禁用的旧 Feishu 任务清单轮询路径。
+
+- 旧任务清单兼容代码仍保留，但 `LEGACY_POLLING_ENABLED=false`，启动入口不会创建旧 Poller。Web Task Desk 使用独立的 Dispatcher 和 Codex worker。
 - AAMP + Relay 模式：把 `@larktask/aamp-feishu-task-agent` 作为 Feishu WSS/IM/CardKit 入口，将 AAMP host 指向内网自建 Relay；官方包继续负责飞书任务智能体、交互卡片、绑定和重连，本项目补充 SQLite 业务状态、启动补偿和本地看板。
 - 原生直连模式：`@larksuiteoapi/node-sdk` 负责飞书 WebSocket 文本消息，SQLite 负责去重、任务租约和 durable outbox，`@openai/codex-sdk` 负责 Codex thread；不启动 AAMP、Relay、ACP 或 ACPX。`feishu-sqlite-acp` 仅作为此前方案的兼容配置别名，实际同样走 Codex SDK。
 
+## 当前能力和状态来源
+
+| 能力 | 页面和主要 API | 执行器 | 状态来源 | 当前操作 |
+| --- | --- | --- | --- | --- |
+| 任务面板（Bridge Task Desk + 飞书 Direct） | `/`、`/tasks/desk/:id`、`/tasks/direct/:id`；列表 `/api/task-panel`，详情沿用各自 API | Bridge 任务由 Dispatcher → ChildWorkerRunner → codex-worker → Codex SDK 执行；Direct 任务由原生直连链路执行 | Bridge 任务读取 `tasks`、`runs`、`run_events`、`outbox`；Direct 任务读取 `bridge_tasks` 等原有表 | 同一列表按更新时间展示两类任务；详情是独立页面，底部可向支持续问的任务追加信息。Bridge 任务可新建、上传附件和中断；Direct 取消与重试仍通过飞书或 CLI 完成 |
+| AAMP + Relay | Feishu AAMP Agent；只读 API `/api/aamp/tasks`、`/api/aamp/tasks/:id` | 官方 AAMP Agent 经 Relay 执行 | Bridge SQLite 的 `aamp_tasks` 是任务状态日志；任务入口和执行由 AAMP 管理 | 通过 Feishu 卡片与 AAMP CLI 操作；Web API 只读 |
+| 原生直连 | Feishu WebSocket；CLI `codex:*`；`/api/direct/tasks[/:id]` | `FeishuSqliteCodexRuntime` → Codex SDK | `inbound_events`、`bridge_tasks`、`bridge_task_followups`、事件/outbox 表；附件在 `runtime/direct/attachments` | 通过飞书消息、回复和卡片操作；用 `codex:*` 查询或管理。Direct runtime 可用且任务已有 thread 时，任务详情也可提交续问；列表、附件和事件可在 Web 查看 |
+| Codex 历史 | `/codex-history`；`/api/codex/homes`、`/api/codex/threads...` | Codex app-server 读取 `thread/list`/`thread/read`；Codex SDK 继续会话 | 各自的 `CODEX_HOME` 和 Codex 状态库；续问附件暂存于本机临时目录 | 筛选和查看 session、继续对话、附加文件、中断当前 turn |
+| tmux Dashboard | `/tmux-dashboard`、`/tmux-dashboard/files/:sessionId`；`/tmux-dashboard/api/*` 和 `/tmux-dashboard/terminal` WebSocket | 连接 Bridge 主机现有 tmux server | 实时 tmux session；项目目录来自 Bridge SQLite，文件来自对应 session 工作目录 | 查看输出、向选中 pane 发送 composer 消息、创建或结束 session、预览/上传/下载 session 文件 |
+| Web 配对与设备 | `/pair-admin`；`/api/auth/*` | WebPairingAuth | Bridge SQLite 配对 session 和设备记录 | 配对、重命名设备、撤销单个设备或全部设备 |
+
+生产环境的受保护业务页面和 API 使用配对 session；Web-only 本地开发模式还允许本机请求，健康检查、配对状态和 claim 等引导接口有独立公开行为。状态修改还需要 Action Token 和同源校验。第一阶段工作见 [阶段一清单](doc/phase-one-checklist.md)，人工浏览器验收见 [浏览器冒烟清单](doc/browser-smoke-checklist.md)。路线图保留评审时的证据，后续交付状态以阶段清单为准。
+
 原生直连模式处理文本和常见图片/文件附件，并使用飞书原生流式卡片展示 Codex 进度；支持 `/cancel`、`取消`、`停止`、`中断` 取消当前任务、细粒度权限、SQLite 任务租约和启动恢复。服务不使用 Dagu、Webhook 或公网 meshmail。Web 看板默认只监听 `127.0.0.1:7310`，不允许通过配置绑定到非 loopback 地址。
-
-## Codex Session SSH + tmux 验证器
-
-仓库还提供一个独立的本地 CS 验证程序，用来验证“Web Backend → SSH Worker → tmux session → Codex TUI”这条适配器链路；它不接入飞书业务状态机，也不复用 Bridge 业务数据库。页面已并入 Bridge 的 React Router，统一从 `http://127.0.0.1:7310/tmux` 打开。
-
-统一启动 Bridge（`bun run start`）时，tmux 验证器 API 会由同一进程在 `7310` 提供，不需要单独启动服务。若要独立调试验证器后端，可运行：
-
-```bash
-bun run tmux:verify -- --port 7320
-```
-
-页面中的 `机器` 填 `local` 或 SSH 配置中的 `user@host`，工作路径从程序读取的 `~/.codex/project-map.yaml`（可用 `TMUX_VERIFY_PROJECT_MAP` 覆盖）中搜索选择。Codex 可执行文件不由页面填写，而是使用 Bridge 进程的 `CODEX_PATH`/自动发现结果。远程执行只使用现有 SSH key/SSH config，不保存或请求密码。默认复用所选机器已有的 tmux 默认 server，本地 Session 会出现在你平时使用的 tmux 会话列表中；只有显式传入 `--socket <name>` 才使用独立 socket。Bridge 看板默认地址为 `http://127.0.0.1:7310`，自定义端口时用 `--bridge-url <url>` 指定。页面通过 `xterm.js → WebSocket → Bun.Terminal PTY → tmux attach-session` 查看真实 PTY，页面关闭只会断开 attach 客户端，不会杀掉 tmux/Codex。重新打开页面会先按 SQLite 中的 `after` event cursor 恢复快照，再接入实时 PTY 输出。
-
-Web 追问必须带 `clientMessageId`/`Idempotency-Key`。同一个逻辑请求重试时只会向已经存在的 Codex TUI 注入一次 `tmux send-keys`，不会启动第二个 Codex 进程。原始终端键盘输入仍属于 TUI 的低层输入；若人为在两个界面分别输入完全相同的新句子，后端无法从 tmux 原始字节中推断这是有意重复，因此这不属于当前最小验证范围。
-
-`bun run tmux:verify` 独立运行时默认监听 `127.0.0.1:7320`；主服务内嵌运行时接口随 Bridge 使用 `7310`，验证数据仍保存在 `tmux-verifier.db`（默认 `runtime/tmux-verifier.db`）。默认 attach 命令直接连接现有 tmux server：
-
-```bash
-tmux attach-session -t codex-verify-...
-```
 
 ## tmux Dashboard
 
-会话看板已迁入本仓库，并作为 React 页面挂载到 Bridge 的统一入口。统一启动 Bridge 后，从 `http://127.0.0.1:7310/tmux-dashboard` 打开；菜单可在 Bridge、tmux 验证器和 tmux Dashboard 之间用 React Router 切换。Bridge 主进程会直接处理 `/api/tmux/*`、`/tmux-dashboard/api/*` 和两个终端 WebSocket，不再依赖额外后端进程。
+统一启动 Bridge 后，从 http://127.0.0.1:7310/tmux-dashboard 打开 tmux Dashboard。项目名称和目录保存在 Bridge 主库 runtime/bridge.db；看板直接枚举现有 tmux server 中的实时会话，不启动独立 verifier 服务。
+
+旧的 /tmux verifier 页面、/api/tmux 接口和 tmux-session 任务执行模式已移除。旧 tmux-verifier.db 已移回项目 runtime/，作为独立本地历史文件保留；不导入 bridge.db，程序也不再读写它，该文件不纳入 Git 提交。
+
+## 任务面板
+
+任务面板支持直接新建任务：选择项目后填写描述即可，不要求单独标题或模式。可附加图片及普通文件，单个文件上限 25 MiB、每任务最多 10 个；附件存入本机 Bridge 数据目录，SDK 模式会把图片作为视觉输入，并可在任务详情预览图片或下载文件。标题由描述首行生成，模式沿用服务器配置的默认 sandbox；所有新任务统一由 Codex SDK 执行；tmux Dashboard 用于浏览和操作现有 tmux 会话，不作为任务执行后端。系统管理的 `/system-management/projects` 页面提供项目名称/目录搜索、状态筛选及弹框新增、编辑；停用项目不会出现在任务或 tmux 目录选择器中。项目表是运行时唯一来源；旧 project map 仅在 SQLite 项目表为空时迁移一次。
+
+任务面板将 Bridge Task Desk 和飞书 Direct 任务按更新时间合并展示，可按来源、状态和关键词筛选。项目与模式筛选用于 Bridge 任务；详情页展示各自的运行结果，Direct 事件按需展开。底部追加输入框沿用各来源的任务状态机，Direct 任务需要可用的运行时和已保存的 thread；未发送内容保存在当前浏览器的 sessionStorage。Web 提交支持可选 `idempotencyKey`：同键同内容返回原任务，同键不同内容返回 409，服务器回执在重启后保留。页面在提交失败后重试相同内容时复用键；新建任务表单的刷新后草稿恢复尚未实现。未使用的暂存附件超过 24 小时在启动/上传时清理；已绑定任务的附件保留。
+
+旧 `/direct-tasks` 列表链接会转到任务面板，带 `task` 参数的详情链接会打开 `/tasks/direct/:id`；搜索、状态和分页参数用于返回列表。
+
+## 数据备份与恢复演练
+
+使用 `bun run backup create --db <源数据库> --out <新备份目录>` 创建备份，`bun run backup verify --backup <备份目录>` 校验，再用 `bun run backup restore --backup <备份目录> --out <新恢复目录>` 演练恢复。也可在系统管理的“数据备份”页面创建、校验、检查升级兼容性并恢复到新的隔离目录；页面不会覆盖或切换运行服务。当前清单包含数据库引用的 Web/Direct/AAMP 附件和 tmux 任务提交记录中引用且文件仍存在的附件；旧版清单不含 tmux 附件引用。Portable 使用 `feishu-codex-bridge backup`；源 DB 必须显式指定，已有目标目录一律拒绝覆盖。安装根目录与自定义附件目录参数、限制及验证记录见 [第一阶段清单](doc/phase-one-checklist.md#命令与使用边界)。
+
+## Codex 历史会话
+
+统一 Bridge 启动后，从 http://127.0.0.1:7310/codex-history 打开本机 Codex 历史页面。页面通过 Codex app-server 的 `thread/list` 和 `thread/read` 协议读取会话，不直接解析 `auth.json`、SQLite 或 JSONL；详情页可通过 Codex SDK `resumeThread()` 继续现有 session，附件保存在本机临时目录，并通过游标轮询增量展示当前 turn 的新增事件。
+
+默认会读取当前 `CODEX_HOME`（未设置时为 `~/.codex`）以及 `~/.codex/accounts/*` 下的独立 home；每个 home 都会用自己的 `CODEX_HOME` 和状态数据库目录启动一个短生命周期查询客户端，因此两个登录账号的历史不会混在一起。若账号目录不在这个结构中，可用系统环境变量 `FEISHU_CODEX_HISTORY_HOMES`（macOS 用冒号分隔多个绝对路径）补充路径。页面支持按 home、关键词、归档状态和运行状态筛选，并可打开会话轮次与命令执行详情。
+
+Codex History 的完成、失败、取消回合及附件最多保留 24 小时，每 thread 最多 4 个终态回合、全局最多 40 个；运行和取消中的回合不计入数量上限。此保留策略只管理当前 Bridge 实例持有的记录，不删除重启后无法确认归属的孤儿文件，不影响 Codex 自身历史。
 
 ## 安装和配置
 
@@ -71,13 +88,23 @@ bun run portable:restart
 
 该命令会先完成构建和 smoke test，再执行带有 `--config`、`--db` 和 `--mode feishu-sqlite-codex` 的 `service restart`，最后执行 `service status`；构建失败时不会停止正在运行的服务。可用 `--config <path>`、`--db <path>` 和 `--mode <mode>` 覆盖默认值，`--skip-build` 仅重用现有 `dist` 打包。
 
-发布 GitHub Release（默认使用 `package.json` 版本生成 `v0.3.0` tag）：
+如需将当前源码打包并部署到已有的固定安装目录，然后启动 Bridge 服务，可运行：
+
+```bash
+bun run portable:deploy
+# 可通过 --root 指定已有安装目录
+bun run portable:deploy -- --root "$HOME/Applications/Feishu Codex Bridge"
+```
+
+该命令默认使用 `~/Applications/Feishu Codex Bridge`，要求目录中已有 Portable 安装和配置；它通过安装目录的更新流程切换版本，保留根目录的配置与运行数据，然后启动并检查 LaunchAgent。新生成的 LaunchAgent 会设置 `FEISHU_CODEX_BRIDGE_LAN_BIND=1`，使 Web 服务监听 `0.0.0.0`；网页仍需配对认证。
+
+发布 GitHub Release（默认使用 `package.json` 版本生成 `v0.4.0` tag）：
 
 ```bash
 bun run release:github
 ```
 
-该命令会构建新的 Bun 单一二进制包，以及由 legacy 入口生成的 core、Lite 资产，提交并推送当前分支和版本 tag；GitHub Actions 会自动生成 macOS arm64 资产并上传到对应 Release。可用 `--tag`、`--message`、`--skip-build` 或 `--dry-run` 覆盖默认行为。
+该命令当前只构建新的 Bun 单一二进制包，Core/Lite 打包步骤暂时停用；随后提交并推送当前分支和版本 tag，GitHub Actions 会构建 macOS arm64 包并上传到对应 Release。仍可用 --tag、--message、--skip-build 或 --dry-run 覆盖默认行为。
 
 产物默认写入根目录 `release/`，包含已构建的 Bridge 和生产依赖，不包含源码、测试、配置密钥或运行数据。新的 Bun 单一二进制包由包内编译产物直接启动，不再携带或下载独立 Bun runtime；legacy 包继续使用原有 runtime/launcher 逻辑。可以用 `--output <path>` 覆盖默认目录。接收方解压后可以直接双击 `install.command`；也可以执行：
 
@@ -87,9 +114,9 @@ bun run release:github
 
 Lite 包默认不包含 Bun 和独立 Codex CLI；它属于 legacy 打包路径，启动器会按需下载并缓存 Bun。`codex:update` 在便携包中被禁用，升级时使用下面的 Portable 更新命令。
 
-默认 `bun run release` 生成只包含 Bun 单一二进制运行入口的 direct 包，不构建 Node universal archive，也不携带独立 Bun runtime。旧的 Lite/Core 产物分别使用 `bun run release:legacy -- --mode lite` 和 `bun run release:legacy -- --mode core`；Core 包只供已安装包的更新器使用。单一二进制包首次安装时仍可能需要联网准备 lark-cli 原生二进制。
+新的默认发布入口生成当前架构的 Bun 单一二进制 Direct 包，不携带独立 Bun runtime。Core/Lite legacy 构建器暂时不参与 GitHub Release；Direct 首次安装仍可能需要联网准备 lark-cli 原生二进制。
 
-已安装的 Portable 包默认从 GitHub 拉取小型 Core 包。更新器会先下载、校验、解压并完成包完整性检查，再在极短窗口内停止当前 LaunchAgent、替换核心文件并自动启动；启动失败会回滚。`config.json`、`runtime/` 和 direct 包中的 Bun/lark-cli 不会被 Core 更新覆盖。旧 Node 运行时或 Bun 代际不匹配时，检查和自动更新会选择完整 direct/lite 包迁移；Core overlay 仅用于相同 Bun 代际，保留配置和用户 runtime 数据。完整 direct 更新才会替换运行时依赖：
+已安装 Portable 包的自动更新现在下载版本化 Direct 包，先下载并验证 SHA-256，再执行完整版本替换。固定安装根目录中的 config.json 和 runtime 数据在版本切换时保留；失败会回滚。Core/Lite 包型暂时不再由 GitHub Actions 打包。
 
 ```bash
 ./feishu-codex-bridge update
@@ -98,7 +125,7 @@ Lite 包默认不包含 Bun 和独立 Codex CLI；它属于 legacy 打包路径�
 ./feishu-codex-bridge update --auto
 ./feishu-codex-bridge update --file ./feishu-codex-bridge-core-darwin-arm64.tar.gz
 # 如需完整替换为 direct 包：
-./feishu-codex-bridge update --mode direct --file ./feishu-codex-bridge-direct-darwin-arm64-v0.3.0.tar.gz
+./feishu-codex-bridge update --mode direct --file ./feishu-codex-bridge-direct-darwin-arm64-v0.4.0.tar.gz
 ./feishu-codex-bridge update --unschedule
 ```
 
@@ -339,7 +366,7 @@ LARKSUITE_CLI_CONFIG_DIR="$HOME/.lark-cli-aamp-one-click-v1" \
 
 AAMP 流式回复卡片和等待补充信息的求助卡会显示“中断执行”按钮。点击后适配层通过官方 `AampClient.sendCancel()` 向任务原目标发送 `task.cancel`，目标 ACP agent 会终止当前 Codex turn；原卡随后更新为“本轮执行已中断”，不会另发一张结果卡。重复点击是幂等的；如果发送失败，原卡会保留“重试中断”按钮。服务级停止仍使用 `bun run aamp:stop`。
 
-AAMP 本地 ACP agent 支持按任务隔离。开启 `aamp.worktree` 后，只有任务正文或 dispatch context 中存在且命中 `project-map.yaml` 的 `项目：<名称>` 才进入隔离流程；每个命中任务会先写成独立 Markdown 文件，再从配置的 `baseRef` 创建唯一分支和 Git worktree，ACP session 使用该 worktree 作为 `--cwd`。没有项目字段的聊天任务继续使用官方 AAMP 路径；项目字段存在但未映射时会报告路由错误，不会猜测目录或在错误项目中执行。这保留了官方 AAMP 的消息、附件、流式卡片和 `task.cancel`，不会在已经运行的 ACP/Codex 会话里再嵌套调用 `codex-worktree`。任务完成或中断后会关闭该任务的 ACP session，但保留任务文件、分支和 worktree 供检查，也不会自动 commit、push、merge、部署或删除。
+AAMP 本地 ACP agent 支持按任务隔离。开启 `aamp.worktree` 后，只有任务正文或 dispatch context 中存在且命中 Bridge SQLite 可用项目的 `项目：<名称>` 才进入隔离流程；每个命中任务会先写成独立 Markdown 文件，再从配置的 `baseRef` 创建唯一分支和 Git worktree，ACP session 使用该 worktree 作为 `--cwd`。没有项目字段的聊天任务继续使用官方 AAMP 路径；项目字段存在但未登记或已停用时会报告路由错误，不会猜测目录或在错误项目中执行。这保留了官方 AAMP 的消息、附件、流式卡片和 `task.cancel`，不会在已经运行的 ACP/Codex 会话里再嵌套调用 `codex-worktree`。任务完成或中断后会关闭该任务的 ACP session，但保留任务文件、分支和 worktree 供检查，也不会自动 commit、push、merge、部署或删除。
 
 `worktreeRoot` 是所有项目 worktree 的公共父目录，项目名会由运行时追加一次。例如配置为 `/Users/xiajian/.codex/worktrees` 时，`food` 项目的任务目录为 `/Users/xiajian/.codex/worktrees/food/wt-<前两个任务词>-<任务哈希>`，不会把接收任务的桥接仓库名（如 `ai-work`）放进路径。分支格式为 `<branchPrefix>/<项目名>/<3-4 个有效任务词>-<任务哈希>`。
 
@@ -350,7 +377,6 @@ AAMP 本地 ACP agent 支持按任务隔离。开启 `aamp.worktree` 后，只�
     "stopOnShutdown": false,
     "worktree": {
       "enabled": true,
-      "projectMapPath": "/Users/xiajian/.codex/project-map.yaml",
       "globalAgentsPath": "/Users/xiajian/.codex/AGENTS.md",
       "taskDir": "/Users/xiajian/works/ai_work/codex/tasks",
       "worktreeRoot": "/Users/xiajian/.codex/worktrees",
@@ -408,21 +434,20 @@ bun run aamp:worktrees
 bun run start:all
 ```
 
-当 `aamp.enabled=true` 时，主入口启动 AAMP + Relay 和 Web 看板；旧任务清单的轮询、Dispatcher 执行链已经禁用。打开 <http://127.0.0.1:7310> 可以查看只读任务看板和 AAMP 状态接口：
+当 `aamp.enabled=true` 时，主入口启动 AAMP + Relay 和统一 Web 服务。旧 Feishu 任务清单 Poller 不会启动；Web 服务仍独立创建 Task Desk Dispatcher 并用 Codex worker 执行 Web 提交的任务。AAMP 任务状态接口 `/api/aamp/tasks` 只读，Web Task Desk 使用 `/api/tasks` 及自己的 SQLite 状态表：
 
 - 按状态、项目和模式筛选任务。
 - 按标题、描述、任务 GUID、Codex thread ID 或错误文本搜索。
 - 查看正在执行任务的 Worker、Codex turn/item 事件和最后进展。
 - 查看任务的完整 run 历史、提示词、最终响应、usage 和飞书 outbox 状态。
-- 旧兼容模式的中断、反馈操作接口仍保留在代码中，但当前入口不会启用。
+- `/api/tasks/:taskGuid` 的中断操作由 Web Task Desk Dispatcher 处理；详情页的 `POST /api/task-panel/:source/:id/followups` 对 Bridge Web 任务排入同 thread 的新 run，对 Direct 任务写入原任务续问；历史 Feishu 来源任务仍沿用原反馈流程。AAMP 任务状态接口保持只读。
 - React 页面通过 SSE 接收任务状态、run 进展和执行事件变化，只更新受影响的任务行和详情区块；连接断开时自动使用快照轮询并重连。
-- 详情弹窗持续显示实时进展，反馈草稿和操作状态由前端组件独立维护，不会被进展更新覆盖；“刷新详情”用于主动校准完整快照。
+- 任务详情使用独立页面，显示原任务和续问的结果；底部输入框保留未发送草稿，顶部“刷新详情”用于主动校准完整快照。
 
-查询接口为 `GET /healthz`、`GET /api/session`、`GET /api/tasks`、`GET /api/tasks/:taskGuid`、`GET /api/aamp/tasks`、`GET /api/aamp/tasks/:id` 和 `GET /api/events`；旧兼容模式的 `POST /api/tasks/:taskGuid` 操作接口当前不会配置 Dispatcher。页面包含 CSP、禁止 iframe 和 `no-store` 响应头。由于内容包含任务描述、仓库路径和 Codex 结果，不应通过端口转发或反向代理对外暴露。
+查询接口为 `GET /healthz`、`GET /api/session`、`GET /api/task-panel`、`GET /api/tasks[/:taskGuid]`、`GET /api/direct/tasks[/:id]`、`GET /api/aamp/tasks[/:id]`、`GET /api/codex/homes`、`GET /api/codex/threads[/:homeId/:threadId]` 和 `GET /api/events`；`POST /api/tasks` 创建 Web 任务，`POST /api/task-panel/:source/:id/followups` 追加信息，`POST /api/tasks/:taskGuid` 中断执行或为历史 Feishu 来源任务提交反馈。AAMP 任务查询接口只读。生产环境中的受保护任务、Codex history、tmux、SSE 和终端 WebSocket 路由使用配对 session；不要将服务暴露到公网。
 
-页面现在支持一个轻量的一次性配对层。配对码和二维码只由 Mac 命令行生成，不在网页中生成或显示。独立 tmux verifier 可运行 bun run tmux:pair -- --url http://192.168.1.10:7320/；统一 Bridge 可运行 bun run web:pair -- --url http://192.168.1.10:7310/；开发页面 5173 会自动使用 runtime/dev/bridge.db。手机扫描终端二维码后，网页从 URL fragment 自动 claim，服务端签发一个 30 天 HttpOnly 会话 Cookie，二维码 5 分钟后失效且只能使用一次。任务 API、tmux API、SSE 和终端 WebSocket 都要求已配对会话；未认证网页只显示等待扫码提示。认证后从 /pair-admin 进入设备管理，可查看已配对设备并撤销所有手机；刷新配对码需重新运行对应的 pair 命令。配对成功、设备会话和撤销状态都保存在服务使用的 SQLite 数据库中。配对只解决访问控制，不替代 HTTPS；当前服务默认 HTTP，如果局域网中存在抓包或主动劫持风险，需要另行配置 HTTPS，并确保代理不会绕过配对规则。
-
-前端源码位于 `web/`，生产构建输出到 `dist/web`，由同一个 Bridge Bun 进程静态托管。开发时在两个终端分别运行 `bun run dev:api` 和 `bun run dev:web`，然后打开 `http://127.0.0.1:5173`。开发 API 独立监听 `127.0.0.1:17310`，使用 `runtime/dev/bridge.db` 和 `runtime/dev/tmux-verifier.db`，不触碰 LaunchAgent 的服务、`7310` 生产 API 或 SQLite，也不会启动 Feishu/AAMP/Relay/Codex 消息运行时；Vite 的 Bridge、tmux API 和 WebSocket 默认都代理到这个开发 API。`dev:api` 默认读取 `config.example.json`，需要本地项目配置时可运行 `bun run dev:api -- --config ./config.json`；也可用 `--db`、`--web-port` 覆盖开发数据路径和端口，Vite 目标可用 `BRIDGE_WEB_API_TARGET` 覆盖。tmux API 沿用现有默认 tmux server（或显式设置的 `TMUX_VERIFY_SOCKET`），不会默认额外启动 tmux server。发布或 LaunchAgent 启动前仍须执行 `bun run build`。React 组件使用稳定的任务/run/event ID 合并服务端变化，避免全页面刷新导致操作丢失。
+页面支持一次性配对。系统安装后运行 `feishu-codex-bridge web:pair`，源码目录运行 `bun run web:pair`；CLI 自动选择当前机器的局域网 IPv4 和 `config.json` 中的 `web.port`（默认 7310），并始终写入生产库 `runtime/bridge.db`。可用 `--url`、`--port` 覆盖地址，或用 `--db` 显式指定数据库；URL/端口不会自动切换到开发库。手机扫描二维码后，网页从 URL fragment 自动 claim，服务端签发一个 30 天 HttpOnly 会话 Cookie，二维码 5 分钟后失效且只能使用一次。未认证网页只显示等待扫码提示。认证后从 `/pair-admin` 进入设备管理，可查看已配对设备并撤销所有手机；刷新配对码需重新运行 `web:pair`。配对状态保存在 Bridge 使用的 SQLite 数据库中。\n
+前端源码位于 web/，生产构建输出到 dist/web，由同一个 Bridge Bun 进程静态托管。源码开发环境使用 `bun run dev:start` 一次启动 Bridge Web-only API 与 Vite。两个进程以脱离启动终端的后台进程运行，启动命令退出后仍继续服务；日志和 PID 写入系统临时目录。Vite 监听 `0.0.0.0:5173`，API 监听 `0.0.0.0:17310`，Vite 将 `/api`、tmux Dashboard API 和 WebSocket 请求代理到本机 API。API 使用 `config.example.json` 并明确指定 `runtime/bridge.db`；该路径可能是指向安装目录正式库的符号链接，开发启动不会选择 `runtime/dev/bridge.db`。`--web-only` 不启动 Feishu/AAMP 消息入口。用 `bun run dev:status` 查看状态，`bun run dev:stop` 停止，`bun run dev:restart` 重启。tmux Dashboard 连接现有默认 tmux server。发布或 LaunchAgent 启动前仍须执行 `bun run build`。
 
 默认 `runTimeoutSeconds` 为 `3600` 秒（1 小时）；超时会先终止 Worker，必要时再强制结束，并将本轮标记为失败。
 
@@ -436,7 +461,7 @@ bun run start:all -- --config ./config.json --db ./runtime/bridge.db
 
 `lark-cli` 调用使用参数数组，不经过 shell。清单的 `tasklist_guid`、分页参数和 `completed: false` 统一通过 `--params` 传入，兼容当前 CLI 的通用参数接口。默认从 PATH 查找 `lark-cli`，也可以在配置中设置绝对路径 `lark.cliPath`，或通过 `LARK_CLI_PATH` 覆盖。
 
-当 `aamp.enabled` 为 `true` 时，`bun run start` 或 `bun run start:all` 会先打开共享 SQLite 并执行一次 `running` 任务补偿查询，再调用官方 `feishu-task-agent start`，同时启动同一进程内的 SQLite 看板。旧 Poller、Dispatcher 不会启动；AAMP Relay 负责任务触发和流式事件，运行时补丁在 `task.dispatch` 发送前和 `task.update/task.result/task.failed` 生命周期写入 SQLite。
+当 `aamp.enabled` 为 `true` 时，`bun run start` 或 `bun run start:all` 会先打开共享 SQLite 并执行一次 `running` 任务补偿查询，再调用官方 `feishu-task-agent start`，同时启动同一进程内的 SQLite 看板。旧 Feishu 清单 Poller 不会启动；AAMP Relay 负责 AAMP 任务触发和流式事件，Bridge 在 `task.dispatch` 发送前及 `task.update/task.result/task.failed` 生命周期写入 `aamp_tasks`。若 Web 已启用，Task Desk Dispatcher 仍单独服务 Web 任务，使用 `tasks/runs/outbox` 状态机和 Codex worker。
 
 推荐使用：
 

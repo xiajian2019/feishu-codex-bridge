@@ -1,4 +1,9 @@
 import { useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
+import * as QRCode from "qrcode";
+import { clearLocalDraftsAfterDeviceRevocation } from "./local-draft-cleanup.js";
+import { setLocalDraftScope } from "./local-draft-scope.js";
+
+const PAIRING_COMMAND = "feishu-codex-bridge web:pair";
 
 interface AuthStatus {
   authenticated: boolean;
@@ -6,6 +11,7 @@ interface AuthStatus {
   activeSessionCount: number | null;
   pairingAvailable: boolean;
   pairingExpiresAt: number | null;
+  draftScope?: string | null;
 }
 
 interface ApiError {
@@ -23,10 +29,15 @@ interface WebAuthDevice {
   expiresAt: string;
 }
 
+interface PairingInfo {
+  pairingUrl: string;
+  expiresAt: number;
+}
+
 export function AuthGate({ children }: { children: ReactNode }): ReactElement {
   const [status, setStatus] = useState<AuthStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const pairingClaimRef = useRef<string | null>(null);
+  const pairingClaimRef = useRef<Promise<AuthStatus> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -49,7 +60,7 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
 }
 
 async function loadAuthStatus(
-  pairingClaimRef?: { current: string | null },
+  pairingClaimRef?: { current: Promise<AuthStatus> | null },
 ): Promise<AuthStatus> {
   const statusResponse = await fetch("/api/auth/status", {
     headers: { Accept: "application/json" },
@@ -57,30 +68,43 @@ async function loadAuthStatus(
   });
   const statusBody = await statusResponse.json() as AuthStatus & ApiError;
   if (!statusResponse.ok) {
+    setLocalDraftScope(null);
     throw new Error("鉴权状态读取失败（" + statusResponse.status + "）");
   }
+  setLocalDraftScope(statusBody.authenticated ? statusBody.draftScope : null);
   if (statusBody.authenticated) return statusBody;
 
   const code = readPairingCodeFromHash();
   if (!code) return statusBody;
-  if (pairingClaimRef?.current === code) return statusBody;
-  if (pairingClaimRef) pairingClaimRef.current = code;
-  const claimResponse = await fetch("/api/auth/pairing/claim", {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    credentials: "same-origin",
-    body: JSON.stringify({ code }),
-  });
-  const claimBody = await claimResponse.json() as ApiError;
-  if (!claimResponse.ok) {
-    if (pairingClaimRef?.current === code) pairingClaimRef.current = null;
-    throw new Error(claimBody.error || "二维码配对失败（" + claimResponse.status + "）");
+  if (pairingClaimRef?.current) return pairingClaimRef.current;
+
+  const claimPromise = (async (): Promise<AuthStatus> => {
+    const claimResponse = await fetch("/api/auth/pairing/claim", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      credentials: "same-origin",
+      body: JSON.stringify({ code }),
+    });
+    const claimBody = await claimResponse.json() as ApiError;
+    if (!claimResponse.ok) {
+      throw new Error(claimBody.error || "二维码配对失败（" + claimResponse.status + "）");
+    }
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    return loadAuthStatus();
+  })();
+
+  if (pairingClaimRef) {
+    pairingClaimRef.current = claimPromise;
+    try {
+      return await claimPromise;
+    } finally {
+      if (pairingClaimRef.current === claimPromise) pairingClaimRef.current = null;
+    }
   }
-  window.history.replaceState(null, "", window.location.pathname + window.location.search);
-  return loadAuthStatus();
+  return claimPromise;
 }
 
 function readPairingCodeFromHash(): string | null {
@@ -93,12 +117,44 @@ function readPairingCodeFromHash(): string | null {
   return code || null;
 }
 
+async function copyTextToClipboard(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Fall back for browsers that expose the API but deny access on HTTP pages.
+    }
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("浏览器未允许访问剪贴板。");
+}
+
 export function PairingAdmin(): ReactElement {
   const [status, setStatus] = useState<AuthStatus | null>(null);
   const [devices, setDevices] = useState<WebAuthDevice[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [pairing, setPairing] = useState<PairingInfo | null>(null);
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [pairingBusy, setPairingBusy] = useState(false);
+  const [pairingError, setPairingError] = useState<string | null>(null);
+  const [pairingLinkCopied, setPairingLinkCopied] = useState(false);
+  const [pairingLinkCopyError, setPairingLinkCopyError] = useState<string | null>(null);
+  const [pairingCommandError, setPairingCommandError] = useState<string | null>(null);
+  const [pairingCommandCopied, setPairingCommandCopied] = useState(false);
+  const [editingDeviceId, setEditingDeviceId] = useState<string | null>(null);
+  const [editingDeviceName, setEditingDeviceName] = useState("");
+  const [renamingDeviceId, setRenamingDeviceId] = useState<string | null>(null);
 
   const loadManagement = async (): Promise<void> => {
     setLoading(true);
@@ -128,6 +184,140 @@ export function PairingAdmin(): ReactElement {
     void loadManagement();
   }, []);
 
+  useEffect(() => {
+    if (!pairing) {
+      setQrDataUrl(null);
+      return;
+    }
+    let cancelled = false;
+    setQrDataUrl(null);
+    void QRCode.toDataURL(pairing.pairingUrl, {
+      errorCorrectionLevel: "M",
+      margin: 2,
+      width: 280,
+      color: { dark: "#111827", light: "#ffffff" },
+    })
+      .then((dataUrl) => {
+        if (!cancelled) {
+          setQrDataUrl(dataUrl);
+        }
+      })
+      .catch((qrError: unknown) => {
+        if (!cancelled) {
+          const message = qrError instanceof Error ? qrError.message : String(qrError);
+          setPairingError(redactPairingSecrets(message));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [pairing]);
+
+  const copyPairingCommand = async (): Promise<void> => {
+    setPairingCommandError(null);
+    try {
+      await copyTextToClipboard(PAIRING_COMMAND);
+      setPairingCommandCopied(true);
+    } catch (copyError: unknown) {
+      setPairingCommandCopied(false);
+      setPairingCommandError(copyError instanceof Error ? copyError.message : String(copyError));
+    }
+  };
+
+  const copyPairingLink = async (): Promise<void> => {
+    if (!pairing) return;
+    setPairingLinkCopyError(null);
+    setPairingLinkCopied(false);
+    try {
+      await copyTextToClipboard(pairing.pairingUrl);
+      setPairingLinkCopied(true);
+    } catch (copyError: unknown) {
+      setPairingLinkCopyError(copyError instanceof Error ? copyError.message : String(copyError));
+    }
+  };
+
+  const generatePairingQr = async (): Promise<void> => {
+    setPairingBusy(true);
+    setPairingError(null);
+    setPairing(null);
+    setPairingLinkCopied(false);
+    setPairingLinkCopyError(null);
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 10_000);
+    try {
+      const response = await fetch("/api/auth/pairing/start", {
+        method: "POST",
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+        signal: controller.signal,
+      });
+      let body: { pairingUrl?: string; expiresAt?: number } & ApiError;
+      try {
+        body = await response.json() as { pairingUrl?: string; expiresAt?: number } & ApiError;
+      } catch {
+        throw new Error("服务端没有返回有效的 JSON 响应。");
+      }
+      if (!response.ok) {
+        if (response.status === 401) {
+          window.location.assign("/");
+          return;
+        }
+        throw new Error(body.error || "二维码生成失败（" + response.status + "）");
+      }
+      if (typeof body.pairingUrl !== "string" || typeof body.expiresAt !== "number") {
+        throw new Error("二维码响应不完整。");
+      }
+      const serverPairingUrl = new URL(body.pairingUrl);
+      const currentPairingUrl = new URL("/", window.location.origin);
+      currentPairingUrl.hash = serverPairingUrl.hash;
+      setPairing({ pairingUrl: currentPairingUrl.toString(), expiresAt: body.expiresAt });
+    } catch (requestError: unknown) {
+      const message = requestError instanceof DOMException && requestError.name === "AbortError"
+        ? "请求超过 10 秒没有返回。"
+        : requestError instanceof Error ? requestError.message : String(requestError);
+      setPairingError(redactPairingSecrets(message));
+    } finally {
+      window.clearTimeout(timeoutId);
+      setPairingBusy(false);
+    }
+  };
+
+  const saveDeviceName = async (sessionId: string): Promise<void> => {
+    const deviceName = editingDeviceName.trim();
+    if (!deviceName) {
+      setError("设备名称不能为空。");
+      return;
+    }
+    setRenamingDeviceId(sessionId);
+    setError(null);
+    try {
+      const response = await fetch("/api/auth/devices/" + encodeURIComponent(sessionId), {
+        method: "PATCH",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        credentials: "same-origin",
+        body: JSON.stringify({ deviceName }),
+      });
+      const body = await response.json() as ApiError;
+      if (!response.ok) {
+        if (response.status === 401) {
+          window.location.assign("/");
+          return;
+        }
+        throw new Error(body.error || "设备名称保存失败（" + response.status + "）");
+      }
+      setEditingDeviceId(null);
+      setEditingDeviceName("");
+      await loadManagement();
+    } catch (requestError: unknown) {
+      setError(requestError instanceof Error ? requestError.message : String(requestError));
+    } finally {
+      setRenamingDeviceId(null);
+    }
+  };
+
   const revokeAll = async (): Promise<void> => {
     setBusy(true);
     setError(null);
@@ -139,6 +329,7 @@ export function PairingAdmin(): ReactElement {
       });
       const body = await response.json() as ApiError;
       if (!response.ok) throw new Error(body.error || "撤销失败（" + response.status + "）");
+      await clearLocalDraftsAfterDeviceRevocation();
       window.location.assign("/");
     } catch (requestError: unknown) {
       setError(requestError instanceof Error ? requestError.message : String(requestError));
@@ -166,6 +357,7 @@ export function PairingAdmin(): ReactElement {
         throw new Error(body.error || "设备撤销失败（" + response.status + "）");
       }
       if (current) {
+        await clearLocalDraftsAfterDeviceRevocation();
         window.location.assign("/");
         return;
       }
@@ -177,24 +369,29 @@ export function PairingAdmin(): ReactElement {
     }
   };
 
+  const beginRename = (device: WebAuthDevice): void => {
+    setEditingDeviceId(device.sessionId);
+    setEditingDeviceName(device.deviceName);
+    setError(null);
+  };
+
+  const cancelRename = (): void => {
+    setEditingDeviceId(null);
+    setEditingDeviceName("");
+  };
+
+  const editingDevice = editingDeviceId
+    ? devices.find((device) => device.sessionId === editingDeviceId) ?? null
+    : null;
+
   return (
     <main className="device-management-page">
-      <header className="device-page-header">
-        <div>
-          <p className="device-page-eyebrow">SECURITY / DEVICES</p>
-          <p className="device-page-subtitle">
-            管理可以访问 Bridge 和 tmux 终端的已配对设备。
-          </p>
-        </div>
-      </header>
-
       {error ? <div className="pairing-error device-page-alert" role="alert">{error}</div> : null}
 
       <div className="device-management-grid">
         <section className="device-list-panel">
           <div className="device-panel-heading">
             <div>
-              <p className="device-panel-kicker">PAIRED DEVICES</p>
               <h2>已配对设备</h2>
             </div>
             <div className="device-panel-heading-actions">
@@ -208,7 +405,7 @@ export function PairingAdmin(): ReactElement {
           {!loading && devices.length === 0 ? (
             <div className="device-empty-state">
               <strong>还没有配对设备</strong>
-              <span>在 Mac 终端运行 web:pair，再用手机扫描二维码。</span>
+              <span>在下方生成二维码，再用新设备扫描完成配对。</span>
             </div>
           ) : null}
           <div className="device-list">
@@ -225,27 +422,87 @@ export function PairingAdmin(): ReactElement {
                     首次配对 {formatDate(device.createdAt)} · 最近访问 {formatDate(device.lastSeenAt)} · 到期 {formatDate(device.expiresAt)}
                   </small>
                 </div>
+                <div className="device-row-actions">
+                  {editingDeviceId !== device.sessionId ? (
+                    <button className="secondary device-row-action-button device-rename-button" type="button" disabled={busy} onClick={() => beginRename(device)}>
+                      设置名称
+                    </button>
+                  ) : null}
                   <button
-                    className="device-revoke-button"
+                    className="device-row-action-button device-revoke-button"
                     type="button"
                     disabled={busy}
                     onClick={() => void revokeDevice(device.sessionId, device.current)}
-                >
-                  撤销
-                </button>
+                  >
+                    撤销
+                  </button>
+                </div>
               </article>
             ))}
           </div>
         </section>
 
-        <aside className="device-side-panel">
-          <section className="device-info-section">
-            <p className="device-panel-kicker">PAIRING</p>
+        <section className="device-side-panel">
+          <div className="device-info-section">
             <h2>添加新设备</h2>
-            <p>配对码不会出现在网页中，只会显示在 Mac 的终端二维码里。</p>
-            <code className="device-command">bun run web:pair -- --url http://内网IP:端口/</code>
-            <p>二维码 5 分钟有效，使用一次后立即失效。过期后重新运行命令即可刷新。</p>
-          </section>
+            <div className="device-pairing-actions">
+              <button className="primary" type="button" disabled={pairingBusy} onClick={() => void generatePairingQr()}>
+                {pairingBusy ? "正在生成…" : pairing ? "重新生成二维码" : "生成二维码"}
+              </button>
+              {pairing ? <span className="device-pairing-expiry">有效期至 {formatDate(pairing.expiresAt)}</span> : null}
+            </div>
+            {pairing ? (
+              <div className="device-qr-card">
+                <div className="device-qr-frame">
+                  {qrDataUrl ? <img src={qrDataUrl} alt="设备配对二维码" /> : <span>二维码生成中…</span>}
+                </div>
+                <div className="device-qr-copy">
+                  <strong>扫码或打开链接配对</strong>
+                  <span>二维码和链接 5 分钟有效，配对成功后立即失效。</span>
+                  <div className="device-pairing-link">
+                    <p>没有扫码功能？在新设备的浏览器中打开此链接：</p>
+                    <div className="device-pairing-link-row">
+                      <a href={pairing.pairingUrl} target="_blank" rel="noreferrer">
+                        {pairing.pairingUrl}
+                      </a>
+                      <button
+                        className="secondary device-pairing-link-copy"
+                        type="button"
+                        onClick={() => void copyPairingLink()}
+                        aria-label={pairingLinkCopied ? "配对链接已复制" : "复制配对链接"}
+                        title={pairingLinkCopied ? "已复制" : "复制配对链接"}
+                      >
+                        {pairingLinkCopied ? (
+                          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6" /></svg>
+                        ) : (
+                          <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" /></svg>
+                        )}
+                      </button>
+                    </div>
+                    {pairingLinkCopyError ? <p className="device-pairing-link-error" role="status">{pairingLinkCopyError}</p> : null}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="device-qr-placeholder">点击“生成二维码”，在这里显示新设备的配对二维码。</div>
+            )}
+            {pairingError ? <p className="device-command-error" role="status">{pairingError}</p> : null}
+            <details className="device-cli-fallback">
+              <summary>也可在 Mac 终端生成</summary>
+              <p>终端命令会使用正式数据库，并自动检测局域网 IP 和服务端口。</p>
+              <div className="device-command-row">
+                <code className="device-command">{PAIRING_COMMAND}</code>
+                <button
+                  className="secondary device-command-copy"
+                  type="button"
+                  onClick={() => void copyPairingCommand()}
+                >
+                  {pairingCommandCopied ? "已复制" : "复制命令"}
+                </button>
+              </div>
+              {pairingCommandError ? <p className="device-command-error" role="status">{pairingCommandError}</p> : null}
+            </details>
+          </div>
           <details className="device-danger-section">
             <summary>危险操作 · 撤销所有访问</summary>
             <div className="device-danger-content">
@@ -255,17 +512,67 @@ export function PairingAdmin(): ReactElement {
               </button>
             </div>
           </details>
-        </aside>
+        </section>
       </div>
+
+      {editingDevice ? (
+        <div
+          className="device-modal-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) cancelRename();
+          }}
+        >
+          <section className="device-name-modal" role="dialog" aria-modal="true" aria-labelledby="device-name-modal-title">
+            <div className="device-modal-heading">
+              <div>
+                <p className="device-panel-kicker">DEVICE NAME</p>
+                <h2 id="device-name-modal-title">设置设备名称</h2>
+              </div>
+              <button className="secondary device-modal-close" type="button" aria-label="关闭" onClick={cancelRename}>
+                ×
+              </button>
+            </div>
+            <p className="device-modal-description">为“{editingDevice.deviceName}”设置一个方便识别的名称或备注。</p>
+            <form onSubmit={(event) => {
+              event.preventDefault();
+              void saveDeviceName(editingDevice.sessionId);
+            }}>
+              <label className="device-name-field" htmlFor="device-name-modal-input">
+                名称 / 备注
+                <input
+                  id="device-name-modal-input"
+                  value={editingDeviceName}
+                  maxLength={80}
+                  autoFocus
+                  onChange={(event) => setEditingDeviceName(event.target.value)}
+                />
+              </label>
+              <div className="device-modal-actions">
+                <button className="secondary" type="button" disabled={renamingDeviceId !== null} onClick={cancelRename}>
+                  取消
+                </button>
+                <button className="primary" type="submit" disabled={renamingDeviceId !== null}>
+                  {renamingDeviceId ? "保存中…" : "保存名称"}
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      ) : null}
     </main>
   );
 }
 
-function formatDate(value: string): string {
+function formatDate(value: string | number): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime())
     ? "未知时间"
     : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function redactPairingSecrets(value: string): string {
+  return value.replace(/#pair=[^\s&"'}]+/gi, "#pair=<已隐藏>");
 }
 
 function PairingClaim({

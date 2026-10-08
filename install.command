@@ -231,7 +231,6 @@ export FEISHU_CODEX_BRIDGE_PORTABLE_ROOT="$INSTALL_DIR/current"
 if "$INSTALL_DIR/current/feishu-codex-bridge" install \
   --config "$INSTALL_DIR/config.json" \
   --db "$INSTALL_DIR/runtime/bridge.db" \
-  --start \
   "$@"; then
   echo "已激活不可变版本目录：$release_dir"
   echo "活动版本入口：$INSTALL_DIR/current"

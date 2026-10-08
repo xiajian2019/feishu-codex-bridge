@@ -27,6 +27,7 @@ describe("WebPairingAuth", () => {
       authenticated: false,
       local: false,
       pairingAvailable: true,
+      draftScope: null,
     });
 
     const secondDb = new StateDatabase(statePath);
@@ -42,6 +43,12 @@ describe("WebPairingAuth", () => {
 
     expect(second.isAuthorized(authenticatedRequest)).toBe(true);
     expect(second.listDevices(authenticatedRequest)).toHaveLength(1);
+    const draftScope = first.status(authenticatedRequest).draftScope;
+    expect(draftScope).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(second.status(authenticatedRequest).draftScope).toBe(draftScope);
+    const deviceId = second.listDevices(authenticatedRequest)![0]!.sessionId;
+    expect(second.revokeDevice(authenticatedRequest, deviceId)).toBe(true);
+    expect(second.status(authenticatedRequest).draftScope).toBeNull();
     firstDb.close();
     secondDb.close();
   });
@@ -60,6 +67,24 @@ describe("WebPairingAuth", () => {
     const token = auth.claimPairing(validRemote, pairing.code);
     expect(token).toBeTruthy();
     expect(() => auth.claimPairing(validRemote, pairing.code)).toThrow("pairing code expired or unavailable");
+    db.close();
+  });
+
+  it("allows an authenticated admin to rename a device", () => {
+    const db = new StateDatabase(":memory:");
+    const auth = new WebPairingAuth({ db });
+    const remote = fakeRequest("203.0.113.23");
+    const pairing = auth.startPairing();
+    const response = fakeResponse();
+    const token = auth.claimPairing(remote, pairing.code);
+    auth.setSessionCookie(remote, response as unknown as ServerResponse, token);
+
+    const authenticatedRequest = fakeRequest("203.0.113.23", response.headers["set-cookie"]);
+    const device = auth.listDevices(authenticatedRequest)?.[0];
+    expect(device?.deviceName).toBe("Browser device");
+    expect(auth.renameDevice(authenticatedRequest, device!.sessionId, "办公室 iPhone")).toBe(true);
+    expect(auth.listDevices(authenticatedRequest)?.[0]?.deviceName).toBe("办公室 iPhone");
+    expect(auth.renameDevice(authenticatedRequest, device!.sessionId, "")).toBe(false);
     db.close();
   });
 });

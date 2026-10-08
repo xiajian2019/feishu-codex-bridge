@@ -101,6 +101,7 @@ export function routeTask(task: LarkTask, config: BridgeConfig): RouteResult {
       inputHash: computeInputHash(input),
       input,
       completed: isLarkTaskCompleted(task),
+      origin: "feishu",
       url: typeof task.url === "string" ? task.url : undefined,
     },
   };

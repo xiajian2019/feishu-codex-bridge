@@ -434,6 +434,8 @@ export function buildCodexLaunchAgentPlist(options: CodexLaunchAgentOptions): st
   <dict>
     <key>PATH</key>
     <string>${xmlEscape(values.path)}</string>
+    <key>FEISHU_CODEX_BRIDGE_LAN_BIND</key>
+    <string>1</string>
     ${values.singleBinary ? `<key>FEISHU_CODEX_BRIDGE_SINGLE_BINARY</key>
     <string>1</string>
     <key>FEISHU_CODEX_BRIDGE_APP_ROOT</key>

@@ -84,7 +84,8 @@ describe("portable release", () => {
     expect(source).toContain('launch_agent_backup="$INSTALL_DIR/.launch-agent-backup-$$.plist"');
     expect(source.indexOf('cp -p "$launch_agent_backup" "$launch_agent_plist"'))
       .toBeLessThan(source.indexOf('service start >/dev/null 2>&1 || true'));
-    expect(source).toContain("--start");
+    expect(source).toContain('"$@"');
+    expect(source).not.toContain("--no-start");
     expect(source).toContain("ditto");
     expect(source).toContain("按回车关闭窗口");
   });

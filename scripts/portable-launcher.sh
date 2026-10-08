@@ -18,6 +18,7 @@ if [ -n "${FEISHU_CODEX_BRIDGE_INSTALL_ROOT:-}" ]; then
 else
   SHARED_RUNTIME_DIR="$RUNTIME_DIR"
 fi
+export FEISHU_CODEX_BRIDGE_LAN_BIND=1
 
 BUN_VERSION_REQUIRED="1.4.2"
 BUN_VERSION_DOWNLOAD="1.4.2"
@@ -188,6 +189,8 @@ run_entry() {
       main) internal_command="--bridge-main" ;;
       codex-cli) internal_command="--bridge-codex" ;;
       install-cli) internal_command="--bridge-install" ;;
+      web-pair-cli) internal_command="--bridge-web-pair" ;;
+      backup-cli) internal_command="--bridge-backup" ;;
       aamp-cli)
         echo "Direct 单二进制包不提供 AAMP 管理命令。" >&2
         exit 2
@@ -209,6 +212,7 @@ usage() {
   feishu-codex-bridge start [选项]
   feishu-codex-bridge update [选项]
   feishu-codex-bridge service <install|start|stop|restart|status|logs|uninstall>
+  feishu-codex-bridge web:pair
   feishu-codex-bridge aamp:<命令> [参数...]
   feishu-codex-bridge codex:<命令> [参数...]
   feishu-codex-bridge --version
@@ -234,6 +238,7 @@ case "$1" in
   list|scripts)
     printf '%s\n' \
       install init doctor start update service \
+      web:pair backup \
       aamp aamp:install aamp:start aamp:stop aamp:restart aamp:status aamp:logs aamp:update aamp:add aamp:remove \
       aamp:recent aamp:task aamp:inspect aamp:worktrees \
       codex codex:install codex:setup codex:start codex:stop codex:restart codex:status codex:logs \
@@ -269,6 +274,14 @@ case "$1" in
   bridge:install)
     shift
     run_entry install-cli install "$@"
+    ;;
+  backup)
+    shift
+    run_entry backup-cli "$@"
+    ;;
+  web:pair)
+    shift
+    run_entry web-pair-cli "$@"
     ;;
   aamp)
     shift

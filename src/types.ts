@@ -11,6 +11,12 @@ export const TASK_STATES = [
 
 export type TaskState = (typeof TASK_STATES)[number];
 
+export const TASK_ORIGINS = ["feishu", "web"] as const;
+export type TaskOrigin = (typeof TASK_ORIGINS)[number];
+
+export type ExecutionBackend = "codex-sdk";
+export type StoredExecutionBackend = ExecutionBackend | "tmux-session";
+
 export const SANDBOX_MODES = ["read-only", "workspace-write"] as const;
 export type SandboxMode = (typeof SANDBOX_MODES)[number];
 
@@ -59,6 +65,68 @@ export interface ProjectConfig {
   repo: string;
 }
 
+export const PROJECT_STATUSES = ["available", "disabled"] as const;
+export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
+
+export interface StoredProject {
+  name: string;
+  path: string;
+  status: ProjectStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export const SHORTCUT_KINDS = ["terminal", "insert", "send", "sequence"] as const;
+export type ShortcutKind = (typeof SHORTCUT_KINDS)[number];
+export const SHORTCUT_SURFACES = ["palette", "composer"] as const;
+export type ShortcutSurface = (typeof SHORTCUT_SURFACES)[number];
+export const SHORTCUT_DISPLAY_MODES = ["closed", "expanded", "both"] as const;
+export type ShortcutDisplayMode = (typeof SHORTCUT_DISPLAY_MODES)[number];
+export const SHORTCUT_GROUP_LAYOUTS = ["grid", "keyboard"] as const;
+export type ShortcutGroupLayout = (typeof SHORTCUT_GROUP_LAYOUTS)[number];
+
+export interface StoredShortcutGroup {
+  id: string;
+  title: string;
+  icon: string;
+  description: string;
+  surface: ShortcutSurface;
+  layout: ShortcutGroupLayout;
+  sort_order: number;
+  enabled: boolean;
+  built_in: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoredShortcut {
+  id: string;
+  group_id: string;
+  title: string;
+  detail: string;
+  kind: ShortcutKind;
+  value: string;
+  enabled: boolean;
+  built_in: boolean;
+  dangerous: boolean;
+  action_key: string | null;
+  display_mode: ShortcutDisplayMode;
+  sort_order: number;
+  operation_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoredWebTaskAttachment {
+  attachment_id: string;
+  task_guid: string | null;
+  file_name: string;
+  mime_type: string;
+  size_bytes: number;
+  local_path: string;
+  created_at: string;
+}
+
 export interface ModeConfig {
   optionGuid: string;
   sandboxMode: SandboxMode;
@@ -79,7 +147,7 @@ export interface BridgeConfig {
     /** Optional per-task Git worktree isolation for local ACP agents. */
     worktree?: {
       enabled: boolean;
-      projectMapPath: string;
+      projectMapPath?: string;
       globalAgentsPath: string;
       taskDir: string;
       worktreeRoot: string;
@@ -168,6 +236,66 @@ export interface TaskInput {
   description: string;
 }
 
+export interface WebTaskSubmission {
+  /** Optional for compatibility with older API clients. */
+  idempotencyKey?: string;
+  summary?: string;
+  description: string;
+  projectKey: string;
+  mode?: string;
+  attachmentIds?: string[];
+}
+
+export type TmuxSessionActionType = "task_submit" | "terminal_command" | "shortcut" | "control_sequence";
+export type TmuxSessionActionStatus = "sending" | "sent" | "confirmed" | "unconfirmed" | "failed";
+
+export interface StoredTmuxSession {
+  record_id: string;
+  tmux_session_id: string;
+  session_name: string;
+  project_key: string | null;
+  codex_home_id: string | null;
+  working_directory: string;
+  tmux_created_at: number;
+  first_seen_at: string;
+  last_seen_at: string;
+  ended_at: string | null;
+  created_by_device_id: string | null;
+}
+
+export interface StoredTmuxSessionAction {
+  action_id: string;
+  session_record_id: string;
+  tmux_session_id: string;
+  session_name: string;
+  project_key: string | null;
+  working_directory: string;
+  session_ended_at: string | null;
+  device_id: string | null;
+  device_name: string | null;
+  action_type: TmuxSessionActionType;
+  request_id: string | null;
+  content: string;
+  status: TmuxSessionActionStatus;
+  error: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface TmuxSessionActionQuery {
+  search?: string;
+  tmuxSessionId?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export class WebTaskSubmissionConflictError extends Error {
+  constructor() {
+    super("相同幂等键已用于不同的任务内容，请刷新表单后重试。");
+    this.name = "WebTaskSubmissionConflictError";
+  }
+}
+
 export interface LarkCustomField {
   guid?: string;
   name?: string;
@@ -223,6 +351,7 @@ export interface RoutedTask {
   inputHash: string;
   input: TaskInput;
   completed: boolean;
+  origin?: TaskOrigin;
   url?: string;
 }
 
@@ -241,6 +370,7 @@ export interface ConfigProblem {
 
 export interface StoredTask {
   task_guid: string;
+  origin: TaskOrigin;
   project_key: string;
   mode: string;
   repo: string;
@@ -359,6 +489,7 @@ export interface StoredBridgeTask {
   cancel_reason: string | null;
   recovery_count: number;
   last_recovered_at: string | null;
+  initial_final_response: string | null;
   final_response: string | null;
   error: string | null;
   created_at: string;
@@ -422,6 +553,8 @@ export interface StoredRun {
   previous_input_text: string | null;
   prompt_text: string;
   thread_id: string | null;
+  execution_backend: StoredExecutionBackend;
+  tmux_session_id: string | null;
   state: TaskState;
   final_response: string | null;
   usage_json: string | null;
@@ -491,7 +624,7 @@ export interface WorkerProgress {
 }
 
 export interface WorkerHandle {
-  pid: number;
+  pid: number | null;
   result: Promise<WorkerResult>;
   terminate(): Promise<void>;
 }

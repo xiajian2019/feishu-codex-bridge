@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Domain } from "@larksuiteoapi/node-sdk";
@@ -9,6 +9,7 @@ import type { CodexAppServerQueryClient } from "../src/codex-app-server.js";
 import { StateDatabase } from "../src/db.js";
 import {
   FeishuSqliteCodexRuntime,
+  buildProjectRoutingConfig,
   buildDirectPrompt,
   evaluateDirectPermission,
   parseDirectTaskRoute,
@@ -311,35 +312,16 @@ describe("native Feishu + SQLite + Codex runtime helpers", () => {
     });
   });
 
-  it("resolves direct projects from the shared Codex project map", () => {
-    const directory = mkdtempSync(join(tmpdir(), "direct-project-map-"));
-    const projectMapPath = join(directory, "project-map.yaml");
-    writeFileSync(projectMapPath, `projects:\n  feishu-codex-bridge:\n    root: ${process.cwd()}\n`);
-    try {
-      const mappedConfig = {
-        ...config,
-        aamp: {
-          ...config.aamp,
-          worktree: {
-            enabled: true,
-            projectMapPath,
-            globalAgentsPath: join(directory, "AGENTS.md"),
-            taskDir: join(directory, "tasks"),
-            worktreeRoot: join(directory, "worktrees"),
-            baseRef: "HEAD",
-            branchPrefix: "test/agent",
-          },
-        },
-        projects: { food: config.projects.food },
-      };
-      expect(resolveDirectTaskRoute("项目：feishu-codex-bridge\n模式：implement\n查看状态", mappedConfig)).toMatchObject({
-        ok: true,
-        projectKey: "feishu-codex-bridge",
-        project: { repo: process.cwd() },
-      });
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
+  it("resolves direct projects from the Bridge SQLite registry", () => {
+    const db = new StateDatabase(":memory:");
+    db.createProject({ name: "feishu-codex-bridge", path: process.cwd() });
+    const registryConfig = buildProjectRoutingConfig(config, db);
+    expect(resolveDirectTaskRoute("项目：feishu-codex-bridge\n模式：implement\n查看状态", registryConfig)).toMatchObject({
+      ok: true,
+      projectKey: "feishu-codex-bridge",
+      project: { repo: process.cwd() },
+    });
+    db.close();
   });
 
   it("resolves credentials from the configured environment names", () => {

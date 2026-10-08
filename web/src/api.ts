@@ -1,14 +1,42 @@
 import type {
   DashboardChange,
+  CodexHistoryAttachment,
+  CodexHistoryDetailResponse,
+  CodexHistoryHome,
+  CodexHistoryInterruptResponse,
+  CodexHistoryListResponse,
+  CodexHistoryMessageResponse,
+  CodexHistoryReasoningEffort,
+  CodexHistoryUpdatesResponse,
+  CodexHistoryWriterStatus,
+  CodexResetCreditConsumeResponse,
+  CodexUsageResponse,
+  CreateTaskInput,
+  CreateTaskResponse,
+  ProjectRecord,
+  ProjectStatus,
+  TaskAttachment,
   TaskDetailResponse,
   TaskListResponse,
 } from "./types.js";
+import { DEFAULT_COMPOSER_SHORTCUTS, type ShortcutDefinition, type ShortcutDisplayMode, type ShortcutGroup, type ShortcutKind, type ShortcutStore, type ShortcutSurface } from "./tmux-shortcuts.js";
+import { invalidateShortcutConfigCache, observeShortcutConfigServerRevision, readShortcutConfigRevision, recordShortcutConfigServerRevision, writeShortcutConfigCache } from "./shortcut-config-cache.js";
 
 export interface TaskQuery {
   q?: string;
   state?: string;
+  source?: string;
   project?: string;
   mode?: string;
+  limit: number;
+  offset: number;
+}
+
+export interface CodexHistoryQuery {
+  home?: string;
+  q?: string;
+  status?: string;
+  archived: "active" | "archived" | "all";
   limit: number;
   offset: number;
 }
@@ -48,11 +76,410 @@ export function fetchTasks(query: TaskQuery, signal?: AbortSignal): Promise<Task
     if (key === "limit" || key === "offset" || !value) continue;
     params.set(key, value);
   }
-  return getJson<TaskListResponse>(`/api/tasks?${params.toString()}`, { signal });
+  return getJson<TaskListResponse>(`/api/task-panel?${params.toString()}`, { signal });
+}
+
+export function fetchCodexHistory(
+  query: CodexHistoryQuery,
+  signal?: AbortSignal,
+): Promise<CodexHistoryListResponse> {
+  const params = new URLSearchParams({
+    archived: query.archived,
+    limit: String(query.limit),
+    offset: String(query.offset),
+  });
+  if (query.home) params.set("home", query.home);
+  if (query.q) params.set("q", query.q);
+  if (query.status) params.set("status", query.status);
+  return getJson<CodexHistoryListResponse>(`/api/codex/threads?${params.toString()}`, { signal });
+}
+
+export async function fetchCodexHistoryHomes(signal?: AbortSignal): Promise<CodexHistoryHome[]> {
+  const result = await getJson<{ homes: CodexHistoryHome[] }>("/api/codex/homes", { signal });
+  return result.homes;
+}
+
+export async function updateCodexThreadHomePreference(
+  threadId: string,
+  preferredHomeId: string,
+): Promise<{ threadId: string; preferredHomeId: string; updatedAt: string }> {
+  const token = await getActionToken();
+  return getJson<{ threadId: string; preferredHomeId: string; updatedAt: string }>(
+    `/api/codex/threads/${encodeURIComponent(threadId)}/home`,
+    {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Bridge-Action-Token": token,
+      },
+      body: JSON.stringify({ preferredHomeId }),
+    },
+  );
+}
+
+export function fetchCodexUsage(options: { homeId?: string; signal?: AbortSignal } = {}): Promise<CodexUsageResponse> {
+  const params = new URLSearchParams();
+  if (options.homeId) params.set("home", options.homeId);
+  const query = params.toString();
+  return getJson<CodexUsageResponse>(`/api/codex/usage${query ? `?${query}` : ""}`, { signal: options.signal });
+}
+
+export async function consumeCodexResetCredit(input: {
+  homeId: string;
+  creditId: string;
+  idempotencyKey: string;
+}): Promise<CodexResetCreditConsumeResponse> {
+  const token = await getActionToken();
+  return getJson<CodexResetCreditConsumeResponse>("/api/codex/usage/reset-credit/consume", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Action-Token": token,
+    },
+    body: JSON.stringify(input),
+  });
+}
+
+export function fetchCodexThreadDetail(
+  homeId: string,
+  threadId: string,
+  signal?: AbortSignal,
+): Promise<CodexHistoryDetailResponse> {
+  return getJson<CodexHistoryDetailResponse>(
+    `/api/codex/threads/${encodeURIComponent(homeId)}/${encodeURIComponent(threadId)}?turns=1`,
+    { signal },
+  );
+}
+
+export async function uploadCodexHistoryAttachment(file: File): Promise<CodexHistoryAttachment> {
+  const token = await getActionToken();
+  const result = await getJson<{ attachment: CodexHistoryAttachment }>("/api/codex/attachments", {
+    method: "POST",
+    headers: {
+      "Content-Type": file.type || "application/octet-stream",
+      "X-Bridge-Action-Token": token,
+      "X-File-Name": encodeURIComponent(file.name),
+    },
+    body: file,
+  });
+  return result.attachment;
+}
+
+export async function deleteCodexHistoryAttachment(attachmentId: string): Promise<void> {
+  const token = await getActionToken();
+  await getJson(`/api/codex/attachments/${encodeURIComponent(attachmentId)}`, {
+    method: "DELETE",
+    headers: { "X-Bridge-Action-Token": token },
+  });
+}
+
+export async function sendCodexThreadMessage(
+  homeId: string,
+  threadId: string,
+  input: {
+    text: string;
+    attachmentIds?: string[];
+    turnIndex: number;
+    idempotencyKey: string;
+    model?: string;
+    reasoningEffort?: CodexHistoryReasoningEffort;
+  },
+): Promise<CodexHistoryMessageResponse> {
+  const token = await getActionToken();
+  return getJson<CodexHistoryMessageResponse>(
+    `/api/codex/threads/${encodeURIComponent(homeId)}/${encodeURIComponent(threadId)}/messages`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Bridge-Action-Token": token,
+      },
+      body: JSON.stringify(input),
+    },
+  );
+}
+
+export function codexHistoryRunAttachmentUrl(
+  homeId: string,
+  threadId: string,
+  runId: string,
+  attachmentId: string,
+): string {
+  return `/api/codex/threads/${encodeURIComponent(homeId)}/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/attachments/${encodeURIComponent(attachmentId)}`;
+}
+
+export function fetchCodexThreadUpdates(
+  homeId: string,
+  threadId: string,
+  runId: string,
+  after: number,
+  signal?: AbortSignal,
+): Promise<CodexHistoryUpdatesResponse> {
+  const params = new URLSearchParams({ runId, after: String(after) });
+  return getJson<CodexHistoryUpdatesResponse>(
+    `/api/codex/threads/${encodeURIComponent(homeId)}/${encodeURIComponent(threadId)}/updates?${params.toString()}`,
+    { signal },
+  );
+}
+
+export function fetchCodexThreadWriterStatus(
+  homeId: string,
+  threadId: string,
+  signal?: AbortSignal,
+): Promise<CodexHistoryWriterStatus> {
+  return getJson<CodexHistoryWriterStatus>(
+    `/api/codex/threads/${encodeURIComponent(homeId)}/${encodeURIComponent(threadId)}/writer-status`,
+    { signal },
+  );
+}
+
+export async function interruptCodexThreadMessage(
+  homeId: string,
+  threadId: string,
+  runId: string,
+): Promise<CodexHistoryInterruptResponse> {
+  const token = await getActionToken();
+  return getJson<CodexHistoryInterruptResponse>(
+    `/api/codex/threads/${encodeURIComponent(homeId)}/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/interrupt`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Bridge-Action-Token": token,
+      },
+      body: JSON.stringify({}),
+    },
+  );
+}
+
+export async function fetchProjects(): Promise<ProjectRecord[]> {
+  const result = await getJson<{ projects: ProjectRecord[] }>("/api/projects");
+  return result.projects;
+}
+
+export async function createProject(input: { name: string; path: string; status: ProjectStatus }): Promise<ProjectRecord> {
+  const token = await getActionToken();
+  const result = await getJson<{ project: ProjectRecord }>("/api/projects", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Action-Token": token,
+    },
+    body: JSON.stringify(input),
+  });
+  return result.project;
+}
+
+export async function updateProject(
+  name: string,
+  input: { path?: string; status?: ProjectStatus },
+): Promise<ProjectRecord> {
+  const token = await getActionToken();
+  const result = await getJson<{ project: ProjectRecord }>(`/api/projects/${encodeURIComponent(name)}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Action-Token": token,
+    },
+    body: JSON.stringify(input),
+  });
+  return result.project;
+}
+
+export async function fetchShortcutConfig(): Promise<ShortcutStore> {
+  const revisionAtStart = readShortcutConfigRevision();
+  const result = await getJson<{ groups: ShortcutGroup[]; shortcuts: ShortcutDefinition[]; revision?: string }>("/api/shortcut-config");
+  if (result.revision) recordShortcutConfigServerRevision(result.revision);
+  const composerDefaults = new Map(DEFAULT_COMPOSER_SHORTCUTS.map((shortcut) => [shortcut.id, shortcut]));
+  const shortcuts = Array.isArray(result.shortcuts)
+    ? result.shortcuts.map((shortcut) => {
+      const fallback = shortcut.groupId === "composer" && !shortcut.actionKey
+        ? composerDefaults.get(shortcut.id)
+        : undefined;
+      return fallback
+        ? { ...fallback, ...shortcut, actionKey: fallback.actionKey, displayMode: fallback.displayMode }
+        : shortcut;
+    })
+    : [];
+  const store: ShortcutStore = {
+    groups: Array.isArray(result.groups)
+      ? result.groups.map((group) => group.id === "composer" && group.surface !== "composer" ? { ...group, surface: "composer" } : group)
+      : [],
+    shortcuts,
+  };
+  if (revisionAtStart === readShortcutConfigRevision()) writeShortcutConfigCache(store);
+  return store;
+}
+
+/** Polls the small server revision while the page is visible so other devices' edits appear. */
+export function watchRemoteShortcutConfig(onChanged?: () => void): () => void {
+  let active = true;
+  const check = async (): Promise<void> => {
+    if (!active || document.visibilityState === "hidden") return;
+    try {
+      const response = await getJson<{ revision: string }>("/api/shortcut-config/revision");
+      if (active && observeShortcutConfigServerRevision(response.revision)) onChanged?.();
+    } catch {
+      // Keep the last valid configuration while the device is offline.
+    }
+  };
+  const onVisibility = (): void => { if (document.visibilityState === "visible") void check(); };
+  document.addEventListener("visibilitychange", onVisibility);
+  const timer = window.setInterval(() => void check(), 30_000);
+  return () => {
+    active = false;
+    window.clearInterval(timer);
+    document.removeEventListener("visibilitychange", onVisibility);
+  };
+}
+
+export async function createShortcutGroup(input: {
+  title: string;
+  icon: string;
+  description: string;
+  surface?: ShortcutSurface;
+  layout: "grid" | "keyboard";
+}): Promise<ShortcutGroup> {
+  const token = await getActionToken();
+  const result = await getJson<{ group: ShortcutGroup }>("/api/shortcut-groups", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
+    body: JSON.stringify(input),
+  });
+  invalidateShortcutConfigCache();
+  return result.group;
+}
+
+export async function updateShortcutGroup(
+  id: string,
+  input: Partial<Pick<ShortcutGroup, "title" | "icon" | "description" | "surface" | "layout" | "sortOrder" | "enabled">>,
+): Promise<ShortcutGroup> {
+  const token = await getActionToken();
+  const result = await getJson<{ group: ShortcutGroup }>(`/api/shortcut-groups/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
+    body: JSON.stringify(input),
+  });
+  invalidateShortcutConfigCache();
+  return result.group;
+}
+
+export async function deleteShortcutGroup(id: string): Promise<void> {
+  const token = await getActionToken();
+  await getJson(`/api/shortcut-groups/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { "X-Bridge-Action-Token": token },
+  });
+  invalidateShortcutConfigCache();
+}
+
+export async function createShortcut(input: {
+  groupId: string;
+  title: string;
+  detail: string;
+  kind: ShortcutKind;
+  value: string;
+  actionKey?: string;
+  displayMode?: ShortcutDisplayMode;
+  enabled: boolean;
+  dangerous: boolean;
+}): Promise<ShortcutDefinition> {
+  const token = await getActionToken();
+  const result = await getJson<{ shortcut: ShortcutDefinition }>("/api/shortcuts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
+    body: JSON.stringify(input),
+  });
+  invalidateShortcutConfigCache();
+  return result.shortcut;
+}
+
+export async function updateShortcut(
+  id: string,
+  input: Partial<Pick<ShortcutDefinition, "groupId" | "title" | "detail" | "kind" | "value" | "actionKey" | "displayMode" | "enabled" | "dangerous" | "sortOrder">>,
+): Promise<ShortcutDefinition> {
+  const token = await getActionToken();
+  const result = await getJson<{ shortcut: ShortcutDefinition }>(`/api/shortcuts/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
+    body: JSON.stringify(input),
+  });
+  invalidateShortcutConfigCache();
+  return result.shortcut;
+}
+
+export async function moveShortcutToEdge(
+  id: string,
+  position: "start" | "end",
+): Promise<ShortcutDefinition> {
+  const token = await getActionToken();
+  const result = await getJson<{ shortcut: ShortcutDefinition }>(`/api/shortcuts/${encodeURIComponent(id)}/move`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
+    body: JSON.stringify({ position }),
+  });
+  invalidateShortcutConfigCache();
+  return result.shortcut;
+}
+
+export async function deleteShortcut(id: string): Promise<void> {
+  const token = await getActionToken();
+  await getJson(`/api/shortcuts/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { "X-Bridge-Action-Token": token },
+  });
+  invalidateShortcutConfigCache();
+}
+
+export async function recordShortcutUse(id: string): Promise<ShortcutDefinition> {
+  const token = await getActionToken();
+  const result = await getJson<{ shortcut: ShortcutDefinition }>(`/api/shortcuts/${encodeURIComponent(id)}/use`, {
+    method: "POST",
+    headers: { "X-Bridge-Action-Token": token },
+  });
+  return result.shortcut;
 }
 
 export function fetchTaskDetail(taskGuid: string, signal?: AbortSignal): Promise<TaskDetailResponse> {
   return getJson<TaskDetailResponse>(`/api/tasks/${encodeURIComponent(taskGuid)}`, { signal });
+}
+
+export async function uploadTaskAttachment(file: File): Promise<TaskAttachment> {
+  const token = await getActionToken();
+  const result = await getJson<{ attachment: TaskAttachment }>("/api/tasks/attachments", {
+    method: "POST",
+    headers: {
+      "Content-Type": file.type || "application/octet-stream",
+      "X-Bridge-Action-Token": token,
+      "X-File-Name": encodeURIComponent(file.name),
+    },
+    body: file,
+  });
+  return result.attachment;
+}
+
+export async function deleteTaskAttachment(attachmentId: string): Promise<void> {
+  const token = await getActionToken();
+  await getJson(`/api/tasks/attachments/${encodeURIComponent(attachmentId)}`, {
+    method: "DELETE",
+    headers: { "X-Bridge-Action-Token": token },
+  });
+}
+
+export function taskAttachmentUrl(taskGuid: string, attachmentId: string): string {
+  return `/api/tasks/${encodeURIComponent(taskGuid)}/attachments/${encodeURIComponent(attachmentId)}`;
+}
+
+export async function createTask(input: CreateTaskInput): Promise<CreateTaskResponse> {
+  const token = await getActionToken();
+  return getJson<CreateTaskResponse>("/api/tasks", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Action-Token": token,
+    },
+    body: JSON.stringify(input),
+  });
 }
 
 export async function postTaskAction(
@@ -71,7 +498,16 @@ export async function postTaskAction(
   });
 }
 
-async function getActionToken(): Promise<string> {
+export async function postTaskFollowup(source: "desk" | "direct", taskId: string, text: string, idempotencyKey: string): Promise<{ ok: boolean; state: string }> {
+  const token = await getActionToken();
+  return getJson(`/api/task-panel/${source}/${encodeURIComponent(taskId)}/followups`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
+    body: JSON.stringify({ text, idempotencyKey }),
+  });
+}
+
+export async function getActionToken(): Promise<string> {
   const meta = document.querySelector<HTMLMetaElement>("meta[name=bridge-action-token]");
   const embedded = meta?.content;
   if (embedded && embedded !== "__BRIDGE_ACTION_TOKEN__") return embedded;

@@ -1,19 +1,20 @@
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { AampTaskAgentRuntime } from "./aamp-task-agent.js";
 import { AampRelayClient, reconcileRunningAampTasks } from "./aamp-relay.js";
 import { isDirectExecutionMode, loadConfig, parseExecutionMode } from "./config.js";
 import { buildCodexAppServerEnvironment, CodexAppServerClient } from "./codex-app-server.js";
+import { CodexHistoryService } from "./codex-history.js";
+import { isExecutableCodexPath, resolveCodexCliPath } from "./codex-path.js";
 import { LocalCodexNotificationInbox } from "./codex-notification-inbox.js";
 import { StateDatabase } from "./db.js";
+import { defaultBridgeAttachmentRoots } from "./bridge-backup.js";
+import { initializeProjectRegistry, writeProjectRegistrySnapshot } from "./project-registry.js";
 import { TmuxDashboardApi } from "./tmux-dashboard-api.js";
-import { TmuxVerifier } from "./tmux-verifier.js";
-import { TmuxVerifierStore } from "./tmux-verifier-store.js";
-import { TmuxVerifierWebServer } from "./tmux-verifier-web.js";
 import { Dispatcher } from "./dispatcher.js";
+import { captureGitWorkspaceSnapshot } from "./run-artifacts.js";
 import { LarkCliClient } from "./lark.js";
 import { LocalCodexNotificationWatcher } from "./local-codex-notifications.js";
 import { Poller } from "./poller.js";
@@ -37,50 +38,116 @@ export interface MainArguments {
   help?: boolean;
 }
 
-interface UnifiedTmuxBackend {
-  verifier: TmuxVerifier;
-  verifierWeb: TmuxVerifierWebServer;
-  dashboardApi: TmuxDashboardApi;
-  start(): void;
-  stop(): void;
-}
-
-function createUnifiedTmuxBackend(
+function createDashboardTaskDispatcher(
   config: ReturnType<typeof loadConfig>,
-  dbPath: string,
+  args: MainArguments,
+  db: StateDatabase,
   logger: Logger,
-  webPort = config.web.port,
-  auth?: WebPairingAuth,
-): UnifiedTmuxBackend {
-  const store = new TmuxVerifierStore(join(dirname(resolve(dbPath)), "tmux-verifier.db"));
-  const verifier = new TmuxVerifier({
-    store,
-    defaultCodexPath: resolveTmuxVerifierCodexPath(),
-    tmuxSocket: process.env.TMUX_VERIFY_SOCKET ?? "",
-    pollIntervalMs: 500,
-    adapterOptions: { tmuxPath: process.env.TMUX_VERIFY_TMUX_PATH || resolveTmuxPath() },
-  });
-  const verifierWeb = new TmuxVerifierWebServer({
-    verifier,
-    host: config.web.host,
-    port: webPort,
-    projectMapPath: process.env.TMUX_VERIFY_PROJECT_MAP
-      ?? resolve(homedir(), ".codex", "project-map.yaml"),
-    bridgeDashboardUrl: process.env.TMUX_VERIFY_BRIDGE_DASHBOARD_URL
-      ?? "http://127.0.0.1:" + webPort,
-    auth,
+): Dispatcher {
+  const workerScript = isSingleBinaryRuntime()
+    ? "--bridge-worker"
+    : join(
+      dirname(fileURLToPath(import.meta.url)),
+      existsSync(join(dirname(fileURLToPath(import.meta.url)), "codex-worker.js"))
+        ? "codex-worker.js"
+        : "codex-worker.ts",
+    );
+  const codexWorker = new ChildWorkerRunner({
+    workerScript,
+    dbPath: resolve(args.dbPath),
+    configPath: resolve(args.configPath),
+    executable: process.execPath,
+    onEvent: (runId, event) => {
+      if (event.type === "thread.started") db.saveThreadId(runId, event.threadId);
+      else if (event.type === "worker.progress") db.recordRunProgress(runId, event.progress);
+    },
     logger,
   });
+  const dispatcher = new Dispatcher({
+    db,
+    lark: new LarkCliClient(config, { logger }),
+    config,
+    workerRunner: codexWorker,
+    captureWorkspaceSnapshot: captureGitWorkspaceSnapshot,
+    larkOutboxEnabled: false,
+    logger,
+  });
+  dispatcher.recoverInterruptedRuns();
+  return dispatcher;
+}
+
+function dashboardBackupOptions(databasePathInput: string, taskAttachmentsDirectoryInput: string): {
+  backupRoot: string;
+  backupAttachmentRoots: ReturnType<typeof defaultBridgeAttachmentRoots>;
+} {
+  const databasePath = resolve(databasePathInput);
+  let canonicalDatabasePath = databasePath;
+  try { canonicalDatabasePath = realpathSync.native(databasePath); } catch { /* Dashboard startup validates the database separately. */ }
+  const dataRoot = resolveBridgeDataRoot(import.meta.url);
+  const attachmentRoots = defaultBridgeAttachmentRoots(canonicalDatabasePath, dataRoot);
+  attachmentRoots.web = [...new Set([
+    ...attachmentRoots.web,
+    resolve(taskAttachmentsDirectoryInput),
+    join(dirname(databasePath), "task-attachments"),
+  ])];
   return {
-    verifier,
-    verifierWeb,
-    dashboardApi: new TmuxDashboardApi(),
-    start: () => verifier.start(),
-    stop: () => {
-      verifier.stop();
-      store.close();
-    },
+    backupRoot: join(dirname(canonicalDatabasePath), "backups"),
+    backupAttachmentRoots: attachmentRoots,
   };
+}
+
+function dashboardTaskActions(dispatcher: Dispatcher) {
+  return {
+    createTask: (input: Parameters<Dispatcher["submitWebTask"]>[0]) => dispatcher.submitWebTask(input),
+    retryWebTask: (taskGuid: string, idempotencyKey: string) => dispatcher.retryWebTask(taskGuid, idempotencyKey),
+    interruptTask: async (taskGuid: string, reason?: string) => ({
+      ok: await dispatcher.interruptTask(taskGuid, reason),
+    }),
+    appendFeedback: async (taskGuid: string, details: string) => ({
+      ok: true,
+      state: (await dispatcher.appendFeedback(taskGuid, details)).state,
+    }),
+    appendWebFollowup: (taskGuid: string, details: string, idempotencyKey: string) =>
+      dispatcher.appendWebTaskFollowup(taskGuid, details, idempotencyKey),
+  };
+}
+
+function resolveDashboardListenHost(configuredHost: string): string {
+  return process.env.FEISHU_CODEX_BRIDGE_LAN_BIND === "1" ? "0.0.0.0" : configuredHost;
+}
+
+function createCodexHistoryService(
+  config: ReturnType<typeof loadConfig>,
+  projectRoot: string,
+  logger: Logger,
+  db: StateDatabase,
+): CodexHistoryService {
+  let executable = config.codex.cliPath;
+  if (!isExecutableCodexPath(executable)) {
+    // Do not let `bun run`'s node_modules/.bin/codex shadow the system Codex
+    // that owns the user's local homes and state database. Keep PATH-based
+    // discovery for the configured path above; fallback discovery prefers the
+    // known user/system/App locations instead.
+    const discovered = resolveCodexCliPath({
+      environment: { ...process.env, CODEX_PATH: undefined, PATH: "" },
+    });
+    if (discovered) {
+      logger.warn("configured Codex path is unavailable; local history will use the discovered executable", {
+        configuredPath: executable,
+        executable: discovered.path,
+      });
+      executable = discovered.path;
+    }
+  }
+  return new CodexHistoryService({
+    executable,
+    cwd: projectRoot,
+    environment: buildCodexAppServerEnvironment(config),
+    listCacheStore: db,
+    threadHomePreferenceStore: db,
+    runStore: db,
+    logger,
+  });
 }
 
 async function runWebOnlyMode(
@@ -89,18 +156,25 @@ async function runWebOnlyMode(
   logger: Logger,
 ): Promise<void> {
   const db = new StateDatabase(args.dbPath);
+  initializeProjectRegistry(db, config.projects);
   const port = args.webPort ?? 17310;
-  const auth = new WebPairingAuth({ db });
-  const tmuxBackend = createUnifiedTmuxBackend(config, args.dbPath, logger, port, auth);
+  const auth = new WebPairingAuth({ db, allowLocalRequests: true });
+  const tmuxDashboardApi = new TmuxDashboardApi({ db });
+  const dispatcher = createDashboardTaskDispatcher(config, args, db, logger);
   const dashboard = new DashboardServer({
     db,
+    databasePath: resolve(args.dbPath),
+    ...dashboardBackupOptions(resolve(args.dbPath), join(dirname(resolve(args.dbPath)), "task-attachments")),
+    executionMode: "web-only",
+    codexCliPath: config.codex.cliPath,
     auth,
-    tmuxVerifier: tmuxBackend.verifierWeb,
-    tmuxDashboard: tmuxBackend.dashboardApi,
-    host: config.web.host,
+    tmuxDashboard: tmuxDashboardApi,
+    codexHistory: createCodexHistoryService(config, resolveBridgeProjectRoot(import.meta.url), logger, db),
+    host: resolveDashboardListenHost(config.web.host),
     port,
-    projects: Object.keys(config.projects),
     modes: Object.keys(config.modes),
+    taskAttachmentsDirectory: join(dirname(resolve(args.dbPath)), "task-attachments"),
+    actions: dashboardTaskActions(dispatcher),
     logger,
   });
   let resolveStopped: () => void = () => {};
@@ -112,10 +186,10 @@ async function runWebOnlyMode(
     if (!stopPromise) {
       stopPromise = (async () => {
         try {
-          await dashboard.stop();
+          await dispatcher.shutdown();
         } finally {
           try {
-            tmuxBackend.stop();
+            await dashboard.stop();
           } finally {
             db.close();
           }
@@ -136,7 +210,6 @@ async function runWebOnlyMode(
   process.once("SIGTERM", onSignal);
 
   try {
-    tmuxBackend.start();
     const url = await dashboard.start();
     logger.info("web-only development API started", {
       url,
@@ -149,21 +222,6 @@ async function runWebOnlyMode(
     process.off("SIGTERM", onSignal);
     await stop();
   }
-}
-
-function resolveTmuxVerifierCodexPath(): string {
-  const candidates = [
-    process.env.CODEX_PATH,
-    "/opt/homebrew/bin/codex",
-    "/usr/local/bin/codex",
-    "codex",
-  ].filter((candidate): candidate is string => Boolean(candidate));
-  return candidates.find((candidate) => !candidate.startsWith("/") || existsSync(candidate)) ?? "codex";
-}
-
-function resolveTmuxPath(): string {
-  const candidates = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "tmux"];
-  return candidates.find((candidate) => !candidate.startsWith("/") || existsSync(candidate)) ?? "tmux";
 }
 
 export function parseMainArguments(argv: string[], cwd = process.cwd()): MainArguments {
@@ -284,6 +342,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   logger.info("bridge state database", { path: resolve(args.dbPath) });
   const db = new StateDatabase(args.dbPath);
+  initializeProjectRegistry(db, config.projects);
   const lark = new LarkCliClient(config, { logger });
   const workerScript = isSingleBinaryRuntime()
     ? "--bridge-worker"
@@ -324,19 +383,21 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const auth = config.web.enabled
     ? new WebPairingAuth({ db })
     : null;
-  const tmuxBackend = config.web.enabled
-    ? createUnifiedTmuxBackend(config, args.dbPath, logger, config.web.port, auth!)
-    : null;
+  const tmuxDashboardApi = config.web.enabled ? new TmuxDashboardApi({ db }) : null;
   const dashboard = config.web.enabled
-    ? new DashboardServer({
+      ? new DashboardServer({
         db,
+        databasePath: resolve(args.dbPath),
+        ...dashboardBackupOptions(resolve(args.dbPath), join(dirname(resolve(args.dbPath)), "task-attachments")),
+        executionMode: config.execution.mode,
+        codexCliPath: config.codex.cliPath,
         auth: auth!,
-        tmuxVerifier: tmuxBackend!.verifierWeb,
-        tmuxDashboard: tmuxBackend!.dashboardApi,
-        host: config.web.host,
+        tmuxDashboard: tmuxDashboardApi!,
+        codexHistory: createCodexHistoryService(config, projectRoot, logger, db),
+        host: resolveDashboardListenHost(config.web.host),
         port: config.web.port,
-        projects: Object.keys(config.projects),
         modes: Object.keys(config.modes),
+        taskAttachmentsDirectory: join(dirname(resolve(args.dbPath)), "task-attachments"),
         actions: {
           interruptTask: async (taskGuid, reason) => ({
             ok: await dispatcher.interruptTask(taskGuid, reason),
@@ -345,6 +406,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
             ok: true,
             state: (await dispatcher.appendFeedback(taskGuid, details)).state,
           }),
+          appendWebFollowup: (taskGuid, details, idempotencyKey) =>
+            dispatcher.appendWebTaskFollowup(taskGuid, details, idempotencyKey),
         },
         logger,
       })
@@ -358,7 +421,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     poller.stop();
     await dispatcher.shutdown();
     await dashboard?.stop();
-    tmuxBackend?.stop();
     db.close();
   };
   const onSignal = (): void => {
@@ -398,7 +460,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   process.on("unhandledRejection", onUnhandledRejection);
 
   try {
-    tmuxBackend?.start();
     if (dashboard) {
       const dashboardUrl = await dashboard.start();
       logger.info("dashboard listening", { url: dashboardUrl });
@@ -427,6 +488,7 @@ async function runDirectMode(
 ): Promise<void> {
   const dbPath = resolve(args.dbPath);
   const db = new StateDatabase(dbPath);
+  initializeProjectRegistry(db, config.projects);
   logger.info("bridge state database", {
     path: dbPath,
     mode: config.execution.mode,
@@ -437,6 +499,33 @@ async function runDirectMode(
     logger,
     attachmentsDir: join(resolveBridgeDataRoot(import.meta.url), "runtime", "direct", "attachments"),
   });
+  const auth = config.web.enabled ? new WebPairingAuth({ db }) : null;
+  const tmuxDashboardApi = auth ? new TmuxDashboardApi({ db }) : null;
+  const dashboardDispatcher = tmuxDashboardApi
+    ? createDashboardTaskDispatcher(config, args, db, logger)
+    : null;
+  const dashboard = auth && tmuxDashboardApi && dashboardDispatcher
+    ? new DashboardServer({
+      db,
+      databasePath: dbPath,
+      ...dashboardBackupOptions(dbPath, join(dirname(dbPath), "task-attachments")),
+      executionMode: config.execution.mode,
+      codexCliPath: config.codex.cliPath,
+      auth,
+      tmuxDashboard: tmuxDashboardApi,
+      codexHistory: createCodexHistoryService(config, projectRoot, logger, db),
+      host: resolveDashboardListenHost(config.web.host),
+      port: config.web.port,
+      modes: Object.keys(config.modes),
+      taskAttachmentsDirectory: join(dirname(dbPath), "task-attachments"),
+      actions: {
+        ...dashboardTaskActions(dashboardDispatcher),
+        appendDirectFollowup: async (taskId, details, idempotencyKey) =>
+          db.appendWebDirectFollowup(taskId, details, idempotencyKey),
+      },
+      logger,
+    })
+    : null;
   const localNotifications = config.localNotifications.enabled
     && config.localNotifications.mode === "poll"
     ? new LocalCodexNotificationWatcher({
@@ -474,9 +563,17 @@ async function runDirectMode(
         });
       }
       try {
-        await runtime.stop();
+        await dashboardDispatcher?.shutdown();
       } finally {
-        db.close();
+        try {
+          await dashboard?.stop();
+        } finally {
+          try {
+            await runtime.stop();
+          } finally {
+            db.close();
+          }
+        }
       }
     })();
     return stopPromise;
@@ -490,6 +587,7 @@ async function runDirectMode(
   process.once("SIGTERM", onSignal);
 
   try {
+    if (dashboard) logger.info("dashboard listening", { url: await dashboard.start() });
     await runtime.start();
     await startLocalNotifications(localNotifications, config.localNotifications.intervalSeconds, logger);
     await startNotificationInbox(notificationInbox, logger);
@@ -514,6 +612,9 @@ async function runAampMode(
 ): Promise<void> {
   const dbPath = resolve(args.dbPath);
   const db = new StateDatabase(dbPath);
+  initializeProjectRegistry(db, config.projects);
+  const projectRegistryPath = join(resolveBridgeDataRoot(import.meta.url), "runtime", "aamp", "project-registry.json");
+  writeProjectRegistrySnapshot(db, projectRegistryPath);
   logger.info("bridge state database", { path: dbPath, mode: "aamp" });
   const relay = new AampRelayClient(config.relay);
   if (config.relay.enabled && config.relay.statusUrl) {
@@ -529,6 +630,7 @@ async function runAampMode(
     projectRoot,
     configPath: args.configPath,
     sqlitePath: dbPath,
+    projectRegistryPath,
     attachmentsDir: join(resolveBridgeDataRoot(import.meta.url), "runtime", "aamp", "attachments"),
     logger,
   });
@@ -553,19 +655,26 @@ async function runAampMode(
   const auth = config.web.enabled
     ? new WebPairingAuth({ db })
     : null;
-  const tmuxBackend = config.web.enabled
-    ? createUnifiedTmuxBackend(config, dbPath, logger, config.web.port, auth!)
+  const tmuxDashboardApi = config.web.enabled ? new TmuxDashboardApi({ db }) : null;
+  const dashboardDispatcher = tmuxDashboardApi
+    ? createDashboardTaskDispatcher(config, args, db, logger)
     : null;
   const dashboard = config.web.enabled
     ? new DashboardServer({
         db,
+        databasePath: dbPath,
+        ...dashboardBackupOptions(dbPath, join(dirname(dbPath), "task-attachments")),
+        executionMode: config.execution.mode,
+        codexCliPath: config.codex.cliPath,
         auth: auth!,
-        tmuxVerifier: tmuxBackend!.verifierWeb,
-        tmuxDashboard: tmuxBackend!.dashboardApi,
-        host: config.web.host,
+        tmuxDashboard: tmuxDashboardApi!,
+        codexHistory: createCodexHistoryService(config, projectRoot, logger, db),
+        host: resolveDashboardListenHost(config.web.host),
         port: config.web.port,
-        projects: Object.keys(config.projects),
         modes: Object.keys(config.modes),
+        projectRegistrySnapshotPath: projectRegistryPath,
+        taskAttachmentsDirectory: join(dirname(dbPath), "task-attachments"),
+        ...(dashboardDispatcher ? { actions: dashboardTaskActions(dashboardDispatcher) } : {}),
         logger,
       })
     : null;
@@ -595,12 +704,16 @@ async function runAampMode(
         error: error instanceof Error ? error.message : String(error),
       });
     } finally {
+      await dashboardDispatcher?.shutdown().catch((error) => {
+        logger.warn("failed to stop dashboard task dispatcher", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
       await dashboard?.stop().catch((error) => {
         logger.warn("failed to stop AAMP dashboard", {
           error: error instanceof Error ? error.message : String(error),
         });
       });
-      tmuxBackend?.stop();
       db.close();
       resolveStopped?.();
     }
@@ -611,7 +724,6 @@ async function runAampMode(
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
   try {
-    tmuxBackend?.start();
     if (dashboard) {
       const dashboardUrl = await dashboard.start();
       logger.info("dashboard listening", { url: dashboardUrl, mode: "aamp" });

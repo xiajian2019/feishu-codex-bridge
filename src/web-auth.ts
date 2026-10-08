@@ -26,13 +26,20 @@ export interface WebAuthSessionRecord {
 }
 
 export interface WebAuthDatabase {
+  getOrCreateDraftInstallationId?(): string;
   getWebAuthPairing(): WebAuthPairingRecord | null;
   saveWebAuthPairing(record: WebAuthPairingRecord): void;
   clearWebAuthPairing(): void;
   createWebAuthSession(record: WebAuthSessionRecord): void;
   getWebAuthSession(tokenHash: string): WebAuthSessionRecord | null;
-  touchWebAuthSession(sessionId: string, lastSeenAt: string): void;
+  touchWebAuthSession(
+    sessionId: string,
+    lastSeenAt: string,
+    userAgent: string | null,
+    remoteAddress: string | null,
+  ): void;
   listWebAuthSessions(): WebAuthSessionRecord[];
+  updateWebAuthSessionDeviceName(sessionId: string, deviceName: string): void;
   revokeWebAuthSession(sessionId: string, revokedAt: string): void;
   revokeAllWebAuthSessions(revokedAt: string): void;
 }
@@ -68,6 +75,7 @@ export interface PairingStatus {
   activeSessionCount: number | null;
   pairingAvailable: boolean;
   pairingExpiresAt: number | null;
+  draftScope: string | null;
 }
 
 export class PairingRateLimitError extends Error {
@@ -86,6 +94,7 @@ export class WebPairingAuth {
   private readonly allowLocalRequests: boolean;
   private readonly localAddresses = collectLocalAddresses();
   private readonly memorySessions = new Map<string, WebAuthSessionRecord>();
+  private readonly draftInstallationId: string;
   private memoryPairing: PairingState | null = null;
 
   constructor(options: {
@@ -96,10 +105,11 @@ export class WebPairingAuth {
     this.db = options.db;
     this.now = options.now ?? (() => Date.now());
     this.allowLocalRequests = options.allowLocalRequests ?? false;
+    this.draftInstallationId = this.db?.getOrCreateDraftInstallationId?.() ?? randomUUID();
   }
 
   public isLocalRequest(request: IncomingMessage): boolean {
-    const address = normalizeAddress(request.socket.remoteAddress);
+    const address = this.clientAddress(request);
     return address !== null && this.localAddresses.has(address);
   }
 
@@ -113,19 +123,37 @@ export class WebPairingAuth {
       this.revokeSession(session.sessionId);
       return false;
     }
-    this.touchSession(session);
+    this.touchSession(session, request);
     return true;
+  }
+
+  public currentDeviceId(request: IncomingMessage): string | null {
+    const token = readCookie(request.headers.cookie, SESSION_COOKIE);
+    if (!token) return null;
+    const session = this.getSession(hashToken(token));
+    if (!session || session.revokedAt !== null) return null;
+    if (Date.parse(session.expiresAt) <= this.now()) {
+      this.revokeSession(session.sessionId);
+      return null;
+    }
+    return session.sessionId;
   }
 
   public status(request: IncomingMessage): PairingStatus {
     const pairing = this.getPairing();
     const authenticated = this.isAuthorized(request);
+    const deviceId = authenticated
+      ? this.currentDeviceId(request) ?? (this.allowLocalRequests && this.isLocalRequest(request) ? "local" : null)
+      : null;
     return {
       authenticated,
       local: this.isLocalRequest(request),
       activeSessionCount: authenticated ? this.listActiveSessions().length : null,
       pairingAvailable: pairing !== null && pairing.expiresAt > this.now(),
       pairingExpiresAt: pairing && pairing.expiresAt > this.now() ? pairing.expiresAt : null,
+      draftScope: deviceId
+        ? createHash("sha256").update(JSON.stringify([this.draftInstallationId, deviceId])).digest("base64url")
+        : null,
     };
   }
 
@@ -138,7 +166,7 @@ export class WebPairingAuth {
     return this.listActiveSessions().map((session) => ({
       sessionId: session.sessionId,
       current: session.sessionId === currentSessionId,
-      deviceName: session.deviceName,
+      deviceName: deviceDisplayName(session),
       userAgent: session.userAgent,
       remoteAddress: session.remoteAddress,
       createdAt: session.createdAt,
@@ -181,7 +209,7 @@ export class WebPairingAuth {
       tokenHash: hashToken(token),
       deviceName: deviceNameFromRequest(request),
       userAgent: headerValue(request, "user-agent"),
-      remoteAddress: normalizeAddress(request.socket.remoteAddress),
+      remoteAddress: this.clientAddress(request),
       createdAt: new Date(now).toISOString(),
       lastSeenAt: new Date(now).toISOString(),
       expiresAt: new Date(now + SESSION_TTL_MS).toISOString(),
@@ -237,6 +265,17 @@ export class WebPairingAuth {
     return true;
   }
 
+  public renameDevice(request: IncomingMessage, sessionId: string, deviceName: string): boolean {
+    if (!this.isAuthorized(request)) return false;
+    const normalizedName = deviceName.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+    if (!normalizedName || normalizedName.length > 80) return false;
+    const session = this.listActiveSessions().find((item) => item.sessionId === sessionId);
+    if (!session) return false;
+    session.deviceName = normalizedName;
+    this.updateSessionDeviceName(sessionId, normalizedName);
+    return true;
+  }
+
   private getPairing(): PairingState | null {
     const stored = this.db ? this.db.getWebAuthPairing() : this.memoryPairing;
     if (!stored) return null;
@@ -280,10 +319,25 @@ export class WebPairingAuth {
     else this.memorySessions.set(session.tokenHash, session);
   }
 
-  private touchSession(session: WebAuthSessionRecord): void {
+  private touchSession(session: WebAuthSessionRecord, request: IncomingMessage): void {
     const lastSeenAt = new Date(this.now()).toISOString();
-    if (this.db) this.db.touchWebAuthSession(session.sessionId, lastSeenAt);
-    else session.lastSeenAt = lastSeenAt;
+    // A browser can keep its session cookie through an OS upgrade, so refresh its display metadata on access.
+    const userAgent = headerValue(request, "user-agent") ?? session.userAgent;
+    const remoteAddress = this.clientAddress(request) ?? session.remoteAddress;
+    if (this.db) {
+      this.db.touchWebAuthSession(session.sessionId, lastSeenAt, userAgent, remoteAddress);
+    } else {
+      session.lastSeenAt = lastSeenAt;
+      session.userAgent = userAgent;
+      session.remoteAddress = remoteAddress;
+    }
+  }
+
+  private updateSessionDeviceName(sessionId: string, deviceName: string): void {
+    if (this.db) this.db.updateWebAuthSessionDeviceName(sessionId, deviceName);
+    for (const session of this.memorySessions.values()) {
+      if (session.sessionId === sessionId) session.deviceName = deviceName;
+    }
   }
 
   private revokeSession(sessionId: string): void {
@@ -302,8 +356,19 @@ export class WebPairingAuth {
     );
   }
 
+  private clientAddress(request: IncomingMessage): string | null {
+    const socketAddress = normalizeAddress(request.socket.remoteAddress);
+    if (socketAddress && this.localAddresses.has(socketAddress)) {
+      // A local reverse proxy can hide a remote browser behind its loopback socket.
+      // Vite overwrites this header from its socket peer; ignore forwarded headers from remote peers.
+      const forwardedAddress = firstForwardedAddress(request.headers["x-forwarded-for"]);
+      if (forwardedAddress) return normalizeAddress(forwardedAddress);
+    }
+    return socketAddress;
+  }
+
   private checkPairingRateLimit(request: IncomingMessage, pairing: PairingState): void {
-    const key = normalizeAddress(request.socket.remoteAddress) ?? "unknown";
+    const key = this.clientAddress(request) ?? "unknown";
     const attempt = pairing.failedAttempts.get(key);
     if (!attempt) return;
     const now = this.now();
@@ -317,7 +382,7 @@ export class WebPairingAuth {
   }
 
   private recordFailedPairingAttempt(request: IncomingMessage, pairing: PairingState): void {
-    const key = normalizeAddress(request.socket.remoteAddress) ?? "unknown";
+    const key = this.clientAddress(request) ?? "unknown";
     const now = this.now();
     const current = pairing.failedAttempts.get(key);
     if (!current || current.resetAt <= now) {
@@ -371,11 +436,20 @@ function headerValue(request: IncomingMessage, name: string): string | null {
 
 function deviceNameFromRequest(request: IncomingMessage): string {
   const userAgent = headerValue(request, "user-agent")?.toLowerCase() ?? "";
+  if (userAgent.includes("harmonyos") || userAgent.includes("huawei")) return "华为手机";
   if (userAgent.includes("iphone") || userAgent.includes("ipad")) return "iPhone / iPad";
   if (userAgent.includes("android")) return "Android";
   if (userAgent.includes("macintosh")) return "Mac";
   if (userAgent.includes("windows")) return "Windows";
   return "Browser device";
+}
+
+function deviceDisplayName(session: WebAuthSessionRecord): string {
+  const userAgent = session.userAgent?.toLowerCase() ?? "";
+  if (session.deviceName === "Android" && (userAgent.includes("harmonyos") || userAgent.includes("huawei"))) {
+    return "华为手机";
+  }
+  return session.deviceName;
 }
 
 function isSecureRequest(request: IncomingMessage): boolean {
@@ -393,4 +467,10 @@ function collectLocalAddresses(): Set<string> {
 function normalizeAddress(value: string | undefined): string | null {
   if (!value) return null;
   return value.startsWith("::ffff:") ? value.slice("::ffff:".length) : value;
+}
+
+function firstForwardedAddress(value: string | string[] | undefined): string | null {
+  const header = Array.isArray(value) ? value[0] : value;
+  const address = header?.split(",", 1)[0]?.trim();
+  return address || null;
 }

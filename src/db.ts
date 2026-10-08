@@ -1,13 +1,28 @@
-import { randomUUID } from "node:crypto";
-import { dirname, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, statSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 
 import { DatabaseSync as DatabaseSyncConstructor, type SqliteDatabase } from "./sqlite.js";
-import { DIRECT_FOLLOWUP_STATUSES, DIRECT_TASK_STATUSES } from "./types.js";
+import { DEFAULT_SHORTCUT_GROUPS, DEFAULT_SHORTCUTS } from "./tmux-shortcut-defaults.js";
+import {
+  WebTaskSubmissionConflictError,
+  DIRECT_FOLLOWUP_STATUSES,
+  DIRECT_TASK_STATUSES,
+  AAMP_TASK_STATUSES,
+  SHORTCUT_DISPLAY_MODES,
+  SHORTCUT_GROUP_LAYOUTS,
+  SHORTCUT_KINDS,
+  SHORTCUT_SURFACES,
+  TASK_STATES,
+} from "./types.js";
 import type { WebAuthPairingRecord, WebAuthSessionRecord } from "./web-auth.js";
+import type { GitWorkspaceSnapshot } from "./run-artifacts.js";
+import type { CodexHistoryStoredRun } from "./codex-history.js";
 import type {
   DatabaseChange,
   DirectMessageInput,
+  StoredExecutionBackend,
   OutboxEntry,
   RoutedTask,
   StoredRun,
@@ -18,16 +33,47 @@ import type {
   StoredBridgeTaskEvent,
   StoredBridgeTaskFollowup,
   StoredInboundEvent,
+  StoredProject,
+  StoredWebTaskAttachment,
+  ProjectStatus,
+  TaskOrigin,
   AampTaskStatus,
   DirectTaskStatus,
   StoredTask,
   TaskState,
   WorkerProgress,
+  ShortcutDisplayMode,
+  ShortcutGroupLayout,
+  ShortcutKind,
+  ShortcutSurface,
+  StoredShortcut,
+  StoredShortcutGroup,
+  StoredTmuxSession,
+  StoredTmuxSessionAction,
+  TmuxSessionActionQuery,
+  TmuxSessionActionStatus,
+  TmuxSessionActionType,
 } from "./types.js";
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS bridge_instance_identity (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    installation_id TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+    name TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'disabled')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_projects_status_name ON projects(status, name);
+
 CREATE TABLE IF NOT EXISTS tasks (
     task_guid TEXT PRIMARY KEY,
+    origin TEXT NOT NULL DEFAULT 'feishu',
     project_key TEXT NOT NULL,
     mode TEXT NOT NULL,
     repo TEXT NOT NULL,
@@ -46,6 +92,20 @@ CREATE TABLE IF NOT EXISTS tasks (
     progress_text TEXT,
     progress_updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS web_task_attachments (
+    attachment_id TEXT PRIMARY KEY,
+    task_guid TEXT,
+    file_name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    local_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(task_guid) REFERENCES tasks(task_guid) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_task_attachments_task
+  ON web_task_attachments(task_guid, created_at);
 
 -- AAMP tasks are intentionally separate from the legacy Feishu task-list
 -- state machine. The AAMP task id is the durable cross-process primary key;
@@ -87,6 +147,8 @@ CREATE TABLE IF NOT EXISTS runs (
     previous_input_text TEXT,
     prompt_text TEXT NOT NULL DEFAULT '',
     thread_id TEXT,
+    execution_backend TEXT NOT NULL DEFAULT 'codex-sdk',
+    tmux_session_id TEXT,
     state TEXT NOT NULL,
     final_response TEXT,
     usage_json TEXT,
@@ -114,6 +176,27 @@ CREATE TABLE IF NOT EXISTS run_events (
     FOREIGN KEY(task_guid) REFERENCES tasks(task_guid)
 );
 
+-- Human review belongs to one Web run and never rewrites the execution state.
+CREATE TABLE IF NOT EXISTS web_run_reviews (
+    run_id TEXT PRIMARY KEY,
+    task_guid TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('accepted', 'changes_requested')),
+    note TEXT NOT NULL DEFAULT '',
+    reviewed_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE CASCADE,
+    FOREIGN KEY(task_guid) REFERENCES tasks(task_guid) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_run_reviews_task ON web_run_reviews(task_guid, reviewed_at DESC);
+
+CREATE TABLE IF NOT EXISTS run_workspace_snapshots (
+    run_id TEXT NOT NULL,
+    stage TEXT NOT NULL CHECK (stage IN ('before', 'after')),
+    snapshot_json TEXT NOT NULL,
+    PRIMARY KEY(run_id, stage),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_guid TEXT NOT NULL,
@@ -128,6 +211,17 @@ CREATE INDEX IF NOT EXISTS idx_runs_task_guid ON runs(task_guid);
 CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(completed_at, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_aamp_tasks_status ON aamp_tasks(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS web_task_submissions (
+    idempotency_key TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    normalized_request_json TEXT NOT NULL,
+    task_guid TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(task_guid) REFERENCES tasks(task_guid),
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+);
 
 -- Direct Feishu + Codex SDK mode. These tables deliberately do not share the
 -- legacy task-list state machine: an unrelated message starts a task, while a
@@ -172,12 +266,52 @@ CREATE TABLE IF NOT EXISTS bridge_tasks (
     cancel_reason TEXT,
     recovery_count INTEGER NOT NULL DEFAULT 0,
     last_recovered_at TEXT,
+    initial_final_response TEXT,
     final_response TEXT,
     error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(source_event_id) REFERENCES inbound_events(source_event_id)
 );
+
+CREATE TABLE IF NOT EXISTS codex_history_list_cache (
+    home_id TEXT NOT NULL,
+    filter_key TEXT NOT NULL,
+    source_fingerprint TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    refreshed_at TEXT NOT NULL,
+    PRIMARY KEY(home_id, filter_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_codex_history_list_cache_refreshed
+  ON codex_history_list_cache(home_id, refreshed_at DESC);
+
+CREATE TABLE IF NOT EXISTS codex_history_thread_home_preferences (
+    thread_id TEXT PRIMARY KEY,
+    preferred_home_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_codex_history_thread_home_preferences_home
+  ON codex_history_thread_home_preferences(preferred_home_id, updated_at DESC);
+
+-- Keep accepted historical send receipts even after bounded run detail expires.
+-- Only a scoped hash of the client key is stored, never the raw key.
+CREATE TABLE IF NOT EXISTS codex_history_runs (
+    run_id TEXT PRIMARY KEY,
+    home_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    idempotency_key_hash TEXT,
+    request_fingerprint TEXT NOT NULL,
+    payload_json TEXT,
+    state TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(home_id, thread_id, idempotency_key_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_codex_history_runs_updated
+  ON codex_history_runs(updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS bridge_task_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -245,6 +379,44 @@ CREATE TABLE IF NOT EXISTS bridge_runtime_leases (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS shortcut_groups (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    icon TEXT NOT NULL DEFAULT '⌘',
+    description TEXT NOT NULL DEFAULT '',
+    surface TEXT NOT NULL DEFAULT 'palette' CHECK (surface IN ('palette', 'composer')),
+    layout TEXT NOT NULL DEFAULT 'grid' CHECK (layout IN ('grid', 'keyboard')),
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    built_in INTEGER NOT NULL DEFAULT 0 CHECK (built_in IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shortcuts (
+    id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL CHECK (kind IN ('terminal', 'insert', 'send', 'sequence')),
+    value TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    built_in INTEGER NOT NULL DEFAULT 0 CHECK (built_in IN (0, 1)),
+    dangerous INTEGER NOT NULL DEFAULT 0 CHECK (dangerous IN (0, 1)),
+    action_key TEXT,
+    display_mode TEXT NOT NULL DEFAULT 'closed' CHECK (display_mode IN ('closed', 'expanded', 'both')),
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    operation_count INTEGER NOT NULL DEFAULT 0 CHECK (operation_count >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(group_id) REFERENCES shortcut_groups(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_shortcut_groups_order
+  ON shortcut_groups(enabled, sort_order, id);
+CREATE INDEX IF NOT EXISTS idx_shortcuts_group_order
+  ON shortcuts(group_id, enabled, operation_count DESC, title COLLATE NOCASE);
+
 CREATE TABLE IF NOT EXISTS web_auth_pairings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     code_hash TEXT NOT NULL,
@@ -265,14 +437,76 @@ CREATE TABLE IF NOT EXISTS web_auth_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_web_auth_sessions_active
   ON web_auth_sessions(revoked_at, expires_at);
+
+CREATE TABLE IF NOT EXISTS tmux_sessions (
+    record_id TEXT PRIMARY KEY,
+    tmux_session_id TEXT NOT NULL,
+    session_name TEXT NOT NULL,
+    project_key TEXT,
+    codex_home_id TEXT,
+    working_directory TEXT NOT NULL,
+    tmux_created_at INTEGER NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    ended_at TEXT,
+    created_by_device_id TEXT,
+    FOREIGN KEY(created_by_device_id) REFERENCES web_auth_sessions(session_id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tmux_sessions_active
+  ON tmux_sessions(ended_at, last_seen_at DESC);
+
+CREATE TABLE IF NOT EXISTS tmux_session_actions (
+    action_id TEXT PRIMARY KEY,
+    session_record_id TEXT NOT NULL,
+    tmux_session_id TEXT NOT NULL,
+    session_name TEXT NOT NULL,
+    project_key TEXT,
+    working_directory TEXT NOT NULL,
+    device_id TEXT,
+    action_type TEXT NOT NULL CHECK (action_type IN ('task_submit', 'terminal_command', 'shortcut', 'control_sequence')),
+    request_id TEXT,
+    submission_fingerprint TEXT,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('sending', 'sent', 'confirmed', 'unconfirmed', 'failed')),
+    error TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY(session_record_id) REFERENCES tmux_sessions(record_id) ON DELETE CASCADE,
+    FOREIGN KEY(device_id) REFERENCES web_auth_sessions(session_id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tmux_session_actions_session
+  ON tmux_session_actions(session_record_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tmux_session_actions_created
+  ON tmux_session_actions(created_at DESC);
 `;
 
 export interface ClaimRunArgs {
   task: RoutedTask;
   inputText: string;
   promptText: string;
-  startedComment: string | ((runId: string) => string);
+  startedComment?: string | ((runId: string) => string);
+  attachmentIds?: string[];
 }
+
+export interface ClaimWebTaskSubmissionArgs extends ClaimRunArgs {
+  idempotencyKey: string;
+  normalizedRequestJson: string;
+}
+
+export interface StoredWebTaskSubmission {
+  idempotency_key: string;
+  request_hash: string;
+  normalized_request_json: string;
+  task_guid: string;
+  run_id: string;
+  created_at: string;
+}
+
+export type ClaimWebTaskSubmissionResult =
+  | { status: "created"; claim: RunClaim }
+  | { status: "existing"; submission: StoredWebTaskSubmission };
 
 export interface AampTaskInit {
   aampTaskId: string;
@@ -349,6 +583,20 @@ export interface OutboxSummary {
   delivered: number;
 }
 
+export interface StoredWebRunReview {
+  run_id: string;
+  task_guid: string;
+  decision: "accepted" | "changes_requested";
+  note: string;
+  reviewed_at: string;
+}
+
+export interface StoredRunWorkspaceSnapshot {
+  run_id: string;
+  stage: "before" | "after";
+  snapshot: GitWorkspaceSnapshot;
+}
+
 export interface RunClaim {
   runId: string;
   taskGuid: string;
@@ -392,6 +640,16 @@ export interface TaskQuery {
   offset?: number;
 }
 
+export interface TaskPanelQuery {
+  source?: "all" | "desk" | "direct" | "aamp";
+  states?: string[];
+  projectKey?: string;
+  mode?: string;
+  search?: string;
+  limit?: number;
+  offset?: number;
+}
+
 export class StateDatabase {
   private readonly db: SqliteDatabase;
   private readonly now: () => Date;
@@ -410,6 +668,17 @@ export class StateDatabase {
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec(SCHEMA);
     this.runMigrations();
+    this.seedShortcutDefaults();
+  }
+
+  public getOrCreateDraftInstallationId(): string {
+    this.db.prepare(
+      "INSERT OR IGNORE INTO bridge_instance_identity (id, installation_id) VALUES (1, ?)",
+    ).run(randomUUID());
+    const row = this.db.prepare(
+      "SELECT installation_id FROM bridge_instance_identity WHERE id = 1",
+    ).get() as { installation_id: string };
+    return row.installation_id;
   }
 
   public transaction<T>(callback: () => T): T {
@@ -455,11 +724,375 @@ export class StateDatabase {
     return () => this.changeListeners.delete(listener);
   }
 
+  public listProjects(): StoredProject[] {
+    const rows = this.db
+      .prepare("SELECT * FROM projects ORDER BY name COLLATE NOCASE ASC")
+      .all() as Record<string, unknown>[];
+    return rows.map(mapProject);
+  }
+
+  public listAvailableProjects(): StoredProject[] {
+    return this.listProjects().filter((project) =>
+      project.status === "available" && isProjectDirectory(project.path)
+    );
+  }
+
+  public getAvailableProject(name: string): StoredProject | null {
+    const project = this.getProject(name);
+    return project?.status === "available" && isProjectDirectory(project.path) ? project : null;
+  }
+
+  public getProject(name: string): StoredProject | null {
+    const row = this.db.prepare("SELECT * FROM projects WHERE name = ?").get(name) as Record<string, unknown> | undefined;
+    return row ? mapProject(row) : null;
+  }
+
+  public createProject(input: { name: string; path: string; status?: ProjectStatus }): StoredProject {
+    const name = input.name.trim();
+    const path = input.path.trim();
+    if (!name || name.length > 120) throw new Error("项目名称不能为空且不能超过 120 个字符。");
+    if (!isAbsolute(path)) throw new Error("项目路径必须是绝对路径。");
+    const now = this.timestamp();
+    this.db.prepare(
+      "INSERT INTO projects (name, path, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(name, resolve(path), input.status ?? "available", now, now);
+    return this.getProject(name)!;
+  }
+
+  public updateProject(
+    name: string,
+    input: { path?: string; status?: ProjectStatus },
+  ): StoredProject | null {
+    const existing = this.getProject(name);
+    if (!existing) return null;
+    const path = input.path?.trim();
+    if (path !== undefined && !isAbsolute(path)) throw new Error("项目路径必须是绝对路径。");
+    this.db.prepare(
+      "UPDATE projects SET path = ?, status = ?, updated_at = ? WHERE name = ?",
+    ).run(path === undefined ? existing.path : resolve(path), input.status ?? existing.status, this.timestamp(), name);
+    return this.getProject(name);
+  }
+
+  public ensureProject(input: { name: string; path: string; status?: ProjectStatus }): StoredProject {
+    const name = input.name.trim();
+    const path = input.path.trim();
+    if (!name || name.length > 120) throw new Error("项目名称不能为空且不能超过 120 个字符。");
+    if (!isAbsolute(path)) throw new Error("项目路径必须是绝对路径。");
+    const now = this.timestamp();
+    this.db.prepare(
+      "INSERT OR IGNORE INTO projects (name, path, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(name, resolve(path), input.status ?? "available", now, now);
+    return this.getProject(name)!;
+  }
+
+  public getShortcutConfig(): { groups: StoredShortcutGroup[]; shortcuts: StoredShortcut[] } {
+    return { groups: this.listShortcutGroups(), shortcuts: this.listShortcuts() };
+  }
+
+  public listShortcutGroups(includeDisabled = true): StoredShortcutGroup[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM shortcut_groups${includeDisabled ? "" : " WHERE enabled = 1"}
+       ORDER BY sort_order ASC, id COLLATE NOCASE ASC`,
+    ).all() as Record<string, unknown>[];
+    return rows.map(mapShortcutGroup);
+  }
+
+  public listShortcuts(groupId?: string, includeDisabled = true): StoredShortcut[] {
+    const conditions: string[] = [];
+    const params: string[] = [];
+    if (groupId) {
+      conditions.push("group_id = ?");
+      params.push(groupId);
+    }
+    if (!includeDisabled) conditions.push("enabled = 1");
+    const where = conditions.length > 0 ? ` WHERE ${conditions.join(" AND ")}` : "";
+    const rows = this.db.prepare(
+      `SELECT * FROM shortcuts${where}
+       ORDER BY group_id COLLATE NOCASE ASC, sort_order ASC, title COLLATE NOCASE ASC, id ASC`,
+    ).all(...params) as Record<string, unknown>[];
+    return rows.map(mapShortcut);
+  }
+
+  public getShortcut(id: string): StoredShortcut | null {
+    const row = this.db.prepare("SELECT * FROM shortcuts WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? mapShortcut(row) : null;
+  }
+
+  public createShortcutGroup(input: {
+    id?: string;
+    title: string;
+    icon?: string;
+    description?: string;
+    surface?: ShortcutSurface;
+    layout?: ShortcutGroupLayout;
+    sortOrder?: number;
+    enabled?: boolean;
+    builtIn?: boolean;
+  }): StoredShortcutGroup {
+    const id = input.id?.trim() || `group-${randomUUID()}`;
+    const title = normalizeShortcutText(input.title, "分组名称", 64);
+    const icon = normalizeShortcutText(input.icon ?? "⌘", "分组图标", 8);
+    const description = normalizeShortcutText(input.description ?? "", "分组说明", 160, false);
+    const surface = normalizeShortcutSurface(input.surface ?? "palette");
+    const layout = normalizeShortcutLayout(input.layout ?? "grid");
+    const sortOrder = Number.isSafeInteger(input.sortOrder) ? input.sortOrder! : this.nextShortcutGroupOrder();
+    const now = this.timestamp();
+    this.db.prepare(
+      `INSERT INTO shortcut_groups
+        (id, title, icon, description, surface, layout, sort_order, enabled, built_in, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, title, icon, description, surface, layout, sortOrder, input.enabled === false ? 0 : 1, input.builtIn ? 1 : 0, now, now);
+    return this.getShortcutGroup(id)!;
+  }
+
+  public getShortcutGroup(id: string): StoredShortcutGroup | null {
+    const row = this.db.prepare("SELECT * FROM shortcut_groups WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? mapShortcutGroup(row) : null;
+  }
+
+  public updateShortcutGroup(id: string, input: {
+    title?: string;
+    icon?: string;
+    description?: string;
+    surface?: ShortcutSurface;
+    layout?: ShortcutGroupLayout;
+    sortOrder?: number;
+    enabled?: boolean;
+  }): StoredShortcutGroup | null {
+    const existing = this.getShortcutGroup(id);
+    if (!existing) return null;
+    const title = input.title === undefined ? existing.title : normalizeShortcutText(input.title, "分组名称", 64);
+    const icon = input.icon === undefined ? existing.icon : normalizeShortcutText(input.icon, "分组图标", 8);
+    const description = input.description === undefined ? existing.description : normalizeShortcutText(input.description, "分组说明", 160, false);
+    const surface = input.surface === undefined ? existing.surface : normalizeShortcutSurface(input.surface);
+    const layout = input.layout === undefined ? existing.layout : normalizeShortcutLayout(input.layout);
+    const sortOrder = input.sortOrder === undefined ? existing.sort_order : input.sortOrder;
+    if (!Number.isSafeInteger(sortOrder)) throw new Error("分组排序必须是整数。");
+    this.db.prepare(
+      `UPDATE shortcut_groups SET title = ?, icon = ?, description = ?, surface = ?, layout = ?, sort_order = ?,
+       enabled = ?, updated_at = ? WHERE id = ?`,
+    ).run(title, icon, description, surface, layout, sortOrder, input.enabled === undefined ? (existing.enabled ? 1 : 0) : input.enabled ? 1 : 0, this.timestamp(), id);
+    return this.getShortcutGroup(id);
+  }
+
+  public deleteShortcutGroup(id: string): boolean {
+    const group = this.getShortcutGroup(id);
+    if (!group || group.built_in) return false;
+    const shortcutCount = this.db.prepare("SELECT COUNT(*) AS count FROM shortcuts WHERE group_id = ?").get(id) as { count: number };
+    if (shortcutCount.count > 0) throw new Error("请先移除该分组中的快捷键。");
+    return this.db.prepare("DELETE FROM shortcut_groups WHERE id = ? AND built_in = 0").run(id).changes > 0;
+  }
+
+  public createShortcut(input: {
+    id?: string;
+    groupId: string;
+    title: string;
+    detail?: string;
+    kind: ShortcutKind;
+    value: string;
+    enabled?: boolean;
+    builtIn?: boolean;
+    dangerous?: boolean;
+    actionKey?: string;
+    displayMode?: ShortcutDisplayMode;
+    sortOrder?: number;
+  }): StoredShortcut {
+    if (!this.getShortcutGroup(input.groupId)) throw new Error("快捷键分组不存在。");
+    const id = input.id?.trim() || `shortcut-${randomUUID()}`;
+    const title = normalizeShortcutText(input.title, "快捷键名称", 64);
+    const detail = normalizeShortcutText(input.detail ?? "", "快捷键说明", 120, false);
+    const kind = normalizeShortcutKind(input.kind);
+    const actionKey = input.actionKey?.trim() || null;
+    const value = normalizeShortcutText(input.value, "快捷键内容", 8_000, !actionKey);
+    const displayMode = normalizeShortcutDisplayMode(input.displayMode ?? "closed");
+    const sortOrder = Number.isSafeInteger(input.sortOrder) ? input.sortOrder! : this.nextShortcutOrder(input.groupId);
+    const now = this.timestamp();
+    this.db.prepare(
+      `INSERT INTO shortcuts
+        (id, group_id, title, detail, kind, value, enabled, built_in, dangerous, action_key, display_mode, sort_order, operation_count, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+    ).run(id, input.groupId, title, detail, kind, value, input.enabled === false ? 0 : 1, input.builtIn ? 1 : 0, input.dangerous ? 1 : 0, actionKey, displayMode, sortOrder, now, now);
+    return this.getShortcut(id)!;
+  }
+
+  public updateShortcut(id: string, input: {
+    groupId?: string;
+    title?: string;
+    detail?: string;
+    kind?: ShortcutKind;
+    value?: string;
+    enabled?: boolean;
+    dangerous?: boolean;
+    actionKey?: string | null;
+    displayMode?: ShortcutDisplayMode;
+    sortOrder?: number;
+  }): StoredShortcut | null {
+    const existing = this.getShortcut(id);
+    if (!existing) return null;
+    const groupId = input.groupId ?? existing.group_id;
+    if (!this.getShortcutGroup(groupId)) throw new Error("快捷键分组不存在。");
+    const title = input.title === undefined ? existing.title : normalizeShortcutText(input.title, "快捷键名称", 64);
+    const detail = input.detail === undefined ? existing.detail : normalizeShortcutText(input.detail, "快捷键说明", 120, false);
+    const kind = input.kind === undefined ? existing.kind : normalizeShortcutKind(input.kind);
+    const actionKey = input.actionKey === undefined ? existing.action_key : input.actionKey?.trim() || null;
+    const value = input.value === undefined ? existing.value : normalizeShortcutText(input.value, "快捷键内容", 8_000, !actionKey);
+    const displayMode = input.displayMode === undefined ? existing.display_mode : normalizeShortcutDisplayMode(input.displayMode);
+    const sortOrder = input.sortOrder === undefined ? existing.sort_order : input.sortOrder;
+    if (!Number.isSafeInteger(sortOrder)) throw new Error("快捷键排序必须是整数。");
+    this.db.prepare(
+      `UPDATE shortcuts SET group_id = ?, title = ?, detail = ?, kind = ?, value = ?, enabled = ?, dangerous = ?, action_key = ?, display_mode = ?, sort_order = ?,
+       updated_at = ? WHERE id = ?`,
+    ).run(groupId, title, detail, kind, value, input.enabled === undefined ? (existing.enabled ? 1 : 0) : input.enabled ? 1 : 0, input.dangerous === undefined ? (existing.dangerous ? 1 : 0) : input.dangerous ? 1 : 0, actionKey, displayMode, sortOrder, this.timestamp(), id);
+    return this.getShortcut(id);
+  }
+
+  public moveShortcutToEdge(id: string, position: "start" | "end"): StoredShortcut | null {
+    const existing = this.getShortcut(id);
+    if (!existing) return null;
+    if (position !== "start" && position !== "end") throw new Error("快捷键位置必须是 start 或 end。");
+
+    return this.transaction(() => {
+      const bounds = this.db.prepare(
+        `SELECT MIN(sort_order) AS min_order, MAX(sort_order) AS max_order
+         FROM shortcuts WHERE group_id = ? AND id <> ?`,
+      ).get(existing.group_id, id) as { min_order: number | null; max_order: number | null };
+      const sortOrder = position === "start"
+        ? (bounds.min_order === null ? 0 : Number(bounds.min_order) - 1)
+        : (bounds.max_order === null ? 0 : Number(bounds.max_order) + 1);
+      this.db.prepare(
+        "UPDATE shortcuts SET sort_order = ?, updated_at = ? WHERE id = ?",
+      ).run(sortOrder, this.timestamp(), id);
+      return this.getShortcut(id);
+    });
+  }
+
+  public deleteShortcut(id: string): boolean {
+    const shortcut = this.getShortcut(id);
+    if (!shortcut || shortcut.built_in) return false;
+    return this.db.prepare("DELETE FROM shortcuts WHERE id = ? AND built_in = 0").run(id).changes > 0;
+  }
+
+  public recordShortcutUse(id: string): StoredShortcut | null {
+    const result = this.db.prepare(
+      "UPDATE shortcuts SET operation_count = operation_count + 1, updated_at = ? WHERE id = ?",
+    ).run(this.timestamp(), id);
+    return result.changes > 0 ? this.getShortcut(id) : null;
+  }
+
+  public createStagedWebTaskAttachment(input: {
+    attachmentId: string;
+    fileName: string;
+    mimeType: string;
+    sizeBytes: number;
+    localPath: string;
+  }): StoredWebTaskAttachment {
+    const now = this.timestamp();
+    this.db.prepare(
+      `INSERT INTO web_task_attachments
+        (attachment_id, task_guid, file_name, mime_type, size_bytes, local_path, created_at)
+       VALUES (?, NULL, ?, ?, ?, ?, ?)`,
+    ).run(input.attachmentId, input.fileName, input.mimeType, input.sizeBytes, input.localPath, now);
+    return this.getStagedWebTaskAttachment(input.attachmentId)!;
+  }
+
+  public getStagedWebTaskAttachment(attachmentId: string): StoredWebTaskAttachment | null {
+    const row = this.db.prepare(
+      "SELECT * FROM web_task_attachments WHERE attachment_id = ? AND task_guid IS NULL",
+    ).get(attachmentId) as Record<string, unknown> | undefined;
+    return row ? mapWebTaskAttachment(row) : null;
+  }
+
+  public getStagedWebTaskAttachments(attachmentIds: string[]): StoredWebTaskAttachment[] {
+    if (attachmentIds.length === 0) return [];
+    const uniqueIds = [...new Set(attachmentIds)];
+    const rows = this.db.prepare(
+      `SELECT * FROM web_task_attachments WHERE task_guid IS NULL
+       AND attachment_id IN (${uniqueIds.map(() => "?").join(", ")})`,
+    ).all(...uniqueIds) as Record<string, unknown>[];
+    const byId = new Map(rows.map((row) => [String(row.attachment_id), mapWebTaskAttachment(row)]));
+    return uniqueIds.flatMap((attachmentId) => {
+      const attachment = byId.get(attachmentId);
+      return attachment ? [attachment] : [];
+    });
+  }
+
+  public countStagedWebTaskAttachments(since?: string): number {
+    const row = since
+      ? this.db.prepare(
+          "SELECT COUNT(*) AS total FROM web_task_attachments WHERE task_guid IS NULL AND created_at >= ?",
+        ).get(since) as { total: number }
+      : this.db.prepare(
+          "SELECT COUNT(*) AS total FROM web_task_attachments WHERE task_guid IS NULL",
+        ).get() as { total: number };
+    return row.total;
+  }
+
+  public stagedWebTaskAttachmentBytes(): number {
+    const row = this.db.prepare(
+      "SELECT COALESCE(SUM(size_bytes), 0) AS total FROM web_task_attachments WHERE task_guid IS NULL",
+    ).get() as { total: number };
+    return row.total;
+  }
+
+  public listWebTaskAttachments(taskGuid: string): StoredWebTaskAttachment[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM web_task_attachments WHERE task_guid = ? ORDER BY created_at ASC",
+    ).all(taskGuid) as Record<string, unknown>[];
+    return rows.map(mapWebTaskAttachment);
+  }
+
+  public getWebTaskAttachment(taskGuid: string, attachmentId: string): StoredWebTaskAttachment | null {
+    const row = this.db.prepare(
+      "SELECT * FROM web_task_attachments WHERE task_guid = ? AND attachment_id = ?",
+    ).get(taskGuid, attachmentId) as Record<string, unknown> | undefined;
+    return row ? mapWebTaskAttachment(row) : null;
+  }
+
+  public deleteStagedWebTaskAttachment(attachmentId: string): StoredWebTaskAttachment | null {
+    return this.transaction(() => {
+      const attachment = this.getStagedWebTaskAttachment(attachmentId);
+      if (!attachment) return null;
+      this.db.prepare(
+        "DELETE FROM web_task_attachments WHERE attachment_id = ? AND task_guid IS NULL",
+      ).run(attachmentId);
+      return attachment;
+    });
+  }
+
+  public deleteExpiredStagedWebTaskAttachments(olderThan: string): StoredWebTaskAttachment[] {
+    return this.transaction(() => {
+      const rows = this.db.prepare(
+        "SELECT * FROM web_task_attachments WHERE task_guid IS NULL AND created_at < ?",
+      ).all(olderThan) as Record<string, unknown>[];
+      if (rows.length > 0) {
+        this.db.prepare(
+          "DELETE FROM web_task_attachments WHERE task_guid IS NULL AND created_at < ?",
+        ).run(olderThan);
+      }
+      return rows.map(mapWebTaskAttachment);
+    });
+  }
+
   public getTask(taskGuid: string): StoredTask | null {
     const row = this.db
       .prepare("SELECT * FROM tasks WHERE task_guid = ?")
       .get(taskGuid) as Record<string, unknown> | undefined;
     return row ? mapTask(row) : null;
+  }
+
+  public getWebTaskSubmission(idempotencyKey: string): StoredWebTaskSubmission | null {
+    const row = this.db
+      .prepare("SELECT * FROM web_task_submissions WHERE idempotency_key = ?")
+      .get(idempotencyKey) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      idempotency_key: String(row.idempotency_key),
+      request_hash: String(row.request_hash),
+      normalized_request_json: String(row.normalized_request_json),
+      task_guid: String(row.task_guid),
+      run_id: String(row.run_id),
+      created_at: String(row.created_at),
+    };
   }
 
   public getAampTask(aampTaskId: string): StoredAampTask | null {
@@ -495,6 +1128,148 @@ export class StateDatabase {
       .prepare("SELECT * FROM inbound_events WHERE source_event_id = ?")
       .get(sourceEventId) as Record<string, unknown> | undefined;
     return row ? mapInboundEvent(row) : null;
+  }
+
+  public getCodexHistoryListCache(homeId: string, filterKey: string): {
+    sourceFingerprint: string;
+    payloadJson: string;
+    refreshedAt: string;
+  } | null {
+    const row = this.db.prepare(
+      `SELECT source_fingerprint, payload_json, refreshed_at
+       FROM codex_history_list_cache WHERE home_id = ? AND filter_key = ?`,
+    ).get(homeId, filterKey) as Record<string, unknown> | undefined;
+    return row ? {
+      sourceFingerprint: String(row.source_fingerprint),
+      payloadJson: String(row.payload_json),
+      refreshedAt: String(row.refreshed_at),
+    } : null;
+  }
+
+  public listCodexHistoryRuns(limit: number): CodexHistoryStoredRun[] {
+    const boundedLimit = Math.min(1_000, Math.max(1, Math.trunc(limit) || 1));
+    const rows = this.db.prepare(
+      `SELECT payload_json FROM codex_history_runs
+       WHERE payload_json IS NOT NULL ORDER BY updated_at DESC LIMIT ?`,
+    ).all(boundedLimit) as Array<{ payload_json: string }>;
+    return rows.map((row) => JSON.parse(row.payload_json) as CodexHistoryStoredRun);
+  }
+
+  public findCodexHistoryRunByKey(homeId: string, threadId: string, keyHash: string): {
+    requestFingerprint: string;
+    runId: string;
+    run?: CodexHistoryStoredRun;
+  } | null {
+    const row = this.db.prepare(
+      `SELECT run_id, request_fingerprint, payload_json FROM codex_history_runs
+       WHERE home_id = ? AND thread_id = ? AND idempotency_key_hash = ?`,
+    ).get(homeId, threadId, keyHash) as {
+      run_id: string; request_fingerprint: string; payload_json: string | null;
+    } | undefined;
+    if (!row) return null;
+    return {
+      requestFingerprint: row.request_fingerprint,
+      runId: row.run_id,
+      ...(row.payload_json ? { run: JSON.parse(row.payload_json) as CodexHistoryStoredRun } : {}),
+    };
+  }
+
+  public createCodexHistoryRun(run: CodexHistoryStoredRun, keyHash?: string): {
+    kind: "created" | "existing" | "conflict" | "expired";
+    run?: CodexHistoryStoredRun;
+  } {
+    return this.transaction(() => {
+      if (keyHash) {
+        const receipt = this.findCodexHistoryRunByKey(run.homeId, run.threadId, keyHash);
+        if (receipt) {
+          if (receipt.requestFingerprint !== run.requestFingerprint) return { kind: "conflict" };
+          return receipt.run ? { kind: "existing", run: receipt.run } : { kind: "expired" };
+        }
+      }
+      this.db.prepare(
+        `INSERT INTO codex_history_runs
+           (run_id, home_id, thread_id, idempotency_key_hash, request_fingerprint,
+            payload_json, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        run.runId, run.homeId, run.threadId, keyHash ?? null,
+        run.requestFingerprint, JSON.stringify(run), run.state, run.createdAt, run.updatedAt,
+      );
+      return { kind: "created", run };
+    });
+  }
+
+  public saveCodexHistoryRun(run: CodexHistoryStoredRun): void {
+    this.db.prepare(
+      `UPDATE codex_history_runs SET payload_json = ?, state = ?, updated_at = ?
+       WHERE run_id = ? AND home_id = ? AND thread_id = ? AND payload_json IS NOT NULL`,
+    ).run(JSON.stringify(run), run.state, run.updatedAt, run.runId, run.homeId, run.threadId);
+  }
+
+  public expireCodexHistoryRun(runId: string): void {
+    this.db.prepare(
+      `UPDATE codex_history_runs SET payload_json = NULL, state = 'expired', updated_at = ?
+       WHERE run_id = ?`,
+    ).run(this.now().getTime(), runId);
+  }
+
+  public saveCodexHistoryListCache(
+    homeId: string,
+    filterKey: string,
+    sourceFingerprint: string,
+    payloadJson: string,
+  ): void {
+    const refreshedAt = this.timestamp();
+    this.db.prepare(
+      `INSERT INTO codex_history_list_cache
+         (home_id, filter_key, source_fingerprint, payload_json, refreshed_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(home_id, filter_key) DO UPDATE SET
+         source_fingerprint = excluded.source_fingerprint,
+         payload_json = excluded.payload_json,
+         refreshed_at = excluded.refreshed_at`,
+    ).run(homeId, filterKey, sourceFingerprint, payloadJson, refreshedAt);
+    this.db.prepare(
+      `DELETE FROM codex_history_list_cache
+       WHERE home_id = ? AND filter_key IN (
+         SELECT filter_key FROM codex_history_list_cache
+         WHERE home_id = ? ORDER BY refreshed_at DESC, filter_key ASC LIMIT -1 OFFSET 24
+       )`,
+    ).run(homeId, homeId);
+  }
+
+  public getCodexHistoryThreadHomePreferences(threadIds: string[]): Map<string, string> {
+    const uniqueThreadIds = [...new Set(threadIds.map((threadId) => threadId.trim()).filter(Boolean))];
+    if (uniqueThreadIds.length === 0) return new Map();
+    const preferences = new Map<string, string>();
+    for (let offset = 0; offset < uniqueThreadIds.length; offset += 500) {
+      const batch = uniqueThreadIds.slice(offset, offset + 500);
+      const placeholders = batch.map(() => "?").join(", ");
+      const rows = this.db.prepare(
+        `SELECT thread_id, preferred_home_id
+         FROM codex_history_thread_home_preferences
+         WHERE thread_id IN (${placeholders})`,
+      ).all(...batch) as Array<{ thread_id: string; preferred_home_id: string }>;
+      for (const row of rows) preferences.set(String(row.thread_id), String(row.preferred_home_id));
+    }
+    return preferences;
+  }
+
+  public saveCodexHistoryThreadHomePreference(threadId: string, preferredHomeId: string): string {
+    const normalizedThreadId = requireNonEmpty(threadId, "threadId");
+    const normalizedHomeId = requireNonEmpty(preferredHomeId, "preferredHomeId");
+    if (normalizedThreadId.length > 200 || normalizedHomeId.length > 200) {
+      throw new Error("threadId and preferredHomeId must be 200 characters or fewer");
+    }
+    const updatedAt = this.timestamp();
+    this.db.prepare(
+      `INSERT INTO codex_history_thread_home_preferences (thread_id, preferred_home_id, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(thread_id) DO UPDATE SET
+         preferred_home_id = excluded.preferred_home_id,
+         updated_at = excluded.updated_at`,
+    ).run(normalizedThreadId, normalizedHomeId, updatedAt);
+    return updatedAt;
   }
 
   public getBridgeTask(bridgeTaskId: string): StoredBridgeTask | null {
@@ -780,9 +1555,70 @@ export class StateDatabase {
       .prepare(`SELECT COUNT(*) AS total FROM bridge_tasks${where}`)
       .get(...params) as { total: number };
     const rows = this.db
-      .prepare(`SELECT * FROM bridge_tasks${where} ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
+      .prepare(`SELECT * FROM bridge_tasks${where} ORDER BY updated_at DESC, bridge_task_id DESC LIMIT ? OFFSET ?`)
       .all(...params, limit, offset) as Record<string, unknown>[];
     return { items: rows.map(mapBridgeTask), total: countRow.total };
+  }
+
+  public readBridgeTaskPage(taskId: string, limit: number, offset: number, includeEvents = true): {
+    followups: { items: StoredBridgeTaskFollowup[]; total: number };
+    attachments: { items: StoredBridgeTaskAttachment[]; total: number };
+    events: { items: StoredBridgeTaskEvent[]; total: number };
+  } {
+    const page = <T>(table: string, order: string, map: (row: Record<string, unknown>) => T, includeItems = true) => {
+      const total = (this.db.prepare(`SELECT COUNT(*) AS total FROM ${table} WHERE bridge_task_id = ?`)
+        .get(taskId) as { total: number }).total;
+      const rows = includeItems ? this.db.prepare(`SELECT * FROM ${table} WHERE bridge_task_id = ? ORDER BY ${order} LIMIT ? OFFSET ?`)
+        .all(taskId, limit, offset) as Record<string, unknown>[] : [];
+      return { total, items: rows.map(map) };
+    };
+    return {
+      followups: page("bridge_task_followups", "created_at DESC, followup_id DESC", mapBridgeTaskFollowup),
+      attachments: page("bridge_task_attachments", "created_at DESC, attachment_id DESC", mapBridgeTaskAttachment),
+      events: page("bridge_task_events", "id DESC", mapBridgeTaskEvent, includeEvents),
+    };
+  }
+
+  public appendWebDirectFollowup(taskId: string, text: string, idempotencyKey: string): StoredBridgeTask {
+    const normalizedTaskId = requireNonEmpty(taskId, "taskId");
+    const normalizedText = requireNonEmpty(text.trim(), "text");
+    const key = requireNonEmpty(idempotencyKey.trim(), "idempotencyKey");
+    if (normalizedText.length > 2000) throw new Error("补充内容不能超过 2000 个字符。");
+    if (!/^[a-zA-Z0-9_-]{8,100}$/.test(key)) throw new Error("无效的幂等键。");
+    const sourceEventId = `web-task-followup:${key}`;
+    return this.transaction(() => {
+      const existing = this.db.prepare(
+        "SELECT bridge_task_id, text FROM bridge_task_followups WHERE source_event_id = ?",
+      ).get(sourceEventId) as { bridge_task_id: string; text: string } | undefined;
+      if (existing) {
+        if (existing.bridge_task_id !== normalizedTaskId || existing.text !== normalizedText) {
+          throw new WebTaskSubmissionConflictError();
+        }
+        return this.getBridgeTask(normalizedTaskId)!;
+      }
+      const task = this.getBridgeTask(normalizedTaskId);
+      if (!task) throw new Error("Direct 任务不存在。");
+      if (!task.thread_id) throw new Error("该任务尚无可续接的 Codex thread。");
+      if (task.status === "CANCEL_REQUESTED") throw new Error("任务正在取消，请稍后再追加。");
+      const result = this.ingestDirectMessage({
+        sourceEventId,
+        eventType: "web.task.followup",
+        messageId: sourceEventId,
+        chatId: task.chat_id,
+        chatType: task.chat_type,
+        senderId: task.sender_id,
+        senderName: "Bridge Web",
+        text: normalizedText,
+        sessionKey: task.session_key,
+        replyToMessageId: task.message_id,
+        payload: { source: "web-task-panel" },
+        attachments: [],
+      });
+      if (!result.continued || result.task.bridge_task_id !== normalizedTaskId) {
+        throw new Error("续问没有关联到原 Direct 任务。");
+      }
+      return result.task;
+    });
   }
 
   public getBridgeTaskStatusCounts(): Record<DirectTaskStatus, number> {
@@ -1439,6 +2275,7 @@ export class StateDatabase {
     finalResponse?: string,
     error?: string,
     workerId?: string,
+    initialTurn = true,
   ): StoredBridgeTask | null {
     const taskId = requireNonEmpty(bridgeTaskId, "bridgeTaskId");
     return this.transaction(() => {
@@ -1463,10 +2300,12 @@ export class StateDatabase {
       this.db
         .prepare(
           `UPDATE bridge_tasks SET status = ?, final_response = ?, error = ?,
+             initial_final_response = CASE WHEN ? THEN COALESCE(initial_final_response, ?) ELSE initial_final_response END,
              lease_owner = NULL, lease_expires_at = NULL, next_attempt_at = ?,
              updated_at = ? WHERE bridge_task_id = ?`,
         )
-        .run(finalStatus, response, failure, finalStatus === "QUEUED" ? now : null, now, taskId);
+        .run(finalStatus, response, failure, initialTurn ? 1 : 0, finalResponse?.trim() || null,
+          finalStatus === "QUEUED" ? now : null, now, taskId);
       if (hasPendingFollowup) {
         this.db
           .prepare(
@@ -1508,7 +2347,7 @@ export class StateDatabase {
     }
     const followup = this.finishBridgeTaskFollowup(followupId, status, finalResponse, error);
     if (!followup) return this.getBridgeTask(bridgeTaskId);
-    return this.finishBridgeTask(bridgeTaskId, status, finalResponse, error, workerId);
+    return this.finishBridgeTask(bridgeTaskId, status, finalResponse, error, workerId, false);
   }
 
   /** Requeue a terminal direct task after an explicit operator retry request. */
@@ -1881,6 +2720,88 @@ export class StateDatabase {
     return { items: rows.map(mapTask), total: countRow.total };
   }
 
+  public queryTaskPanel(query: TaskPanelQuery = {}): {
+    items: Array<{ source: "desk"; task: StoredTask } | { source: "direct"; task: StoredBridgeTask } | { source: "aamp"; task: StoredAampTask }>;
+    total: number;
+  } {
+    const candidates: string[] = [];
+    const params: Array<string | number> = [];
+    const needsAttention = query.states?.includes("ATTENTION") ?? false;
+    const requestedStates = query.states?.filter((state) => state !== "ATTENTION") ?? [];
+    const deskStates = requestedStates.filter((state) => TASK_STATES.includes(state as TaskState));
+    const directStates = requestedStates.filter((state) => DIRECT_TASK_STATUSES.includes(state as DirectTaskStatus));
+    const aampStates = requestedStates.filter((state) => AAMP_TASK_STATUSES.includes(state as AampTaskStatus));
+    const deskAttention = `(state IN ('BLOCKED_CONFIG', 'FAILED') OR (state = 'WAITING_REVIEW' AND NOT EXISTS (
+      SELECT 1 FROM web_run_reviews review WHERE review.run_id = (
+        SELECT run_id FROM runs WHERE task_guid = tasks.task_guid ORDER BY started_at DESC LIMIT 1
+      ) AND review.decision = 'accepted'
+    )))`;
+    if (query.source !== "direct" && query.source !== "aamp" && (!requestedStates.length || deskStates.length || needsAttention)) {
+      const clauses: string[] = [];
+      if (deskStates.length && needsAttention) {
+        clauses.push(`(state IN (${deskStates.map(() => "?").join(", ")}) OR ${deskAttention})`);
+        params.push(...deskStates);
+      } else if (deskStates.length) { clauses.push(`state IN (${deskStates.map(() => "?").join(", ")})`); params.push(...deskStates); }
+      else if (needsAttention) clauses.push(deskAttention);
+      if (query.projectKey) { clauses.push("project_key = ?"); params.push(query.projectKey); }
+      if (query.mode) { clauses.push("mode = ?"); params.push(query.mode); }
+      if (query.search) {
+        clauses.push("(task_guid LIKE ? OR input_text LIKE ? OR COALESCE(thread_id, '') LIKE ? OR COALESCE(last_error, '') LIKE ?)");
+        params.push(...Array(4).fill(`%${query.search}%`));
+      }
+      candidates.push(`SELECT 'desk' AS source, task_guid AS id, updated_at FROM tasks${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""}`);
+    }
+    if (query.source !== "desk" && query.source !== "aamp" && !query.projectKey && !query.mode
+      && (!requestedStates.length || directStates.length || needsAttention)) {
+      const clauses: string[] = [];
+      if (directStates.length && needsAttention) {
+        clauses.push(`(status IN (${directStates.map(() => "?").join(", ")}) OR status IN ('FAILED', 'CANCEL_REQUESTED') OR card_state = 'DELIVERY_FAILED')`);
+        params.push(...directStates);
+      } else if (directStates.length) { clauses.push(`status IN (${directStates.map(() => "?").join(", ")})`); params.push(...directStates); }
+      else if (needsAttention) clauses.push("(status IN ('FAILED', 'CANCEL_REQUESTED') OR card_state = 'DELIVERY_FAILED')");
+      if (query.search) {
+        clauses.push("(bridge_task_id LIKE ? OR text LIKE ? OR COALESCE(thread_id, '') LIKE ? OR COALESCE(error, '') LIKE ?)");
+        params.push(...Array(4).fill(`%${query.search}%`));
+      }
+      candidates.push(`SELECT 'direct' AS source, bridge_task_id AS id, updated_at FROM bridge_tasks${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""}`);
+    }
+    if (query.source !== "desk" && query.source !== "direct" && !query.projectKey && !query.mode
+      && (!requestedStates.length || aampStates.length || needsAttention)) {
+      const clauses: string[] = [];
+      if (aampStates.length && needsAttention) {
+        clauses.push(`(status IN (${aampStates.map(() => "?").join(", ")}) OR status = 'failed')`);
+        params.push(...aampStates);
+      } else if (aampStates.length) { clauses.push(`status IN (${aampStates.map(() => "?").join(", ")})`); params.push(...aampStates); }
+      else if (needsAttention) clauses.push("status = 'failed'");
+      if (query.search) {
+        clauses.push("(aamp_task_id LIKE ? OR chat_id LIKE ? OR COALESCE(user_text, '') LIKE ? OR COALESCE(last_delta_text, '') LIKE ? OR COALESCE(error_msg, '') LIKE ?)");
+        params.push(...Array(5).fill(`%${query.search}%`));
+      }
+      candidates.push(`SELECT 'aamp' AS source, aamp_task_id AS id, updated_at FROM aamp_tasks${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""}`);
+    }
+    if (!candidates.length) return { items: [], total: 0 };
+    const union = candidates.join(" UNION ALL ");
+    const total = (this.db.prepare(`SELECT COUNT(*) AS total FROM (${union})`).get(...params) as { total: number }).total;
+    const limit = Math.min(200, Math.max(1, query.limit ?? 50));
+    const offset = Math.max(0, query.offset ?? 0);
+    const rows = this.db.prepare(`SELECT source, id FROM (${union}) ORDER BY updated_at DESC, source, id DESC LIMIT ? OFFSET ?`)
+      .all(...params, limit, offset) as Array<{ source: "desk" | "direct" | "aamp"; id: string }>;
+    const items: Array<{ source: "desk"; task: StoredTask } | { source: "direct"; task: StoredBridgeTask } | { source: "aamp"; task: StoredAampTask }> = [];
+    for (const row of rows) {
+      if (row.source === "desk") {
+        const task = this.getTask(row.id);
+        if (task) items.push({ source: "desk", task });
+      } else if (row.source === "direct") {
+        const task = this.getBridgeTask(row.id);
+        if (task) items.push({ source: "direct", task });
+      } else {
+        const task = this.getAampTask(row.id);
+        if (task) items.push({ source: "aamp", task });
+      }
+    }
+    return { total, items };
+  }
+
   public getRun(runId: string): StoredRun | null {
     const row = this.db
       .prepare("SELECT * FROM runs WHERE run_id = ?")
@@ -1900,6 +2821,67 @@ export class StateDatabase {
       .prepare("SELECT * FROM runs WHERE task_guid = ? ORDER BY started_at DESC")
       .all(taskGuid) as Record<string, unknown>[];
     return rows.map(mapRun);
+  }
+
+  public listWebRunReviews(taskGuid: string): StoredWebRunReview[] {
+    return this.db.prepare("SELECT * FROM web_run_reviews WHERE task_guid = ? ORDER BY reviewed_at DESC")
+      .all(taskGuid) as unknown as StoredWebRunReview[];
+  }
+
+  public getWebRunReview(runId: string): StoredWebRunReview | null {
+    const row = this.db.prepare("SELECT * FROM web_run_reviews WHERE run_id = ?").get(runId) as unknown as StoredWebRunReview | undefined;
+    return row ?? null;
+  }
+
+  public getLatestWebRunReview(taskGuid: string): StoredWebRunReview | null {
+    const row = this.db.prepare(`SELECT * FROM web_run_reviews WHERE run_id = (
+      SELECT run_id FROM runs WHERE task_guid = ? ORDER BY started_at DESC LIMIT 1
+    )`).get(taskGuid) as unknown as StoredWebRunReview | undefined;
+    return row ?? null;
+  }
+
+  public saveRunWorkspaceSnapshot(runId: string, stage: "before" | "after", snapshot: GitWorkspaceSnapshot): void {
+    const run = this.getRun(runId);
+    if (!run || this.getTask(run.task_guid)?.origin !== "web") return;
+    this.db.prepare(`INSERT INTO run_workspace_snapshots (run_id, stage, snapshot_json) VALUES (?, ?, ?)
+      ON CONFLICT(run_id, stage) DO UPDATE SET snapshot_json = excluded.snapshot_json`)
+      .run(runId, stage, JSON.stringify(snapshot));
+    this.noteChange({ kind: "task", taskGuid: run.task_guid, runId, at: this.timestamp() });
+  }
+
+  public listRunWorkspaceSnapshots(taskGuid: string): StoredRunWorkspaceSnapshot[] {
+    const rows = this.db.prepare(`SELECT snapshots.run_id, snapshots.stage, snapshots.snapshot_json
+      FROM run_workspace_snapshots snapshots JOIN runs ON runs.run_id = snapshots.run_id
+      WHERE runs.task_guid = ? ORDER BY runs.started_at DESC, snapshots.stage`)
+      .all(taskGuid) as Array<{ run_id: string; stage: "before" | "after"; snapshot_json: string }>;
+    return rows.flatMap((row) => {
+      try { return [{ run_id: row.run_id, stage: row.stage, snapshot: JSON.parse(row.snapshot_json) as GitWorkspaceSnapshot }]; }
+      catch { return []; }
+    });
+  }
+
+  public saveWebRunReview(
+    taskGuid: string,
+    runId: string,
+    decision: "accepted" | "changes_requested",
+    note: string,
+  ): StoredWebRunReview {
+    const normalizedNote = note.trim();
+    if (normalizedNote.length > 1000) throw new Error("验收备注不能超过 1000 个字符。");
+    if (decision === "changes_requested" && !normalizedNote) throw new Error("需要修改时请填写验收意见。");
+    const task = this.getTask(taskGuid);
+    const run = this.getRun(runId);
+    if (!task || task.origin !== "web" || !run || run.task_guid !== taskGuid) throw new Error("Bridge 网页任务或运行不存在。");
+    if (run.state !== "WAITING_REVIEW") throw new Error("仅能验收已完成的成功运行。");
+    const latest = this.getLatestRun(taskGuid);
+    if (latest?.run_id !== runId) throw new Error("只能验收当前最新一轮运行。");
+    const now = this.timestamp();
+    this.db.prepare(`INSERT INTO web_run_reviews (run_id, task_guid, decision, note, reviewed_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(run_id) DO UPDATE SET decision = excluded.decision, note = excluded.note, reviewed_at = excluded.reviewed_at`)
+      .run(runId, taskGuid, decision, normalizedNote, now);
+    this.noteChange({ kind: "task", taskGuid, runId, at: now });
+    return this.db.prepare("SELECT * FROM web_run_reviews WHERE run_id = ?").get(runId) as unknown as StoredWebRunReview;
   }
 
   public listRunEvents(runId: string, limit = 500): StoredRunEvent[] {
@@ -1972,13 +2954,39 @@ export class StateDatabase {
     });
   }
 
+  public claimWebTaskSubmission(args: ClaimWebTaskSubmissionArgs): ClaimWebTaskSubmissionResult {
+    return this.transaction(() => {
+      const existing = this.getWebTaskSubmission(args.idempotencyKey);
+      const requestHash = createHash("sha256").update(args.normalizedRequestJson).digest("hex");
+      if (existing) {
+        if (existing.request_hash !== requestHash || existing.normalized_request_json !== args.normalizedRequestJson) {
+          throw new WebTaskSubmissionConflictError();
+        }
+        return { status: "existing", submission: existing };
+      }
+      const claim = this.claimRun(args);
+      if (!claim) throw new Error("任务暂时无法排队，请稍后重试。");
+      this.db.prepare(`INSERT INTO web_task_submissions
+        (idempotency_key, request_hash, normalized_request_json, task_guid, run_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(
+          args.idempotencyKey, requestHash, args.normalizedRequestJson, claim.taskGuid, claim.runId, this.timestamp(),
+        );
+      return { status: "created", claim };
+    });
+  }
+
+  public listQueuedWebRunIds(): string[] {
+    return (this.db.prepare(`SELECT r.run_id FROM runs r JOIN tasks t ON t.task_guid = r.task_guid
+      WHERE t.origin = 'web' AND t.active_run_id = r.run_id AND t.state = 'QUEUED' AND r.state = 'QUEUED'
+      ORDER BY r.started_at, r.run_id`).all() as Array<{ run_id: string }>).map((row) => row.run_id);
+  }
+
   public claimRun(args: ClaimRunArgs): RunClaim | null {
     return this.transaction(() => {
       const existing = this.getTask(args.task.taskGuid);
       if (existing && (existing.state === "RUNNING" || existing.state === "QUEUED")) {
         return null;
       }
-
       const now = this.timestamp();
       const runId = makeRunId(now);
       const previousInputText = existing?.input_text ?? null;
@@ -1988,7 +2996,7 @@ export class StateDatabase {
         this.db
           .prepare(
             `UPDATE tasks SET
-              project_key = ?, mode = ?, repo = ?, state = 'QUEUED',
+              origin = ?, project_key = ?, mode = ?, repo = ?, state = 'QUEUED',
               input_text = ?, input_hash = ?, active_run_id = ?,
               completed_at = NULL, last_error = NULL, worker_pid = NULL, service_instance_id = NULL,
               progress_event = NULL, progress_text = NULL, progress_updated_at = NULL,
@@ -1996,6 +3004,7 @@ export class StateDatabase {
              WHERE task_guid = ?`,
           )
           .run(
+            args.task.origin ?? "feishu",
             args.task.projectKey,
             args.task.mode,
             args.task.repo,
@@ -2009,13 +3018,14 @@ export class StateDatabase {
         this.db
           .prepare(
             `INSERT INTO tasks (
-              task_guid, project_key, mode, repo, state, input_text, input_hash,
+              task_guid, origin, project_key, mode, repo, state, input_text, input_hash,
               thread_id, active_run_id, completed_at, last_error, created_at, updated_at,
               worker_pid, service_instance_id
-            ) VALUES (?, ?, ?, ?, 'QUEUED', ?, ?, NULL, ?, NULL, NULL, ?, ?, NULL, NULL)`,
+            ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, NULL, ?, NULL, NULL, ?, ?, NULL, NULL)`,
           )
           .run(
             args.task.taskGuid,
+            args.task.origin ?? "feishu",
             args.task.projectKey,
             args.task.mode,
             args.task.repo,
@@ -2031,9 +3041,9 @@ export class StateDatabase {
         .prepare(
           `INSERT INTO runs (
             run_id, task_guid, input_hash, input_text, previous_input_text, prompt_text,
-            thread_id, state, final_response, usage_json, started_at, finished_at,
+            thread_id, execution_backend, tmux_session_id, state, final_response, usage_json, started_at, finished_at,
             worker_pid, service_instance_id
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'QUEUED', NULL, NULL, ?, NULL, NULL, NULL)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', NULL, NULL, ?, NULL, NULL, NULL)`,
         )
         .run(
           runId,
@@ -2043,19 +3053,42 @@ export class StateDatabase {
           previousInputText,
           args.promptText,
           resumedThreadId,
+          "codex-sdk",
+          null,
           now,
         );
 
-      this.enqueueOutboxInTransaction(
-        args.task.taskGuid,
-        "comment",
-        {
-          content: typeof args.startedComment === "function"
-            ? args.startedComment(runId)
-            : args.startedComment,
-        },
-        now,
-      );
+      const attachmentIds = [...new Set(args.attachmentIds ?? [])];
+      if (attachmentIds.length > 0) {
+        if ((args.task.origin ?? "feishu") !== "web") {
+          throw new Error("only web tasks can attach local task files");
+        }
+        const stagedAttachments = this.getStagedWebTaskAttachments(attachmentIds);
+        if (stagedAttachments.length !== attachmentIds.length) {
+          throw new Error("任务附件已失效或已绑定其他任务，请重新选择附件。");
+        }
+        const attach = this.db.prepare(
+          "UPDATE web_task_attachments SET task_guid = ? WHERE attachment_id = ? AND task_guid IS NULL",
+        );
+        for (const attachmentId of attachmentIds) {
+          if (attach.run(args.task.taskGuid, attachmentId).changes !== 1) {
+            throw new Error("任务附件已被其他请求绑定，请重新选择附件。");
+          }
+        }
+      }
+
+      if (args.startedComment !== undefined) {
+        this.enqueueOutboxInTransaction(
+          args.task.taskGuid,
+          "comment",
+          {
+            content: typeof args.startedComment === "function"
+              ? args.startedComment(runId)
+              : args.startedComment,
+          },
+          now,
+        );
+      }
 
       this.noteChange({
         kind: "task",
@@ -2199,7 +3232,7 @@ export class StateDatabase {
 
   public markRunRunning(
     runId: string,
-    workerPid: number,
+    workerPid: number | null,
     serviceInstanceId: string,
   ): boolean {
     return this.transaction(() => {
@@ -2395,8 +3428,12 @@ export class StateDatabase {
   ): RecoveredRun[] {
     return this.transaction(() => {
       const rows = this.db
-        .prepare("SELECT run_id, task_guid FROM runs WHERE state = 'RUNNING'")
-        .all() as Array<{ run_id: string; task_guid: string }>;
+        .prepare(
+          `SELECT r.run_id, r.task_guid, t.origin FROM runs r
+           INNER JOIN tasks t ON t.task_guid = r.task_guid
+           WHERE r.state = 'RUNNING'`,
+        )
+        .all() as Array<{ run_id: string; task_guid: string; origin: string }>;
       const recovered: RecoveredRun[] = [];
       for (const row of rows) {
         const now = this.timestamp();
@@ -2414,13 +3451,15 @@ export class StateDatabase {
              WHERE task_guid = ? AND active_run_id = ?`,
           )
           .run(error, now, row.task_guid, row.run_id);
-        const comment = commentForTask(row.task_guid, error);
-        this.enqueueOutboxInTransaction(
-          row.task_guid,
-          "comment",
-          { content: comment },
-          now,
-        );
+        const comment = row.origin === "web" ? "" : commentForTask(row.task_guid, error);
+        if (comment) {
+          this.enqueueOutboxInTransaction(
+            row.task_guid,
+            "comment",
+            { content: comment },
+            now,
+          );
+        }
         this.noteChange({
           kind: "task",
           taskGuid: row.task_guid,
@@ -2600,12 +3639,17 @@ export class StateDatabase {
     return row ? mapWebAuthSession(row) : null;
   }
 
-  public touchWebAuthSession(sessionId: string, lastSeenAt: string): void {
+  public touchWebAuthSession(
+    sessionId: string,
+    lastSeenAt: string,
+    userAgent: string | null,
+    remoteAddress: string | null,
+  ): void {
     this.db
       .prepare(
-        "UPDATE web_auth_sessions SET last_seen_at = ? WHERE session_id = ? AND revoked_at IS NULL",
+        "UPDATE web_auth_sessions SET last_seen_at = ?, user_agent = ?, remote_address = ? WHERE session_id = ? AND revoked_at IS NULL",
       )
-      .run(lastSeenAt, sessionId);
+      .run(lastSeenAt, userAgent, remoteAddress, sessionId);
   }
 
   public listWebAuthSessions(): WebAuthSessionRecord[] {
@@ -2613,6 +3657,12 @@ export class StateDatabase {
       .prepare("SELECT * FROM web_auth_sessions ORDER BY created_at DESC")
       .all() as Record<string, unknown>[];
     return rows.map(mapWebAuthSession);
+  }
+
+  public updateWebAuthSessionDeviceName(sessionId: string, deviceName: string): void {
+    this.db
+      .prepare("UPDATE web_auth_sessions SET device_name = ? WHERE session_id = ? AND revoked_at IS NULL")
+      .run(deviceName, sessionId);
   }
 
   public revokeWebAuthSession(sessionId: string, revokedAt: string): void {
@@ -2627,6 +3677,215 @@ export class StateDatabase {
     this.db
       .prepare("UPDATE web_auth_sessions SET revoked_at = ? WHERE revoked_at IS NULL")
       .run(revokedAt);
+  }
+
+  public recordTmuxSession(
+    session: { id: string; name: string; cwd: string; createdAt: number },
+    options: { projectKey?: string | null; createdByDeviceId?: string | null } = {},
+  ): StoredTmuxSession {
+    const resolvedCwd = resolve(session.cwd);
+    const inferredProject = this.db.prepare(
+      "SELECT name FROM projects WHERE path = ? AND status = 'available' LIMIT 1",
+    ).get(resolvedCwd) as { name: string } | undefined;
+    const projectKey = options.projectKey ?? inferredProject?.name ?? null;
+    const existing = this.db.prepare(
+      `SELECT record_id, session_name, project_key, working_directory, last_seen_at, ended_at, created_by_device_id
+       FROM tmux_sessions WHERE tmux_session_id = ? AND tmux_created_at = ? AND ended_at IS NULL
+       ORDER BY first_seen_at DESC LIMIT 1`,
+    ).get(session.id, session.createdAt) as {
+      record_id: string;
+      session_name: string;
+      project_key: string | null;
+      working_directory: string;
+      last_seen_at: string;
+      ended_at: string | null;
+      created_by_device_id: string | null;
+    } | undefined;
+    const now = this.timestamp();
+    if (existing) {
+      const current = existing;
+      const refreshAfter = new Date(this.now().getTime() - 60_000).toISOString();
+      const refreshedLastSeen = current.last_seen_at <= refreshAfter ? now : current.last_seen_at;
+      const nextProjectKey = projectKey ?? current.project_key;
+      const nextDeviceId = current.created_by_device_id ?? options.createdByDeviceId ?? null;
+      if (
+        current.session_name !== session.name
+        || current.project_key !== nextProjectKey
+        || current.working_directory !== session.cwd
+        || current.last_seen_at !== refreshedLastSeen
+        || current.ended_at !== null
+        || current.created_by_device_id !== nextDeviceId
+      ) {
+        this.db.prepare(`UPDATE tmux_sessions SET
+          session_name = ?, project_key = ?, working_directory = ?, last_seen_at = ?,
+          ended_at = NULL, created_by_device_id = ? WHERE record_id = ?`).run(
+            session.name,
+            nextProjectKey,
+            session.cwd,
+            refreshedLastSeen,
+            nextDeviceId,
+            current.record_id,
+          );
+      }
+      return this.getTmuxSession(current.record_id)!;
+    }
+
+    const recordId = randomUUID();
+    this.db.prepare(`INSERT INTO tmux_sessions
+      (record_id, tmux_session_id, session_name, project_key, working_directory,
+       tmux_created_at, first_seen_at, last_seen_at, ended_at, created_by_device_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`).run(
+        recordId,
+        session.id,
+        session.name,
+        projectKey,
+        session.cwd,
+        session.createdAt,
+        now,
+        now,
+        options.createdByDeviceId ?? null,
+      );
+    return this.getTmuxSession(recordId)!;
+  }
+
+  public setTmuxSessionCodexHome(tmuxSessionId: string, codexHomeId: string | null): StoredTmuxSession | null {
+    const session = this.db.prepare(`SELECT record_id FROM tmux_sessions
+      WHERE tmux_session_id = ? AND ended_at IS NULL
+      ORDER BY first_seen_at DESC LIMIT 1`).get(tmuxSessionId) as { record_id: string } | undefined;
+    if (!session) return null;
+    this.db.prepare("UPDATE tmux_sessions SET codex_home_id = ? WHERE record_id = ?")
+      .run(codexHomeId, session.record_id);
+    return this.getTmuxSession(session.record_id);
+  }
+
+  public syncTmuxSessions(sessions: Array<{ id: string; name: string; cwd: string; createdAt: number }>): void {
+    const currentKeys = new Set(sessions.map((session) => `${session.id}\u0000${session.createdAt}`));
+    const endedAt = this.timestamp();
+    this.transaction(() => {
+      const active = this.db.prepare(
+        "SELECT record_id, tmux_session_id, tmux_created_at FROM tmux_sessions WHERE ended_at IS NULL",
+      ).all() as Array<{ record_id: string; tmux_session_id: string; tmux_created_at: number }>;
+      for (const record of active) {
+        if (!currentKeys.has(`${record.tmux_session_id}\u0000${record.tmux_created_at}`)) {
+          this.db.prepare("UPDATE tmux_sessions SET ended_at = ? WHERE record_id = ? AND ended_at IS NULL")
+            .run(endedAt, record.record_id);
+        }
+      }
+      for (const session of sessions) this.recordTmuxSession(session);
+    });
+  }
+
+  public getTmuxSession(recordId: string): StoredTmuxSession | null {
+    const row = this.db.prepare("SELECT * FROM tmux_sessions WHERE record_id = ?")
+      .get(recordId) as Record<string, unknown> | undefined;
+    return row ? mapTmuxSession(row) : null;
+  }
+
+  public getLatestTmuxSession(tmuxSessionId: string): StoredTmuxSession | null {
+    const row = this.db.prepare(`SELECT * FROM tmux_sessions
+      WHERE tmux_session_id = ?
+      ORDER BY (ended_at IS NULL) DESC, first_seen_at DESC
+      LIMIT 1`).get(tmuxSessionId) as Record<string, unknown> | undefined;
+    return row ? mapTmuxSession(row) : null;
+  }
+
+  public markTmuxSessionEnded(tmuxSessionId: string): void {
+    this.db.prepare("UPDATE tmux_sessions SET ended_at = ? WHERE tmux_session_id = ? AND ended_at IS NULL")
+      .run(this.timestamp(), tmuxSessionId);
+  }
+
+  public beginTmuxSessionAction(input: {
+    sessionRecordId: string;
+    deviceId: string | null;
+    actionType: TmuxSessionActionType;
+    requestId: string | null;
+    content: string;
+    submissionFingerprint?: string;
+  }): { actionId: string; duplicate: boolean } {
+    const session = this.getTmuxSession(input.sessionRecordId);
+    if (!session) throw new Error("tmux session record not found");
+    return this.transaction(() => {
+      if (input.actionType === "task_submit" && input.submissionFingerprint) {
+        const recent = this.db.prepare(`SELECT action_id FROM tmux_session_actions
+          WHERE session_record_id = ? AND submission_fingerprint = ?
+            AND status IN ('sending', 'confirmed', 'unconfirmed') AND created_at >= ?
+          LIMIT 1`).get(
+            session.record_id,
+            input.submissionFingerprint,
+            new Date(this.now().getTime() - 5 * 60_000).toISOString(),
+          );
+        if (recent) return { actionId: "", duplicate: true };
+      }
+      const actionId = randomUUID();
+      this.db.prepare(`INSERT INTO tmux_session_actions
+      (action_id, session_record_id, tmux_session_id, session_name, project_key, working_directory,
+       device_id, action_type, request_id, content, submission_fingerprint, status, error, created_at, completed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sending', NULL, ?, NULL)`).run(
+        actionId,
+        session.record_id,
+        session.tmux_session_id,
+        session.session_name,
+        session.project_key,
+        session.working_directory,
+        input.deviceId,
+        input.actionType,
+        input.requestId,
+        input.content,
+        input.submissionFingerprint ?? null,
+        this.timestamp(),
+      );
+      return { actionId, duplicate: false };
+    });
+  }
+
+  public finishTmuxSessionAction(
+    actionId: string,
+    status: Exclude<TmuxSessionActionStatus, "sending">,
+    error: string | null = null,
+  ): boolean {
+    const result = this.db.prepare(`UPDATE tmux_session_actions
+      SET status = ?, error = ?, completed_at = ?
+      WHERE action_id = ? AND status = 'sending'`).run(status, error, this.timestamp(), actionId);
+    return result.changes > 0;
+  }
+
+  public listTmuxSessionActions(query: TmuxSessionActionQuery = {}): { items: StoredTmuxSessionAction[]; total: number } {
+    const clauses: string[] = [];
+    const params: Array<string> = [];
+    if (query.tmuxSessionId) {
+      clauses.push("(s.tmux_session_id = ? OR s.record_id = ?)");
+      params.push(query.tmuxSessionId, query.tmuxSessionId);
+    }
+    // Keep this aligned with the 10-second submission waiter in TmuxDashboard.tsx.
+    // This is a read-only projection: a different Bridge process may still own a live send.
+    const unknownAfter = new Date(this.now().getTime() - 10_000).toISOString();
+    const unknownDeliveryMessage = "发送确认已超过 10 秒等待窗口；消息可能已写入 Session。请先查看 Session，再决定是否重新提交。";
+    if (query.search?.trim()) {
+      const pattern = `%${query.search.trim().slice(0, 500)}%`;
+      clauses.push("(a.content LIKE ? OR a.session_name LIKE ? OR a.working_directory LIKE ? OR COALESCE(d.device_name, '') LIKE ?)");
+      params.push(pattern, pattern, pattern, pattern);
+    }
+    const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
+    const limit = Math.min(200, Math.max(1, Math.trunc(query.limit ?? 50)));
+    const offset = Math.max(0, Math.trunc(query.offset ?? 0));
+    const count = this.db.prepare(`SELECT COUNT(*) AS total
+      FROM tmux_session_actions a
+      JOIN tmux_sessions s ON s.record_id = a.session_record_id
+      LEFT JOIN web_auth_sessions d ON d.session_id = a.device_id${where}`)
+      .get(...params) as { total: number };
+    const rows = this.db.prepare(`SELECT
+      a.action_id, a.session_record_id, a.tmux_session_id, a.session_name, a.project_key,
+      a.working_directory, s.ended_at AS session_ended_at, a.device_id, d.device_name,
+      a.action_type, a.request_id, a.content,
+      CASE WHEN a.status = 'sending' AND a.created_at <= ? THEN 'unconfirmed' ELSE a.status END AS status,
+      CASE WHEN a.status = 'sending' AND a.created_at <= ? THEN ? ELSE a.error END AS error,
+      a.created_at, a.completed_at
+      FROM tmux_session_actions a
+      JOIN tmux_sessions s ON s.record_id = a.session_record_id
+      LEFT JOIN web_auth_sessions d ON d.session_id = a.device_id${where}
+      ORDER BY a.created_at DESC, a.action_id DESC LIMIT ? OFFSET ?`)
+      .all(unknownAfter, unknownAfter, unknownDeliveryMessage, ...params, limit, offset) as Record<string, unknown>[];
+    return { items: rows.map(mapTmuxSessionAction), total: count.total };
   }
 
   public close(): void {
@@ -2774,7 +4033,34 @@ export class StateDatabase {
   private runMigrations(): void {
     // These columns were added after the minimal schema in the design document.
     // Keeping the migration additive lets an operator upgrade an existing database.
+    addColumnIfMissing(this.db, "tmux_session_actions", "tmux_session_id", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(this.db, "tmux_session_actions", "session_name", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(this.db, "tmux_session_actions", "project_key", "TEXT");
+    addColumnIfMissing(this.db, "tmux_session_actions", "working_directory", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(this.db, "tmux_session_actions", "submission_fingerprint", "TEXT");
+    addColumnIfMissing(this.db, "tmux_sessions", "codex_home_id", "TEXT");
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tmux_session_actions_fingerprint
+      ON tmux_session_actions(session_record_id, submission_fingerprint, created_at DESC)`);
+    this.db.exec(`UPDATE tmux_session_actions
+      SET tmux_session_id = COALESCE(NULLIF(tmux_session_id, ''), (
+            SELECT tmux_session_id FROM tmux_sessions WHERE record_id = tmux_session_actions.session_record_id
+          )),
+          session_name = COALESCE(NULLIF(session_name, ''), (
+            SELECT session_name FROM tmux_sessions WHERE record_id = tmux_session_actions.session_record_id
+          )),
+          project_key = COALESCE(project_key, (
+            SELECT project_key FROM tmux_sessions WHERE record_id = tmux_session_actions.session_record_id
+          )),
+          working_directory = COALESCE(NULLIF(working_directory, ''), (
+            SELECT working_directory FROM tmux_sessions WHERE record_id = tmux_session_actions.session_record_id
+          ))
+      WHERE EXISTS (
+        SELECT 1 FROM tmux_sessions WHERE record_id = tmux_session_actions.session_record_id
+      ) AND (
+        tmux_session_id = '' OR session_name = '' OR working_directory = ''
+      )`);
     addColumnIfMissing(this.db, "tasks", "worker_pid", "INTEGER");
+    addColumnIfMissing(this.db, "tasks", "origin", "TEXT NOT NULL DEFAULT 'feishu'");
     addColumnIfMissing(this.db, "tasks", "service_instance_id", "TEXT");
     addColumnIfMissing(this.db, "tasks", "progress_event", "TEXT");
     addColumnIfMissing(this.db, "tasks", "progress_text", "TEXT");
@@ -2783,10 +4069,13 @@ export class StateDatabase {
     addColumnIfMissing(this.db, "runs", "previous_input_text", "TEXT");
     addColumnIfMissing(this.db, "runs", "prompt_text", "TEXT NOT NULL DEFAULT ''");
     addColumnIfMissing(this.db, "runs", "worker_pid", "INTEGER");
+    addColumnIfMissing(this.db, "runs", "execution_backend", "TEXT NOT NULL DEFAULT 'codex-sdk'");
+    addColumnIfMissing(this.db, "runs", "tmux_session_id", "TEXT");
     addColumnIfMissing(this.db, "runs", "service_instance_id", "TEXT");
     addColumnIfMissing(this.db, "runs", "progress_event", "TEXT");
     addColumnIfMissing(this.db, "runs", "progress_text", "TEXT");
     addColumnIfMissing(this.db, "runs", "progress_updated_at", "TEXT");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_runs_tmux_target_state ON runs(tmux_session_id, state)");
     // The first direct-mode schema only allowed four task states. Add the
     // progress columns before a possible table rebuild so old databases can
     // be copied without losing those fields.
@@ -2802,8 +4091,96 @@ export class StateDatabase {
     addColumnIfMissing(this.db, "bridge_tasks", "cancel_reason", "TEXT");
     addColumnIfMissing(this.db, "bridge_tasks", "recovery_count", "INTEGER NOT NULL DEFAULT 0");
     addColumnIfMissing(this.db, "bridge_tasks", "last_recovered_at", "TEXT");
+    addColumnIfMissing(this.db, "bridge_tasks", "initial_final_response", "TEXT");
+    this.db.exec(`UPDATE bridge_tasks SET initial_final_response = final_response
+      WHERE initial_final_response IS NULL AND final_response IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM bridge_task_followups f WHERE f.bridge_task_id = bridge_tasks.bridge_task_id)`);
     addColumnIfMissing(this.db, "bridge_task_attachments", "followup_id", "TEXT");
+    addColumnIfMissing(this.db, "shortcuts", "sort_order", "INTEGER NOT NULL DEFAULT 0");
+    addColumnIfMissing(this.db, "shortcut_groups", "surface", "TEXT NOT NULL DEFAULT 'palette'");
+    addColumnIfMissing(this.db, "shortcuts", "action_key", "TEXT");
+    addColumnIfMissing(this.db, "shortcuts", "display_mode", "TEXT NOT NULL DEFAULT 'closed'");
   }
+
+  private seedShortcutDefaults(): void {
+    this.transaction(() => {
+      const now = this.timestamp();
+      const insertGroup = this.db.prepare(
+        `INSERT OR IGNORE INTO shortcut_groups
+          (id, title, icon, description, surface, layout, sort_order, enabled, built_in, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)`,
+      );
+      for (const group of DEFAULT_SHORTCUT_GROUPS) {
+        insertGroup.run(group.id, group.title, group.icon, group.description, group.surface, group.layout, group.sortOrder, now, now);
+      }
+      const insertShortcut = this.db.prepare(
+        `INSERT OR IGNORE INTO shortcuts
+          (id, group_id, title, detail, kind, value, enabled, built_in, dangerous, action_key, display_mode, sort_order, operation_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, 0, ?, ?)`,
+      );
+      for (const [sortOrder, shortcut] of DEFAULT_SHORTCUTS.entries()) {
+        insertShortcut.run(
+          shortcut.id,
+          shortcut.groupId,
+          shortcut.title,
+          shortcut.detail,
+          shortcut.kind,
+          shortcut.value,
+          shortcut.dangerous ? 1 : 0,
+          shortcut.actionKey ?? null,
+          shortcut.displayMode ?? "closed",
+          shortcut.sortOrder ?? sortOrder,
+          now,
+          now,
+        );
+      }
+      this.db.prepare("UPDATE shortcut_groups SET surface = 'composer', updated_at = ? WHERE id = 'composer' AND built_in = 1").run(now);
+      const repairComposerShortcut = this.db.prepare(
+        `UPDATE shortcuts SET action_key = ?, display_mode = ?, updated_at = ?
+         WHERE id = ? AND group_id = 'composer' AND built_in = 1 AND (action_key IS NULL OR action_key = '')`,
+      );
+      for (const shortcut of DEFAULT_SHORTCUTS) {
+        if (shortcut.groupId === "composer" && shortcut.actionKey) {
+          repairComposerShortcut.run(shortcut.actionKey, shortcut.displayMode ?? "closed", now, shortcut.id);
+        }
+      }
+
+      // The first alias implementation used a separate command-line group.
+      // Keep its counts, enabled state and any user edits, but place the four
+      // built-in aliases into the existing Tmux/Codex groups instead.
+      const legacyCommandShortcutTargets = new Map<string, string>([
+        ["command-tmuxctl", "tmux"],
+        ["command-s", "tmux"],
+        ["command-proxyctl", "codex"],
+        ["command-jump", "codex"],
+      ]);
+      const migrateLegacyCommandShortcut = this.db.prepare(
+        `UPDATE shortcuts SET group_id = ?, sort_order = ?, updated_at = ?
+         WHERE id = ? AND group_id = 'command-line' AND built_in = 1`,
+      );
+      for (const [sortOrder, shortcut] of DEFAULT_SHORTCUTS.entries()) {
+        const targetGroupId = legacyCommandShortcutTargets.get(shortcut.id);
+        if (targetGroupId) migrateLegacyCommandShortcut.run(targetGroupId, shortcut.sortOrder ?? sortOrder, now, shortcut.id);
+      }
+      this.db.prepare(
+        `DELETE FROM shortcut_groups
+         WHERE id = 'command-line' AND built_in = 1
+           AND NOT EXISTS (SELECT 1 FROM shortcuts WHERE group_id = 'command-line')`,
+      ).run();
+    });
+  }
+
+  private nextShortcutGroupOrder(): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS max_order FROM shortcut_groups").get() as { max_order: number };
+    return Number(row.max_order) + 1;
+  }
+
+  private nextShortcutOrder(groupId: string): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(sort_order), -1) AS max_order FROM shortcuts WHERE group_id = ?").get(groupId) as { max_order: number };
+    return Number(row.max_order) + 1;
+  }
+
+
 }
 
 function makeRunId(date: string): string {
@@ -2893,7 +4270,7 @@ function migrateBridgeTaskStatusConstraint(db: SqliteDatabase): void {
 
 function addColumnIfMissing(
   db: SqliteDatabase,
-  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments",
+  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts" | "shortcut_groups" | "tmux_sessions" | "tmux_session_actions",
   column: string,
   definition: string,
 ): void {
@@ -2903,9 +4280,77 @@ function addColumnIfMissing(
   }
 }
 
+function mapShortcutGroup(row: Record<string, unknown>): StoredShortcutGroup {
+  const layout = String(row.layout);
+  const surface = String(row.surface ?? "palette");
+  return {
+    id: String(row.id),
+    title: String(row.title),
+    icon: String(row.icon ?? "⌘"),
+    description: String(row.description ?? ""),
+    surface: SHORTCUT_SURFACES.includes(surface as ShortcutSurface) ? surface as ShortcutSurface : "palette",
+    layout: SHORTCUT_GROUP_LAYOUTS.includes(layout as ShortcutGroupLayout) ? layout as ShortcutGroupLayout : "grid",
+    sort_order: Number(row.sort_order ?? 0),
+    enabled: Number(row.enabled) === 1,
+    built_in: Number(row.built_in) === 1,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapShortcut(row: Record<string, unknown>): StoredShortcut {
+  const kind = String(row.kind);
+  const displayMode = String(row.display_mode ?? "closed");
+  return {
+    id: String(row.id),
+    group_id: String(row.group_id),
+    title: String(row.title),
+    detail: String(row.detail ?? ""),
+    kind: SHORTCUT_KINDS.includes(kind as ShortcutKind) ? kind as ShortcutKind : "send",
+    value: String(row.value),
+    enabled: Number(row.enabled) === 1,
+    built_in: Number(row.built_in) === 1,
+    dangerous: Number(row.dangerous) === 1,
+    action_key: row.action_key === null || row.action_key === undefined ? null : String(row.action_key),
+    display_mode: SHORTCUT_DISPLAY_MODES.includes(displayMode as ShortcutDisplayMode) ? displayMode as ShortcutDisplayMode : "closed",
+    sort_order: Number(row.sort_order ?? 0),
+    operation_count: Number(row.operation_count ?? 0),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function normalizeShortcutText(value: string, field: string, maxLength: number, required = true): string {
+  const normalized = value.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  if (required && !normalized) throw new Error(`${field}不能为空。`);
+  if (normalized.length > maxLength) throw new Error(`${field}不能超过 ${maxLength} 个字符。`);
+  return normalized;
+}
+
+function normalizeShortcutKind(value: ShortcutKind): ShortcutKind {
+  if (!SHORTCUT_KINDS.includes(value)) throw new Error("快捷键类型无效。");
+  return value;
+}
+
+function normalizeShortcutSurface(value: ShortcutSurface): ShortcutSurface {
+  if (!SHORTCUT_SURFACES.includes(value)) throw new Error("快捷键作用面无效。");
+  return value;
+}
+
+function normalizeShortcutDisplayMode(value: ShortcutDisplayMode): ShortcutDisplayMode {
+  if (!SHORTCUT_DISPLAY_MODES.includes(value)) throw new Error("快捷键展示状态无效。");
+  return value;
+}
+
+function normalizeShortcutLayout(value: ShortcutGroupLayout): ShortcutGroupLayout {
+  if (!SHORTCUT_GROUP_LAYOUTS.includes(value)) throw new Error("分组布局无效。");
+  return value;
+}
+
 function mapTask(row: Record<string, unknown>): StoredTask {
   return {
     task_guid: String(row.task_guid),
+    origin: String(row.origin ?? "feishu") as TaskOrigin,
     project_key: String(row.project_key),
     mode: String(row.mode),
     repo: String(row.repo),
@@ -2924,6 +4369,36 @@ function mapTask(row: Record<string, unknown>): StoredTask {
     progress_text: nullableString(row.progress_text),
     progress_updated_at: nullableString(row.progress_updated_at),
   };
+}
+
+function mapProject(row: Record<string, unknown>): StoredProject {
+  return {
+    name: String(row.name),
+    path: String(row.path),
+    status: String(row.status) as ProjectStatus,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapWebTaskAttachment(row: Record<string, unknown>): StoredWebTaskAttachment {
+  return {
+    attachment_id: String(row.attachment_id),
+    task_guid: nullableString(row.task_guid),
+    file_name: String(row.file_name),
+    mime_type: String(row.mime_type),
+    size_bytes: Number(row.size_bytes),
+    local_path: String(row.local_path),
+    created_at: String(row.created_at),
+  };
+}
+
+function isProjectDirectory(path: string): boolean {
+  try {
+    return isAbsolute(path) && existsSync(path) && statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function mapAampTask(row: Record<string, unknown>): StoredAampTask {
@@ -2988,6 +4463,7 @@ function mapBridgeTask(row: Record<string, unknown>): StoredBridgeTask {
     cancel_reason: nullableString(row.cancel_reason),
     recovery_count: Number(row.recovery_count ?? 0),
     last_recovered_at: nullableString(row.last_recovered_at),
+    initial_final_response: nullableString(row.initial_final_response),
     final_response: nullableString(row.final_response),
     error: nullableString(row.error),
     created_at: String(row.created_at),
@@ -3053,6 +4529,8 @@ function mapRun(row: Record<string, unknown>): StoredRun {
     previous_input_text: nullableString(row.previous_input_text),
     prompt_text: String(row.prompt_text ?? ""),
     thread_id: nullableString(row.thread_id),
+    execution_backend: String(row.execution_backend ?? "codex-sdk") as StoredExecutionBackend,
+    tmux_session_id: nullableString(row.tmux_session_id),
     state: String(row.state) as TaskState,
     final_response: nullableString(row.final_response),
     usage_json: nullableString(row.usage_json),
@@ -3103,6 +4581,43 @@ function mapWebAuthSession(row: Record<string, unknown>): WebAuthSessionRecord {
     lastSeenAt: String(row.last_seen_at),
     expiresAt: String(row.expires_at),
     revokedAt: nullableString(row.revoked_at),
+  };
+}
+
+function mapTmuxSession(row: Record<string, unknown>): StoredTmuxSession {
+  return {
+    record_id: String(row.record_id),
+    tmux_session_id: String(row.tmux_session_id),
+    session_name: String(row.session_name),
+    project_key: nullableString(row.project_key),
+    codex_home_id: nullableString(row.codex_home_id),
+    working_directory: String(row.working_directory),
+    tmux_created_at: Number(row.tmux_created_at),
+    first_seen_at: String(row.first_seen_at),
+    last_seen_at: String(row.last_seen_at),
+    ended_at: nullableString(row.ended_at),
+    created_by_device_id: nullableString(row.created_by_device_id),
+  };
+}
+
+function mapTmuxSessionAction(row: Record<string, unknown>): StoredTmuxSessionAction {
+  return {
+    action_id: String(row.action_id),
+    session_record_id: String(row.session_record_id),
+    tmux_session_id: String(row.tmux_session_id),
+    session_name: String(row.session_name),
+    project_key: nullableString(row.project_key),
+    working_directory: String(row.working_directory),
+    session_ended_at: nullableString(row.session_ended_at),
+    device_id: nullableString(row.device_id),
+    device_name: nullableString(row.device_name),
+    action_type: String(row.action_type) as StoredTmuxSessionAction["action_type"],
+    request_id: nullableString(row.request_id),
+    content: String(row.content),
+    status: String(row.status) as StoredTmuxSessionAction["status"],
+    error: nullableString(row.error),
+    created_at: String(row.created_at),
+    completed_at: nullableString(row.completed_at),
   };
 }
 

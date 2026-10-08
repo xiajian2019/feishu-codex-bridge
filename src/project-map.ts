@@ -1,13 +1,6 @@
-import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { readFileSync } from "node:fs";
 
-/** The deliberately small project-map.yaml contract shared by AAMP and direct mode. */
-export interface ProjectMapEntry {
-  key: string;
-  root: string;
-}
-
+/** Legacy project-map.yaml reader used only for one-time SQLite registry import. */
 export function readProjectMap(filePath: string): Record<string, string> {
   const source = readFileSync(filePath, "utf8");
   const projects: Record<string, string> = {};
@@ -48,26 +41,6 @@ export function readProjectMap(filePath: string): Record<string, string> {
     }
   }
   return projects;
-}
-
-export function resolveMappedProject(filePath: string, projectKey: string): ProjectMapEntry | undefined {
-  const projects = readProjectMap(filePath);
-  const root = projects[projectKey];
-  if (!root) return undefined;
-  if (!isAbsolute(root) || !existsSync(root) || !statSync(root).isDirectory()) {
-    throw new Error(`project "${projectKey}" mapping path is invalid or missing: ${root}`);
-  }
-  try {
-    const isRepository = execFileSync(
-      "git",
-      ["-C", root, "rev-parse", "--is-inside-work-tree"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-    ).trim();
-    if (isRepository !== "true") throw new Error("not a Git repository");
-  } catch {
-    throw new Error(`project "${projectKey}" mapping path is not a Git repository: ${root}`);
-  }
-  return { key: projectKey, root };
 }
 
 function stripYamlComment(value: string): string {
