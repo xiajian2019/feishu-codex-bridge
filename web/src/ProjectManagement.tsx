@@ -93,8 +93,13 @@ export function ProjectManagement(): ReactElement {
       <div className="project-manager-list" aria-live="polite">
         {loading && projects.length === 0 ? <p className="muted">正在加载项目…</p> : null}
         {visible.map((project) => <div className="project-manager-row" key={project.name}>
-          <div><strong>{project.name}</strong><span>{project.path}</span></div>
-          <span className={project.available ? "project-status-available" : "project-status-disabled"}>{project.available ? "可用" : project.status === "disabled" ? "已停用" : "路径不可用"}</span>
+          <div className="project-manager-details">
+            <div className="project-manager-title">
+              <strong>{project.name}</strong>
+              <span className={project.available ? "project-status-available" : "project-status-disabled"}>{project.available ? "可用" : project.status === "disabled" ? "已停用" : "路径不可用"}</span>
+            </div>
+            <span className="project-manager-path">{project.path}</span>
+          </div>
           <button type="button" onClick={() => editProject(project)}>编辑</button>
         </div>)}
         {!loading && projects.length === 0 ? <p className="muted">尚未登记项目。</p> : !loading && visible.length === 0 ? <p className="muted">没有符合条件的项目。</p> : null}

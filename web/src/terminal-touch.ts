@@ -238,6 +238,7 @@ export function bindMobileTerminalTouch(
   onSelectionChange: (selection: TerminalSelectionDisplay | null) => void,
 ): () => void {
   let lastWheelSampleAt = 0;
+  let wheelPixelRemainder = 0;
   let lastViewportSampleAt = 0;
   let lastObservedViewportY = terminal.buffer.active.viewportY;
   let pendingScrollRender: PendingScrollRender | null = null;
@@ -268,45 +269,64 @@ export function bindMobileTerminalTouch(
     const now = performance.now();
     const position = cellPosition(terminal, host, event.clientX, event.clientY);
     const buffer = terminal.buffer.active;
-    if (buffer.type === "normal") {
-      watchScrollRender("wheel", position, event.deltaY, 0, event.target);
+    const pixelsPerLine = 18;
+    const deltaPixels = event.deltaY * (
+      event.deltaMode === WheelEvent.DOM_DELTA_LINE
+        ? pixelsPerLine
+        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+          ? Math.max(terminal.rows, 1) * pixelsPerLine
+          : 1
+    );
+    const accumulatedPixels = wheelPixelRemainder + deltaPixels;
+    const requestedLines = Math.trunc(accumulatedPixels / pixelsPerLine);
+    if (requestedLines === 0) {
+      wheelPixelRemainder = accumulatedPixels;
       if (now - lastWheelSampleAt >= 120) {
         lastWheelSampleAt = now;
         logScrollDiagnostic("wheel", {
-          route: "xterm-default-local",
+          route: "xterm-local-scrollLines",
+          deltaMode: event.deltaMode,
           deltaX: event.deltaX,
           deltaY: event.deltaY,
-          col: position.col,
-          row: position.row,
+          requestedLines,
           buffer: buffer.type,
           viewportY: buffer.viewportY,
           baseY: buffer.baseY,
+          mouseTrackingMode: terminal.modes.mouseTrackingMode,
           target: touchTargetName(event.target),
         });
       }
-      return true;
+      event.preventDefault();
+      return false;
     }
-    const lines = Math.round(event.deltaY / 18);
+    const maxLines = Math.max(12, Math.min(120, terminal.rows * 3));
+    const lines = Math.max(-maxLines, Math.min(maxLines, requestedLines));
+    wheelPixelRemainder = accumulatedPixels - requestedLines * pixelsPerLine;
     const beforeViewportY = buffer.viewportY;
     const startedAt = performance.now();
     watchScrollRender("wheel", position, event.deltaY, lines, event.target);
     terminal.scrollLines(lines);
     const handlerMs = performance.now() - startedAt;
     const afterViewportY = terminal.buffer.active.viewportY;
-    if (now - lastWheelSampleAt >= 120 || beforeViewportY === afterViewportY || handlerMs >= 16) {
+    const movedRows = afterViewportY - beforeViewportY;
+    if (movedRows === 0) wheelPixelRemainder = 0;
+    if (now - lastWheelSampleAt >= 120 || movedRows === 0 || handlerMs >= 16) {
       lastWheelSampleAt = now;
       logScrollDiagnostic("wheel", {
         route: "xterm-local-scrollLines",
+        deltaMode: event.deltaMode,
         deltaX: event.deltaX,
         deltaY: event.deltaY,
         col: position.col,
         row: position.row,
-        requestedLines: lines,
-        movedRows: afterViewportY - beforeViewportY,
+        requestedLines,
+        appliedLines: lines,
+        movedRows,
         handlerMs: Number(handlerMs.toFixed(2)),
         buffer: terminal.buffer.active.type,
         viewportY: afterViewportY,
         baseY: terminal.buffer.active.baseY,
+        mouseTrackingMode: terminal.modes.mouseTrackingMode,
         target: touchTargetName(event.target),
       });
     }
@@ -463,6 +483,7 @@ export function bindMobileTerminalTouch(
     });
   });
   const selectionResize = terminal.onResize(() => {
+    wheelPixelRemainder = 0;
     if (selectedRange) updateSelectionControls(selectedRange);
   });
   const onTouchStart = (event: TouchEvent): void => {

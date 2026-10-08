@@ -608,9 +608,12 @@ export class CodexHistoryService {
     return { threadId: normalizedThreadId, preferredHomeId: normalizedHomeId, updatedAt };
   }
 
-  public async readUsage(): Promise<CodexHistoryUsageResponse> {
+  public async readUsage(homeId?: string): Promise<CodexHistoryUsageResponse> {
     const generatedAt = new Date().toISOString();
-    const accounts = await Promise.all(this.resolveHomes().map(async (home) => {
+    const homes = this.resolveHomes();
+    const selectedHomes = homeId ? homes.filter((home) => home.id === homeId) : homes;
+    if (homeId && selectedHomes.length === 0) throw new Error("找不到 Codex home");
+    const accounts = await Promise.all(selectedHomes.map(async (home) => {
       const checkedAt = new Date().toISOString();
       if (!home.available) {
         return {

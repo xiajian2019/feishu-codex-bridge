@@ -407,7 +407,7 @@ export function App(): ReactElement {
         <button type="button" onClick={() => void loadTasks()} disabled={listLoading}>刷新</button>
       </header>
 
-      <main className="page-main">
+      <main className="page-main task-panel-page">
         <form className="filters task-panel-filters" onSubmit={submitFilters}>
           <input
             aria-label="搜索任务"

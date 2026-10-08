@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,6 +19,19 @@ describe("read-only system health", () => {
     const now = new Date("2026-10-05T10:00:00.000Z");
     const db = new StateDatabase(path, () => now);
     cleanup.push(() => db.close());
+    const tmuxAttachmentRoot = join(root, "attachments", "tmux");
+    mkdirSync(tmuxAttachmentRoot, { recursive: true });
+    const tmuxImage = join(tmuxAttachmentRoot, "9c7daf93-3e89-413f-b430-1c0b2d82fadc.jpg");
+    writeFileSync(tmuxImage, Buffer.from([1, 2, 3]));
+    writeFileSync(join(tmuxAttachmentRoot, "e9c45a3a-79c5-44b3-85b8-588dc79c7eb2.jpg"), Buffer.from([4, 5, 6, 7]));
+    const tmuxSession = db.recordTmuxSession({ id: "$1", name: "health-tmux", cwd: root, createdAt: 1 });
+    db.beginTmuxSessionAction({
+      sessionRecordId: tmuxSession.record_id,
+      deviceId: null,
+      actionType: "task_submit",
+      requestId: "health-tmux-submit",
+      content: `查看图片 <image name=[Image #1] path="${tmuxImage}">`,
+    });
     const direct = db.ingestDirectMessage({
       sourceEventId: "health-event", eventType: "im.message.receive_v1", messageId: "health-message",
       chatId: "health-chat", chatType: "p2p", senderId: "health-user", text: "health task", sessionKey: "chat:health-chat",
@@ -54,7 +67,14 @@ describe("read-only system health", () => {
       sql.prepare("UPDATE web_task_attachments SET created_at = ? WHERE attachment_id = 'staged'")
         .run("2026-10-03T09:00:00.000Z");
       const before = (sql.prepare("SELECT COUNT(*) AS n FROM outbox").get() as { n: number }).n;
-      const snapshot = await readSystemHealth({ databasePath: path, mode: "feishu-sqlite-codex", version: "fixture", codexCliPath: join(root, "missing-codex"), now });
+      const snapshot = await readSystemHealth({
+        databasePath: path,
+        tmuxAttachmentRoots: [tmuxAttachmentRoot],
+        mode: "feishu-sqlite-codex",
+        version: "fixture",
+        codexCliPath: join(root, "missing-codex"),
+        now,
+      });
       const after = (sql.prepare("SELECT COUNT(*) AS n FROM outbox").get() as { n: number }).n;
       expect(snapshot.mode).toBe("feishu-sqlite-codex");
       expect(snapshot.version).toBe("fixture");
@@ -72,6 +92,10 @@ describe("read-only system health", () => {
       expect(snapshot.storage.webStaged).toEqual({ count: 1, bytes: 1024, expiredCount: 1, expiredBytes: 1024 });
       expect(snapshot.storage.historyRetained).toEqual({ count: 1, declaredBytes: 2048, truncated: false });
       expect(snapshot.storage.aampReferencedImageCount).toBe(1);
+      expect(snapshot.storage.tmuxAttachments).toEqual({
+        referencedCount: 1, referencedBytes: 3, missingReferencedCount: 0,
+        unreferencedFileCount: 1, unreferencedBytes: 4, scanTruncated: false,
+      });
       expect(after).toBe(before);
     } finally {
       sql.close();

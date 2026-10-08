@@ -195,6 +195,12 @@ describe("Dispatcher", () => {
           headCommit: "a".repeat(40),
           dirtyPaths: snapshots.length === 0 ? ["before.ts"] : ["after.ts"],
           untrackedPaths: [],
+          fileFingerprints: [{
+            path: snapshots.length === 0 ? "before.ts" : "after.ts",
+            status: "hashed",
+            sizeBytes: 4,
+            sha256: "b".repeat(64),
+          }],
           truncated: false,
           taskAttribution: "unattributed-shared-workspace",
           attributionNote: "This is a shared-workspace snapshot; changed paths cannot be attributed to one task.",
@@ -213,7 +219,7 @@ describe("Dispatcher", () => {
     const runId = runner.starts[0];
     expect(snapshots).toHaveLength(1);
     expect(db.listRunWorkspaceSnapshots(taskRecord.task_guid)).toMatchObject([
-      { run_id: runId, stage: "before", snapshot: { capturedAt: snapshots[0]?.capturedAt, dirtyPaths: ["before.ts"] } },
+      { run_id: runId, stage: "before", snapshot: { capturedAt: snapshots[0]?.capturedAt, dirtyPaths: ["before.ts"], fileFingerprints: [{ path: "before.ts", sha256: "b".repeat(64) }] } },
     ]);
 
     runner.finish(runId, { status: "succeeded", finalResponse: "完成" });
@@ -221,8 +227,8 @@ describe("Dispatcher", () => {
 
     expect(snapshots).toHaveLength(2);
     expect(db.listRunWorkspaceSnapshots(taskRecord.task_guid)).toMatchObject([
-      { run_id: runId, stage: "after", snapshot: { capturedAt: snapshots[1]?.capturedAt, dirtyPaths: ["after.ts"] } },
-      { run_id: runId, stage: "before", snapshot: { capturedAt: snapshots[0]?.capturedAt, dirtyPaths: ["before.ts"] } },
+      { run_id: runId, stage: "after", snapshot: { capturedAt: snapshots[1]?.capturedAt, dirtyPaths: ["after.ts"], fileFingerprints: [{ path: "after.ts", sha256: "b".repeat(64) }] } },
+      { run_id: runId, stage: "before", snapshot: { capturedAt: snapshots[0]?.capturedAt, dirtyPaths: ["before.ts"], fileFingerprints: [{ path: "before.ts", sha256: "b".repeat(64) }] } },
     ]);
     expect(db.listRunWorkspaceSnapshots(taskRecord.task_guid).every((item) => item.snapshot.taskAttribution === "unattributed-shared-workspace")).toBe(true);
     expect(db.getTask(taskRecord.task_guid)?.state).toBe("WAITING_REVIEW");

@@ -3856,6 +3856,10 @@ export class StateDatabase {
       clauses.push("(s.tmux_session_id = ? OR s.record_id = ?)");
       params.push(query.tmuxSessionId, query.tmuxSessionId);
     }
+    // Keep this aligned with the 10-second submission waiter in TmuxDashboard.tsx.
+    // This is a read-only projection: a different Bridge process may still own a live send.
+    const unknownAfter = new Date(this.now().getTime() - 10_000).toISOString();
+    const unknownDeliveryMessage = "发送确认已超过 10 秒等待窗口；消息可能已写入 Session。请先查看 Session，再决定是否重新提交。";
     if (query.search?.trim()) {
       const pattern = `%${query.search.trim().slice(0, 500)}%`;
       clauses.push("(a.content LIKE ? OR a.session_name LIKE ? OR a.working_directory LIKE ? OR COALESCE(d.device_name, '') LIKE ?)");
@@ -3872,12 +3876,15 @@ export class StateDatabase {
     const rows = this.db.prepare(`SELECT
       a.action_id, a.session_record_id, a.tmux_session_id, a.session_name, a.project_key,
       a.working_directory, s.ended_at AS session_ended_at, a.device_id, d.device_name,
-      a.action_type, a.request_id, a.content, a.status, a.error, a.created_at, a.completed_at
+      a.action_type, a.request_id, a.content,
+      CASE WHEN a.status = 'sending' AND a.created_at <= ? THEN 'unconfirmed' ELSE a.status END AS status,
+      CASE WHEN a.status = 'sending' AND a.created_at <= ? THEN ? ELSE a.error END AS error,
+      a.created_at, a.completed_at
       FROM tmux_session_actions a
       JOIN tmux_sessions s ON s.record_id = a.session_record_id
       LEFT JOIN web_auth_sessions d ON d.session_id = a.device_id${where}
       ORDER BY a.created_at DESC, a.action_id DESC LIMIT ? OFFSET ?`)
-      .all(...params, limit, offset) as Record<string, unknown>[];
+      .all(unknownAfter, unknownAfter, unknownDeliveryMessage, ...params, limit, offset) as Record<string, unknown>[];
     return { items: rows.map(mapTmuxSessionAction), total: count.total };
   }
 

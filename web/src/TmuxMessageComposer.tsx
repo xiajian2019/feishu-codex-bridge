@@ -162,8 +162,8 @@ function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): 
         if (event.target === event.currentTarget) onClose();
       }}
     >
+      <button className="dashboard-image-lightbox-close" type="button" aria-label="关闭图片预览" onClick={onClose}>×</button>
       <div className="dashboard-image-lightbox-content">
-        <button className="dashboard-image-lightbox-close" type="button" aria-label="关闭图片预览" onClick={onClose}>×</button>
         {previewUrl ? (
           <img
             src={previewUrl}

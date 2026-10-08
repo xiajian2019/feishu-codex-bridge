@@ -25,6 +25,14 @@ export interface SystemHealthSnapshot {
     historyRetained: { count: number; declaredBytes: number; truncated: boolean };
     aampReferencedImageCount: number;
     aampReferenceScanTruncated: boolean;
+    tmuxAttachments: {
+      referencedCount: number;
+      referencedBytes: number;
+      missingReferencedCount: number;
+      unreferencedFileCount: number;
+      unreferencedBytes: number;
+      scanTruncated: boolean;
+    };
   };
   recentErrors: Array<{ source: "desk" | "direct" | "aamp"; id: string; message: string; updatedAt: string }>;
 }
@@ -102,8 +110,10 @@ export function SystemHealth(): ReactElement {
           <div><dt>Direct 已下载</dt><dd>{snapshot.storage.directDownloadedCount} 个；当前记录不含文件大小</dd></div>
           <div><dt>历史续聊保留附件</dt><dd>{snapshot.storage.historyRetained.count} 个 · 记录大小 {(snapshot.storage.historyRetained.declaredBytes / 1024 / 1024).toFixed(1)} MiB{snapshot.storage.historyRetained.truncated ? " · 已达到统计上限" : ""}</dd></div>
           <div><dt>AAMP 图片引用</dt><dd>{snapshot.storage.aampReferencedImageCount} 个；当前记录不含文件大小{snapshot.storage.aampReferenceScanTruncated ? " · 已达到统计上限" : ""}</dd></div>
+          <div><dt>tmux 任务附件引用</dt><dd>{snapshot.storage.tmuxAttachments.referencedCount} 个 · {(snapshot.storage.tmuxAttachments.referencedBytes / 1024 / 1024).toFixed(1)} MiB{snapshot.storage.tmuxAttachments.missingReferencedCount ? ` · 缺失 ${snapshot.storage.tmuxAttachments.missingReferencedCount} 个` : ""}{snapshot.storage.tmuxAttachments.scanTruncated ? " · 扫描已截断" : ""}</dd></div>
+          <div><dt>tmux 未引用文件</dt><dd>{snapshot.storage.tmuxAttachments.unreferencedFileCount} 个 · {(snapshot.storage.tmuxAttachments.unreferencedBytes / 1024 / 1024).toFixed(1)} MiB；只统计，不执行清理</dd></div>
         </dl>
-        <p className="muted">引用数量和记录大小不代表磁盘占用；tmux 临时输入附件未纳入此页统计。清理预览仅覆盖 Web 暂存附件。</p>
+        <p className="muted">tmux 仅统计受控目录内、由任务提交记录引用的 UUID 附件和未引用文件；扫描有上限，symlink 不计入。引用记录大小不代表总磁盘占用。清理预览仅覆盖 Web 暂存附件，本页不会删除文件。</p>
       </section>
     </> : null}
   </main>;

@@ -5,6 +5,7 @@ import { BrowserRouter, Navigate, Route, Routes, useLocation } from "react-route
 import { App } from "./App.js";
 import { SystemNavigationProvider, WebNavigation } from "./WebNavigation.js";
 import { AuthGate, PairingAdmin } from "./auth.js";
+import { readVConsoleVisible, VCONSOLE_VISIBILITY_CHANGE_EVENT } from "./app-settings.js";
 import { ThemeProvider } from "./theme.js";
 import "./styles.css";
 
@@ -18,6 +19,7 @@ const ProjectManagement = lazy(() => import("./ProjectManagement.js").then((modu
 const TaskDetailPage = lazy(() => import("./TaskDetailPage.js").then((module) => ({ default: module.TaskDetailPage })));
 const SystemHealth = lazy(() => import("./SystemHealth.js").then((module) => ({ default: module.SystemHealth })));
 const SystemBackups = lazy(() => import("./SystemBackups.js").then((module) => ({ default: module.SystemBackups })));
+const SystemSettings = lazy(() => import("./SystemSettings.js").then((module) => ({ default: module.SystemSettings })));
 
 function LegacyDirectTasksRedirect() {
   const location = useLocation();
@@ -79,11 +81,15 @@ function disableBrowserPullToRefresh(): void {
   document.addEventListener("touchcancel", clearTouch, { passive: true, capture: true });
 }
 
-type MobileVConsole = {
+type VConsoleVisibilityControl = {
   showSwitch: () => void;
+  hideSwitch: () => void;
+  show: () => void;
   hide: () => void;
   setSwitchPosition: (right: number, bottom: number) => void;
 };
+
+type MobileVConsole = Pick<VConsoleVisibilityControl, "hide" | "setSwitchPosition">;
 
 function makeVConsoleSwitchMovable(vConsole: MobileVConsole): void {
   const attach = (): boolean => {
@@ -91,7 +97,6 @@ function makeVConsoleSwitchMovable(vConsole: MobileVConsole): void {
     if (!switchElement || switchElement.dataset.dashboardMovable === "true") return Boolean(switchElement);
     switchElement.dataset.dashboardMovable = "true";
     switchElement.style.touchAction = "none";
-    vConsole.showSwitch();
     vConsole.hide();
     vConsole.setSwitchPosition(16, Math.max(90, window.innerHeight - 110));
 
@@ -143,10 +148,25 @@ function makeVConsoleSwitchMovable(vConsole: MobileVConsole): void {
 
 async function mountApp(): Promise<void> {
   disableBrowserPullToRefresh();
+  let vConsoleControl: VConsoleVisibilityControl | null = null;
+  const syncVConsoleVisibility = (): void => {
+    if (!vConsoleControl) return;
+    vConsoleControl.hide();
+    if (!readVConsoleVisible()) {
+      vConsoleControl.hideSwitch();
+      return;
+    }
+    vConsoleControl.showSwitch();
+    if (window.matchMedia("(max-width: 760px)").matches && window.location.pathname.startsWith("/tmux-dashboard")) {
+      makeVConsoleSwitchMovable(vConsoleControl);
+    }
+  };
+  window.addEventListener(VCONSOLE_VISIBILITY_CHANGE_EVENT, syncVConsoleVisibility);
   if (import.meta.env.DEV) {
     try {
       const { default: VConsole } = await import("vconsole");
       const vConsole = VConsole.instance ?? new VConsole({ theme: "dark", network: { maxNetworkNumber: 200 } });
+      vConsoleControl = vConsole;
       const { installKeyboardLogExport } = await import("./vconsole-keyboard-export.js");
       await installKeyboardLogExport(vConsole, VConsole);
       if (window.matchMedia("(max-width: 760px)").matches) {
@@ -156,6 +176,7 @@ async function mountApp(): Promise<void> {
           vConsole.setSwitchPosition(16, 190);
         }
       }
+      syncVConsoleVisibility();
     } catch (error) {
       console.warn("Could not load vConsole.", error);
     }
@@ -185,6 +206,7 @@ async function mountApp(): Promise<void> {
                   <Route path="/system-management/usage" element={<CodexUsage />} />
                   <Route path="/system-management/health" element={<SystemHealth />} />
                   <Route path="/system-management/backups" element={<SystemBackups />} />
+                  <Route path="/system-management/settings" element={<SystemSettings />} />
                   <Route path="/pair-admin" element={<Navigate to="/system-management/devices" replace />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>

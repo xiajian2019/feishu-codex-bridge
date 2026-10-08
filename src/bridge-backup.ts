@@ -640,7 +640,7 @@ function collectAttachmentReferences(database: SqliteDatabase, includeTmux = tru
   return result;
 }
 
-function parseTmuxAttachmentTags(content: string): Array<{ index: number; path: string }> {
+export function parseTmuxAttachmentTags(content: string): Array<{ index: number; path: string }> {
   const tags = /<(?:image name=\[Image #\d+\]|file name="[^"\r\n]*") path="([^"\r\n]+)">/g;
   const result: Array<{ index: number; path: string }> = [];
   let index = 0;
@@ -651,7 +651,7 @@ function parseTmuxAttachmentTags(content: string): Array<{ index: number; path: 
   return result;
 }
 
-function isManagedTmuxAttachmentPath(path: string): boolean {
+export function isManagedTmuxAttachmentPath(path: string): boolean {
   if (!isAbsolute(path) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-z0-9]{1,12}$/i.test(basename(path))) {
     return false;
   }
@@ -724,25 +724,50 @@ async function resolveOwnedAttachmentPath(
   if (matchingRoots.length === 0) {
     throw new Error(`${kind} attachment is outside Bridge-owned attachment directories: ${inputPath}`);
   }
+  const sourceRoot = resolve(matchingRoots.sort((left, right) => resolve(right).length - resolve(left).length)[0]);
+  const relativePath = relative(sourceRoot, absolutePath);
+  const candidates = kind === "tmux" && relativePath && !relativePath.includes(sep)
+    ? [...new Set([absolutePath, ...roots.tmux.map((root) => join(resolve(root), relativePath))])]
+    : [absolutePath];
+  let missingError: Error | null = null;
+  for (const candidate of candidates) {
+    if (!await lstat(candidate).catch(() => null)) {
+      missingError ??= new Error(`${kind} attachment is missing: ${inputPath}`);
+      continue;
+    }
+    return validateOwnedAttachmentPath(candidate, kind, roots);
+  }
+  throw missingError ?? new Error(`${kind} attachment is missing: ${inputPath}`);
+}
+
+async function validateOwnedAttachmentPath(
+  absolutePath: string,
+  kind: BridgeAttachmentKind,
+  roots: BridgeAttachmentRoots,
+): Promise<string> {
+  const matchingRoots = roots[kind].filter((root) => pathContains(resolve(root), absolutePath));
+  if (matchingRoots.length === 0) {
+    throw new Error(`${kind} attachment is outside Bridge-owned attachment directories: ${absolutePath}`);
+  }
   const rootAbsolute = resolve(matchingRoots.sort((left, right) => resolve(right).length - resolve(left).length)[0]);
   const rootReal = await realpath(rootAbsolute).catch(() => null);
   if (!rootReal) throw new Error(`${kind} attachment directory is missing: ${rootAbsolute}`);
   const relativePath = relative(rootAbsolute, absolutePath);
   if (!relativePath || relativePath.split(sep).some((part) => part === ".." || part === "")) {
-    throw new Error(`${kind} attachment does not name a file under its attachment directory: ${inputPath}`);
+    throw new Error(`${kind} attachment does not name a file under its attachment directory: ${absolutePath}`);
   }
   let cursor = rootAbsolute;
   const parts = relativePath.split(sep);
   for (let index = 0; index < parts.length; index += 1) {
     cursor = join(cursor, parts[index]);
     const info = await lstat(cursor).catch(() => null);
-    if (!info) throw new Error(`${kind} attachment is missing: ${inputPath}`);
-    if (info.isSymbolicLink()) throw new Error(`${kind} attachment path contains a symlink: ${inputPath}`);
-    if (index < parts.length - 1 && !info.isDirectory()) throw new Error(`${kind} attachment parent is not a directory: ${inputPath}`);
-    if (index === parts.length - 1 && !info.isFile()) throw new Error(`${kind} attachment is not a regular file: ${inputPath}`);
+    if (!info) throw new Error(`${kind} attachment is missing: ${absolutePath}`);
+    if (info.isSymbolicLink()) throw new Error(`${kind} attachment path contains a symlink: ${absolutePath}`);
+    if (index < parts.length - 1 && !info.isDirectory()) throw new Error(`${kind} attachment parent is not a directory: ${absolutePath}`);
+    if (index === parts.length - 1 && !info.isFile()) throw new Error(`${kind} attachment is not a regular file: ${absolutePath}`);
   }
   const realFile = await realpath(absolutePath);
-  if (!pathContains(rootReal, realFile)) throw new Error(`${kind} attachment resolves outside its Bridge-owned directory: ${inputPath}`);
+  if (!pathContains(rootReal, realFile)) throw new Error(`${kind} attachment resolves outside its Bridge-owned directory: ${absolutePath}`);
   return absolutePath;
 }
 

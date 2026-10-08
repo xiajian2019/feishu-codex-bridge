@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
 import { writeFile, mkdir, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -66,6 +67,62 @@ describe("tmux submission deduplication", () => {
       expect(submit(firstSession.record_id).duplicate).toBe(false);
     } finally {
       db.close();
+    }
+  });
+
+  it("projects timed-out sending actions as delivery-unknown without changing stored status", () => {
+    let clock = new Date("2026-10-04T01:00:00.000Z");
+    const root = mkdtempSync(join(tmpdir(), "bridge-tmux-restart-test-"));
+    const databasePath = join(root, "bridge.db");
+    let db = new StateDatabase(databasePath, () => clock);
+    try {
+      const session = db.recordTmuxSession({ id: "$1", name: "restart-test", cwd: "/tmp", createdAt: 1 });
+      const timedOut = db.beginTmuxSessionAction({
+        sessionRecordId: session.record_id,
+        deviceId: null,
+        actionType: "task_submit",
+        requestId: "timed-out-submit",
+        content: "处理等待超时的任务",
+        submissionFingerprint: "timed-out-fingerprint",
+      });
+      clock = new Date("2026-10-04T01:00:05.000Z");
+      const recent = db.beginTmuxSessionAction({
+        sessionRecordId: session.record_id,
+        deviceId: null,
+        actionType: "task_submit",
+        requestId: "recent-submit",
+        content: "刚提交的任务",
+        submissionFingerprint: "recent-fingerprint",
+      });
+      expect(timedOut.duplicate).toBe(false);
+      expect(recent.duplicate).toBe(false);
+      db.close();
+
+      clock = new Date("2026-10-04T01:00:10.000Z");
+      db = new StateDatabase(databasePath, () => clock);
+      const actions = db.listTmuxSessionActions().items;
+      expect(actions.find((action) => action.action_id === timedOut.actionId)).toMatchObject({
+        status: "unconfirmed",
+        error: "发送确认已超过 10 秒等待窗口；消息可能已写入 Session。请先查看 Session，再决定是否重新提交。",
+      });
+      expect(actions.find((action) => action.action_id === recent.actionId)?.status).toBe("sending");
+
+      const duplicate = db.beginTmuxSessionAction({
+        sessionRecordId: session.record_id,
+        deviceId: null,
+        actionType: "task_submit",
+        requestId: "retry-timed-out-submit",
+        content: "处理等待超时的任务",
+        submissionFingerprint: "timed-out-fingerprint",
+      });
+      expect(duplicate).toEqual({ actionId: "", duplicate: true });
+
+      clock = new Date("2026-10-04T01:00:09.999Z");
+      expect(db.listTmuxSessionActions().items.find((action) => action.action_id === timedOut.actionId)?.status).toBe("sending");
+      expect(db.finishTmuxSessionAction(timedOut.actionId, "confirmed")).toBe(true);
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

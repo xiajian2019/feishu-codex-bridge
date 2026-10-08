@@ -10,7 +10,9 @@ import { isDebugLogCaptureActive, logDebugDiagnostic } from "./debug-log-capture
 
 import { bindMobileTerminalTouch, downloadTerminalScrollDiagnostics, type TerminalSelectionDisplay } from "./terminal-touch.js";
 import { TmuxMessageComposer, type SessionFileForwardRequest, type TerminalShortcut } from "./TmuxMessageComposer.js";
-import { getActionToken } from "./api.js";
+import { fetchCodexUsage, getActionToken } from "./api.js";
+import { CodexUsageDialog, getCodexUsageRemainingPercentages, preserveCodexUsageAccount } from "./CodexUsage.js";
+import type { CodexUsageAccount } from "./types.js";
 import { useSystemNavigation } from "./WebNavigation.js";
 
 type TmuxSession = {
@@ -25,7 +27,7 @@ type TmuxSession = {
 
 type ProjectOption = { name: string; root: string };
 type CodexHomeOption = { id: string; label: string; available: boolean };
-type Toast = { message: string; isError: boolean };
+type Toast = { message: string; isError: boolean; durationMs?: number; isTop?: boolean };
 type SubmissionResult = { ok: boolean; message?: string };
 
 function CodexHomeSelect({
@@ -209,6 +211,10 @@ export function TmuxDashboard(): ReactElement {
   const [codexHomes, setCodexHomes] = useState<CodexHomeOption[]>([]);
   const [savingCodexHomeId, setSavingCodexHomeId] = useState<string | null>(null);
   const [checkingCodexHomeId, setCheckingCodexHomeId] = useState<string | null>(null);
+  const [codexUsageAccount, setCodexUsageAccount] = useState<CodexUsageAccount | null>(null);
+  const [codexUsageLoading, setCodexUsageLoading] = useState(false);
+  const [codexUsageError, setCodexUsageError] = useState<string | null>(null);
+  const [codexUsageDialogOpen, setCodexUsageDialogOpen] = useState(false);
   const [mobileView, setMobileView] = useState<"sessions" | "terminal">("sessions");
   const [selectedId, setSelectedId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("session"));
   const [sessionFileForward, setSessionFileForward] = useState<SessionFileForwardRequest | null>(() => {
@@ -245,6 +251,8 @@ export function TmuxDashboard(): ReactElement {
   const sessionApiResponseRef = useRef("");
   const sessionApiStatusRef = useRef<number | null>(null);
   const restoreSessionDetailRef = useRef(new URLSearchParams(window.location.search).has("session"));
+  const codexUsageRequestSequenceRef = useRef(0);
+  const lastAutoCodexUsageKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     const state = location.state as { sessionFileForward?: unknown } | null;
@@ -424,6 +432,66 @@ export function TmuxDashboard(): ReactElement {
     ? codexHomes.find((home) => home.id === selectedSession.codexHomeId)?.label
       ?? (selectedSession.codexHomeId ? "账号不可用" : "未标记")
     : "";
+  const selectedCodexHomeId = selectedSession?.codexHomeId ?? null;
+  const currentCodexRemainingPercentages = getCodexUsageRemainingPercentages(codexUsageAccount);
+  const loadCurrentCodexUsage = useCallback(async (homeId: string): Promise<void> => {
+    const requestSequence = ++codexUsageRequestSequenceRef.current;
+    setCodexUsageLoading(true);
+    setCodexUsageError(null);
+    try {
+      const result = await fetchCodexUsage({ homeId });
+      const account = result.accounts.find((candidate) => candidate.homeId === homeId);
+      if (!account) throw new Error("当前 Codex 账号没有返回用量数据。");
+      if (codexUsageRequestSequenceRef.current !== requestSequence) return;
+      setCodexUsageAccount((previous) => preserveCodexUsageAccount(previous, account));
+    } catch (requestError: unknown) {
+      if (codexUsageRequestSequenceRef.current !== requestSequence) return;
+      setCodexUsageError(requestError instanceof Error ? requestError.message : String(requestError));
+    } finally {
+      if (codexUsageRequestSequenceRef.current === requestSequence) setCodexUsageLoading(false);
+    }
+  }, []);
+  useEffect(() => {
+    const isMobileDetailVisible = window.matchMedia("(max-width: 760px)").matches
+      ? mobileView === "terminal"
+      : true;
+    if (!selectedSession || !isMobileDetailVisible) {
+      lastAutoCodexUsageKeyRef.current = null;
+      codexUsageRequestSequenceRef.current += 1;
+      setCodexUsageAccount(null);
+      setCodexUsageLoading(false);
+      setCodexUsageError(null);
+      setCodexUsageDialogOpen(false);
+      return;
+    }
+
+    const queryKey = `${selectedSession.id}\u0000${selectedSession.codexHomeId ?? ""}`;
+    if (lastAutoCodexUsageKeyRef.current === queryKey) return;
+    lastAutoCodexUsageKeyRef.current = queryKey;
+    setCodexUsageAccount(null);
+    setCodexUsageError(null);
+    setCodexUsageDialogOpen(false);
+
+    if (!selectedSession.codexHomeId) {
+      codexUsageRequestSequenceRef.current += 1;
+      setCodexUsageLoading(false);
+      setToast({
+        message: "当前 Session 未关联 Codex 账号，暂时无法读取用量。",
+        isError: false,
+        durationMs: 3_000,
+        isTop: true,
+      });
+      return;
+    }
+
+    setToast({
+      message: `正在读取「${selectedCodexHomeLabel}」Codex 用量…`,
+      isError: false,
+      durationMs: 3_000,
+      isTop: true,
+    });
+    void loadCurrentCodexUsage(selectedSession.codexHomeId);
+  }, [loadCurrentCodexUsage, mobileView, selectedCodexHomeLabel, selectedSession?.codexHomeId, selectedSession?.id]);
   const selectSession = (sessionId: string): void => {
     setSelectedId(sessionId);
     if (window.matchMedia("(max-width: 760px)").matches) {
@@ -726,7 +794,11 @@ export function TmuxDashboard(): ReactElement {
     }
 
     const onWindowResize = (): void => {
-      if (window.matchMedia("(max-width: 760px)").matches && host.clientWidth === lastHostWidth) return;
+      if (
+        window.matchMedia("(max-width: 760px)").matches
+        && host.clientWidth === lastHostWidth
+        && host.clientHeight === lastHostHeight
+      ) return;
       scheduleResize(true);
     };
     const onViewportResize = (): void => {
@@ -777,7 +849,7 @@ export function TmuxDashboard(): ReactElement {
         keyboardResizePending = true;
         return;
       }
-      if (host.clientWidth === lastHostWidth) return;
+      if (host.clientWidth === lastHostWidth && host.clientHeight === lastHostHeight) return;
       scheduleResize();
     });
     resizeObserver.observe(host);
@@ -817,7 +889,7 @@ export function TmuxDashboard(): ReactElement {
 
   useEffect(() => {
     if (!toast) return;
-    const timer = window.setTimeout(() => setToast(null), toast.isError ? 8_000 : 3_200);
+    const timer = window.setTimeout(() => setToast(null), toast.durationMs ?? (toast.isError ? 8_000 : 3_200));
     return () => window.clearTimeout(timer);
   }, [toast]);
 
@@ -840,7 +912,7 @@ export function TmuxDashboard(): ReactElement {
         const timeout = window.setTimeout(() => {
           if (!submissionWaitersRef.current.has(requestId)) return;
           submissionWaitersRef.current.delete(requestId);
-          resolve({ ok: false, message: "等待确认超时，消息可能已经送达；请先检查 Session，避免重复发送。" });
+          resolve({ ok: false, message: "发送确认超时，送达结果未知；消息可能已写入 Session。请先检查 Session，避免重复提交。" });
         }, 10_000);
         submissionWaitersRef.current.set(requestId, (response) => {
           window.clearTimeout(timeout);
@@ -1115,17 +1187,39 @@ export function TmuxDashboard(): ReactElement {
       <section className={`dashboard-main is-mobile-${mobileView}`}>
         <aside className="dashboard-sidebar">
           <div className="dashboard-sidebar-heading">
-            <div><span className="dashboard-eyebrow">WORKSPACES</span><h2>Sessions <span>{sessions.length}</span></h2></div>
+            <div><h2>Sessions <span>{sessions.length}</span></h2></div>
             <div className="dashboard-session-tools">
-              <span className={`dashboard-backend dashboard-backend-${backendStatus}`}>{backendStatus.toUpperCase()}</span>
-              <button className="dashboard-action" type="button" onClick={() => void loadSessions()}>Refresh</button>
+              <span
+                className={`dashboard-backend-indicator dashboard-backend-${backendStatus}`}
+                role="img"
+                aria-label={`Backend ${backendStatus}`}
+                title={`Backend ${backendStatus}`}
+              />
               <button
-                className="dashboard-action dashboard-history-top"
+                className="dashboard-action dashboard-icon-button"
+                type="button"
+                onClick={() => void loadSessions()}
+                aria-label="刷新 Session 列表"
+                title="刷新 Session 列表"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M20 7v5h-5" />
+                  <path d="M4 17v-5h5" />
+                  <path d="M5.6 9A7 7 0 0 1 18 6.3L20 8M4 16l2 1.7A7 7 0 0 0 18.4 15" />
+                </svg>
+              </button>
+              <button
+                className="dashboard-action dashboard-icon-button dashboard-history-top"
                 type="button"
                 onClick={() => navigate("/tmux-dashboard/history")}
                 aria-label="查看 Session 操作历史"
                 title="查看 Session 操作历史"
-              >历史</button>
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 7v5l3 2" />
+                </svg>
+              </button>
               {import.meta.env.DEV ? (
                 <button
                   className="dashboard-action dashboard-copy-api"
@@ -1135,7 +1229,18 @@ export function TmuxDashboard(): ReactElement {
                   title="Copy the latest sessions API request and response"
                 >⧉</button>
               ) : null}
-              <button className="dashboard-add" type="button" onClick={openCreateDialog} disabled={projects.length === 0} aria-label="Create session">+</button>
+              <button
+                className="dashboard-add dashboard-icon-button"
+                type="button"
+                onClick={openCreateDialog}
+                disabled={projects.length === 0}
+                aria-label="新建 Session"
+                title="新建 Session"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+              </button>
             </div>
           </div>
           <label className="dashboard-filter">
@@ -1185,9 +1290,23 @@ export function TmuxDashboard(): ReactElement {
             <div className="dashboard-active-session"><span className="dashboard-terminal-glyph">⌘</span><div><strong>{selectedSession?.name ?? "No session selected"}</strong><span title={selectedSession?.cwd}>{selectedSession?.cwd ?? "Choose a session to open its terminal"}</span></div></div>
             {selectedSession ? (
               <div className="dashboard-codex-inline" aria-label="Session 账号与操作">
-                <span className="dashboard-codex-home-label" title={selectedCodexHomeLabel}>{selectedCodexHomeLabel}</span>
+                <button
+                  className="dashboard-codex-usage-trigger"
+                  type="button"
+                  disabled={!selectedSession.codexHomeId}
+                  onClick={() => setCodexUsageDialogOpen(true)}
+                  title={selectedSession.codexHomeId ? "查看当前 Codex 用量" : "当前 Session 未关联 Codex 账号"}
+                  aria-label={selectedSession.codexHomeId
+                    ? `${selectedCodexHomeLabel} Codex 剩余额度：${currentCodexRemainingPercentages[0]}，${currentCodexRemainingPercentages[1]}，点击查看详情`
+                    : "当前 Session 未关联 Codex 账号"}
+                >
+                  <span className="dashboard-codex-home-label" title={selectedCodexHomeLabel}>{selectedCodexHomeLabel}</span>
+                  <span className="dashboard-codex-usage-summary">
+                    {currentCodexRemainingPercentages[0]}·{currentCodexRemainingPercentages[1]}
+                  </span>
+                </button>
                 <details className="dashboard-codex-actions">
-                  <summary aria-label="Session 操作" title="Session 操作">⌄</summary>
+                  <summary aria-label="Session 操作" title="Session 操作"><span className="menu-chevron" aria-hidden="true" /></summary>
                   <div className="dashboard-codex-actions-panel">
                     <button type="button" onClick={() => navigate(`/tmux-dashboard/history?session=${encodeURIComponent(selectedSession.id)}`)}>
                       查看历史（当前 Session）
@@ -1251,7 +1370,6 @@ export function TmuxDashboard(): ReactElement {
             onScrollToBottom={() => terminalInstanceRef.current?.scrollToBottom()}
             onExportScrollDiagnostics={exportScrollDiagnostics}
           />
-          <footer className="dashboard-workspace-footer"><span>Read-only tmux view</span><span>Messages and images go to the selected Codex session</span></footer>
         </section>
       </section>
       {createOpen ? (
@@ -1347,7 +1465,17 @@ export function TmuxDashboard(): ReactElement {
           </form>
         </div>
       ) : null}
-      {toast ? <div className={`dashboard-toast${toast.isError ? " is-error" : ""}`} role="status">{toast.message}</div> : null}
+      {codexUsageDialogOpen && selectedCodexHomeId ? (
+        <CodexUsageDialog
+          accountLabel={selectedCodexHomeLabel}
+          account={codexUsageAccount}
+          loading={codexUsageLoading}
+          error={codexUsageError}
+          onRefresh={() => loadCurrentCodexUsage(selectedCodexHomeId)}
+          onClose={() => setCodexUsageDialogOpen(false)}
+        />
+      ) : null}
+      {toast ? <div className={`dashboard-toast${toast.isError ? " is-error" : ""}${toast.isTop ? " is-top" : ""}`} role="status">{toast.message}</div> : null}
     </main>
   );
 }

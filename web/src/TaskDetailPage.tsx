@@ -5,7 +5,7 @@ import remarkGfm from "remark-gfm";
 import { fetchTaskDetail, getActionToken, getJson, postTaskAction, postTaskFollowup, taskAttachmentUrl } from "./api.js";
 import { directTaskTitle } from "./task-title.js";
 import { TaskFileBrowser } from "./TaskFileBrowser.js";
-import type { AampTaskDetailResponse, DirectTaskDetailResponse, RunWorkspaceSnapshot, StoredRun, TaskDetailResponse, WebRunReview } from "./types.js";
+import type { AampTaskDetailResponse, DirectTaskDetailResponse, RunWorkspaceSnapshot, StoredRun, TaskDetailResponse, WebRunReview, WorkspaceFileFingerprint } from "./types.js";
 
 const DIRECT_PAGE_SIZE = 50;
 const DIRECT_STATUS_LABELS: Record<string, string> = {
@@ -336,14 +336,68 @@ function WorkspaceSnapshotDetails({ snapshots, onOpenCurrentFile }: {
       {snapshot.isGitRepository ? <>
         <p>HEAD：<code>{snapshot.headCommit ?? "无提交或不可读取"}</code></p>
         {snapshot.dirtyPaths.length || snapshot.untrackedPaths.length ? <ul>
-          {snapshot.dirtyPaths.map((path) => <li key={`dirty:${path}`}>已跟踪文件有未提交变更：<button type="button" className="task-run-snapshot-path" onClick={() => onOpenCurrentFile(path)} title="查看当前文件（实时）"><code>{path}</code></button></li>)}
-          {snapshot.untrackedPaths.map((path) => <li key={`untracked:${path}`}>未跟踪文件：<button type="button" className="task-run-snapshot-path" onClick={() => onOpenCurrentFile(path)} title="查看当前文件（实时）"><code>{path}</code></button></li>)}
+          {snapshot.dirtyPaths.map((path) => <WorkspaceSnapshotPath key={`dirty:${path}`} label="已跟踪文件有未提交变更" path={path} fingerprint={findFingerprint(snapshot.fileFingerprints, path)} hasFingerprintManifest={snapshot.fileFingerprints !== undefined} onOpenCurrentFile={onOpenCurrentFile} />)}
+          {snapshot.untrackedPaths.map((path) => <WorkspaceSnapshotPath key={`untracked:${path}`} label="未跟踪文件" path={path} fingerprint={findFingerprint(snapshot.fileFingerprints, path)} hasFingerprintManifest={snapshot.fileFingerprints !== undefined} onOpenCurrentFile={onOpenCurrentFile} />)}
         </ul> : <p>未发现未提交变更路径。</p>}
       </> : <p>未能读取此目录的 Git 仓库状态。</p>}
       {snapshot.truncated ? <p className="muted">状态输出受限或采集超时，结果可能不完整。</p> : null}
-      <p className="muted">点选路径将打开该文件的当前内容，可能已不同于采集时。</p>
+      <p className="muted">SHA-256 与大小记录的是采集时文件字节；点选路径打开当前文件，内容可能已改变。共享目录中的变化无法归因到单个任务。</p>
     </section>)}
   </details>;
+}
+
+function WorkspaceSnapshotPath({ label, path, fingerprint, hasFingerprintManifest, onOpenCurrentFile }: {
+  label: string;
+  path: string;
+  fingerprint?: WorkspaceFileFingerprint;
+  hasFingerprintManifest: boolean;
+  onOpenCurrentFile: (path: string) => void;
+}): ReactElement {
+  return <li>{label}：<button type="button" className="task-run-snapshot-path" onClick={() => onOpenCurrentFile(path)} title="查看当前文件（实时）"><code>{path}</code></button>
+    <FingerprintEvidence fingerprint={fingerprint} hasFingerprintManifest={hasFingerprintManifest} />
+  </li>;
+}
+
+function FingerprintEvidence({ fingerprint, hasFingerprintManifest }: {
+  fingerprint?: WorkspaceFileFingerprint;
+  hasFingerprintManifest: boolean;
+}): ReactElement {
+  if (!hasFingerprintManifest) return <small className="muted"> · 旧快照未采集指纹</small>;
+  if (!fingerprint) return <small className="muted"> · 未记录指纹</small>;
+  if (fingerprint.status === "hashed" && fingerprint.sha256) {
+    return <small> · SHA-256 <code style={{ overflowWrap: "anywhere" }}>{fingerprint.sha256}</code> · {formatSnapshotBytes(fingerprint.sizeBytes)}</small>;
+  }
+  const status = fingerprint.status === "unsafe" ? "安全跳过" : "未采集指纹";
+  return <small className="muted"> · {status}：{fingerprintReasonLabel(fingerprint.reason)}{fingerprint.sizeBytes === null ? "" : ` · ${formatSnapshotBytes(fingerprint.sizeBytes)}`}</small>;
+}
+
+function findFingerprint(fingerprints: WorkspaceFileFingerprint[] | undefined, path: string): WorkspaceFileFingerprint | undefined {
+  return fingerprints?.find((fingerprint) => fingerprint.path === path);
+}
+
+function fingerprintReasonLabel(reason: WorkspaceFileFingerprint["reason"]): string {
+  const labels: Record<NonNullable<WorkspaceFileFingerprint["reason"]>, string> = {
+    "unsafe-path": "路径不安全",
+    symlink: "符号链接",
+    "outside-repository": "路径超出仓库",
+    "non-directory-parent": "父路径不是目录",
+    "not-regular-file": "不是普通文件",
+    "safe-open-unavailable": "当前平台缺少安全的非阻塞打开标志",
+    "file-too-large": "超过单文件大小上限",
+    "byte-budget-exceeded": "超过本次总读取上限",
+    "file-limit-reached": "超过本次文件数上限",
+    "not-found": "采集时文件不存在",
+    unreadable: "文件不可读取",
+    "changed-during-read": "读取期间文件发生变化",
+  };
+  return reason ? labels[reason] : "原因未提供";
+}
+
+function formatSnapshotBytes(size: number | null): string {
+  if (size === null) return "大小未知";
+  if (size < 1_024) return `${size} B`;
+  if (size < 1_048_576) return `${(size / 1_024).toFixed(1)} KiB`;
+  return `${(size / 1_048_576).toFixed(1)} MiB`;
 }
 
 function formatSnapshotTime(value: string): string {

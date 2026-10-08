@@ -1,7 +1,8 @@
-import { stat, readFile, realpath } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { lstat, opendir, stat, readFile, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { isManagedTmuxAttachmentPath, parseTmuxAttachmentTags } from "./bridge-backup.js";
 import { DIRECT_RUNTIME_LEASE_NAME } from "./feishu-sqlite-codex.js";
 import { isExecutableCodexPath } from "./codex-path.js";
 import { resolveBridgeProjectRoot } from "./portable-runtime.js";
@@ -30,6 +31,14 @@ export interface SystemHealthSnapshot {
     historyRetained: { count: number; declaredBytes: number; truncated: boolean };
     aampReferencedImageCount: number;
     aampReferenceScanTruncated: boolean;
+    tmuxAttachments: {
+      referencedCount: number;
+      referencedBytes: number;
+      missingReferencedCount: number;
+      unreferencedFileCount: number;
+      unreferencedBytes: number;
+      scanTruncated: boolean;
+    };
   };
   recentErrors: Array<{ source: "desk" | "direct" | "aamp"; id: string; message: string; updatedAt: string }>;
 }
@@ -37,6 +46,103 @@ export interface SystemHealthSnapshot {
 type ReadonlySqliteConstructor = new (path: string, options: { readonly?: boolean; readOnly?: boolean }) => SqliteDatabase;
 const Sqlite = DatabaseSync as unknown as ReadonlySqliteConstructor;
 const MAX_STORAGE_REFERENCE_ROWS = 10_000;
+const MAX_TMUX_ATTACHMENT_SCAN_ENTRIES = 10_000;
+const TMUX_ATTACHMENT_FILE_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-z0-9]{1,12}$/i;
+
+async function tmuxAttachmentSummary(db: SqliteDatabase, attachmentRoots: string[]): Promise<{
+  referencedCount: number;
+  referencedBytes: number;
+  missingReferencedCount: number;
+  unreferencedFileCount: number;
+  unreferencedBytes: number;
+  scanTruncated: boolean;
+}> {
+  const roots = [...new Set(attachmentRoots.map((root) => resolve(root)))];
+  const rows = db.prepare(`SELECT content FROM tmux_session_actions
+    WHERE action_type = 'task_submit' LIMIT ?`).all(MAX_STORAGE_REFERENCE_ROWS + 1) as Array<{ content: string }>;
+  const references = new Map<string, string[]>();
+  let scanTruncated = rows.length > MAX_STORAGE_REFERENCE_ROWS;
+  for (const row of rows.slice(0, MAX_STORAGE_REFERENCE_ROWS)) {
+    if (typeof row.content !== "string" || row.content.length > 2_000_000) { scanTruncated = true; continue; }
+    for (const attachment of parseTmuxAttachmentTags(row.content)) {
+      if (!isManagedTmuxAttachmentPath(attachment.path)) continue;
+      const referencePath = resolve(attachment.path);
+      const fileName = basename(referencePath);
+      if (!TMUX_ATTACHMENT_FILE_NAME.test(fileName)) { scanTruncated = true; continue; }
+      const isDirectChildOfManagedRoot = roots.some((root) => {
+        const pathFromRoot = relative(root, referencePath);
+        return pathFromRoot !== "" && !isAbsolute(pathFromRoot)
+          && pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`)
+          && !pathFromRoot.includes(sep);
+      });
+      if (!isDirectChildOfManagedRoot) continue;
+      const paths = references.get(fileName) ?? [];
+      paths.push(referencePath);
+      references.set(fileName, paths);
+    }
+  }
+
+  const existingFiles = new Map<string, number>();
+  const scanRoots: string[] = [];
+  let entriesScanned = 0;
+  for (const root of roots) {
+    const rootStat = await lstat(root).catch(() => null);
+    if (!rootStat) continue;
+    const canonicalRoot = await realpath(root).catch(() => null);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || !canonicalRoot) {
+      scanTruncated = true;
+      continue;
+    }
+    scanRoots.push(canonicalRoot);
+    const directory = await opendir(canonicalRoot).catch(() => null);
+    if (!directory) { scanTruncated = true; continue; }
+    try {
+      for await (const entry of directory) {
+        entriesScanned += 1;
+        if (entriesScanned > MAX_TMUX_ATTACHMENT_SCAN_ENTRIES) {
+          scanTruncated = true;
+          break;
+        }
+        if (!entry.isFile() || !TMUX_ATTACHMENT_FILE_NAME.test(entry.name)) continue;
+        const path = join(canonicalRoot, entry.name);
+        const info = await lstat(path).catch(() => null);
+        if (info?.isFile() && !info.isSymbolicLink()) existingFiles.set(path, info.size);
+      }
+    } catch {
+      scanTruncated = true;
+    } finally {
+      await directory.close().catch(() => undefined);
+    }
+  }
+
+  let referencedBytes = 0;
+  let missingReferencedCount = 0;
+  const referencedPhysicalPaths = new Set<string>();
+  for (const [fileName, paths] of references) {
+    const candidates = [...new Set([...paths, ...scanRoots.map((root) => join(root, fileName))])];
+    const found = candidates.find((path) => existingFiles.has(path));
+    if (found) {
+      referencedBytes += existingFiles.get(found)!;
+      referencedPhysicalPaths.add(found);
+    }
+    else missingReferencedCount += 1;
+  }
+  let unreferencedFileCount = 0;
+  let unreferencedBytes = 0;
+  for (const [path, size] of existingFiles) {
+    if (referencedPhysicalPaths.has(path)) continue;
+    unreferencedFileCount += 1;
+    unreferencedBytes += size;
+  }
+  return {
+    referencedCount: references.size,
+    referencedBytes,
+    missingReferencedCount,
+    unreferencedFileCount,
+    unreferencedBytes,
+    scanTruncated,
+  };
+}
 
 function historyAttachmentSummary(db: SqliteDatabase): { count: number; declaredBytes: number; truncated: boolean } {
   const rows = db.prepare("SELECT payload_json FROM codex_history_runs WHERE payload_json IS NOT NULL LIMIT ?")
@@ -119,6 +225,7 @@ export async function readBridgeVersion(): Promise<string> {
 /** Read-only diagnostic snapshot. It never claims, retries, or sends a task. */
 export async function readSystemHealth(options: {
   databasePath: string;
+  tmuxAttachmentRoots?: string[];
   mode: string;
   version?: string;
   codexCliPath?: string;
@@ -153,6 +260,7 @@ export async function readSystemHealth(options: {
       .get() as { total: number };
     const historyStorage = historyAttachmentSummary(db);
     const aampStorage = aampImageReferenceSummary(db);
+    const tmuxStorage = await tmuxAttachmentSummary(db, options.tmuxAttachmentRoots ?? []);
     const deliveryFailedCards = db.prepare("SELECT COUNT(*) AS total FROM bridge_tasks WHERE card_state = 'DELIVERY_FAILED'")
       .get() as { total: number };
     const errorRows = db.prepare(`SELECT source, id, message, updated_at FROM (
@@ -199,6 +307,7 @@ export async function readSystemHealth(options: {
         historyRetained: historyStorage,
         aampReferencedImageCount: aampStorage.count,
         aampReferenceScanTruncated: aampStorage.truncated,
+        tmuxAttachments: tmuxStorage,
       },
       recentErrors: errorRows.map((row) => ({ source: row.source, id: row.id, message: row.message.slice(0, 400), updatedAt: row.updated_at })),
     };

@@ -117,8 +117,11 @@ export async function updateCodexThreadHomePreference(
   );
 }
 
-export function fetchCodexUsage(signal?: AbortSignal): Promise<CodexUsageResponse> {
-  return getJson<CodexUsageResponse>("/api/codex/usage", { signal });
+export function fetchCodexUsage(options: { homeId?: string; signal?: AbortSignal } = {}): Promise<CodexUsageResponse> {
+  const params = new URLSearchParams();
+  if (options.homeId) params.set("home", options.homeId);
+  const query = params.toString();
+  return getJson<CodexUsageResponse>(`/api/codex/usage${query ? `?${query}` : ""}`, { signal: options.signal });
 }
 
 export async function consumeCodexResetCredit(input: {

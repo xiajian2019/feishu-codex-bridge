@@ -390,7 +390,8 @@ export class DashboardServer {
         return;
       }
       try {
-        sendJson(response, 200, await this.options.codexHistory.readUsage());
+        const homeId = url.searchParams.get("home")?.trim();
+        sendJson(response, 200, await this.options.codexHistory.readUsage(homeId || undefined));
       } catch {
         sendJson(response, 502, { error: "Codex usage could not be loaded" });
       }
@@ -597,6 +598,7 @@ export class DashboardServer {
       try {
         sendJson(response, 200, await readSystemHealth({
           databasePath: this.options.databasePath,
+          tmuxAttachmentRoots: this.options.backupAttachmentRoots?.tmux,
           mode: this.options.executionMode ?? "unknown",
           codexCliPath: this.options.codexCliPath,
         }));

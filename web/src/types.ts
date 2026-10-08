@@ -391,9 +391,32 @@ export interface GitWorkspaceSnapshot {
   headCommit: string | null;
   dirtyPaths: string[];
   untrackedPaths: string[];
+  fileFingerprints?: WorkspaceFileFingerprint[];
   truncated: boolean;
   taskAttribution: "unattributed-shared-workspace";
   attributionNote: string;
+}
+
+export type WorkspaceFileFingerprintReason =
+  | "unsafe-path"
+  | "symlink"
+  | "outside-repository"
+  | "non-directory-parent"
+  | "not-regular-file"
+  | "safe-open-unavailable"
+  | "file-too-large"
+  | "byte-budget-exceeded"
+  | "file-limit-reached"
+  | "not-found"
+  | "unreadable"
+  | "changed-during-read";
+
+export interface WorkspaceFileFingerprint {
+  path: string;
+  status: "hashed" | "omitted" | "unsafe";
+  sizeBytes: number | null;
+  sha256?: string;
+  reason?: WorkspaceFileFingerprintReason;
 }
 
 export interface RunWorkspaceSnapshot {

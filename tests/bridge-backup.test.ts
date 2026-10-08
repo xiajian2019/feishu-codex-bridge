@@ -147,6 +147,98 @@ describe("Bridge backup", () => {
     database.close();
   });
 
+  it("backs up and relocates Tmux task attachments referenced in durable session actions", async () => {
+    const root = makeTemporaryDirectory();
+    const databasePath = join(root, "runtime", "bridge.db");
+    mkdirSync(join(root, "runtime"), { recursive: true });
+    const database = new StateDatabase(databasePath);
+    const roots = defaultBridgeAttachmentRoots(databasePath, root);
+    const migratedAttachmentRoot = join(root, "home", ".feishu-codex-bridge", "tmux-dashboard-attachments");
+    const legacyAttachmentRoot = join(root, "tmp", "feishu-codex-bridge", "tmux-dashboard-attachments");
+    roots.tmux = [migratedAttachmentRoot, legacyAttachmentRoot];
+    mkdirSync(migratedAttachmentRoot, { recursive: true });
+    const imageName = "9c7daf93-0aa0-4e8a-a214-5475796af882.jpg";
+    const imagePath = join(migratedAttachmentRoot, imageName);
+    const legacyImagePath = join(legacyAttachmentRoot, imageName);
+    writeFileSync(imagePath, Buffer.from([0xff, 0xd8, 0xff, 1, 2, 3]));
+    const session = database.recordTmuxSession({ id: "$1", name: "backup-test", cwd: root, createdAt: 10 });
+    const action = database.beginTmuxSessionAction({
+      sessionRecordId: session.record_id,
+      deviceId: null,
+      actionType: "task_submit",
+      requestId: "backup-tmux-request",
+      content: `请查看我附上的图片：<image name=[Image #1] path="${legacyImagePath}">`,
+    });
+    expect(action.duplicate).toBe(false);
+    database.finishTmuxSessionAction(action.actionId, "confirmed");
+    database.close();
+
+    const backupDirectory = join(root, "backup-v2");
+    const backup = await createBridgeBackup({ databasePath, outputDirectory: backupDirectory, attachmentRoots: roots });
+    expect(backup.attachmentCount).toBe(1);
+    const manifest = JSON.parse(readFileSync(join(backupDirectory, "manifest.json"), "utf8")) as {
+      formatVersion: number;
+      attachments: Array<{ kind: string; file: string; references: Array<{ kind: string; key: string; index?: number }> }>;
+    };
+    expect(manifest.formatVersion).toBe(2);
+    expect(manifest.attachments[0]).toMatchObject({
+      kind: "tmux",
+      references: [{ kind: "tmux", key: action.actionId, index: 0 }],
+    });
+    expect((await verifyBridgeBackup(backupDirectory)).attachmentCount).toBe(1);
+
+    const restoreDirectory = join(root, "restored-tmux");
+    const restored = await restoreBridgeBackup({ backupDirectory, outputDirectory: restoreDirectory });
+    expect(restored.attachmentCount).toBe(1);
+    const restoredDatabase = new DatabaseSync(restored.databasePath);
+    try {
+      const row = restoredDatabase.prepare("SELECT content FROM tmux_session_actions WHERE action_id = ?")
+        .get(action.actionId) as { content: string };
+      const restoredAttachmentPath = join(restoreDirectory, manifest.attachments[0]!.file);
+      expect(row.content).toContain(restoredAttachmentPath);
+      expect(existsSync(restoredAttachmentPath)).toBe(true);
+    } finally {
+      restoredDatabase.close();
+    }
+  });
+
+  it("refuses an incomplete v1 restore when the database still references Tmux attachments", async () => {
+    const root = makeTemporaryDirectory();
+    const databasePath = join(root, "runtime", "bridge.db");
+    mkdirSync(join(root, "runtime"), { recursive: true });
+    const database = new StateDatabase(databasePath);
+    const roots = defaultBridgeAttachmentRoots(databasePath, root);
+    const tmuxAttachmentRoot = roots.tmux[roots.tmux.length - 1]!;
+    mkdirSync(tmuxAttachmentRoot, { recursive: true });
+    const imagePath = join(tmuxAttachmentRoot, "9c7daf93-0aa0-4e8a-a214-5475796af882.jpg");
+    writeFileSync(imagePath, Buffer.from([0xff, 0xd8, 0xff, 1]));
+    const session = database.recordTmuxSession({ id: "$1", name: "legacy-test", cwd: root, createdAt: 11 });
+    const action = database.beginTmuxSessionAction({
+      sessionRecordId: session.record_id,
+      deviceId: null,
+      actionType: "task_submit",
+      requestId: "legacy-tmux-request",
+      content: `<image name=[Image #1] path="${imagePath}">`,
+    });
+    database.close();
+    const backupDirectory = join(root, "legacy-backup");
+    await createBridgeBackup({ databasePath, outputDirectory: backupDirectory, attachmentRoots: roots });
+
+    const manifestPath = join(backupDirectory, "manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { formatVersion: number; attachments: unknown[] };
+    manifest.formatVersion = 1;
+    manifest.attachments = [];
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    rmSync(join(backupDirectory, "attachments"), { recursive: true, force: true });
+
+    expect((await verifyBridgeBackup(backupDirectory)).attachmentCount).toBe(0);
+    const restoreDirectory = join(root, "incomplete-restore");
+    await expect(restoreBridgeBackup({ backupDirectory, outputDirectory: restoreDirectory }))
+      .rejects.toThrow("旧版备份没有保存 tmux 附件");
+    expect(existsSync(restoreDirectory)).toBe(false);
+    expect(action.actionId).toBeTruthy();
+  });
+
   it("refuses an existing destination and cleans the reserved output after a failed attachment copy", async () => {
     const root = makeTemporaryDirectory();
     const databasePath = join(root, "runtime", "bridge.db");

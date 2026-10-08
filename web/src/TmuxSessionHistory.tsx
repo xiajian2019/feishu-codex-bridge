@@ -47,7 +47,7 @@ const STATUS_LABELS: Record<TmuxSessionAction["status"], string> = {
   sending: "提交中",
   sent: "已发送",
   confirmed: "已确认",
-  unconfirmed: "待核实",
+  unconfirmed: "送达结果未知",
   failed: "失败",
 };
 

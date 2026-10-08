@@ -83,9 +83,92 @@ export function CodexUsage(): ReactElement {
   );
 }
 
-function UsageAccountCard({ account, onRefresh }: {
+export function CodexUsageDialog({
+  accountLabel,
+  account,
+  loading,
+  error,
+  onRefresh,
+  onClose,
+}: {
+  accountLabel: string;
+  account: CodexUsageAccount | null;
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => Promise<void>;
+  onClose: () => void;
+}): ReactElement {
+  const [refreshing, setRefreshing] = useState(false);
+
+  return (
+    <div
+      className="codex-usage-modal-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section className="codex-usage-modal codex-usage-details-modal" role="dialog" aria-modal="true" aria-labelledby="codex-usage-details-title">
+        <header className="codex-usage-modal-header">
+          <div className="codex-usage-modal-title">
+            <h2 id="codex-usage-details-title">{account ? `${account.label} · Codex 用量` : `${accountLabel} · Codex 用量`}</h2>
+          </div>
+          <div className="codex-usage-modal-header-actions">
+            <button
+              className="codex-usage-modal-refresh"
+              type="button"
+              onClick={async () => {
+                setRefreshing(true);
+                try {
+                  await onRefresh();
+                } finally {
+                  setRefreshing(false);
+                }
+              }}
+              disabled={loading || refreshing}
+            >{loading || refreshing ? "刷新中…" : "刷新"}</button>
+            <button className="codex-usage-modal-close" type="button" onClick={onClose} aria-label="关闭">×</button>
+          </div>
+        </header>
+        <div className="codex-usage-details-body">
+          {error ? <div className="codex-usage-error" role="alert">{error}</div> : null}
+          {loading && !account ? <div className="codex-usage-empty">正在读取 Codex 账户用量…</div> : null}
+          {account ? <UsageAccountCard account={account} onRefresh={onRefresh} showResetCredits={false} /> : null}
+          {!loading && !account && !error ? <div className="codex-usage-empty">暂无可显示的 Codex 账户用量。</div> : null}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+export function getCodexUsageRemainingPercentages(account: CodexUsageAccount | null): [string, string] {
+  const windowsByDuration = new Map<string, { duration: number | null; remainingPercent: number }>();
+  for (const bucket of account?.quota?.buckets ?? []) {
+    for (const window of [bucket.primary, bucket.secondary]) {
+      if (!window || !Number.isFinite(window.usedPercent)) continue;
+      const duration = typeof window.windowDurationMins === "number" ? window.windowDurationMins : null;
+      const key = duration === null ? "unknown" : String(duration);
+      const previous = windowsByDuration.get(key);
+      const remainingPercent = 100 - clampPercent(window.usedPercent);
+      if (!previous || remainingPercent < previous.remainingPercent) {
+        windowsByDuration.set(key, { duration, remainingPercent });
+      }
+    }
+  }
+
+  const windows = [...windowsByDuration.values()].sort((left, right) => {
+    if (left.duration === null) return right.duration === null ? 0 : 1;
+    if (right.duration === null) return -1;
+    return left.duration - right.duration;
+  });
+  const percentages = windows.slice(0, 2).map(({ remainingPercent }) => formatPercent(remainingPercent));
+  return [percentages[0] ?? "—", percentages[1] ?? "—"];
+}
+
+function UsageAccountCard({ account, onRefresh, showResetCredits = true }: {
   account: CodexUsageAccount;
   onRefresh: () => Promise<void>;
+  showResetCredits?: boolean;
 }): ReactElement {
   const [resetCreditsOpen, setResetCreditsOpen] = useState(false);
   const [confirmingCredit, setConfirmingCredit] = useState<CodexUsageResetCredit | null>(null);
@@ -120,7 +203,7 @@ function UsageAccountCard({ account, onRefresh }: {
               <span className={`codex-usage-status is-${status.state}`}>{status.label}</span>
             </div>
           </div>
-          {typeof resetCreditCount === "number" ? (
+          {showResetCredits && typeof resetCreditCount === "number" ? (
             <button
               className="codex-usage-credit-trigger"
               type="button"
@@ -175,7 +258,7 @@ function UsageAccountCard({ account, onRefresh }: {
         ) : null}
       </section>
 
-      {resetCreditsOpen ? (
+      {showResetCredits && resetCreditsOpen ? (
         <ResetCreditDialog
           account={account}
           credits={resetCredits}
@@ -576,22 +659,26 @@ function preserveLastSuccessfulData(
   const previousAccounts = new Map(previous.accounts.map((account) => [account.homeId, account]));
   return {
     ...latest,
-    accounts: latest.accounts.map((account) => {
-      const prior = previousAccounts.get(account.homeId);
-      if (!prior) return account;
-      const preserveQuota = !account.quota && Boolean(account.errors?.quota && prior.quota);
-      const preserveTokenUsage = !account.tokenUsage && Boolean(account.errors?.tokenUsage && prior.tokenUsage);
-      if (!preserveQuota && !preserveTokenUsage) return account;
-      return {
-        ...account,
-        ...(preserveQuota ? { quota: prior.quota } : {}),
-        ...(preserveTokenUsage ? { tokenUsage: prior.tokenUsage } : {}),
-        stale: {
-          ...(preserveQuota ? { quota: true } : {}),
-          ...(preserveTokenUsage ? { tokenUsage: true } : {}),
-        },
-      };
-    }),
+    accounts: latest.accounts.map((account) => preserveCodexUsageAccount(previousAccounts.get(account.homeId) ?? null, account)),
+  };
+}
+
+export function preserveCodexUsageAccount(
+  previous: CodexUsageAccount | null,
+  latest: CodexUsageAccount,
+): CodexUsageAccount {
+  if (!previous || previous.homeId !== latest.homeId) return latest;
+  const preserveQuota = !latest.quota && Boolean(latest.errors?.quota && previous.quota);
+  const preserveTokenUsage = !latest.tokenUsage && Boolean(latest.errors?.tokenUsage && previous.tokenUsage);
+  if (!preserveQuota && !preserveTokenUsage) return latest;
+  return {
+    ...latest,
+    ...(preserveQuota ? { quota: previous.quota } : {}),
+    ...(preserveTokenUsage ? { tokenUsage: previous.tokenUsage } : {}),
+    stale: {
+      ...(preserveQuota ? { quota: true } : {}),
+      ...(preserveTokenUsage ? { tokenUsage: true } : {}),
+    },
   };
 }
 

@@ -1,6 +1,6 @@
 # 第一阶段交付清单
 
-状态复核日期：2026-10-05。这里的「第一阶段」指原[路线图](product-review-roadmap.md#第一批独立任务交付状态)列出的五项，不等于 A–F 六个阶段全部完成。五项均已进入当前分支 `feature/add_tmux_session_task`，并有本地验证；未据此认定远端 CI、生产部署或真实手机验收通过。人工检查范围见[浏览器冒烟清单](browser-smoke-checklist.md)。
+状态复核日期：2026-10-07。这里的「第一阶段」指原[路线图](product-review-roadmap.md#第一批独立任务交付状态)列出的五项，不等于 A–F 六个阶段全部完成。五项均已进入当前分支 `feature/add_tmux_session_task`，并有本地验证；未据此认定远端 CI、生产部署或真实手机验收通过。人工检查范围见[浏览器冒烟清单](browser-smoke-checklist.md)。
 
 | 项目 | 状态 | 已交付行为 |
 | --- | --- | --- |
@@ -16,7 +16,7 @@
 | --- | --- | --- | --- |
 | 附件生命周期 | ✅ Web 暂存超期清理与已绑定保护；✅ History 终态回看、超期/数量淘汰、运行中保护；✅ 并发绑定和不越界删除；✅ 重启后未知孤儿保留 | [History 附件服务](../src/codex-history-attachments.ts)、[生命周期测试](../tests/codex-history-attachments.test.ts)、[Web HTTP 测试](../tests/web-submission-idempotency.test.ts) | 在隔离浏览器完成 History 附件回看；确定未知孤儿文件的人工清理流程 |
 | CI 质量门 | ✅ PR/push 触发、固定 Bun、`--frozen-lockfile`、`bun run test`、`bun run build` 均已写入工作流 | [CI 配置](../.github/workflows/ci.yml)、[Bun 版本](../.bun-version)、[构建脚本](../package.json) | 查看当前提交对应的远端 Actions 结果；失败时记录并修复 |
-| 备份与恢复 | ✅ 活跃 WAL 数据入快照；✅ 数据库/附件 SHA-256 与 schema 校验；✅ Web/Direct/AAMP/tmux 附件引用采集；✅ 拒绝现存目标及不可信路径；✅ 恢复后引用路径重定位；✅ 临时库与正式库隔离演练；✅ 旧清单兼容读取 | [备份实现](../src/bridge-backup.ts)、[备份测试](../tests/bridge-backup.test.ts)、[CLI](../src/backup-cli.ts) | 新版正式 tmux 附件备份和恢复演练；定期备份与恢复检查 |
+| 备份与恢复 | ✅ 活跃 WAL 数据入快照；✅ 数据库/附件 SHA-256 与 schema 校验；✅ Web/Direct/AAMP/tmux 附件引用采集；✅ 拒绝现存目标及不可信路径；✅ 恢复后引用路径重定位；✅ v1/v2 清单兼容；✅ 活动 WAL 数据库含 tmux 附件的隔离恢复演练 | [备份实现](../src/bridge-backup.ts)、[备份测试](../tests/bridge-backup.test.ts)、[CLI](../src/backup-cli.ts) | 将 v2 部署到运行服务；定期备份与恢复检查 |
 | Web 幂等提交 | ✅ 相同键和负载只生成一个任务/运行；✅ 不同负载返回 409；✅ 事务失败整体回滚；✅ 已确认 QUEUED run 重启入队、已有回执不重复执行；✅ 响应丢失的隔离浏览器重试 | [提交调度](../src/dispatcher.ts)、[回执表](../src/db.ts)、[幂等测试](../tests/web-submission-idempotency.test.ts) | 使用真实设备与弱网重试检查交互；旧客户端省略键时不保证跨请求去重 |
 | Direct 只读入口 | ✅ 配对鉴权、筛选/分页、详情子记录及深链；✅ 旧链接跳转；✅ 不把 Direct 状态写入 Web `tasks/runs` | [Direct API](../src/web.ts)、[统一查询](../src/db.ts)、[页面路由](../web/src/main.tsx)、[HTTP 测试](../tests/web-submission-idempotency.test.ts) | 真实飞书任务与手机浏览器验收；AAMP 尚未并入统一列表 |
 
@@ -30,7 +30,9 @@
 | 连续任务 | Web 失败/取消显式幂等重试、逐轮人工验收、运行前后 Git 元数据 | 不可变产物/diff 快照与真实手机闭环；共享目录不能自动归因 |
 | 可靠续聊 | Codex History 最小运行元数据和哈希幂等回执落库；重启时只读核对官方 thread，不自动重发 | 真实 Codex 运行、断网/刷新/重启交互；tmux 崩溃窗口另行验证 |
 | 草稿和快捷键 | Task Desk 与 History 草稿按安装实例/设备会话隔离；本机/跨标签页失效，活动页面每 30 秒检查服务端快捷键版本 | 多设备与浏览器存储受限场景；Task Desk 暂存附件刷新后需重选 |
-| 运维 | `backup list/inspect/check-upgrade` CLI 与系统管理操作页；新清单按引用纳入 tmux 附件；授权运行状态页和各来源附件统计 | 用新版格式对正式 tmux 附件做备份/恢复演练；定期调度、实际磁盘用量与跨来源清理策略 |
+| 运维 | `backup list/inspect/check-upgrade` CLI 与系统管理操作页；v2 清单按引用纳入 tmux 附件；授权运行状态页统计各来源引用并只读预览 tmux 未引用文件 | 将 v2 部署到运行服务；定期调度、实际磁盘用量与跨来源清理策略 |
+| 连续任务产物 | 运行前后有界记录变更路径的 SHA-256 和大小；详情显示采集时指纹，并标记超限、不安全或不可读文件 | 当前只保存指纹元数据，不能还原文件内容或查看不可变 diff；指纹采集为工作区级证据，不能归因到单个任务 |
+| tmux 送达恢复 | 超过 10 秒等待窗口的持久化 `sending` 记录在只读查询中显示“送达结果未知”，不自动更新数据库或重发；同内容重复提交继续拦截 | 已覆盖数据库重开后的投影行为；进程崩溃注入、用户显式处置流程和浏览器交互仍待验收 |
 
 ## 命令与使用边界
 
@@ -58,5 +60,6 @@ Direct 列表分页最多 100 条；详情的续问、附件和事件分别按�
 - Headless Chrome 152：隔离实例配对、Web 响应丢失后重试、Direct 分页/搜索/详情/深链刷新、390px 深色宽度检查、注销后 401；执行器为 fake。
 - 备份 CLI 演练：从临时库恢复 1 个 Web 任务、32 个 Direct 任务及 Web 幂等回执；三类已下载附件的复制和路径迁移另由自动化测试覆盖。
 - 当前复核未测试真实手机、真实飞书事件、真实 Codex 执行、Codex History 浏览器续问或 tmux 浏览器交互，也未查询远端 Actions；没有将自动化测试或构建结果视为这些运行时验收通过。
-- 后续 P1 分支最终本地完整测试为 269 通过、0 失败（54 个文件），`bun run build` 与 `git diff --check` 通过，包含历史续聊 HTTP 同键重放/冲突回归。当前运行主库又在独立临时目录通过备份、校验、升级兼容检查和恢复：8 张关键表备份/恢复计数相同，外键无违例，引用附件 0 个；演练目录已清理，服务未切换。浏览器、真实设备、含附件正式恢复与远端 CI 仍未据此认定完成。
+- 2026-10-07 下一轮专项：备份、运行产物指纹、dispatcher、tmux 提交与系统健康相关测试 29 项通过；前后端 TypeScript 检查、`bun run build:web` 和 `git diff --check` 通过。Vite 仍提示 tmux/dashboard viewer bundle 超过 500 KiB。指纹仅保存 SHA-256/大小，不保存内容；tmux 用测试数据库重开验证只读未知送达投影，未进行进程级故障注入或浏览器/手机验收。
+- 2026-10-05 P1 本地完整测试记录：269 通过、0 失败（54 个文件），`bun run build` 与 `git diff --check` 通过。2026-10-07 备份专项 9 项通过，前后端类型检查通过；当前运行 WAL 数据库的 v2 隔离备份/校验/升级兼容/恢复演练包含 47 个 tmux 附件（约 14.1 MiB），恢复后 47 个文件均存在且外键无违例。演练目录已清理，服务未切换。尚未运行 v2 变更后的完整全套测试、浏览器点击、真实设备和远端 CI。
 - 隔离 Web-only 进程以临时库绑定 `0.0.0.0:17311`，本机根 HTML 与 `/healthz` 均返回 200；已停止并删除临时库。浏览器连接不可用，未进行页面点击与视觉验收。
