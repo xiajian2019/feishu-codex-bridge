@@ -384,6 +384,71 @@ export class DashboardServer {
       sendJson(response, 200, { projects: this.listProjects() });
       return;
     }
+    if (request.method === "GET" && url.pathname === "/api/skills") {
+      const scopePriority: Record<string, number> = {
+        project: 0,
+        codex_home: 1,
+        user: 2,
+        plugin: 3,
+        system: 4,
+      };
+      const byName = new Map<string, ReturnType<StateDatabase["listCodexSkills"]>[number]>();
+      for (const skill of this.options.db.listCodexSkills().sort((left, right) =>
+        (scopePriority[left.scope] ?? 9) - (scopePriority[right.scope] ?? 9)
+          || left.skillName.localeCompare(right.skillName),
+      )) {
+        const key = skill.skillName.toLocaleLowerCase("en-US");
+        if (!byName.has(key)) byName.set(key, skill);
+      }
+      const skills = [...byName.values()].sort((left, right) =>
+        Number(right.pinned) - Number(left.pinned)
+          || left.sortOrder - right.sortOrder
+          || left.skillName.localeCompare(right.skillName),
+      );
+      sendJson(response, 200, { skills });
+      return;
+    }
+    if (request.method === "PATCH" && url.pathname === "/api/skills/preferences") {
+      if (!this.requireActionAuthorization(request, response)) return;
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonBody(request);
+      } catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+        return;
+      }
+      if (!Array.isArray(body.skills) || body.skills.length > 1_000) {
+        sendJson(response, 400, { error: "skills must be an array of at most 1000 items" });
+        return;
+      }
+      const knownNames = new Set(this.options.db.listCodexSkills().map((skill) => skill.skillName.toLocaleLowerCase("en-US")));
+      const seenNames = new Set<string>();
+      const preferences: Array<{ skillName: string; pinned: boolean; sortOrder: number }> = [];
+      for (const value of body.skills) {
+        if (typeof value !== "object" || value === null) {
+          sendJson(response, 400, { error: "each skill preference must be an object" });
+          return;
+        }
+        const item = value as Record<string, unknown>;
+        const skillName = typeof item.skillName === "string" ? item.skillName.trim() : "";
+        const key = skillName.toLocaleLowerCase("en-US");
+        if (!skillName || skillName.length > 160 || !knownNames.has(key) || seenNames.has(key)
+          || typeof item.pinned !== "boolean" || !Number.isInteger(item.sortOrder)
+          || Number(item.sortOrder) < 0 || Number(item.sortOrder) > 1_000_000) {
+          sendJson(response, 400, { error: "invalid or duplicate skill preference" });
+          return;
+        }
+        seenNames.add(key);
+        preferences.push({ skillName, pinned: item.pinned, sortOrder: Number(item.sortOrder) });
+      }
+      try {
+        this.options.db.saveCodexSkillPreferences(preferences);
+        sendJson(response, 200, { ok: true });
+      } catch (error) {
+        sendJson(response, 422, { error: error instanceof Error ? error.message : "skill preference update failed" });
+      }
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/api/codex/usage") {
       if (!this.options.codexHistory) {
         sendJson(response, 501, { error: "Codex usage is not configured" });

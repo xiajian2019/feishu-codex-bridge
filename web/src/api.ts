@@ -41,6 +41,24 @@ export interface CodexHistoryQuery {
   offset: number;
 }
 
+export interface CodexSkillRecord {
+  id: string;
+  skillName: string;
+  nameZh: string;
+  nameEn: string;
+  descriptionZh: string;
+  descriptionEn: string;
+  scope: "project" | "codex_home" | "user" | "system" | "plugin";
+  pinned: boolean;
+  sortOrder: number;
+}
+
+export interface CodexSkillPreference {
+  skillName: string;
+  pinned: boolean;
+  sortOrder: number;
+}
+
 export async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -255,6 +273,20 @@ export async function interruptCodexThreadMessage(
 export async function fetchProjects(): Promise<ProjectRecord[]> {
   const result = await getJson<{ projects: ProjectRecord[] }>("/api/projects");
   return result.projects;
+}
+
+export async function fetchCodexSkills(): Promise<CodexSkillRecord[]> {
+  const result = await getJson<{ skills: CodexSkillRecord[] }>("/api/skills");
+  return Array.isArray(result.skills) ? result.skills : [];
+}
+
+export async function updateCodexSkillPreferences(skills: CodexSkillPreference[]): Promise<void> {
+  const token = await getActionToken();
+  await getJson("/api/skills/preferences", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
+    body: JSON.stringify({ skills }),
+  });
 }
 
 export async function createProject(input: { name: string; path: string; status: ProjectStatus }): Promise<ProjectRecord> {

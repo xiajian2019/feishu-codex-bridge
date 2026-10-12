@@ -278,6 +278,7 @@ export const DEFAULT_SHORTCUTS: readonly ShortcutSeed[] = [
   { id: "keyboard-percent", title: "%", detail: "symbol", groupId: "keyboard", kind: "sequence", value: "%" },
   { id: "keyboard-caret", title: "^", detail: "symbol", groupId: "keyboard", kind: "sequence", value: "^" },
   { id: "composer-attachment", title: "附件", detail: "选择文件", groupId: "composer", kind: "insert", value: "", actionKey: "attachment", displayMode: "closed", sortOrder: 0 },
+  { id: "composer-skill-picker", title: "$", detail: "选择 Codex 技能", groupId: "composer", kind: "insert", value: "", actionKey: "skill-picker", displayMode: "expanded", sortOrder: 12 },
   { id: "composer-close-panel", title: "关闭", detail: "关闭快捷栏", groupId: "composer", kind: "insert", value: "", actionKey: "close-panel", displayMode: "expanded", sortOrder: 0 },
   { id: "composer-scroll-top", title: "顶部", detail: "滚动到顶部", groupId: "composer", kind: "insert", value: "", actionKey: "scroll-top", displayMode: "both", sortOrder: 1 },
   { id: "composer-scroll-bottom", title: "底部", detail: "滚动到底部", groupId: "composer", kind: "insert", value: "", actionKey: "scroll-bottom", displayMode: "both", sortOrder: 2 },

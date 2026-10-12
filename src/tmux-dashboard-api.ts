@@ -9,6 +9,7 @@ import type { Duplex } from "node:stream";
 
 import { getBunRuntime, type BunSubprocess, type BunTerminal } from "./bun-runtime.js";
 import { discoverCodexHistoryHomes, type CodexHistoryHome } from "./codex-history.js";
+import { codexSkillScopeKeys, discoverCodexSkills, type CodexSkillScope } from "./codex-skills.js";
 import type { StateDatabase } from "./db.js";
 import type { StoredTmuxSessionAction } from "./types.js";
 import * as tmux from "./tmux-dashboard.js";
@@ -19,6 +20,8 @@ const MAX_SESSION_FILE_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_SUBMISSION_BYTES = 32 * 1024;
 const MAX_SCROLL_DIAGNOSTIC_EXPORT_BYTES = 5 * 1024 * 1024;
 const MAX_SCROLL_DIAGNOSTIC_ENTRIES = 2_000;
+const CODEX_SKILL_SOURCE_MAX_AGE_MS = 30 * 60 * 1_000;
+const CODEX_SKILL_REFRESH_RETRY_MS = 60 * 1_000;
 const SUBMIT_FAST_FLUSH_WINDOW_MS = 5_000;
 const SUBMIT_FAST_FLUSH_IDLE_MS = 250;
 const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.freeze({
@@ -152,7 +155,7 @@ interface TerminalData {
 export interface TmuxDashboardApiOptions {
   db: StateDatabase;
   operations?: Pick<typeof tmux, "createSession" | "findSession" | "killSession" | "listSessions">
-    & Partial<Pick<typeof tmux, "inspectCodexHome" | "setCodexHomeForSession">>;
+    & Partial<Pick<typeof tmux, "getCurrentPanePath" | "inspectCodexHome" | "setCodexHomeForSession">>;
 }
 
 export class TmuxDashboardApi {
@@ -160,6 +163,8 @@ export class TmuxDashboardApi {
   private readonly operations: NonNullable<TmuxDashboardApiOptions["operations"]>;
   private readonly websocketServer = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
   private readonly clients = new Set<WebSocket>();
+  private readonly skillRefreshes = new Map<string, Promise<void>>();
+  private readonly skillRefreshAttempts = new Map<string, number>();
   private stopped = false;
   private attachmentStorageReady: Promise<void> | null = null;
 
@@ -285,6 +290,67 @@ export class TmuxDashboardApi {
         } else {
           sendJson(response, 500, { error: "Could not store the attachment." });
         }
+      }
+      return;
+    }
+    const skillListMatch = /^\/sessions\/([^/]+)\/skills$/.exec(apiPath);
+    if (request.method === "GET" && skillListMatch) {
+      let sessionId: string;
+      try {
+        sessionId = decodeURIComponent(skillListMatch[1]!);
+      } catch {
+        sendJson(response, 400, { error: "Invalid tmux session id." });
+        return;
+      }
+      try {
+        const session = await this.operations.findSession(sessionId);
+        if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        const [codexHomePath, projectCwd] = await Promise.all([
+          this.codexHomePathForSession(sessionId, session),
+          this.operations.getCurrentPanePath
+            ? this.operations.getCurrentPanePath(sessionId, session)
+            : Promise.resolve(session.cwd),
+        ]);
+        const scopeKeys = codexSkillScopeKeys({ codexHomePath, projectCwd });
+        const scopeKey = [...scopeKeys].sort().join("\u0000");
+        const syncStatus = this.db.codexSkillSourceSyncStatus(scopeKeys, CODEX_SKILL_SOURCE_MAX_AGE_MS);
+        const cachedSkills = this.db.listCodexSkills(scopeKeys);
+        if (!syncStatus.fresh) {
+          const refresh = this.scheduleCodexSkillRefresh(codexHomePath, projectCwd, scopeKeys);
+          if (refresh && !syncStatus.initialized && cachedSkills.length === 0) await refresh;
+        }
+        const scopePriority: Record<CodexSkillScope, number> = {
+          project: 0,
+          codex_home: 1,
+          user: 2,
+          plugin: 3,
+          system: 4,
+        };
+        const query = (url.searchParams.get("q") ?? "").trim().slice(0, 160).toLocaleLowerCase();
+        const resultLimit = query ? 20 : 6;
+        const byName = new Map<string, ReturnType<StateDatabase["listCodexSkills"]>[number]>();
+        for (const skill of this.db.listCodexSkills(scopeKeys).sort((left, right) =>
+          scopePriority[left.scope] - scopePriority[right.scope]
+            || left.skillName.localeCompare(right.skillName),
+        )) {
+          const key = skill.skillName.toLocaleLowerCase("en-US");
+          if (!byName.has(key)) byName.set(key, skill);
+        }
+        const skills = [...byName.values()]
+          .filter((skill) => !query || skill.skillName.toLocaleLowerCase().includes(query))
+          .sort((left, right) => Number(right.pinned) - Number(left.pinned)
+            || left.sortOrder - right.sortOrder
+            || left.skillName.localeCompare(right.skillName))
+          .slice(0, resultLimit);
+        sendJson(response, 200, {
+          skills: skills.map((skill) => ({
+            skillName: skill.skillName,
+            descriptionZh: skill.descriptionZh,
+          })),
+          refreshing: this.skillRefreshes.has(scopeKey),
+        });
+      } catch (error) {
+        sendDashboardError(response, error);
       }
       return;
     }
@@ -668,8 +734,48 @@ export class TmuxDashboardApi {
     return null;
   }
 
+  private scheduleCodexSkillRefresh(
+    codexHomePath: string,
+    projectCwd: string,
+    scopeKeys: string[],
+  ): Promise<void> | null {
+    const scopeKey = [...scopeKeys].sort().join("\u0000");
+    if (!scopeKey) return null;
+    const active = this.skillRefreshes.get(scopeKey);
+    if (active) return active;
+
+    const now = Date.now();
+    const lastAttempt = this.skillRefreshAttempts.get(scopeKey) ?? 0;
+    if (now - lastAttempt < CODEX_SKILL_REFRESH_RETRY_MS) return null;
+    this.skillRefreshAttempts.set(scopeKey, now);
+
+    const refresh = (async (): Promise<void> => {
+      const discovery = await discoverCodexSkills({ codexHomePath, projectCwd });
+      this.db.syncCodexSkills(discovery.sources, discovery.skills);
+    })();
+    this.skillRefreshes.set(scopeKey, refresh);
+    void refresh.catch(() => undefined).finally(() => {
+      if (this.skillRefreshes.get(scopeKey) === refresh) this.skillRefreshes.delete(scopeKey);
+    });
+    return refresh;
+  }
+
   private codexHomeOptions(): CodexHistoryHome[] {
     return discoverCodexHistoryHomes();
+  }
+
+  private async codexHomePathForSession(sessionId: string, session?: tmux.TmuxSession): Promise<string> {
+    const sessionRecord = this.db.getLatestTmuxSession(sessionId);
+    const savedHome = sessionRecord?.codex_home_id
+      ? this.codexHomeOptions().find((home) => home.id === sessionRecord.codex_home_id)
+      : undefined;
+    if (savedHome) return resolve(savedHome.path);
+
+    const inspection = this.operations.inspectCodexHome
+      ? await this.operations.inspectCodexHome(sessionId, session).catch(() => null)
+      : null;
+    if (inspection?.status === "running" && inspection.path) return resolve(inspection.path);
+    return resolve(process.env.CODEX_HOME ?? join(homedir(), ".codex"));
   }
 
   private async tmuxSessionActionView(item: StoredTmuxSessionAction): Promise<StoredTmuxSessionAction & {

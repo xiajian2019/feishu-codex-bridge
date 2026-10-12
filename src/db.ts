@@ -4,6 +4,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 
 import { DatabaseSync as DatabaseSyncConstructor, type SqliteDatabase } from "./sqlite.js";
+import type { CodexSkillScope, CodexSkillSource, DiscoveredCodexSkill } from "./codex-skills.js";
 import { DEFAULT_SHORTCUT_GROUPS, DEFAULT_SHORTCUTS } from "./tmux-shortcut-defaults.js";
 import {
   WebTaskSubmissionConflictError,
@@ -455,6 +456,38 @@ CREATE TABLE IF NOT EXISTS tmux_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_tmux_sessions_active
   ON tmux_sessions(ended_at, last_seen_at DESC);
+
+CREATE TABLE IF NOT EXISTS skills (
+    skill_id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL CHECK (scope IN ('project', 'codex_home', 'user', 'system', 'plugin')),
+    scope_key TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    skill_name TEXT NOT NULL,
+    name_zh TEXT NOT NULL,
+    name_en TEXT NOT NULL,
+    description_zh TEXT NOT NULL DEFAULT '',
+    description_en TEXT NOT NULL DEFAULT '',
+    source_hash TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    UNIQUE(scope, scope_key, source_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_skills_scope_name
+  ON skills(scope_key, skill_name COLLATE NOCASE);
+
+CREATE TABLE IF NOT EXISTS skill_preferences (
+    skill_key TEXT PRIMARY KEY,
+    skill_name TEXT NOT NULL,
+    is_pinned INTEGER NOT NULL DEFAULT 0 CHECK (is_pinned IN (0, 1)),
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS skill_source_sync_state (
+    scope_key TEXT PRIMARY KEY,
+    last_scanned_at TEXT NOT NULL,
+    complete INTEGER NOT NULL DEFAULT 0 CHECK (complete IN (0, 1))
+);
 
 CREATE TABLE IF NOT EXISTS tmux_session_actions (
     action_id TEXT PRIMARY KEY,
@@ -3787,6 +3820,121 @@ export class StateDatabase {
       ORDER BY (ended_at IS NULL) DESC, first_seen_at DESC
       LIMIT 1`).get(tmuxSessionId) as Record<string, unknown> | undefined;
     return row ? mapTmuxSession(row) : null;
+  }
+
+  public syncCodexSkills(sources: CodexSkillSource[], skills: DiscoveredCodexSkill[]): void {
+    const lastSeenAt = this.timestamp();
+    this.transaction(() => {
+      const upsert = this.db.prepare(
+        "INSERT INTO skills (skill_id, scope, scope_key, source_key, skill_name, name_zh, name_en, description_zh, description_en, source_hash, last_seen_at) "
+          + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+          + "ON CONFLICT(skill_id) DO UPDATE SET scope = excluded.scope, scope_key = excluded.scope_key, "
+          + "source_key = excluded.source_key, skill_name = excluded.skill_name, name_zh = excluded.name_zh, "
+          + "name_en = excluded.name_en, description_zh = excluded.description_zh, "
+          + "description_en = excluded.description_en, source_hash = excluded.source_hash, last_seen_at = excluded.last_seen_at",
+      );
+      for (const skill of skills) {
+        upsert.run(
+          skill.id,
+          skill.scope,
+          skill.scopeKey,
+          skill.sourceKey,
+          skill.skillName,
+          skill.nameZh,
+          skill.nameEn,
+          skill.descriptionZh,
+          skill.descriptionEn,
+          skill.sourceHash,
+          lastSeenAt,
+        );
+      }
+
+      const syncSource = this.db.prepare(
+        "INSERT INTO skill_source_sync_state (scope_key, last_scanned_at, complete) VALUES (?, ?, ?) "
+          + "ON CONFLICT(scope_key) DO UPDATE SET last_scanned_at = excluded.last_scanned_at, complete = excluded.complete",
+      );
+      for (const source of sources) {
+        syncSource.run(source.scopeKey, lastSeenAt, source.complete ? 1 : 0);
+        if (source.complete) {
+          this.db.prepare("DELETE FROM skills WHERE scope_key = ? AND last_seen_at <> ?")
+            .run(source.scopeKey, lastSeenAt);
+        }
+      }
+    });
+  }
+
+  public codexSkillSourceSyncStatus(scopeKeys: string[], maxAgeMs: number): {
+    initialized: boolean;
+    fresh: boolean;
+  } {
+    const uniqueScopeKeys = [...new Set(scopeKeys)];
+    if (uniqueScopeKeys.length === 0) return { initialized: true, fresh: true };
+    const rows = this.db.prepare(
+      "SELECT scope_key, last_scanned_at, complete FROM skill_source_sync_state WHERE scope_key IN ("
+        + uniqueScopeKeys.map(() => "?").join(", ") + ")",
+    ).all(...uniqueScopeKeys) as Array<{ scope_key: string; last_scanned_at: string; complete: number }>;
+    const byScopeKey = new Map(rows.map((row) => [row.scope_key, row]));
+    const initialized = uniqueScopeKeys.every((scopeKey) => byScopeKey.has(scopeKey));
+    const cutoff = this.now().getTime() - Math.max(0, maxAgeMs);
+    const fresh = initialized && uniqueScopeKeys.every((scopeKey) => {
+      const row = byScopeKey.get(scopeKey);
+      const scannedAt = row ? Date.parse(row.last_scanned_at) : Number.NaN;
+      return row?.complete === 1 && Number.isFinite(scannedAt) && scannedAt >= cutoff;
+    });
+    return { initialized, fresh };
+  }
+
+  public listCodexSkills(scopeKeys?: string[]): Array<{
+    id: string;
+    scope: CodexSkillScope;
+    skillName: string;
+    nameZh: string;
+    nameEn: string;
+    descriptionZh: string;
+    descriptionEn: string;
+    pinned: boolean;
+    sortOrder: number;
+  }> {
+    const uniqueScopeKeys = scopeKeys ? [...new Set(scopeKeys)] : null;
+    if (uniqueScopeKeys?.length === 0) return [];
+    const where = uniqueScopeKeys ? " WHERE s.scope_key IN (" + uniqueScopeKeys.map(() => "?").join(", ") + ")" : "";
+    const rows = this.db.prepare(
+      "SELECT s.skill_id, s.scope, s.skill_name, s.name_zh, s.name_en, s.description_zh, s.description_en, "
+        + "COALESCE(p.is_pinned, 0) AS is_pinned, COALESCE(p.sort_order, 2147483647) AS sort_order "
+        + "FROM skills s LEFT JOIN skill_preferences p ON p.skill_key = lower(s.skill_name)"
+        + where
+        + " ORDER BY s.skill_name COLLATE NOCASE, s.scope, s.source_key",
+    ).all(...(uniqueScopeKeys ?? [])) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: String(row.skill_id),
+      scope: String(row.scope) as CodexSkillScope,
+      skillName: String(row.skill_name),
+      nameZh: String(row.name_zh),
+      nameEn: String(row.name_en),
+      descriptionZh: String(row.description_zh),
+      descriptionEn: String(row.description_en),
+      pinned: Number(row.is_pinned) === 1,
+      sortOrder: Number(row.sort_order ?? 0),
+    }));
+  }
+
+  public saveCodexSkillPreferences(preferences: Array<{
+    skillName: string;
+    pinned: boolean;
+    sortOrder: number;
+  }>): void {
+    const upsert = this.db.prepare(
+      "INSERT INTO skill_preferences (skill_key, skill_name, is_pinned, sort_order, updated_at) VALUES (?, ?, ?, ?, ?) "
+        + "ON CONFLICT(skill_key) DO UPDATE SET skill_name = excluded.skill_name, is_pinned = excluded.is_pinned, "
+        + "sort_order = excluded.sort_order, updated_at = excluded.updated_at",
+    );
+    const now = this.timestamp();
+    this.transaction(() => {
+      for (const preference of preferences) {
+        const skillName = preference.skillName.trim();
+        upsert.run(skillName.toLocaleLowerCase("en-US"), skillName, preference.pinned ? 1 : 0, preference.sortOrder, now);
+      }
+    });
   }
 
   public markTmuxSessionEnded(tmuxSessionId: string): void {
