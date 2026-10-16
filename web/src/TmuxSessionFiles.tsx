@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type AnchorHTMLAttributes, type ReactElement } from "react";
 import { useNavigate, useParams } from "react-router";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -9,6 +9,7 @@ import { useSystemNavigation } from "./WebNavigation.js";
 
 const API_ROOT = "/tmux-dashboard/api";
 const PREVIEW_TEXT_LIMIT = 2 * 1024 * 1024;
+const PREVIEW_HISTORY_LIMIT = 50;
 const FULL_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 const COMPACT_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, { month: "numeric", day: "numeric" });
 const IMAGE_EXTENSIONS = new Set(["apng", "avif", "bmp", "gif", "jpeg", "jpg", "png", "webp"]);
@@ -37,6 +38,14 @@ type FilePreview =
 
 type SessionFileAction = "view" | "download" | "copy" | "forward";
 
+interface SessionFileMarkdownLinkContextValue {
+  currentFilePath: string;
+  onOpenFile: (relativePath: string) => void;
+  onInvalidLink: () => void;
+}
+
+const SESSION_FILE_MARKDOWN_LINK_CONTEXT = createContext<SessionFileMarkdownLinkContextValue | null>(null);
+
 function SessionFileActionIcon({ action }: { action: SessionFileAction }): ReactElement {
   if (action === "view") {
     return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" /><circle cx="12" cy="12" r="2.5" /></svg>;
@@ -55,7 +64,43 @@ const SESSION_FILE_MARKDOWN_COMPONENTS: Components = {
     void node;
     return <div className="codex-markdown-table-scroll"><table {...props} /></div>;
   },
+  a: ({ node, ...props }) => {
+    void node;
+    return <SessionFileMarkdownAnchor {...props} />;
+  },
 };
+
+function SessionFileMarkdownAnchor({ href, children, onClick, ...props }: AnchorHTMLAttributes<HTMLAnchorElement>): ReactElement {
+  const context = useContext(SESSION_FILE_MARKDOWN_LINK_CONTEXT);
+  const trimmedHref = href?.trim() ?? "";
+  const isExternalWebLink = /^(?:https?:\/\/|\/\/|mailto:|tel:)/i.test(trimmedHref);
+  const hasUnsupportedProtocol = /^[a-z][a-z\d+.-]*:/i.test(trimmedHref) && !isExternalWebLink;
+
+  if (!context || !trimmedHref || trimmedHref.startsWith("#")) {
+    return <a {...props} href={href} onClick={onClick}>{children}</a>;
+  }
+  if (isExternalWebLink) {
+    return <a {...props} href={href} onClick={onClick} target={/^https?:\/\/|^\/\//i.test(trimmedHref) ? "_blank" : undefined} rel="noreferrer">{children}</a>;
+  }
+  if (hasUnsupportedProtocol) return <span>{children}</span>;
+
+  const targetPath = resolveSessionMarkdownFilePath(context.currentFilePath, trimmedHref);
+  return (
+    <a
+      {...props}
+      href={href}
+      onClick={(event) => {
+        onClick?.(event);
+        if (event.defaultPrevented) return;
+        event.preventDefault();
+        if (targetPath === null) context.onInvalidLink();
+        else context.onOpenFile(targetPath);
+      }}
+    >
+      {children}
+    </a>
+  );
+}
 
 function sessionFilesUrl(sessionId: string, action: "list" | "upload" | "download", path: string): string {
   const suffix = action === "list" ? "" : `/${action}`;
@@ -66,6 +111,32 @@ function sessionFilesUrl(sessionId: string, action: "list" | "upload" | "downloa
 
 function fileRelativePath(currentPath: string, name: string): string {
   return currentPath ? `${currentPath}/${name}` : name;
+}
+
+function resolveSessionMarkdownFilePath(currentFilePath: string, href: string): string | null {
+  const pathValue = href.replaceAll("\\", "/").split(/[?#]/, 1)[0] ?? "";
+  if (!pathValue) return null;
+
+  const pathParts = pathValue.startsWith("/")
+    ? []
+    : currentFilePath.split("/").filter(Boolean).slice(0, -1);
+  for (const rawPart of pathValue.split("/")) {
+    let part: string;
+    try {
+      part = decodeURIComponent(rawPart);
+    } catch {
+      return null;
+    }
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (pathParts.length === 0) return null;
+      pathParts.pop();
+      continue;
+    }
+    if (part.includes("/") || part.includes("\\") || part.includes("\0")) return null;
+    pathParts.push(part);
+  }
+  return pathParts.length > 0 ? pathParts.join("/") : null;
 }
 
 function lastPathPart(value: string): string {
@@ -166,6 +237,8 @@ export function TmuxSessionFiles(): ReactElement {
   const [notice, setNotice] = useState("");
   const [refreshKey, setRefreshKey] = useState(0);
   const [preview, setPreview] = useState<FilePreview | null>(null);
+  const [previewHistory, setPreviewHistory] = useState<string[]>([]);
+  const [previewNavigationBusy, setPreviewNavigationBusy] = useState(false);
   const [filenameQuery, setFilenameQuery] = useState("");
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -194,7 +267,10 @@ export function TmuxSessionFiles(): ReactElement {
   useEffect(() => {
     if (!preview) return;
     const closeOnEscape = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") setPreview(null);
+      if (event.key === "Escape") {
+        setPreview(null);
+        setPreviewHistory([]);
+      }
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
@@ -308,11 +384,10 @@ export function TmuxSessionFiles(): ReactElement {
     }
   }, [currentPath, sessionId]);
 
-  const openPreview = async (entry: SessionFileEntry): Promise<void> => {
-    setPreview(null);
+  const openPreview = useCallback(async (entry: SessionFileEntry, directoryPath = currentPath): Promise<boolean> => {
     setError("");
     setNotice("");
-    const relativePath = fileRelativePath(currentPath, entry.name);
+    const relativePath = fileRelativePath(directoryPath, entry.name);
     const extension = fileExtension(entry.name);
     if (IMAGE_EXTENSIONS.has(extension)) {
       try {
@@ -321,30 +396,95 @@ export function TmuxSessionFiles(): ReactElement {
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         setPreview({ name: entry.name, relativePath, size: entry.size, type: "image", url, blob });
+        return true;
       } catch (previewError) {
         setError(previewError instanceof Error ? previewError.message : "Could not preview this image.");
+        return false;
       }
-      return;
     }
     if (!TEXT_EXTENSIONS.has(extension)) {
       setError("该文件类型暂不支持在线预览，请使用下载操作。");
-      return;
+      return false;
     }
     if (entry.size > PREVIEW_TEXT_LIMIT) {
       setError("文件超过 2 MB，请下载后查看。");
-      return;
+      return false;
     }
     try {
       const response = await fetch(sessionFilesUrl(sessionId, "download", relativePath));
       if (!response.ok) throw new Error(await responseError(response));
       setPreview({ name: entry.name, relativePath, size: entry.size, type: extension === "md" || extension === "markdown" ? "markdown" : "text", text: await response.text() });
+      return true;
     } catch (previewError) {
       setError(previewError instanceof Error ? previewError.message : "Could not preview this file.");
+      return false;
     }
-  };
+  }, [currentPath, sessionId]);
+
+  const openSessionFilePreview = useCallback(async (relativePath: string): Promise<boolean> => {
+    setError("");
+    setNotice("");
+    const name = lastPathPart(relativePath);
+    const directoryPath = relativePath.split("/").filter(Boolean).slice(0, -1).join("/");
+    if (!name) {
+      setError("此 Markdown 链接没有指向可打开的文件。");
+      return false;
+    }
+    try {
+      const directory = await getJson<SessionFileListing>(sessionFilesUrl(sessionId, "list", directoryPath));
+      const entry = directory.entries.find((candidate) => candidate.name === name);
+      if (!entry) throw new Error("链接指向的文件不存在或不在此 session 的工作目录内。");
+      if (entry.type === "directory") {
+        throw new Error("链接指向的是文件夹，请先关闭预览再从文件列表进入。");
+      }
+      return await openPreview(entry, directoryPath);
+    } catch (openError) {
+      setError(openError instanceof Error ? openError.message : "无法打开这个 Markdown 链接。");
+      return false;
+    }
+  }, [openPreview, sessionId]);
+
+  const openMarkdownFile = useCallback(async (relativePath: string): Promise<void> => {
+    if (previewNavigationBusy) return;
+    setPreviewNavigationBusy(true);
+    const previousPath = preview?.type === "markdown" ? preview.relativePath : null;
+    try {
+      const opened = await openSessionFilePreview(relativePath);
+      if (opened && previousPath) {
+        setPreviewHistory((history) => [...history, previousPath].slice(-PREVIEW_HISTORY_LIMIT));
+      }
+    } finally {
+      setPreviewNavigationBusy(false);
+    }
+  }, [openSessionFilePreview, preview, previewNavigationBusy]);
+
+  const returnToPreviousPreview = useCallback(async (): Promise<void> => {
+    if (previewNavigationBusy) return;
+    const previousPath = previewHistory.at(-1);
+    if (!previousPath) return;
+    setPreviewNavigationBusy(true);
+    try {
+      if (await openSessionFilePreview(previousPath)) {
+        setPreviewHistory((history) => history.slice(0, -1));
+      }
+    } finally {
+      setPreviewNavigationBusy(false);
+    }
+  }, [openSessionFilePreview, previewHistory, previewNavigationBusy]);
+
+  const reportInvalidMarkdownLink = useCallback((): void => {
+    setError("此 Markdown 链接无效，或试图访问 session 工作目录之外的路径。");
+  }, []);
+
+  const markdownLinkContext = useMemo<SessionFileMarkdownLinkContextValue>(() => ({
+    currentFilePath: preview?.type === "markdown" ? preview.relativePath : "",
+    onOpenFile: openMarkdownFile,
+    onInvalidLink: reportInvalidMarkdownLink,
+  }), [openMarkdownFile, preview, reportInvalidMarkdownLink]);
 
   const navigateToPath = (path: string): void => {
     setFilenameQuery("");
+    setPreviewHistory([]);
     setCurrentPath(path);
   };
 
@@ -355,6 +495,7 @@ export function TmuxSessionFiles(): ReactElement {
       navigateToPath(fileRelativePath(currentPath, entry.name));
       return;
     }
+    setPreviewHistory([]);
     void openPreview(entry);
   };
 
@@ -478,11 +619,22 @@ export function TmuxSessionFiles(): ReactElement {
       </section>
 
       {preview ? (
-        <div className="tmux-files-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreview(null); }}>
+        <div className="tmux-files-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) { setPreview(null); setPreviewHistory([]); } }}>
           <section className="tmux-files-preview" role="dialog" aria-modal="true" aria-label={`预览 ${preview.name}`}>
             <header>
               <strong title={preview.name}>{preview.name}</strong>
               <div className="tmux-files-preview-actions">
+                {previewHistory.length > 0 ? (
+                  <button
+                    type="button"
+                    aria-label="返回上一个文件预览"
+                    title={`返回 ${lastPathPart(previewHistory[previewHistory.length - 1]!)}`}
+                    disabled={previewNavigationBusy}
+                    onClick={() => void returnToPreviousPreview()}
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12H4m7-7-7 7 7 7" /></svg>
+                  </button>
+                ) : null}
                 <a
                   href={sessionFilesUrl(sessionId, "download", preview.relativePath)}
                   download={preview.name}
@@ -502,16 +654,18 @@ export function TmuxSessionFiles(): ReactElement {
                 >
                   <SessionFileActionIcon action="forward" />
                 </button>
-                <button type="button" onClick={() => setPreview(null)} aria-label="关闭预览" title="关闭预览">×</button>
+                <button type="button" onClick={() => { setPreview(null); setPreviewHistory([]); }} aria-label="关闭预览" title="关闭预览">×</button>
               </div>
             </header>
             {error ? <div className="tmux-files-message tmux-files-preview-feedback is-error" role="alert">{error}</div> : null}
             {notice ? <div className="tmux-files-message tmux-files-preview-feedback" role="status">{notice}</div> : null}
             {preview.type === "image" ? <img src={preview.url} alt={preview.name} /> : preview.type === "markdown" ? (
               <div className="tmux-files-markdown codex-assistant-markdown">
-                <ReactMarkdown remarkPlugins={[remarkGfm]} components={SESSION_FILE_MARKDOWN_COMPONENTS}>
-                  {preview.text}
-                </ReactMarkdown>
+                <SESSION_FILE_MARKDOWN_LINK_CONTEXT.Provider value={markdownLinkContext}>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]} components={SESSION_FILE_MARKDOWN_COMPONENTS}>
+                    {preview.text}
+                  </ReactMarkdown>
+                </SESSION_FILE_MARKDOWN_LINK_CONTEXT.Provider>
               </div>
             ) : <CodeTextViewer fileName={preview.name} text={preview.text} />}
           </section>

@@ -44,6 +44,35 @@ const TmuxShortcutPalette = lazy(() => import("./TmuxShortcutPalette.js").then((
 const API_ROOT = "/tmux-dashboard/api";
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
+function macComposerTerminalShortcut(event: KeyboardEvent, composerEmpty: boolean): TerminalShortcut | null {
+  if (
+    typeof navigator === "undefined"
+    || !navigator.platform.toLowerCase().startsWith("mac")
+    || event.isComposing
+    || event.metaKey
+    || event.altKey
+    || event.shiftKey
+  ) return null;
+
+  if (event.ctrlKey) {
+    const key = event.key.toLowerCase();
+    if (key === "c") return "codex-interrupt";
+    if (!composerEmpty) return null;
+    if (key === "l") return "ctrl-l";
+    if (key === "r") return "ctrl-r";
+    return null;
+  }
+
+  if (!composerEmpty) return null;
+  switch (event.key) {
+    case "Escape": return "codex-escape";
+    case "ArrowUp": return "codex-up";
+    case "ArrowDown": return "codex-down";
+    case "Enter": return "codex-enter";
+    default: return null;
+  }
+}
+
 type CodexSkillOption = {
   skillName: string;
   descriptionZh: string;
@@ -787,6 +816,16 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
             unstable_focusOnRunStart={false}
             unstable_focusOnScrollToBottom={false}
             unstable_focusOnThreadSwitched={false}
+            onKeyDown={(event) => {
+              const shortcut = macComposerTerminalShortcut(
+                event.nativeEvent,
+                aui.composer.getState().isEmpty,
+              );
+              if (!shortcut) return;
+              event.preventDefault();
+              event.stopPropagation();
+              void onTerminalShortcut(shortcut);
+            }}
             onBlur={(event) => {
               inputSelectionRef.current = {
                 start: event.currentTarget.selectionStart,

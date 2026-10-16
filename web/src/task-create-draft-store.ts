@@ -5,6 +5,7 @@ export type TaskCreateDraft = {
   projectKey: string;
   description: string;
   hadStagedAttachments: boolean;
+  createWorktree?: boolean;
   updatedAt: number;
 };
 
@@ -37,6 +38,7 @@ function isLiveDraft(value: unknown, projectKey: string): value is TaskCreateDra
     && draft.projectKey === projectKey
     && typeof draft.description === "string"
     && typeof draft.hadStagedAttachments === "boolean"
+    && (draft.createWorktree === undefined || typeof draft.createWorktree === "boolean")
     && Number.isFinite(draft.updatedAt)
     && age >= 0
     && age <= DRAFT_TTL_MS;
@@ -59,6 +61,7 @@ function pruneExpiredDrafts(): void {
         const age = Date.now() - Number(value?.updatedAt);
         if (!value || value.version !== 1 || typeof value.description !== "string"
           || typeof value.hadStagedAttachments !== "boolean" || !Number.isFinite(value.updatedAt)
+          || (value.createWorktree !== undefined && typeof value.createWorktree !== "boolean")
           || age < 0 || age > DRAFT_TTL_MS) {
           window.localStorage.removeItem(key);
           index -= 1;
@@ -85,19 +88,19 @@ export function loadTaskCreateDraft(projectKey: string): TaskCreateDraft | null 
       window.localStorage.removeItem(key);
       return null;
     }
-    return { ...value, description: value.description.slice(0, MAX_DESCRIPTION_LENGTH) };
+    return { ...value, description: value.description.slice(0, MAX_DESCRIPTION_LENGTH), createWorktree: value.createWorktree === true };
   } catch {
     try { window.localStorage.removeItem(key); } catch { /* Browser storage may be unavailable. */ }
     return null;
   }
 }
 
-export function saveTaskCreateDraft(projectKey: string, description: string, hadStagedAttachments: boolean): void {
+export function saveTaskCreateDraft(projectKey: string, description: string, hadStagedAttachments: boolean, createWorktree = false): void {
   const key = draftKey(projectKey);
   const lastKey = lastProjectKey();
   if (!key || !lastKey) return;
   const normalizedDescription = description.slice(0, MAX_DESCRIPTION_LENGTH);
-  if (!normalizedDescription && !hadStagedAttachments) {
+  if (!normalizedDescription && !hadStagedAttachments && !createWorktree) {
     clearTaskCreateDraft(projectKey);
     return;
   }
@@ -106,6 +109,7 @@ export function saveTaskCreateDraft(projectKey: string, description: string, had
     projectKey,
     description: normalizedDescription,
     hadStagedAttachments,
+    createWorktree,
     updatedAt: Date.now(),
   };
   try {

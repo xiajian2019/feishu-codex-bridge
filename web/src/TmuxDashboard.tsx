@@ -23,10 +23,15 @@ type TmuxSession = {
   cwd: string;
   createdAt: number;
   codexHomeId: string | null;
+  workspaceId?: string | null;
+  taskGuid?: string | null;
+  workspaceBranch?: string | null;
+  workspaceStatus?: string | null;
 };
 
 type ProjectOption = { name: string; root: string };
 type CodexHomeOption = { id: string; label: string; available: boolean };
+type TaskCreationContext = { sessionId: string; projectKey: string; projectName: string; directory: string; branch: string | null; baseSha: string; dirtyEntryCount: number };
 type Toast = { message: string; isError: boolean; durationMs?: number; isTop?: boolean };
 type SubmissionResult = { ok: boolean; message?: string };
 
@@ -68,7 +73,7 @@ const SESSION_REFRESH_INTERVAL_MS = 5_000;
 async function requestApi<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
   if (options.body) headers.set("content-type", "application/json");
-  if (options.method?.toUpperCase() === "POST" && path.includes("/codex-account")) {
+  if (options.method && options.method.toUpperCase() !== "GET" && options.method.toUpperCase() !== "HEAD") {
     headers.set("X-Bridge-Action-Token", await getActionToken());
   }
   const response = await fetch(API_ROOT + path, { ...options, headers });
@@ -118,6 +123,10 @@ function normalizeTmuxSession(value: unknown): TmuxSession | null {
   const cwd = record.cwd ?? record.sessionPath ?? record.session_path;
   const createdAt = Number(record.createdAt ?? record.created_at ?? record.session_created);
   const codexHomeId = record.codexHomeId ?? record.codex_home_id ?? null;
+  const workspaceId = record.workspaceId ?? record.workspace_id ?? null;
+  const taskGuid = record.taskGuid ?? record.task_guid ?? null;
+  const workspaceBranch = record.workspaceBranch ?? record.workspace_branch ?? null;
+  const workspaceStatus = record.workspaceStatus ?? record.workspace_status ?? null;
 
   if (
     id
@@ -135,6 +144,10 @@ function normalizeTmuxSession(value: unknown): TmuxSession | null {
       cwd,
       createdAt,
       codexHomeId: typeof codexHomeId === "string" ? codexHomeId : null,
+      workspaceId: typeof workspaceId === "string" ? workspaceId : null,
+      taskGuid: typeof taskGuid === "string" ? taskGuid : null,
+      workspaceBranch: typeof workspaceBranch === "string" ? workspaceBranch : null,
+      workspaceStatus: typeof workspaceStatus === "string" ? workspaceStatus : null,
     };
   }
 
@@ -148,6 +161,10 @@ function normalizeTmuxSession(value: unknown): TmuxSession | null {
     cwd: composite[5],
     createdAt: Number(composite[6]),
     codexHomeId: null,
+    workspaceId: null,
+    taskGuid: null,
+    workspaceBranch: null,
+    workspaceStatus: null,
   };
 }
 
@@ -160,7 +177,11 @@ function tmuxSessionsEqual(left: TmuxSession[], right: TmuxSession[]): boolean {
       && next.attachedClients === session.attachedClients
       && next.cwd === session.cwd
       && next.createdAt === session.createdAt
-      && next.codexHomeId === session.codexHomeId;
+      && next.codexHomeId === session.codexHomeId
+      && next.workspaceId === session.workspaceId
+      && next.taskGuid === session.taskGuid
+      && next.workspaceBranch === session.workspaceBranch
+      && next.workspaceStatus === session.workspaceStatus;
   });
 }
 
@@ -206,6 +227,9 @@ export function TmuxDashboard(): ReactElement {
   const location = useLocation();
   const navigate = useNavigate();
   const { collapsed: navigationCollapsed, setCollapsed: setNavigationCollapsed } = useSystemNavigation();
+  const initialRouteParams = new URLSearchParams(window.location.search);
+  const initialSelectedId = initialRouteParams.get("session");
+  const shouldRestoreSessionDetail = Boolean(initialSelectedId) && initialRouteParams.get("view") !== "sessions";
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
   const [codexHomes, setCodexHomes] = useState<CodexHomeOption[]>([]);
@@ -216,7 +240,7 @@ export function TmuxDashboard(): ReactElement {
   const [codexUsageError, setCodexUsageError] = useState<string | null>(null);
   const [codexUsageDialogOpen, setCodexUsageDialogOpen] = useState(false);
   const [mobileView, setMobileView] = useState<"sessions" | "terminal">("sessions");
-  const [selectedId, setSelectedId] = useState<string | null>(() => new URLSearchParams(window.location.search).get("session"));
+  const [selectedId, setSelectedId] = useState<string | null>(() => initialSelectedId);
   const [sessionFileForward, setSessionFileForward] = useState<SessionFileForwardRequest | null>(() => {
     const state = location.state as { sessionFileForward?: unknown } | null;
     const request = state?.sessionFileForward;
@@ -237,6 +261,12 @@ export function TmuxDashboard(): ReactElement {
   const [createBusy, setCreateBusy] = useState(false);
   const [newName, setNewName] = useState("");
   const [newProjectName, setNewProjectName] = useState("");
+  const [trackedTaskOpen, setTrackedTaskOpen] = useState(false);
+  const [trackedTaskDescription, setTrackedTaskDescription] = useState("");
+  const [trackedTaskBusy, setTrackedTaskBusy] = useState(false);
+  const [trackedTaskContextLoading, setTrackedTaskContextLoading] = useState(false);
+  const [trackedTaskContext, setTrackedTaskContext] = useState<TaskCreationContext | null>(null);
+  const [trackedTaskError, setTrackedTaskError] = useState<string | null>(null);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [projectQuery, setProjectQuery] = useState("");
   const [projectActiveIndex, setProjectActiveIndex] = useState(0);
@@ -248,11 +278,29 @@ export function TmuxDashboard(): ReactElement {
   const terminalSocketRef = useRef<WebSocket | null>(null);
   const terminalReconnectRef = useRef<(() => void) | null>(null);
   const submissionWaitersRef = useRef(new Map<string, (result: SubmissionResult) => void>());
+  const trackedTaskSubmissionRef = useRef<{ sessionId: string; description: string; key: string } | null>(null);
+  const sessionsLoadSequenceRef = useRef(0);
   const sessionApiResponseRef = useRef("");
   const sessionApiStatusRef = useRef<number | null>(null);
-  const restoreSessionDetailRef = useRef(new URLSearchParams(window.location.search).has("session"));
+  const restoreSessionDetailRef = useRef(shouldRestoreSessionDetail);
   const codexUsageRequestSequenceRef = useRef(0);
   const lastAutoCodexUsageKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    if (selectedId) {
+      params.set("session", selectedId);
+      if (window.matchMedia("(max-width: 760px)").matches) params.set("view", mobileView);
+      else params.delete("view");
+    } else {
+      params.delete("session");
+      params.delete("view");
+    }
+    const query = params.toString();
+    const search = query ? `?${query}` : "";
+    if (search === location.search) return;
+    navigate({ pathname: location.pathname, search, hash: location.hash }, { replace: true, state: location.state });
+  }, [location.hash, location.pathname, location.search, location.state, mobileView, navigate, selectedId]);
 
   useEffect(() => {
     const state = location.state as { sessionFileForward?: unknown } | null;
@@ -272,9 +320,12 @@ export function TmuxDashboard(): ReactElement {
   }, [mobileView]);
 
   const loadSessions = useCallback(async (): Promise<void> => {
+    const requestSequence = ++sessionsLoadSequenceRef.current;
     try {
       const response = await fetch(API_ROOT + "/sessions", { headers: { Accept: "application/json" } });
+      if (requestSequence !== sessionsLoadSequenceRef.current) return;
       const rawResponse = await response.text();
+      if (requestSequence !== sessionsLoadSequenceRef.current) return;
       sessionApiResponseRef.current = rawResponse;
       sessionApiStatusRef.current = response.status;
       let result: { sessions?: unknown[]; codexHomes?: unknown[]; error?: string };
@@ -310,6 +361,7 @@ export function TmuxDashboard(): ReactElement {
       setError(null);
       setSelectedId((current) => current && sessionList.some((session) => session.id === current) ? current : null);
     } catch (loadError) {
+      if (requestSequence !== sessionsLoadSequenceRef.current) return;
       setBackendStatus("offline");
       setError(loadError instanceof Error ? loadError.message : "Could not load tmux sessions.");
     }
@@ -493,6 +545,8 @@ export function TmuxDashboard(): ReactElement {
     void loadCurrentCodexUsage(selectedSession.codexHomeId);
   }, [loadCurrentCodexUsage, mobileView, selectedCodexHomeLabel, selectedSession?.codexHomeId, selectedSession?.id]);
   const selectSession = (sessionId: string): void => {
+    sessionsLoadSequenceRef.current += 1;
+    restoreSessionDetailRef.current = false;
     setSelectedId(sessionId);
     if (window.matchMedia("(max-width: 760px)").matches) {
       setNavigationCollapsed(true);
@@ -501,6 +555,7 @@ export function TmuxDashboard(): ReactElement {
   };
 
   const showSessionsOnMobile = (): void => {
+    restoreSessionDetailRef.current = false;
     setNavigationCollapsed(false);
     setMobileView("sessions");
   };
@@ -522,6 +577,7 @@ export function TmuxDashboard(): ReactElement {
     if (!restoreSessionDetailRef.current || backendStatus !== "online") return;
     restoreSessionDetailRef.current = false;
     if (selectedId && sessions.some((session) => session.id === selectedId) && window.matchMedia("(max-width: 760px)").matches) {
+      sessionsLoadSequenceRef.current += 1;
       setMobileView("terminal");
       setNavigationCollapsed(true);
     }
@@ -1096,6 +1152,8 @@ export function TmuxDashboard(): ReactElement {
         setNavigationCollapsed(true);
         setMobileView("terminal");
       }
+      sessionsLoadSequenceRef.current += 1;
+      restoreSessionDetailRef.current = false;
       setSessions((current) => [result.session, ...current.filter((session) => session.id !== result.session.id)]);
       setSelectedId(result.session.id);
       setToast({ message: `Session “${result.session.name}” created.`, isError: false });
@@ -1107,12 +1165,69 @@ export function TmuxDashboard(): ReactElement {
     }
   };
 
+  const openTrackedTaskDialog = async (): Promise<void> => {
+    if (!selectedSession) return;
+    setTrackedTaskError(null);
+    setTrackedTaskDescription("");
+    setTrackedTaskContext(null);
+    trackedTaskSubmissionRef.current = null;
+    setTrackedTaskOpen(true);
+    setTrackedTaskContextLoading(true);
+    try {
+      const context = await requestApi<TaskCreationContext>(`/sessions/${encodeURIComponent(selectedSession.id)}/task-context`);
+      setTrackedTaskContext(context);
+    } catch (failure) {
+      setTrackedTaskError(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      setTrackedTaskContextLoading(false);
+    }
+  };
+
+  const createTrackedTask = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    const session = selectedSession;
+    const description = trackedTaskDescription.trim();
+    if (!session || !description || trackedTaskBusy || !trackedTaskContext || trackedTaskContext.sessionId !== session.id || trackedTaskContext.dirtyEntryCount > 0) return;
+    const previous = trackedTaskSubmissionRef.current;
+    if (!previous || previous.sessionId !== session.id || previous.description !== description) {
+      trackedTaskSubmissionRef.current = { sessionId: session.id, description, key: crypto.randomUUID() };
+    }
+    const submission = trackedTaskSubmissionRef.current;
+    if (!submission) return;
+    setTrackedTaskBusy(true);
+    setTrackedTaskError(null);
+    try {
+      const result = await requestApi<{ task: { task_guid: string } }>(`/sessions/${encodeURIComponent(session.id)}/tasks`, {
+        method: "POST",
+        body: JSON.stringify({
+          description,
+          idempotencyKey: submission.key,
+          sourceDirectory: trackedTaskContext.directory,
+          expectedBaseSha: trackedTaskContext.baseSha,
+        }),
+      });
+      trackedTaskSubmissionRef.current = null;
+      setTrackedTaskOpen(false);
+      navigate(`/tasks/desk/${encodeURIComponent(result.task.task_guid)}`, {
+        state: { returnTo: `${location.pathname}${location.search}` },
+      });
+    } catch (failure) {
+      setTrackedTaskError(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      setTrackedTaskBusy(false);
+    }
+  };
+
   const endSession = async (session: TmuxSession | null = selectedSession): Promise<void> => {
     if (!session || !window.confirm(`确认终结 Session「${session.name}」？这会关闭所有已连接的客户端。`)) return;
     try {
       await requestApi<void>(`/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
       const wasSelected = selectedId === session.id;
-      if (wasSelected) setSelectedId(null);
+      if (wasSelected) {
+        sessionsLoadSequenceRef.current += 1;
+        restoreSessionDetailRef.current = false;
+        setSelectedId(null);
+      }
       if (wasSelected && window.matchMedia("(max-width: 760px)").matches) {
         setMobileView("sessions");
         setNavigationCollapsed(false);
@@ -1267,6 +1382,7 @@ export function TmuxDashboard(): ReactElement {
                   <span className="dashboard-session-top"><strong>{session.name}</strong><span className={session.attachedClients > 0 ? "is-active" : ""} title={session.attachedClients > 0 ? "Attached" : "Detached"} /></span>
                   <span className="dashboard-session-path" title={session.cwd}>{session.cwd}</span>
                   <span className="dashboard-session-meta">{session.windows} {session.windows === 1 ? "window" : "windows"}<span>{session.attachedClients > 0 ? `${session.attachedClients} attached` : "detached"}</span></span>
+                  {session.workspaceBranch ? <span className="dashboard-session-worktree">任务分支 · {session.workspaceBranch} · {session.workspaceStatus ?? "工作区"}</span> : null}
                 </button>
                 <div className="dashboard-session-actions" aria-label={`${session.name} 操作`}>
                   <CodexHomeSelect
@@ -1287,7 +1403,7 @@ export function TmuxDashboard(): ReactElement {
         <section className="dashboard-workspace" aria-label="Session terminal">
           <div className="dashboard-workspace-toolbar">
             <button className="dashboard-mobile-back" type="button" onClick={showSessionsOnMobile} aria-label="Back to sessions">‹</button>
-            <div className="dashboard-active-session"><span className="dashboard-terminal-glyph">⌘</span><div><strong>{selectedSession?.name ?? "No session selected"}</strong><span title={selectedSession?.cwd}>{selectedSession?.cwd ?? "Choose a session to open its terminal"}</span></div></div>
+            <div className="dashboard-active-session"><span className="dashboard-terminal-glyph">⌘</span><div><strong>{selectedSession?.name ?? "No session selected"}</strong><span title={selectedSession?.cwd}>{selectedSession?.workspaceBranch ? `任务分支 ${selectedSession.workspaceBranch} · ${selectedSession.workspaceStatus ?? "工作区"} · ` : ""}{selectedSession?.cwd ?? "Choose a session to open its terminal"}</span></div></div>
             {selectedSession ? (
               <div className="dashboard-codex-inline" aria-label="Session 账号与操作">
                 <button
@@ -1311,6 +1427,8 @@ export function TmuxDashboard(): ReactElement {
                     <button type="button" onClick={() => navigate(`/tmux-dashboard/history?session=${encodeURIComponent(selectedSession.id)}`)}>
                       查看历史（当前 Session）
                     </button>
+                    {selectedSession.taskGuid ? <button type="button" onClick={() => navigate(`/tasks/desk/${encodeURIComponent(selectedSession.taskGuid!)}`, { state: { returnTo: `${location.pathname}${location.search}` } })}>打开关联任务</button> : null}
+                    <button type="button" onClick={() => void openTrackedTaskDialog()}>从当前目录创建 Bridge 任务</button>
                     <CodexHomeSelect
                       session={selectedSession}
                       homes={codexHomes}
@@ -1462,6 +1580,19 @@ export function TmuxDashboard(): ReactElement {
               </div>
             </div>
             <div className="dashboard-modal-actions"><button className="dashboard-action" type="button" onClick={() => setCreateOpen(false)}>Cancel</button><button className="dashboard-submit" type="submit" disabled={createBusy || !newProjectName}>{createBusy ? "Creating…" : "Create session"}</button></div>
+          </form>
+        </div>
+      ) : null}
+      {trackedTaskOpen && selectedSession ? (
+        <div className="dashboard-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !trackedTaskBusy) setTrackedTaskOpen(false); }}>
+          <form className="dashboard-modal dashboard-task-create-modal" onSubmit={(event) => void createTrackedTask(event)}>
+            <div className="dashboard-modal-heading"><div><p className="dashboard-eyebrow">NEW BRIDGE TASK</p><h2>从当前 Session 创建任务</h2></div><button type="button" onClick={() => setTrackedTaskOpen(false)} aria-label="Close" disabled={trackedTaskBusy}>×</button></div>
+            <p className="muted">{trackedTaskContextLoading ? "正在读取当前 pane 目录和 Git 基准…" : trackedTaskContext ? `项目：${trackedTaskContext.projectName} · 来源目录：${trackedTaskContext.directory}` : `Session：${selectedSession.name}`}</p>
+            {trackedTaskContext ? <p className="muted">基准：{trackedTaskContext.branch ?? "detached"} · {trackedTaskContext.baseSha.slice(0, 12)}{trackedTaskContext.dirtyEntryCount ? ` · ${trackedTaskContext.dirtyEntryCount} 项未提交改动` : " · 工作区 clean"}</p> : null}
+            <p className="muted">任务会从当前 pane 的 HEAD 创建独立 worktree；源目录未提交的改动不会复制。</p>
+            <label className="dashboard-modal-field">任务描述<textarea value={trackedTaskDescription} onChange={(event) => setTrackedTaskDescription(event.target.value)} maxLength={20_000} rows={7} required autoFocus disabled={trackedTaskBusy} placeholder="描述需要完成的工作" /></label>
+            {trackedTaskError ? <div className="error" role="alert">{trackedTaskError}</div> : null}
+            <div className="dashboard-modal-actions"><button className="dashboard-action" type="button" onClick={() => setTrackedTaskOpen(false)} disabled={trackedTaskBusy}>取消</button><button className="dashboard-submit" type="submit" disabled={trackedTaskBusy || trackedTaskContextLoading || !trackedTaskContext || trackedTaskContext.dirtyEntryCount > 0 || !trackedTaskDescription.trim()}>{trackedTaskBusy ? "提交中…" : trackedTaskContext?.dirtyEntryCount ? "先处理未提交改动" : "创建任务和 worktree"}</button></div>
           </form>
         </div>
       ) : null}

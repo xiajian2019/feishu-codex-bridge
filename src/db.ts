@@ -19,7 +19,12 @@ import {
 } from "./types.js";
 import type { WebAuthPairingRecord, WebAuthSessionRecord } from "./web-auth.js";
 import type { GitWorkspaceSnapshot } from "./run-artifacts.js";
-import type { CodexHistoryStoredRun } from "./codex-history.js";
+import type { PreparedTaskWorkspace } from "./git-workspaces.js";
+import type {
+  CodexHistoryStoredRun,
+  CodexHistoryUsageDailyBucket,
+  CodexHistoryUsageSnapshot,
+} from "./codex-history.js";
 import type {
   DatabaseChange,
   DirectMessageInput,
@@ -50,6 +55,7 @@ import type {
   StoredShortcut,
   StoredShortcutGroup,
   StoredTmuxSession,
+  StoredTaskWorkspace,
   StoredTmuxSessionAction,
   TmuxSessionActionQuery,
   TmuxSessionActionStatus,
@@ -93,6 +99,32 @@ CREATE TABLE IF NOT EXISTS tasks (
     progress_text TEXT,
     progress_updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS task_workspaces (
+    workspace_id TEXT PRIMARY KEY,
+    task_guid TEXT NOT NULL UNIQUE,
+    project_key TEXT NOT NULL,
+    project_root TEXT NOT NULL,
+    project_git_root TEXT NOT NULL,
+    git_common_directory TEXT NOT NULL,
+    working_directory TEXT NOT NULL,
+    worktree_path TEXT NOT NULL UNIQUE,
+    branch TEXT NOT NULL,
+    base_ref TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    source_tmux_session_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('provisioning', 'ready', 'failed', 'retained', 'removed')),
+    followups_closed_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    removed_at TEXT,
+    UNIQUE(project_git_root, branch),
+    FOREIGN KEY(task_guid) REFERENCES tasks(task_guid) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_workspaces_project_status
+  ON task_workspaces(project_key, status, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS web_task_attachments (
     attachment_id TEXT PRIMARY KEY,
@@ -287,6 +319,25 @@ CREATE TABLE IF NOT EXISTS codex_history_list_cache (
 CREATE INDEX IF NOT EXISTS idx_codex_history_list_cache_refreshed
   ON codex_history_list_cache(home_id, refreshed_at DESC);
 
+CREATE TABLE IF NOT EXISTS codex_account_usage_snapshots (
+    home_id TEXT NOT NULL,
+    snapshot_date TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY(home_id, snapshot_date)
+);
+
+CREATE TABLE IF NOT EXISTS codex_account_usage_daily_buckets (
+    home_id TEXT NOT NULL,
+    usage_date TEXT NOT NULL,
+    tokens INTEGER NOT NULL CHECK (tokens >= 0),
+    captured_at TEXT NOT NULL,
+    PRIMARY KEY(home_id, usage_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_codex_account_usage_daily_date
+  ON codex_account_usage_daily_buckets(usage_date, home_id);
+
 CREATE TABLE IF NOT EXISTS codex_history_thread_home_preferences (
     thread_id TEXT PRIMARY KEY,
     preferred_home_id TEXT NOT NULL,
@@ -451,6 +502,8 @@ CREATE TABLE IF NOT EXISTS tmux_sessions (
     last_seen_at TEXT NOT NULL,
     ended_at TEXT,
     created_by_device_id TEXT,
+    workspace_id TEXT,
+    FOREIGN KEY(workspace_id) REFERENCES task_workspaces(workspace_id) ON DELETE SET NULL,
     FOREIGN KEY(created_by_device_id) REFERENCES web_auth_sessions(session_id) ON DELETE SET NULL
 );
 
@@ -526,6 +579,7 @@ export interface ClaimRunArgs {
 export interface ClaimWebTaskSubmissionArgs extends ClaimRunArgs {
   idempotencyKey: string;
   normalizedRequestJson: string;
+  workspace?: PreparedTaskWorkspace;
 }
 
 export interface StoredWebTaskSubmission {
@@ -1177,6 +1231,51 @@ export class StateDatabase {
       payloadJson: String(row.payload_json),
       refreshedAt: String(row.refreshed_at),
     } : null;
+  }
+
+  public getCodexUsageSnapshot(homeId: string): CodexHistoryUsageSnapshot | null {
+    const row = this.db.prepare(
+      `SELECT snapshot_date, payload_json FROM codex_account_usage_snapshots
+       WHERE home_id = ? ORDER BY snapshot_date DESC LIMIT 1`,
+    ).get(homeId) as { snapshot_date: string; payload_json: string } | undefined;
+    if (!row) return null;
+    try {
+      const snapshot = JSON.parse(row.payload_json) as CodexHistoryUsageSnapshot;
+      return snapshot.snapshotDate === row.snapshot_date ? snapshot : null;
+    } catch {
+      return null;
+    }
+  }
+
+  public saveCodexUsageSnapshot(
+    homeId: string,
+    snapshot: CodexHistoryUsageSnapshot,
+    finalizedDailyBuckets: CodexHistoryUsageDailyBucket[],
+  ): void {
+    this.transaction(() => {
+      for (const bucket of finalizedDailyBuckets) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(bucket.startDate)
+          || bucket.startDate >= snapshot.snapshotDate
+          || !Number.isSafeInteger(bucket.tokens)
+          || bucket.tokens < 0) continue;
+        this.db.prepare(
+          `INSERT OR IGNORE INTO codex_account_usage_daily_buckets
+             (home_id, usage_date, tokens, captured_at) VALUES (?, ?, ?, ?)`,
+        ).run(homeId, bucket.startDate, bucket.tokens, snapshot.capturedAt);
+      }
+      this.db.prepare(
+        `INSERT OR IGNORE INTO codex_account_usage_snapshots (home_id, snapshot_date, captured_at, payload_json)
+         VALUES (?, ?, ?, ?)`,
+      ).run(homeId, snapshot.snapshotDate, snapshot.capturedAt, JSON.stringify(snapshot));
+    });
+  }
+
+  public listCodexUsageDailyBuckets(homeId: string): CodexHistoryUsageDailyBucket[] {
+    const rows = this.db.prepare(
+      `SELECT usage_date, tokens FROM codex_account_usage_daily_buckets
+       WHERE home_id = ? ORDER BY usage_date ASC`,
+    ).all(homeId) as Array<{ usage_date: string; tokens: number }>;
+    return rows.map((row) => ({ startDate: row.usage_date, tokens: Number(row.tokens) }));
   }
 
   public listCodexHistoryRuns(limit: number): CodexHistoryStoredRun[] {
@@ -2999,6 +3098,32 @@ export class StateDatabase {
       }
       const claim = this.claimRun(args);
       if (!claim) throw new Error("任务暂时无法排队，请稍后重试。");
+      if (args.workspace) {
+        if (args.workspace.taskGuid !== claim.taskGuid) {
+          throw new Error("任务工作区与任务标识不匹配。");
+        }
+        const now = this.timestamp();
+        this.db.prepare(`INSERT INTO task_workspaces (
+          workspace_id, task_guid, project_key, project_root, project_git_root, git_common_directory,
+          working_directory, worktree_path, branch, base_ref, base_sha, source_tmux_session_id,
+          status, followups_closed_at, last_error, created_at, updated_at, removed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'provisioning', NULL, NULL, ?, ?, NULL)`).run(
+          args.workspace.workspaceId,
+          args.workspace.taskGuid,
+          args.workspace.projectKey,
+          args.workspace.projectRoot,
+          args.workspace.projectGitRoot,
+          args.workspace.gitCommonDirectory,
+          args.workspace.workingDirectory,
+          args.workspace.worktreePath,
+          args.workspace.branch,
+          args.workspace.baseRef,
+          args.workspace.baseSha,
+          args.workspace.sourceTmuxSessionId,
+          now,
+          now,
+        );
+      }
       this.db.prepare(`INSERT INTO web_task_submissions
         (idempotency_key, request_hash, normalized_request_json, task_guid, run_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?)`).run(
@@ -3006,6 +3131,82 @@ export class StateDatabase {
         );
       return { status: "created", claim };
     });
+  }
+
+  public getTaskWorkspace(taskGuid: string): StoredTaskWorkspace | null {
+    const row = this.db.prepare("SELECT * FROM task_workspaces WHERE task_guid = ?").get(taskGuid) as Record<string, unknown> | undefined;
+    return row ? mapTaskWorkspace(row) : null;
+  }
+
+  public getTaskWorkspaceById(workspaceId: string): StoredTaskWorkspace | null {
+    const row = this.db.prepare("SELECT * FROM task_workspaces WHERE workspace_id = ?").get(workspaceId) as Record<string, unknown> | undefined;
+    return row ? mapTaskWorkspace(row) : null;
+  }
+
+  public listTaskWorkspaces(): StoredTaskWorkspace[] {
+    const rows = this.db.prepare(`SELECT * FROM task_workspaces
+      ORDER BY CASE status WHEN 'provisioning' THEN 0 WHEN 'failed' THEN 1 WHEN 'ready' THEN 2 WHEN 'retained' THEN 3 ELSE 4 END,
+        updated_at DESC, workspace_id`).all() as Record<string, unknown>[];
+    return rows.map(mapTaskWorkspace);
+  }
+
+  public markTaskWorkspaceReady(workspaceId: string): StoredTaskWorkspace | null {
+    const now = this.timestamp();
+    this.db.prepare(`UPDATE task_workspaces SET status = 'ready', last_error = NULL, updated_at = ?
+      WHERE workspace_id = ? AND status IN ('provisioning', 'failed', 'retained') AND followups_closed_at IS NULL`)
+      .run(now, workspaceId);
+    const workspace = this.getTaskWorkspaceById(workspaceId);
+    if (workspace) this.noteChange({ kind: "task", taskGuid: workspace.task_guid, at: now });
+    return workspace;
+  }
+
+  public markTaskWorkspaceFailed(workspaceId: string, error: string): StoredTaskWorkspace | null {
+    const now = this.timestamp();
+    this.db.prepare(`UPDATE task_workspaces SET status = 'failed', last_error = ?, updated_at = ?
+      WHERE workspace_id = ? AND status <> 'removed'`).run(error.slice(0, 1000), now, workspaceId);
+    const workspace = this.getTaskWorkspaceById(workspaceId);
+    if (workspace) this.noteChange({ kind: "task", taskGuid: workspace.task_guid, at: now });
+    return workspace;
+  }
+
+  public retainTaskWorkspace(taskGuid: string): void {
+    const now = this.timestamp();
+    this.db.prepare(`UPDATE task_workspaces SET status = 'retained', updated_at = ?
+      WHERE task_guid = ? AND status IN ('ready', 'provisioning') AND followups_closed_at IS NULL`)
+      .run(now, taskGuid);
+  }
+
+  public archiveTaskWorkspace(workspaceId: string): StoredTaskWorkspace | null {
+    const workspace = this.getTaskWorkspaceById(workspaceId);
+    if (!workspace) return null;
+    const task = this.getTask(workspace.task_guid);
+    if (!task) return null;
+    if (task.state === "QUEUED" || task.state === "RUNNING") {
+      throw new Error("任务仍在执行，暂时不能归档工作区。");
+    }
+    const now = this.timestamp();
+    this.db.prepare(`UPDATE task_workspaces SET followups_closed_at = COALESCE(followups_closed_at, ?),
+      status = CASE WHEN status IN ('ready', 'provisioning') THEN 'retained' ELSE status END,
+      updated_at = ? WHERE workspace_id = ? AND status <> 'removed'`).run(now, now, workspaceId);
+    this.noteChange({ kind: "task", taskGuid: workspace.task_guid, at: now });
+    return this.getTaskWorkspaceById(workspaceId);
+  }
+
+  public markTaskWorkspaceRemoved(workspaceId: string, branchError?: string): StoredTaskWorkspace | null {
+    const current = this.getTaskWorkspaceById(workspaceId);
+    if (!current) return null;
+    const now = this.timestamp();
+    this.db.prepare(`UPDATE task_workspaces SET status = 'removed', removed_at = COALESCE(removed_at, ?),
+      last_error = ?, updated_at = ? WHERE workspace_id = ? AND followups_closed_at IS NOT NULL`)
+      .run(now, branchError?.slice(0, 1000) ?? null, now, workspaceId);
+    this.noteChange({ kind: "task", taskGuid: current.task_guid, at: now });
+    return this.getTaskWorkspaceById(workspaceId);
+  }
+
+  public markTaskWorkspaceRunning(taskGuid: string): void {
+    const now = this.timestamp();
+    this.db.prepare(`UPDATE task_workspaces SET status = 'ready', last_error = NULL, updated_at = ?
+      WHERE task_guid = ? AND status = 'retained' AND followups_closed_at IS NULL`).run(now, taskGuid);
   }
 
   public listQueuedWebRunIds(): string[] {
@@ -3296,6 +3497,8 @@ export class StateDatabase {
           run.task_guid,
           runId,
         );
+      this.db.prepare(`UPDATE task_workspaces SET status = 'ready', last_error = NULL, updated_at = ?
+        WHERE task_guid = ? AND status = 'retained' AND followups_closed_at IS NULL`).run(now, run.task_guid);
       const insertResult = this.db
         .prepare(
           `INSERT INTO run_events
@@ -3381,6 +3584,8 @@ export class StateDatabase {
           run.task_guid,
           runId,
         );
+      this.db.prepare(`UPDATE task_workspaces SET status = 'retained', updated_at = ?
+        WHERE task_guid = ? AND status IN ('ready', 'provisioning') AND followups_closed_at IS NULL`).run(finishedAt, run.task_guid);
       if (args.comment) {
         this.enqueueOutboxInTransaction(
           run.task_guid,
@@ -3714,7 +3919,7 @@ export class StateDatabase {
 
   public recordTmuxSession(
     session: { id: string; name: string; cwd: string; createdAt: number },
-    options: { projectKey?: string | null; createdByDeviceId?: string | null } = {},
+    options: { projectKey?: string | null; createdByDeviceId?: string | null; workspaceId?: string | null } = {},
   ): StoredTmuxSession {
     const resolvedCwd = resolve(session.cwd);
     const inferredProject = this.db.prepare(
@@ -3722,7 +3927,7 @@ export class StateDatabase {
     ).get(resolvedCwd) as { name: string } | undefined;
     const projectKey = options.projectKey ?? inferredProject?.name ?? null;
     const existing = this.db.prepare(
-      `SELECT record_id, session_name, project_key, working_directory, last_seen_at, ended_at, created_by_device_id
+      `SELECT record_id, session_name, project_key, working_directory, last_seen_at, ended_at, created_by_device_id, workspace_id
        FROM tmux_sessions WHERE tmux_session_id = ? AND tmux_created_at = ? AND ended_at IS NULL
        ORDER BY first_seen_at DESC LIMIT 1`,
     ).get(session.id, session.createdAt) as {
@@ -3733,6 +3938,7 @@ export class StateDatabase {
       last_seen_at: string;
       ended_at: string | null;
       created_by_device_id: string | null;
+      workspace_id: string | null;
     } | undefined;
     const now = this.timestamp();
     if (existing) {
@@ -3741,6 +3947,7 @@ export class StateDatabase {
       const refreshedLastSeen = current.last_seen_at <= refreshAfter ? now : current.last_seen_at;
       const nextProjectKey = projectKey ?? current.project_key;
       const nextDeviceId = current.created_by_device_id ?? options.createdByDeviceId ?? null;
+      const nextWorkspaceId = options.workspaceId ?? current.workspace_id;
       if (
         current.session_name !== session.name
         || current.project_key !== nextProjectKey
@@ -3748,15 +3955,17 @@ export class StateDatabase {
         || current.last_seen_at !== refreshedLastSeen
         || current.ended_at !== null
         || current.created_by_device_id !== nextDeviceId
+        || current.workspace_id !== nextWorkspaceId
       ) {
         this.db.prepare(`UPDATE tmux_sessions SET
           session_name = ?, project_key = ?, working_directory = ?, last_seen_at = ?,
-          ended_at = NULL, created_by_device_id = ? WHERE record_id = ?`).run(
+          ended_at = NULL, created_by_device_id = ?, workspace_id = ? WHERE record_id = ?`).run(
             session.name,
             nextProjectKey,
             session.cwd,
             refreshedLastSeen,
             nextDeviceId,
+            nextWorkspaceId,
             current.record_id,
           );
       }
@@ -3766,8 +3975,8 @@ export class StateDatabase {
     const recordId = randomUUID();
     this.db.prepare(`INSERT INTO tmux_sessions
       (record_id, tmux_session_id, session_name, project_key, working_directory,
-       tmux_created_at, first_seen_at, last_seen_at, ended_at, created_by_device_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`).run(
+       tmux_created_at, first_seen_at, last_seen_at, ended_at, created_by_device_id, workspace_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`).run(
         recordId,
         session.id,
         session.name,
@@ -3777,6 +3986,7 @@ export class StateDatabase {
         now,
         now,
         options.createdByDeviceId ?? null,
+        options.workspaceId ?? null,
       );
     return this.getTmuxSession(recordId)!;
   }
@@ -3820,6 +4030,12 @@ export class StateDatabase {
       ORDER BY (ended_at IS NULL) DESC, first_seen_at DESC
       LIMIT 1`).get(tmuxSessionId) as Record<string, unknown> | undefined;
     return row ? mapTmuxSession(row) : null;
+  }
+
+  public listTmuxSessionsForWorkspace(workspaceId: string): StoredTmuxSession[] {
+    const rows = this.db.prepare(`SELECT * FROM tmux_sessions
+      WHERE workspace_id = ? ORDER BY (ended_at IS NULL) DESC, first_seen_at DESC`).all(workspaceId) as Record<string, unknown>[];
+    return rows.map(mapTmuxSession);
   }
 
   public syncCodexSkills(sources: CodexSkillSource[], skills: DiscoveredCodexSkill[]): void {
@@ -4181,12 +4397,36 @@ export class StateDatabase {
   private runMigrations(): void {
     // These columns were added after the minimal schema in the design document.
     // Keeping the migration additive lets an operator upgrade an existing database.
+    // Remove the abandoned model-usage cache from existing Bridge databases.
+    this.db.exec("DROP TABLE IF EXISTS codex_model_usage_threads");
+    this.db.exec("DROP TABLE IF EXISTS codex_model_usage_sync_state");
+    const modelUsageSnapshots = this.db.prepare(
+      `SELECT home_id, snapshot_date, payload_json FROM codex_account_usage_snapshots
+       WHERE payload_json LIKE '%"modelUsage"%'`,
+    ).all() as Array<{ home_id: string; snapshot_date: string; payload_json: string }>;
+    const updateUsageSnapshot = this.db.prepare(
+      `UPDATE codex_account_usage_snapshots SET payload_json = ?
+       WHERE home_id = ? AND snapshot_date = ?`,
+    );
+    for (const row of modelUsageSnapshots) {
+      try {
+        const snapshot = JSON.parse(row.payload_json) as Record<string, unknown>;
+        if (!snapshot || typeof snapshot !== "object" || !Object.prototype.hasOwnProperty.call(snapshot, "modelUsage")) continue;
+        delete snapshot.modelUsage;
+        updateUsageSnapshot.run(JSON.stringify(snapshot), row.home_id, row.snapshot_date);
+      } catch {
+        // Preserve unreadable token snapshots instead of risking their contents.
+      }
+    }
     addColumnIfMissing(this.db, "tmux_session_actions", "tmux_session_id", "TEXT NOT NULL DEFAULT ''");
     addColumnIfMissing(this.db, "tmux_session_actions", "session_name", "TEXT NOT NULL DEFAULT ''");
     addColumnIfMissing(this.db, "tmux_session_actions", "project_key", "TEXT");
     addColumnIfMissing(this.db, "tmux_session_actions", "working_directory", "TEXT NOT NULL DEFAULT ''");
     addColumnIfMissing(this.db, "tmux_session_actions", "submission_fingerprint", "TEXT");
     addColumnIfMissing(this.db, "tmux_sessions", "codex_home_id", "TEXT");
+    addColumnIfMissing(this.db, "tmux_sessions", "workspace_id", "TEXT");
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tmux_sessions_workspace
+      ON tmux_sessions(workspace_id, ended_at, last_seen_at DESC)`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tmux_session_actions_fingerprint
       ON tmux_session_actions(session_record_id, submission_fingerprint, created_at DESC)`);
     this.db.exec(`UPDATE tmux_session_actions
@@ -4745,6 +4985,30 @@ function mapTmuxSession(row: Record<string, unknown>): StoredTmuxSession {
     last_seen_at: String(row.last_seen_at),
     ended_at: nullableString(row.ended_at),
     created_by_device_id: nullableString(row.created_by_device_id),
+    workspace_id: nullableString(row.workspace_id),
+  };
+}
+
+function mapTaskWorkspace(row: Record<string, unknown>): StoredTaskWorkspace {
+  return {
+    workspace_id: String(row.workspace_id),
+    task_guid: String(row.task_guid),
+    project_key: String(row.project_key),
+    project_root: String(row.project_root),
+    project_git_root: String(row.project_git_root),
+    git_common_directory: String(row.git_common_directory),
+    working_directory: String(row.working_directory),
+    worktree_path: String(row.worktree_path),
+    branch: String(row.branch),
+    base_ref: String(row.base_ref),
+    base_sha: String(row.base_sha),
+    source_tmux_session_id: nullableString(row.source_tmux_session_id),
+    status: String(row.status) as StoredTaskWorkspace["status"],
+    followups_closed_at: nullableString(row.followups_closed_at),
+    last_error: nullableString(row.last_error),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+    removed_at: nullableString(row.removed_at),
   };
 }
 

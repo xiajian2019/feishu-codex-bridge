@@ -16,6 +16,7 @@ const SYSTEM_PAGES = [
   { to: "/system-management/projects", label: "项目管理" },
   { to: "/system-management/shortcuts", label: "快捷键与技能管理" },
   { to: "/system-management/usage", label: "Codex 用量" },
+  { to: "/system-management/workspaces", label: "Git 工作区" },
   { to: "/system-management/settings", label: "系统设置" },
 ] as const;
 
@@ -68,7 +69,7 @@ export function WebNavigation(): ReactElement {
     const trigger = systemTriggerRef.current;
     if (!trigger) return;
     const popoverWidth = 190;
-    const estimatedPopoverHeight = 280;
+    const estimatedPopoverHeight = 320;
     const updatePosition = (): void => {
       const rect = trigger.getBoundingClientRect();
       const maxLeft = Math.max(12, window.innerWidth - popoverWidth - 12);

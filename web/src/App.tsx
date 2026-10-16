@@ -101,17 +101,19 @@ export function App(): ReactElement {
   const [attachmentRestoreNotice, setAttachmentRestoreNotice] = useState(false);
   const [attachmentsBusy, setAttachmentsBusy] = useState(false);
   const [newProjectKey, setNewProjectKey] = useState("");
+  const [newCreateWorktree, setNewCreateWorktree] = useState(false);
 
   const listAbortRef = useRef<AbortController | null>(null);
   const listRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previewUrlsRef = useRef(new Set<string>());
-  const createDraftSnapshotRef = useRef<{ projectKey: string; description: string; hadStagedAttachments: boolean } | null>(null);
+  const createDraftSnapshotRef = useRef<{ projectKey: string; description: string; hadStagedAttachments: boolean; createWorktree: boolean } | null>(null);
 
   if (createOpen && newProjectKey) {
     createDraftSnapshotRef.current = {
       projectKey: newProjectKey,
       description: newDescription,
       hadStagedAttachments: newAttachments.length > 0 || attachmentRestoreNotice,
+      createWorktree: newCreateWorktree,
     };
   } else if (!createOpen) {
     createDraftSnapshotRef.current = null;
@@ -210,15 +212,15 @@ export function App(): ReactElement {
   useEffect(() => {
     if (!createOpen || !newProjectKey) return;
     const timeout = window.setTimeout(() => {
-      saveTaskCreateDraft(newProjectKey, newDescription, newAttachments.length > 0 || attachmentRestoreNotice);
+      saveTaskCreateDraft(newProjectKey, newDescription, newAttachments.length > 0 || attachmentRestoreNotice, newCreateWorktree);
     }, 250);
     return () => window.clearTimeout(timeout);
-  }, [attachmentRestoreNotice, createOpen, newAttachments.length, newDescription, newProjectKey]);
+  }, [attachmentRestoreNotice, createOpen, newAttachments.length, newCreateWorktree, newDescription, newProjectKey]);
 
   useEffect(() => {
     const flushDraft = (): void => {
       const draft = createDraftSnapshotRef.current;
-      if (draft) saveTaskCreateDraft(draft.projectKey, draft.description, draft.hadStagedAttachments);
+      if (draft) saveTaskCreateDraft(draft.projectKey, draft.description, draft.hadStagedAttachments, draft.createWorktree);
     };
     const flushWhenHidden = (): void => {
       if (document.visibilityState === "hidden") flushDraft();
@@ -254,6 +256,7 @@ export function App(): ReactElement {
     const draft = loadTaskCreateDraft(projectKey);
     setNewProjectKey(projectKey);
     setNewDescription(draft?.description ?? "");
+    setNewCreateWorktree(draft?.createWorktree ?? false);
     setAttachmentRestoreNotice(draft?.hadStagedAttachments ?? false);
     setCreateOpen(true);
   };
@@ -267,7 +270,7 @@ export function App(): ReactElement {
   const closeCreateTask = (): void => {
     if (createBusy || attachmentsBusy) return;
     const hadStagedAttachments = newAttachments.length > 0 || attachmentRestoreNotice;
-    saveTaskCreateDraft(newProjectKey, newDescription, hadStagedAttachments);
+    saveTaskCreateDraft(newProjectKey, newDescription, hadStagedAttachments, newCreateWorktree);
     setCreateOpen(false);
     setAttachmentRestoreNotice(hadStagedAttachments);
     for (const attachment of newAttachments) {
@@ -280,7 +283,7 @@ export function App(): ReactElement {
   const selectCreateProject = (projectKey: string): void => {
     if (projectKey === newProjectKey) return;
     const discardedSelectedAttachments = newAttachments.length > 0;
-    saveTaskCreateDraft(newProjectKey, newDescription, newAttachments.length > 0 || attachmentRestoreNotice);
+    saveTaskCreateDraft(newProjectKey, newDescription, newAttachments.length > 0 || attachmentRestoreNotice, newCreateWorktree);
     const draft = loadTaskCreateDraft(projectKey);
     for (const attachment of newAttachments) {
       releasePreviewUrl(attachment.previewUrl);
@@ -291,6 +294,7 @@ export function App(): ReactElement {
     setNewAttachments([]);
     setNewProjectKey(projectKey);
     setNewDescription(draft?.description ?? "");
+    setNewCreateWorktree(draft?.createWorktree ?? false);
     setAttachmentRestoreNotice(draft?.hadStagedAttachments ?? false);
   };
 
@@ -341,6 +345,7 @@ export function App(): ReactElement {
       const input: CreateTaskInput = {
         description: newDescription.trim(),
         projectKey: newProjectKey,
+        createWorktree: newCreateWorktree,
         ...(newAttachments.length > 0 ? { attachmentIds: newAttachments.map((attachment) => attachment.attachment_id) } : {}),
       };
       const payload = JSON.stringify(input);
@@ -377,17 +382,17 @@ export function App(): ReactElement {
         setNewAttachments([]);
         setAttachmentRestoreNotice(true);
         const notice = "有附件已过期或已绑定到其他任务，请重新选择附件。项目和任务描述已保留。";
-        saveTaskCreateDraft(submittedProjectKey, newDescription, true);
+        saveTaskCreateDraft(submittedProjectKey, newDescription, true, newCreateWorktree);
         setCreateError(notice);
       } else {
-        saveTaskCreateDraft(submittedProjectKey, newDescription, newAttachments.length > 0 || attachmentRestoreNotice);
+        saveTaskCreateDraft(submittedProjectKey, newDescription, newAttachments.length > 0 || attachmentRestoreNotice, newCreateWorktree);
         setCreateError(message);
       }
     } finally {
       submittingRef.current = false;
       setCreateBusy(false);
     }
-  }, [attachmentRestoreNotice, createBusy, newAttachments, newDescription, newProjectKey, openDetail]);
+  }, [attachmentRestoreNotice, createBusy, newAttachments, newCreateWorktree, newDescription, newProjectKey, openDetail]);
 
   const submitFilters = useCallback((event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault();
@@ -475,7 +480,7 @@ export function App(): ReactElement {
         <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeCreateTask(); }}>
           <section className="dialog task-create-dialog" role="dialog" aria-modal="true" aria-labelledby="create-task-title">
             <div className="dialog-head">
-              <div><h2 id="create-task-title">新建 Codex 任务</h2><div className="muted">使用当前任务状态与执行记录。</div></div>
+              <div><h2 id="create-task-title">新建 Codex 任务</h2></div>
               <button type="button" onClick={closeCreateTask} aria-label="关闭" disabled={createBusy || attachmentsBusy}>×</button>
             </div>
             <form className="task-create-form dialog-body" onSubmit={(event) => void handleCreateTask(event)}>
@@ -494,9 +499,9 @@ export function App(): ReactElement {
                 {attachmentRestoreNotice && newAttachments.length === 0 ? <span className="muted" role="status">暂存附件不会跨项目切换或刷新保留，请重新选择需要的文件。</span> : null}
                 <span className="muted">单个附件最大 25 MiB，每个任务最多 10 个；文件保存在本机，可在任务详情查看。</span>
               </div>
+              <label className="task-worktree-option"><input type="checkbox" checked={newCreateWorktree} onChange={(event) => setNewCreateWorktree(event.target.checked)} disabled={createBusy || attachmentsBusy} /><span><strong>使用 Git worktree</strong></span></label>
               {createError ? <div className="error" role="alert">{createError}</div> : null}
               <div className="dialog-actions task-create-actions">
-                <button type="button" onClick={closeCreateTask} disabled={createBusy || attachmentsBusy}>取消</button>
                 <button className="primary" type="submit" disabled={createBusy || attachmentsBusy || !newProjectKey || !newDescription.trim()}>{createBusy ? "提交中…" : "提交任务"}</button>
               </div>
             </form>

@@ -19,6 +19,7 @@ const ProjectManagement = lazy(() => import("./ProjectManagement.js").then((modu
 const TaskDetailPage = lazy(() => import("./TaskDetailPage.js").then((module) => ({ default: module.TaskDetailPage })));
 const SystemHealth = lazy(() => import("./SystemHealth.js").then((module) => ({ default: module.SystemHealth })));
 const SystemBackups = lazy(() => import("./SystemBackups.js").then((module) => ({ default: module.SystemBackups })));
+const TaskWorkspaces = lazy(() => import("./TaskWorkspaces.js").then((module) => ({ default: module.TaskWorkspaces })));
 const SystemSettings = lazy(() => import("./SystemSettings.js").then((module) => ({ default: module.SystemSettings })));
 
 function LegacyDirectTasksRedirect() {
@@ -206,6 +207,7 @@ async function mountApp(): Promise<void> {
                   <Route path="/system-management/usage" element={<CodexUsage />} />
                   <Route path="/system-management/health" element={<SystemHealth />} />
                   <Route path="/system-management/backups" element={<SystemBackups />} />
+                  <Route path="/system-management/workspaces" element={<TaskWorkspaces />} />
                   <Route path="/system-management/settings" element={<SystemSettings />} />
                   <Route path="/pair-admin" element={<Navigate to="/system-management/devices" replace />} />
                   <Route path="*" element={<Navigate to="/" replace />} />

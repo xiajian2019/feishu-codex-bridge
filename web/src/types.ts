@@ -141,6 +141,7 @@ export interface CodexUsageAccount {
     summary?: CodexAccountUsageSummary;
     dailyUsageBuckets?: Array<{ startDate: string; tokens: number }> | null;
   };
+  tokenUsageUpdatedAt?: string;
   errors?: {
     quota?: string;
     tokenUsage?: string;
@@ -159,6 +160,7 @@ export interface CodexUsageResponse {
   generatedAt: string;
   dataSource: "codex-app-server";
   accounts: CodexUsageAccount[];
+  globalDailyUsageBuckets: Array<{ startDate: string; tokens: number }>;
 }
 
 export interface CodexHistoryDetailResponse {
@@ -272,6 +274,28 @@ export interface CreateTaskInput {
   description: string;
   projectKey: string;
   attachmentIds?: string[];
+  createWorktree?: boolean;
+}
+
+export interface TaskWorkspaceSummary {
+  workspace_id: string;
+  task_guid: string;
+  project_key: string;
+  project_root: string;
+  project_git_root: string;
+  git_common_directory: string;
+  working_directory: string;
+  worktree_path: string;
+  branch: string;
+  base_ref: string;
+  base_sha: string;
+  source_tmux_session_id: string | null;
+  status: "provisioning" | "ready" | "failed" | "retained" | "removed";
+  followups_closed_at: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+  removed_at: string | null;
 }
 
 export interface TaskAttachment {
@@ -463,6 +487,8 @@ export interface TaskDetailResponse {
   task: TaskSummary;
   can_followup?: boolean;
   can_retry?: boolean;
+  workspace?: TaskWorkspaceSummary | null;
+  can_archive_workspace?: boolean;
   runs: StoredRun[];
   attachments: TaskAttachment[];
   outbox: OutboxEntry[];

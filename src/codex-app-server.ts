@@ -839,7 +839,11 @@ function parseAccountTokenUsageResponse(raw: unknown): CodexAccountTokenUsageRes
     parsed.dailyUsageBuckets = result.dailyUsageBuckets.flatMap((bucket) => {
       const entry = asRecord(bucket);
       const tokens = optionalNumber(entry.tokens);
-      return typeof entry.startDate === "string" && tokens !== undefined
+      return typeof entry.startDate === "string"
+        && /^\d{4}-\d{2}-\d{2}$/.test(entry.startDate)
+        && tokens !== undefined
+        && Number.isSafeInteger(tokens)
+        && tokens >= 0
         ? [{ startDate: entry.startDate, tokens }]
         : [];
     });

@@ -30,6 +30,7 @@ import {
 import { writeProjectRegistrySnapshot } from "./project-registry.js";
 import type { TmuxDashboardApi } from "./tmux-dashboard-api.js";
 import { resolveBridgeProjectRoot } from "./portable-runtime.js";
+import { GitWorkspaceError, inspectTaskWorkspace, inspectUnmanagedWorktree, listGitWorktrees, removeTaskWorkspaceDirectory, resolveGitRoot, verifyTaskWorkspace } from "./git-workspaces.js";
 import { readSystemHealth } from "./system-health.js";
 import { parseTaskInput } from "./fingerprint.js";
 import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
@@ -277,7 +278,9 @@ export class DashboardServer {
       if (
         request.method === "POST"
         && (/^\/tmux-dashboard\/api\/sessions\/[^/]+\/files\/upload$/.test(url.pathname)
-          || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/codex-account(?:\/check)?$/.test(url.pathname))
+          || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/codex-account(?:\/check)?$/.test(url.pathname)
+          || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/tasks$/.test(url.pathname)
+          || /^\/tmux-dashboard\/api\/workspaces\/[^/]+\/session$/.test(url.pathname))
         && !this.requireActionAuthorization(request, response)
       ) return;
       await this.options.tmuxDashboard.handleRequest(request, response, this.auth.currentDeviceId(request));
@@ -696,6 +699,26 @@ export class DashboardServer {
     }
     if (request.method === "GET" && url.pathname === "/api/tasks") {
       this.listTasks(url, response);
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/task-workspaces") {
+      await this.listTaskWorkspaces(response);
+      return;
+    }
+    const workspaceArchiveMatch = /^\/api\/task-workspaces\/([^/]+)\/archive$/.exec(url.pathname);
+    if (request.method === "POST" && workspaceArchiveMatch) {
+      let workspaceId: string;
+      try { workspaceId = decodeURIComponent(workspaceArchiveMatch[1]!); }
+      catch { sendJson(response, 400, { error: "invalid workspace selector" }); return; }
+      await this.archiveTaskWorkspace(workspaceId, request, response);
+      return;
+    }
+    const workspaceDeleteMatch = /^\/api\/task-workspaces\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "DELETE" && workspaceDeleteMatch) {
+      let workspaceId: string;
+      try { workspaceId = decodeURIComponent(workspaceDeleteMatch[1]!); }
+      catch { sendJson(response, 400, { error: "invalid workspace selector" }); return; }
+      await this.removeTaskWorkspace(workspaceId, request, response);
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/task-panel") {
@@ -1444,6 +1467,10 @@ export class DashboardServer {
       sendJson(response, 400, { error: "mode must be a string" });
       return;
     }
+    if (body.createWorktree !== undefined && typeof body.createWorktree !== "boolean") {
+      sendJson(response, 400, { error: "createWorktree must be a boolean" });
+      return;
+    }
     if ("executionBackend" in body || "tmuxSessionId" in body) {
       sendJson(response, 400, { error: "task execution target selection is no longer supported" });
       return;
@@ -1464,6 +1491,7 @@ export class DashboardServer {
         projectKey: body.projectKey,
         mode: typeof body.mode === "string" ? body.mode : undefined,
         attachmentIds: attachmentIds as string[],
+        createWorktree: body.createWorktree === true,
       };
       const task = await create(input);
       sendJson(response, 201, {
@@ -1604,9 +1632,14 @@ export class DashboardServer {
       throw new TaskFileRequestError(404, "task working directory is unavailable");
     }
 
-    const rootPath = await realpath(task.repo).catch(() => {
-      throw new TaskFileRequestError(404, "task working directory is unavailable");
-    });
+    const workspace = task.origin === "web" ? this.options.db.getTaskWorkspace(taskGuid) : null;
+    const rootPath = workspace
+      ? await verifyTaskWorkspace(workspace).catch(() => {
+        throw new TaskFileRequestError(404, "task working directory is unavailable");
+      })
+      : await realpath(task.repo).catch(() => {
+        throw new TaskFileRequestError(404, "task working directory is unavailable");
+      });
     const relativePath = normalizeTaskRelativePath(requestedPath);
     const candidatePath = resolve(rootPath, relativePath);
     if (!isTaskPathInside(rootPath, candidatePath)) {
@@ -1712,13 +1745,19 @@ export class DashboardServer {
       sendJson(response, 404, { error: "task not found" });
       return;
     }
+    const workspace = task.origin === "web" ? this.options.db.getTaskWorkspace(taskGuid) : null;
+    const workspaceAcceptsFollowup = !workspace || (!workspace.followups_closed_at && workspace.status !== "removed");
     sendJson(response, 200, {
       task: { ...task, input: parseTaskInput(task.input_text) },
       can_followup: task.origin === "web"
-        ? Boolean(this.options.actions?.appendWebFollowup && task.state !== "RUNNING" && task.state !== "QUEUED")
+        ? Boolean(this.options.actions?.appendWebFollowup && workspaceAcceptsFollowup && task.state !== "RUNNING" && task.state !== "QUEUED")
         : Boolean(this.options.actions?.appendFeedback),
       can_retry: task.origin === "web" && (task.state === "FAILED" || task.state === "CANCELED")
+        && workspaceAcceptsFollowup
         && Boolean(this.options.actions?.retryWebTask),
+      workspace,
+      can_archive_workspace: Boolean(workspace && !workspace.followups_closed_at && workspace.status !== "removed"
+        && task.state !== "RUNNING" && task.state !== "QUEUED"),
       runs: this.options.db.listRunsForTask(taskGuid).map((run) => ({
         ...run,
         events: this.options.db.listRunEvents(run.run_id),
@@ -1993,6 +2032,163 @@ export class DashboardServer {
       ...project,
       available: this.options.db.getAvailableProject(project.name) !== null,
     }));
+  }
+
+  private async listTaskWorkspaces(response: ServerResponse): Promise<void> {
+    let tmuxStatusKnown = true;
+    let liveSessionPaths: Array<{ sessionId: string; currentPath: string }> = [];
+    try {
+      if (!this.options.tmuxDashboard) throw new Error("Tmux Dashboard API is unavailable");
+      liveSessionPaths = await this.options.tmuxDashboard.getWorkspaceSessionSnapshot();
+    } catch (error) {
+      tmuxStatusKnown = false;
+      this.options.logger?.warn("could not refresh tmux sessions before workspace inventory", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    const records = this.options.db.listTaskWorkspaces();
+    const managedPaths = new Set(records.map((workspace) => resolve(workspace.worktree_path)));
+    const workspaces = await Promise.all(records.map(async (workspace) => {
+      const task = this.options.db.getTask(workspace.task_guid);
+      const inspection = await inspectTaskWorkspace(workspace);
+      const linkedSessionIds = new Set(this.options.db.listTmuxSessionsForWorkspace(workspace.workspace_id)
+        .filter((session) => !session.ended_at).map((session) => session.tmux_session_id));
+      const canonicalWorktree = await realpath(workspace.worktree_path).catch(() => resolve(workspace.worktree_path));
+      const paneMatches = liveSessionPaths
+        .filter((session) => isTaskPathInside(canonicalWorktree, resolve(session.currentPath)))
+        .map((session) => session.sessionId);
+      const activeSessionIds = new Set([...linkedSessionIds, ...paneMatches]);
+      const activeSessionCount = activeSessionIds.size;
+      const activeTask = task?.state === "RUNNING" || task?.state === "QUEUED";
+      const blockers: string[] = [];
+      if (activeTask) blockers.push("任务仍在排队或执行");
+      if (!workspace.followups_closed_at) blockers.push("任务仍允许续问；请先归档任务工作区");
+      if (inspection.dirtyEntryCount > 0) blockers.push(`有 ${inspection.dirtyEntryCount} 项未提交改动`);
+      if (activeSessionCount > 0) blockers.push(`有 ${activeSessionCount} 个关联或正在使用此目录的 tmux session`);
+      if (!tmuxStatusKnown) blockers.push("当前无法确认 tmux session 是否仍活动");
+      if (inspection.error && inspection.error !== "Git worktree list 中不存在此目录。") blockers.push(inspection.error);
+      const missingFromGit = inspection.error === "Git worktree list 中不存在此目录。";
+      const canRemoveDirectory = Boolean(
+        workspace.status !== "removed"
+        &&
+        workspace.followups_closed_at
+        && !activeTask
+        && activeSessionCount === 0
+        && tmuxStatusKnown
+        && inspection.dirtyEntryCount === 0
+        && (!inspection.error || missingFromGit),
+      );
+      const canDeleteBranch = canRemoveDirectory
+        && inspection.remoteBranches.length === 0
+        && (inspection.mergedIntoBase === true || inspection.commitsAheadOfBase === 0);
+      const parsedInput = task ? parseTaskInput(task.input_text) : null;
+      return {
+        ...workspace,
+        task_state: task?.state ?? null,
+        task_summary: parsedInput?.summary ?? task?.task_guid ?? "任务记录不可用",
+        active_session_count: activeSessionCount,
+        inspection,
+        blockers,
+        can_remove_directory: canRemoveDirectory,
+        can_delete_branch: canDeleteBranch,
+      };
+    }));
+
+    const unmanaged: Array<{
+      projectKey: string;
+      path: string;
+      branch: string | null;
+      commit: string | null;
+      prunable: boolean;
+      inspection: Awaited<ReturnType<typeof inspectUnmanagedWorktree>>;
+    }> = [];
+    const seenUnmanagedPaths = new Set<string>();
+    for (const project of this.options.db.listAvailableProjects()) {
+      try {
+        const root = await resolveGitRoot(project.path);
+        for (const entry of await listGitWorktrees(root)) {
+          const path = resolve(entry.path);
+          if (path === root || managedPaths.has(path) || seenUnmanagedPaths.has(path)) continue;
+          seenUnmanagedPaths.add(path);
+          unmanaged.push({
+            projectKey: project.name,
+            path,
+            branch: entry.branch,
+            commit: entry.commit,
+            prunable: entry.prunable,
+            inspection: await inspectUnmanagedWorktree(root, entry),
+          });
+        }
+      } catch (error) {
+        this.options.logger?.warn("could not inspect Git worktrees for project inventory", {
+          projectKey: project.name,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    sendJson(response, 200, { workspaces, unmanaged, tmuxStatusKnown });
+  }
+
+  private async archiveTaskWorkspace(workspaceId: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    try {
+      const workspace = this.options.db.archiveTaskWorkspace(workspaceId);
+      if (!workspace) { sendJson(response, 404, { error: "task workspace not found" }); return; }
+      sendJson(response, 200, { workspace });
+    } catch (error) {
+      sendJson(response, error instanceof GitWorkspaceError ? error.statusCode : 409, {
+        error: error instanceof Error ? error.message : "could not archive task workspace",
+      });
+    }
+  }
+
+  private async removeTaskWorkspace(workspaceId: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try { body = await readJsonBody(request); }
+    catch (error) { sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" }); return; }
+    if (body.deleteBranch !== undefined && typeof body.deleteBranch !== "boolean") {
+      sendJson(response, 400, { error: "deleteBranch must be a boolean" });
+      return;
+    }
+    const workspace = this.options.db.getTaskWorkspaceById(workspaceId);
+    if (!workspace) { sendJson(response, 404, { error: "task workspace not found" }); return; }
+    if (workspace.status === "removed") { sendJson(response, 200, { workspace, branchDeleted: false }); return; }
+    const task = this.options.db.getTask(workspace.task_guid);
+    if (!task) { sendJson(response, 409, { error: "task record is unavailable; workspace is retained" }); return; }
+    if (task.state === "QUEUED" || task.state === "RUNNING") {
+      sendJson(response, 409, { error: "任务仍在排队或执行，不能清理工作区。" });
+      return;
+    }
+    if (!workspace.followups_closed_at) {
+      sendJson(response, 409, { error: "请先在任务详情归档工作区并关闭后续续问。" });
+      return;
+    }
+    try {
+      if (!this.options.tmuxDashboard) throw new Error("Tmux Dashboard API is unavailable");
+      const liveSessionPaths = await this.options.tmuxDashboard.getWorkspaceSessionSnapshot();
+      const worktreePath = await realpath(workspace.worktree_path).catch(() => resolve(workspace.worktree_path));
+      const paneMatches = liveSessionPaths.filter((item) => isTaskPathInside(worktreePath, resolve(item.currentPath)));
+      const linkedSessionIds = new Set(this.options.db.listTmuxSessionsForWorkspace(workspaceId)
+        .filter((session) => !session.ended_at).map((session) => session.tmux_session_id));
+      const activeSessionIds = new Set([...linkedSessionIds, ...paneMatches.map((item) => item.sessionId)]);
+      if (activeSessionIds.size > 0) {
+        sendJson(response, 409, { error: `${activeSessionIds.size} 个 tmux session 仍关联或正在使用此工作区；请先显式结束它们。` });
+        return;
+      }
+    } catch (error) {
+      sendJson(response, 503, { error: `无法确认 tmux session 状态，工作区已保留：${error instanceof Error ? error.message : String(error)}` });
+      return;
+    }
+    try {
+      const result = await removeTaskWorkspaceDirectory(workspace, { deleteBranch: body.deleteBranch === true });
+      const updated = this.options.db.markTaskWorkspaceRemoved(workspaceId, result.branchError);
+      sendJson(response, 200, { workspace: updated, branchDeleted: result.branchDeleted, branchError: result.branchError ?? null });
+    } catch (error) {
+      sendJson(response, error instanceof GitWorkspaceError ? error.statusCode : 409, {
+        error: error instanceof Error ? error.message : "could not remove task workspace",
+      });
+    }
   }
 
   private sendShortcutConfig(response: ServerResponse): void {
@@ -2478,6 +2674,7 @@ function isSpaRoute(pathname: string): boolean {
     || pathname === "/system-management/usage"
     || pathname === "/system-management/health"
     || pathname === "/system-management/backups"
+    || pathname === "/system-management/workspaces"
     || pathname === "/direct-tasks"
     || pathname === "/system-management/projects"
     || /^\/tasks\/(?:desk|direct|aamp)\/[^/]+$/.test(pathname)
