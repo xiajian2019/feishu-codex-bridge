@@ -954,7 +954,7 @@ export function TmuxDashboard(): ReactElement {
     if (!selectedSession) return { ok: false, message: "Select a tmux session first." };
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       const message = "The terminal connection is closed.";
-      setToast({ message, isError: true });
+      setToast({ message, isError: true, isTop: true });
       return { ok: false, message };
     }
     if (sendingMessage) return { ok: false, message: "A message is already being sent." };
@@ -988,17 +988,18 @@ export function TmuxDashboard(): ReactElement {
       });
       logDebugDiagnostic("tmux-submit", "client-result", { ok: result.ok, message: result.message ?? null, ...summarizeUnicodeText(messageText) });
       if (!result.ok) {
-        setToast({ message: result.message || "Could not send the message to the session.", isError: true });
+        setToast({ message: result.message || "Could not send the message to the session.", isError: true, isTop: true });
         return result;
       }
 
-      setToast({ message: "Message sent to “" + selectedSession.name + "”.", isError: false });
+      setToast({ message: "Message sent to “" + selectedSession.name + "”.", isError: false, isTop: true });
       return result;
     } catch (sendError) {
       const message = sendError instanceof Error ? sendError.message : "Could not send the message.";
       setToast({
         message,
         isError: true,
+        isTop: true,
       });
       return { ok: false, message };
     } finally {
