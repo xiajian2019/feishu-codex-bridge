@@ -12,6 +12,8 @@ import type {
 
 const REFRESH_INTERVAL_MS = 60_000;
 const RESET_ATTEMPT_STORAGE_PREFIX = "feishu-codex-bridge.reset-credit-attempt";
+const ACCOUNT_USAGE_PAGE_SIZE = 7;
+const GLOBAL_USAGE_PAGE_SIZE = 30;
 const resetAttemptFallback = new Map<string, string>();
 
 export function CodexUsage(): ReactElement {
@@ -55,7 +57,7 @@ export function CodexUsage(): ReactElement {
         <div className="codex-usage-page-heading">
           <h1>Codex 用量</h1>
           <span className="codex-usage-updated">
-            {snapshot ? `更新于 ${formatTimestamp(snapshot.generatedAt)} · 每分钟刷新` : "每分钟自动刷新"}
+            {snapshot ? `额度于 ${formatTimestamp(snapshot.generatedAt)} 检查 · Token 每天同步` : "额度每分钟检查 · Token 每天同步"}
           </span>
         </div>
         <button className="primary codex-usage-refresh" type="button" onClick={() => void loadUsage()} disabled={loading || refreshing}>
@@ -69,15 +71,18 @@ export function CodexUsage(): ReactElement {
         <div className="codex-usage-empty">没有发现已登记的 Codex 账户。</div>
       ) : null}
       {snapshot && snapshot.accounts.length > 0 ? (
-        <section className="codex-usage-grid" aria-label="Codex 账户用量">
-          {snapshot.accounts.map((account) => (
-            <UsageAccountCard key={account.homeId} account={account} onRefresh={loadUsage} />
-          ))}
-        </section>
+        <>
+          <GlobalDailyUsageChart buckets={snapshot.globalDailyUsageBuckets} />
+          <section className="codex-usage-grid" aria-label="Codex 账户用量">
+            {snapshot.accounts.map((account) => (
+              <UsageAccountCard key={account.homeId} account={account} onRefresh={loadUsage} />
+            ))}
+          </section>
+        </>
       ) : null}
 
       <p className="codex-usage-note">
-        额度窗口和每日 Token 数由 Codex app-server 返回；不同账户可能返回不同窗口。页面仅显示 Codex 提供的数据，不估算 API 费用。
+        额度窗口每次读取 Codex app-server；Token 快照按账号及 UTC 日期保存。
       </p>
     </main>
   );
@@ -111,7 +116,7 @@ export function CodexUsageDialog({
       <section className="codex-usage-modal codex-usage-details-modal" role="dialog" aria-modal="true" aria-labelledby="codex-usage-details-title">
         <header className="codex-usage-modal-header">
           <div className="codex-usage-modal-title">
-            <h2 id="codex-usage-details-title">{account ? `${account.label} · Codex 用量` : `${accountLabel} · Codex 用量`}</h2>
+            <h2 id="codex-usage-details-title">{account ? "Codex 用量" : `${accountLabel} · Codex 用量`}</h2>
           </div>
           <div className="codex-usage-modal-header-actions">
             <button
@@ -133,7 +138,7 @@ export function CodexUsageDialog({
         <div className="codex-usage-details-body">
           {error ? <div className="codex-usage-error" role="alert">{error}</div> : null}
           {loading && !account ? <div className="codex-usage-empty">正在读取 Codex 账户用量…</div> : null}
-          {account ? <UsageAccountCard account={account} onRefresh={onRefresh} showResetCredits={false} /> : null}
+          {account ? <UsageAccountCard account={account} onRefresh={onRefresh} showResetCredits={false} embedded /> : null}
           {!loading && !account && !error ? <div className="codex-usage-empty">暂无可显示的 Codex 账户用量。</div> : null}
         </div>
       </section>
@@ -165,10 +170,11 @@ export function getCodexUsageRemainingPercentages(account: CodexUsageAccount | n
   return [percentages[0] ?? "—", percentages[1] ?? "—"];
 }
 
-function UsageAccountCard({ account, onRefresh, showResetCredits = true }: {
+function UsageAccountCard({ account, onRefresh, showResetCredits = true, embedded = false }: {
   account: CodexUsageAccount;
   onRefresh: () => Promise<void>;
   showResetCredits?: boolean;
+  embedded?: boolean;
 }): ReactElement {
   const [resetCreditsOpen, setResetCreditsOpen] = useState(false);
   const [confirmingCredit, setConfirmingCredit] = useState<CodexUsageResetCredit | null>(null);
@@ -177,7 +183,7 @@ function UsageAccountCard({ account, onRefresh, showResetCredits = true }: {
   const [consumeMessage, setConsumeMessage] = useState<string | null>(null);
   const [submittedCreditIds, setSubmittedCreditIds] = useState<Set<string>>(() => new Set());
   const buckets = account.quota?.buckets ?? [];
-  const dailyBuckets = account.tokenUsage?.dailyUsageBuckets?.slice(-7) ?? [];
+  const dailyBuckets = account.tokenUsage?.dailyUsageBuckets ?? [];
   const summary = account.tokenUsage?.summary;
   const resetCreditCount = account.quota?.resetCreditsAvailableCount;
   const resetCredits = account.quota?.resetCredits;
@@ -193,11 +199,11 @@ function UsageAccountCard({ account, onRefresh, showResetCredits = true }: {
     : { label: "账户目录不可用", state: "unavailable" };
 
   return (
-    <article className="codex-usage-account">
+    <article className={`codex-usage-account${embedded ? " is-embedded" : ""}`}>
       <header className="codex-usage-account-header">
         <div className="codex-usage-account-heading">
           <div className="codex-usage-account-title">
-            <h2>{account.label}</h2>
+            {embedded ? <strong className="codex-usage-account-name">{account.label}</strong> : <h2>{account.label}</h2>}
             <div className="codex-usage-account-badges">
               {planType ? <span className="codex-usage-plan">{formatPlanType(planType)}</span> : null}
               <span className={`codex-usage-status is-${status.state}`}>{status.label}</span>
@@ -241,16 +247,24 @@ function UsageAccountCard({ account, onRefresh, showResetCredits = true }: {
 
       <section className="codex-usage-section codex-usage-token-section">
         <div className="codex-usage-section-heading">
-          <h3>账户 Token 统计</h3>
-          <span className="codex-usage-muted">每日统计</span>
+          <h3>Token 统计</h3>
+          {account.tokenUsageUpdatedAt ? <span className="codex-usage-muted">同步于 {formatTimestamp(account.tokenUsageUpdatedAt)}</span> : null}
         </div>
         {account.stale?.tokenUsage ? <p className="codex-usage-stale">本次读取失败，以下为上次成功结果。</p> : null}
         {account.errors?.tokenUsage && !account.stale?.tokenUsage ? <p className="codex-usage-inline-error">{account.errors.tokenUsage}</p> : null}
         {!account.errors?.tokenUsage ? (
           <>
             <div className="codex-usage-metrics">
-              <UsageMetric label="累计 Token" value={formatTokens(summary?.lifetimeTokens)} />
-              <UsageMetric label="单日峰值" value={formatTokens(summary?.peakDailyTokens)} />
+              <UsageMetric
+                label="累计 Token"
+                value={formatTokenUnit(summary?.lifetimeTokens)}
+                exact={formatExactTokens(summary?.lifetimeTokens)}
+              />
+              <UsageMetric
+                label="单日峰值"
+                value={formatTokenUnit(summary?.peakDailyTokens)}
+                exact={formatExactTokens(summary?.peakDailyTokens)}
+              />
               <UsageMetric label="连续活跃" value={formatDays(summary?.currentStreakDays)} />
             </div>
             <DailyUsageChart buckets={dailyBuckets} />
@@ -523,32 +537,290 @@ function QuotaWindow({ window, label }: { window: CodexUsageRateLimitWindow | nu
   );
 }
 
-function UsageMetric({ label, value }: { label: string; value: string }): ReactElement {
+function UsageMetric({ label, value, exact }: { label: string; value: string; exact?: string }): ReactElement {
   return (
     <div className="codex-usage-metric">
       <span>{label}</span>
       <strong>{value}</strong>
+      {exact ? <small>（{exact}）</small> : null}
     </div>
   );
 }
 
 function DailyUsageChart({ buckets }: { buckets: Array<{ startDate: string; tokens: number }> }): ReactElement {
+  const [pageOffset, setPageOffset] = useState(0);
   if (buckets.length === 0) return <p className="codex-usage-muted codex-usage-no-daily">暂无每日 Token 数据。</p>;
-  const maxTokens = Math.max(...buckets.map((bucket) => bucket.tokens), 1);
+  const pageCount = Math.ceil(buckets.length / ACCOUNT_USAGE_PAGE_SIZE);
+  const pageIndex = Math.min(pageOffset, pageCount - 1);
+  const pageEnd = buckets.length - pageIndex * ACCOUNT_USAGE_PAGE_SIZE;
+  const pageStart = Math.max(0, pageEnd - ACCOUNT_USAGE_PAGE_SIZE);
+  const visibleBuckets = buckets.slice(pageStart, pageEnd);
+  const maxTokens = Math.max(...visibleBuckets.map((bucket) => bucket.tokens), 1);
   return (
-    <div className="codex-usage-chart" aria-label="最近每日 Token 用量">
-      {buckets.map((bucket) => {
-        const height = Math.max(3, Math.round((bucket.tokens / maxTokens) * 100));
-        return (
-          <div className="codex-usage-chart-day" key={bucket.startDate} title={`${bucket.startDate} · ${formatTokens(bucket.tokens)} Token`}>
-            <strong>{formatTokens(bucket.tokens)}</strong>
-            <div className="codex-usage-chart-track"><span style={{ height: `${height}%` }} /></div>
-            <span>{bucket.startDate.slice(-5)}</span>
+    <>
+      <div className="codex-usage-chart-navigation">
+        <span>{visibleBuckets[0]?.startDate} 至 {visibleBuckets[visibleBuckets.length - 1]?.startDate} · 共 {buckets.length} 条日记录</span>
+        {pageCount > 1 ? (
+          <div>
+            {pageIndex < pageCount - 1 ? (
+              <HistoryArrowButton
+                direction="older"
+                label="查看较早的 7 天 Token 用量"
+                onClick={() => setPageOffset((current) => Math.min(current + 1, pageCount - 1))}
+              />
+            ) : null}
+            {pageIndex > 0 ? (
+              <HistoryArrowButton
+                direction="newer"
+                label="查看较新的 7 天 Token 用量"
+                onClick={() => setPageOffset((current) => Math.max(0, current - 1))}
+              />
+            ) : null}
           </div>
-        );
-      })}
-    </div>
+        ) : null}
+      </div>
+      <div className="codex-usage-chart" aria-label="每日 Token 用量">
+        {visibleBuckets.map((bucket) => {
+          const height = Math.max(3, Math.round((bucket.tokens / maxTokens) * 100));
+          return (
+            <div className="codex-usage-chart-day" key={bucket.startDate} title={`${bucket.startDate} · ${formatTokens(bucket.tokens)} Token`}>
+              <strong>
+                <span>{formatTokenUnit(bucket.tokens)}</span>
+                <small>（{formatExactTokens(bucket.tokens)}）</small>
+              </strong>
+              <div className="codex-usage-chart-track"><span style={{ height: `${height}%` }} /></div>
+              <span>{bucket.startDate.slice(-5)}</span>
+            </div>
+          );
+        })}
+      </div>
+    </>
   );
+}
+
+function GlobalDailyUsageChart({ buckets }: { buckets: Array<{ startDate: string; tokens: number }> }): ReactElement {
+  const [pageOffset, setPageOffset] = useState(0);
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const validBuckets = buckets
+    .filter((bucket) => /^\d{4}-\d{2}-\d{2}$/.test(bucket.startDate) && Number.isFinite(Date.parse(`${bucket.startDate}T00:00:00Z`)))
+    .sort((left, right) => left.startDate.localeCompare(right.startDate));
+  if (validBuckets.length === 0) {
+    return (
+      <section className="codex-usage-overview">
+        <h2>总体每日 Token</h2>
+        <p className="codex-usage-muted">暂无已保存的每日 Token 数据。</p>
+      </section>
+    );
+  }
+  const latestKnownDate = validBuckets[validBuckets.length - 1]?.startDate;
+  const latestKnownMs = latestKnownDate ? Date.parse(`${latestKnownDate}T00:00:00Z`) : Number.NaN;
+  const earliestKnownMs = validBuckets.length > 0 ? Date.parse(`${validBuckets[0]!.startDate}T00:00:00Z`) : Number.NaN;
+  const rangeDayCount = Number.isFinite(latestKnownMs) && Number.isFinite(earliestKnownMs)
+    ? Math.floor((latestKnownMs - earliestKnownMs) / 86_400_000) + 1
+    : 0;
+  const pageCount = Math.max(1, Math.ceil(rangeDayCount / GLOBAL_USAGE_PAGE_SIZE));
+  const pageIndex = Math.min(pageOffset, pageCount - 1);
+  const pageEndMs = latestKnownMs - pageIndex * GLOBAL_USAGE_PAGE_SIZE * 86_400_000;
+  const rangeStartMs = Math.max(earliestKnownMs, pageEndMs - (GLOBAL_USAGE_PAGE_SIZE - 1) * 86_400_000);
+  const visibleBuckets = validBuckets.filter((bucket) => {
+    const bucketMs = Date.parse(`${bucket.startDate}T00:00:00Z`);
+    return bucketMs >= rangeStartMs && bucketMs <= pageEndMs;
+  });
+  const selectedBucket = visibleBuckets.find((bucket) => bucket.startDate === selectedDate);
+
+  const byDate = new Map(visibleBuckets.map((bucket) => [bucket.startDate, bucket.tokens]));
+  const latestDate = new Date(pageEndMs).toISOString().slice(0, 10);
+  const rangeStartDate = new Date(rangeStartMs).toISOString().slice(0, 10);
+  const dayCount = Math.max(1, Math.floor((pageEndMs - rangeStartMs) / 86_400_000) + 1);
+  const dates = Array.from({ length: dayCount }, (_, index) => new Date(rangeStartMs + index * 86_400_000).toISOString().slice(0, 10));
+  const width = 960;
+  const height = 220;
+  const paddingX = 20;
+  const paddingY = 18;
+  const knownValues = [...byDate.values()];
+  const maxTokens = Math.max(...knownValues, 1);
+  const points = dates.map((date, index) => {
+    const tokens = byDate.get(date);
+    if (tokens === undefined) return { date, tokens: null, x: 0, y: 0 };
+    const x = dates.length === 1
+      ? width / 2
+      : paddingX + (index / (dates.length - 1)) * (width - paddingX * 2);
+    const y = height - paddingY - (tokens / maxTokens) * (height - paddingY * 2);
+    return { date, tokens, x, y };
+  });
+  let path = "";
+  let segmentStarted = false;
+  for (const point of points) {
+    if (point.tokens === null) {
+      segmentStarted = false;
+      continue;
+    }
+    path += `${segmentStarted ? "L" : "M"}${point.x.toFixed(1)},${point.y.toFixed(1)} `;
+    segmentStarted = true;
+  }
+  const totalTokens = visibleBuckets.reduce((total, bucket) => total + bucket.tokens, 0);
+  const labelIndexes = [...new Set([0, Math.floor((dates.length - 1) / 2), dates.length - 1])];
+
+  return (
+    <section className="codex-usage-overview" aria-label="总体每日 Token 用量">
+      <header className="codex-usage-overview-header">
+        <div>
+          <h2>总体每日 Token</h2>
+          <span>{rangeStartDate} 至 {latestDate} · {visibleBuckets.length} 个有数据的日期</span>
+        </div>
+        <div className="codex-usage-overview-actions">
+          {pageCount > 1 ? (
+            <div className="codex-usage-overview-navigation">
+              {pageIndex < pageCount - 1 ? (
+                <HistoryArrowButton
+                  direction="older"
+                  label="查看较早的 30 天 Token 用量"
+                  onClick={() => {
+                    setSelectedDate(null);
+                    setPageOffset((current) => Math.min(current + 1, pageCount - 1));
+                  }}
+                />
+              ) : null}
+              {pageIndex > 0 ? (
+                <HistoryArrowButton
+                  direction="newer"
+                  label="查看较新的 30 天 Token 用量"
+                  onClick={() => {
+                    setSelectedDate(null);
+                    setPageOffset((current) => Math.max(0, current - 1));
+                  }}
+                />
+              ) : null}
+            </div>
+          ) : null}
+          <div className="codex-usage-overview-total">
+            <span>本页累计</span>
+            <strong>{formatTokenUnit(totalTokens)}</strong>
+            <small>（{formatExactTokens(totalTokens)}）</small>
+          </div>
+        </div>
+      </header>
+      <div className={`codex-usage-point-detail${selectedBucket ? " is-selected" : ""}`} aria-live="polite">
+        {selectedBucket ? (
+          <>
+            <span>{selectedBucket.startDate}</span>
+            <strong>{formatTokens(selectedBucket.tokens)} Token</strong>
+          </>
+        ) : <span>点击折线上的日期查看当日用量</span>}
+      </div>
+      <div className="codex-usage-line-chart">
+        {visibleBuckets.length === 0 ? <p className="codex-usage-muted">该日期范围内暂无每日 Token 数据。</p> : null}
+        {visibleBuckets.length > 0 ? (
+          <>
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          role="group"
+          aria-label={`每日 Token 折线图，${rangeStartDate} 至 ${latestDate}，本页累计 ${formatTokens(totalTokens)}`}
+          onClick={(event) => {
+            const bounds = event.currentTarget.getBoundingClientRect();
+            if (bounds.width <= 0) return;
+            const chartX = ((event.clientX - bounds.left) / bounds.width) * width;
+            let nearestDate: string | null = null;
+            let nearestDistance = Number.POSITIVE_INFINITY;
+            for (const point of points) {
+              if (point.tokens === null) continue;
+              const distance = Math.abs(point.x - chartX);
+              if (distance < nearestDistance) {
+                nearestDate = point.date;
+                nearestDistance = distance;
+              }
+            }
+            if (nearestDate) setSelectedDate(nearestDate);
+          }}
+        >
+          <title>总体每日 Token 用量</title>
+          {[0.25, 0.5, 0.75].map((fraction) => {
+            const y = paddingY + fraction * (height - paddingY * 2);
+            return <line key={fraction} x1={paddingX} x2={width - paddingX} y1={y} y2={y} className="codex-usage-line-grid" />;
+          })}
+          <path d={path} className="codex-usage-line-path" />
+          {points.filter((point) => point.tokens !== null).map((point) => (
+            <circle
+              key={point.date}
+              cx={point.x}
+              cy={point.y}
+              r={selectedDate === point.date ? "5.5" : "4.5"}
+              className={`codex-usage-line-point${selectedDate === point.date ? " is-selected" : ""}`}
+              role="button"
+              tabIndex={0}
+              aria-label={`${point.date}，${formatTokens(point.tokens)} Token`}
+              aria-pressed={selectedDate === point.date}
+              onFocus={() => setSelectedDate(point.date)}
+              onClick={() => setSelectedDate(point.date)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  setSelectedDate(point.date);
+                }
+              }}
+            >
+              <title>{point.date} · {formatTokens(point.tokens)} Token</title>
+            </circle>
+          ))}
+        </svg>
+        <div className="codex-usage-line-labels">
+          {labelIndexes.map((index) => <span key={dates[index]}>{dates[index]?.slice(5)}</span>)}
+        </div>
+          </>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function HistoryArrowButton({
+  direction,
+  label,
+  onClick,
+}: {
+  direction: "older" | "newer";
+  label: string;
+  onClick: () => void;
+}): ReactElement {
+  return (
+    <button className="codex-usage-history-arrow" type="button" onClick={onClick} aria-label={label} title={label}>
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d={direction === "older" ? "M15 18 9 12l6-6" : "m9 18 6-6-6-6"} />
+      </svg>
+    </button>
+  );
+}
+
+function preserveLastSuccessfulData(
+  previous: CodexUsageResponse | null,
+  latest: CodexUsageResponse,
+): CodexUsageResponse {
+  if (!previous) return latest;
+  const previousAccounts = new Map(previous.accounts.map((account) => [account.homeId, account]));
+  return {
+    ...latest,
+    accounts: latest.accounts.map((account) => preserveCodexUsageAccount(previousAccounts.get(account.homeId) ?? null, account)),
+  };
+}
+
+export function preserveCodexUsageAccount(
+  previous: CodexUsageAccount | null,
+  latest: CodexUsageAccount,
+): CodexUsageAccount {
+  if (!previous || previous.homeId !== latest.homeId) return latest;
+  const preserveQuota = !latest.quota && Boolean(latest.errors?.quota && previous.quota);
+  const preserveTokenUsage = !latest.tokenUsage && Boolean(latest.errors?.tokenUsage && previous.tokenUsage);
+  if (!preserveQuota && !preserveTokenUsage) return latest;
+  return {
+    ...latest,
+    ...(preserveQuota ? { quota: previous.quota } : {}),
+    ...(preserveTokenUsage ? { tokenUsage: previous.tokenUsage } : {}),
+    ...(preserveTokenUsage ? { tokenUsageUpdatedAt: previous.tokenUsageUpdatedAt } : {}),
+    stale: {
+      ...(preserveQuota ? { quota: true } : {}),
+      ...(preserveTokenUsage ? { tokenUsage: true } : {}),
+    },
+  };
 }
 
 function defaultBucketLabel(limitId?: string | null): string {
@@ -651,37 +923,6 @@ function formatTimestampFromSeconds(timestamp: number): string {
   return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString("zh-CN", { hour12: false });
 }
 
-function preserveLastSuccessfulData(
-  previous: CodexUsageResponse | null,
-  latest: CodexUsageResponse,
-): CodexUsageResponse {
-  if (!previous) return latest;
-  const previousAccounts = new Map(previous.accounts.map((account) => [account.homeId, account]));
-  return {
-    ...latest,
-    accounts: latest.accounts.map((account) => preserveCodexUsageAccount(previousAccounts.get(account.homeId) ?? null, account)),
-  };
-}
-
-export function preserveCodexUsageAccount(
-  previous: CodexUsageAccount | null,
-  latest: CodexUsageAccount,
-): CodexUsageAccount {
-  if (!previous || previous.homeId !== latest.homeId) return latest;
-  const preserveQuota = !latest.quota && Boolean(latest.errors?.quota && previous.quota);
-  const preserveTokenUsage = !latest.tokenUsage && Boolean(latest.errors?.tokenUsage && previous.tokenUsage);
-  if (!preserveQuota && !preserveTokenUsage) return latest;
-  return {
-    ...latest,
-    ...(preserveQuota ? { quota: previous.quota } : {}),
-    ...(preserveTokenUsage ? { tokenUsage: previous.tokenUsage } : {}),
-    stale: {
-      ...(preserveQuota ? { quota: true } : {}),
-      ...(preserveTokenUsage ? { tokenUsage: true } : {}),
-    },
-  };
-}
-
 function formatWindowDuration(minutes?: number | null): string {
   if (typeof minutes !== "number" || minutes <= 0) return "用量窗口";
   if (minutes === 300) return "5 小时";
@@ -722,8 +963,22 @@ function formatPercent(value: number): string {
 }
 
 function formatTokens(value?: number | null): string {
+  const unitValue = formatTokenUnit(value);
+  const exactValue = formatExactTokens(value);
+  return exactValue ? `${unitValue}（${exactValue}）` : unitValue;
+}
+
+function formatTokenUnit(value?: number | null): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "—";
-  return new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(value);
+  const isBillions = value >= 100_000_000;
+  const divisor = isBillions ? 100_000_000 : 10_000;
+  const roundedTenths = Math.round((value / divisor) * 10);
+  return `${(roundedTenths / 10).toFixed(1)}${isBillions ? "亿" : "万"}`;
+}
+
+function formatExactTokens(value?: number | null): string | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(value);
 }
 
 function formatDays(value?: number | null): string {

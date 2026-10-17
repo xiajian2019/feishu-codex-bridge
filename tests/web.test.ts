@@ -334,7 +334,14 @@ describe("DashboardServer", () => {
     const sessionsResponse = await fetch(bridgeUrl + "/tmux-dashboard/api/sessions");
     expect(sessionsResponse.status).toBe(200);
     expect(await sessionsResponse.json()).toEqual({
-      sessions: sessions.map((session) => ({ ...session, codexHomeId: null })),
+      sessions: sessions.map((session) => ({
+        ...session,
+        codexHomeId: null,
+        workspaceId: null,
+        taskGuid: null,
+        workspaceBranch: null,
+        workspaceStatus: null,
+      })),
       codexHomes: expect.any(Array),
     });
 

@@ -69,6 +69,7 @@ function createDashboardTaskDispatcher(
     config,
     workerRunner: codexWorker,
     captureWorkspaceSnapshot: captureGitWorkspaceSnapshot,
+    worktreeRoot: join(dirname(resolve(args.dbPath)), "worktrees"),
     larkOutboxEnabled: false,
     logger,
   });
@@ -146,6 +147,7 @@ function createCodexHistoryService(
     listCacheStore: db,
     threadHomePreferenceStore: db,
     runStore: db,
+    usageSnapshotStore: db,
     logger,
   });
 }
@@ -159,8 +161,11 @@ async function runWebOnlyMode(
   initializeProjectRegistry(db, config.projects);
   const port = args.webPort ?? 17310;
   const auth = new WebPairingAuth({ db, allowLocalRequests: true });
-  const tmuxDashboardApi = new TmuxDashboardApi({ db });
   const dispatcher = createDashboardTaskDispatcher(config, args, db, logger);
+  const tmuxDashboardApi = new TmuxDashboardApi({
+    db,
+    createTaskFromSession: (input, source) => dispatcher.submitWebTask(input, source),
+  });
   const dashboard = new DashboardServer({
     db,
     databasePath: resolve(args.dbPath),
@@ -500,10 +505,15 @@ async function runDirectMode(
     attachmentsDir: join(resolveBridgeDataRoot(import.meta.url), "runtime", "direct", "attachments"),
   });
   const auth = config.web.enabled ? new WebPairingAuth({ db }) : null;
-  const tmuxDashboardApi = auth ? new TmuxDashboardApi({ db }) : null;
-  const dashboardDispatcher = tmuxDashboardApi
+  const dashboardDispatcher = auth
     ? createDashboardTaskDispatcher(config, args, db, logger)
     : null;
+  const tmuxDashboardApi = auth ? new TmuxDashboardApi({
+    db,
+    ...(dashboardDispatcher
+      ? { createTaskFromSession: (input, source) => dashboardDispatcher.submitWebTask(input, source) }
+      : {}),
+  }) : null;
   const dashboard = auth && tmuxDashboardApi && dashboardDispatcher
     ? new DashboardServer({
       db,
@@ -655,10 +665,15 @@ async function runAampMode(
   const auth = config.web.enabled
     ? new WebPairingAuth({ db })
     : null;
-  const tmuxDashboardApi = config.web.enabled ? new TmuxDashboardApi({ db }) : null;
-  const dashboardDispatcher = tmuxDashboardApi
+  const dashboardDispatcher = auth
     ? createDashboardTaskDispatcher(config, args, db, logger)
     : null;
+  const tmuxDashboardApi = config.web.enabled ? new TmuxDashboardApi({
+    db,
+    ...(dashboardDispatcher
+      ? { createTaskFromSession: (input, source) => dashboardDispatcher.submitWebTask(input, source) }
+      : {}),
+  }) : null;
   const dashboard = config.web.enabled
     ? new DashboardServer({
         db,

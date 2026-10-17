@@ -38,6 +38,7 @@ export function TaskDetailPage(): ReactElement {
   const [retrying, setRetrying] = useState(false);
   const [reviewNote, setReviewNote] = useState("");
   const [reviewBusy, setReviewBusy] = useState(false);
+  const [workspaceBusy, setWorkspaceBusy] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
   const [currentFileTarget, setCurrentFileTarget] = useState<{ path: string; sequence: number } | null>(null);
   const filesRef = useRef<HTMLDetailsElement | null>(null);
@@ -151,6 +152,43 @@ export function TaskDetailPage(): ReactElement {
       setReviewBusy(false);
     }
   };
+  const openWorkspaceInTmux = async (): Promise<void> => {
+    const workspace = desk?.workspace;
+    const taskIsActive = desk?.task.state === "QUEUED" || desk?.task.state === "RUNNING";
+    if (!workspace || workspace.status === "removed" || workspaceBusy || taskIsActive) return;
+    setWorkspaceBusy(true);
+    setError(null);
+    try {
+      const token = await getActionToken();
+      const result = await getJson<{ session: { id: string } }>(
+        `/tmux-dashboard/api/workspaces/${encodeURIComponent(workspace.workspace_id)}/session`,
+        { method: "POST", headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token }, body: JSON.stringify({}) },
+      );
+      navigate(`/tmux-dashboard?session=${encodeURIComponent(result.session.id)}`);
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  };
+  const archiveWorkspace = async (): Promise<void> => {
+    const workspace = desk?.workspace;
+    if (!workspace || !desk?.can_archive_workspace || workspaceBusy) return;
+    if (!window.confirm("归档此任务工作区？归档会关闭该任务后续续问；worktree 目录和分支仍会保留，之后可在工作区管理页显式清理。")) return;
+    setWorkspaceBusy(true);
+    setError(null);
+    try {
+      const token = await getActionToken();
+      await getJson(`/api/task-workspaces/${encodeURIComponent(workspace.workspace_id)}/archive`, {
+        method: "POST", headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token }, body: JSON.stringify({}),
+      });
+      setRefresh((value) => value + 1);
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  };
   const retryTask = async (): Promise<void> => {
     if (source !== "desk" || !desk?.can_retry || retrying || !window.confirm("确认重新执行当前任务？原运行记录会保留。")) return;
     if (pendingRetry.current?.taskId !== taskId) pendingRetry.current = { taskId, key: crypto.randomUUID() };
@@ -211,6 +249,21 @@ export function TaskDetailPage(): ReactElement {
         </div>
         <button className="task-detail-page-refresh" type="button" onClick={() => setRefresh((value) => value + 1)} disabled={loading} aria-label="刷新详情" title="刷新详情">↻</button>
       </header>
+      {source === "desk" && desk?.workspace ? <section className="task-workspace-card" aria-label="Git worktree 工作区">
+        <div className="task-workspace-copy">
+          <strong>Git worktree · {desk.workspace.branch}</strong>
+          <span>{desk.workspace.status === "provisioning" ? "正在创建" : desk.workspace.status === "failed" ? "创建或恢复失败" : desk.workspace.status === "removed" ? "目录已移除" : desk.workspace.followups_closed_at ? "已归档" : "保留中"}</span>
+          <code title={desk.workspace.worktree_path}>{desk.workspace.worktree_path}</code>
+          <small>基准提交：{desk.workspace.base_sha.slice(0, 12)} · {desk.workspace.base_ref}</small>
+          {desk.workspace.last_error ? <small className="task-detail-page-error">{desk.workspace.last_error}</small> : null}
+        </div>
+        <div className="task-workspace-actions">
+          <button type="button" disabled={workspaceBusy || active || desk.workspace.status === "removed" || desk.workspace.followups_closed_at !== null} onClick={() => void openWorkspaceInTmux()}>
+            {workspaceBusy ? "处理中…" : "在 Tmux 打开"}
+          </button>
+          {desk.can_archive_workspace ? <button type="button" disabled={workspaceBusy} onClick={() => void archiveWorkspace()}>归档并关闭续问</button> : null}
+        </div>
+      </section> : null}
       {error ? <div className="task-detail-page-error" role="alert">{error}</div> : null}
       <div className="task-detail-page-scroll" ref={scrollRef}>
         {loading && !directTask && !deskTask && !aampTask ? <div className="empty">正在读取任务详情…</div> : null}
@@ -267,7 +320,7 @@ export function TaskDetailPage(): ReactElement {
           {deskTask.progress_text && active ? <div className="task-detail-progress">{deskTask.progress_text}</div> : null}
           {deskTask.last_error ? <div className="task-detail-page-error">{deskTask.last_error}</div> : null}
           {desk.attachments.length ? <details className="task-detail-extra"><summary>附件（{desk.attachments.length}）</summary>{desk.attachments.map((item) => <p key={item.attachment_id}><a href={taskAttachmentUrl(taskId, item.attachment_id)} target="_blank" rel="noreferrer">{item.file_name}</a></p>)}</details> : null}
-          <details ref={filesRef} className="task-detail-extra" open={filesOpen} onToggle={(event) => setFilesOpen(event.currentTarget.open)}><summary>当前项目文件（实时）</summary><p className="muted">此处是当前工作目录，不是任务产物快照；共享目录中的改动不能自动归因到本任务。</p>{filesOpen ? <TaskFileBrowser key={currentFileTarget?.sequence ?? 0} taskGuid={taskId} initialFilePath={currentFileTarget?.path} /> : null}</details>
+          <details ref={filesRef} className="task-detail-extra" open={filesOpen} onToggle={(event) => setFilesOpen(event.currentTarget.open)}><summary>{desk.workspace ? "当前任务工作区文件（实时）" : "当前项目文件（实时）"}</summary><p className="muted">此处读取当前工作目录，不是执行时的不可变产物快照；共享目录中的改动不能自动归因到本任务。</p>{filesOpen ? <TaskFileBrowser key={currentFileTarget?.sequence ?? 0} taskGuid={taskId} initialFilePath={currentFileTarget?.path} /> : null}</details>
           {active ? <button className="danger" type="button" disabled={interrupting} onClick={() => void interrupt()}>{interrupting ? "正在中断…" : "中断当前执行"}</button> : null}
           {desk.can_retry ? <button type="button" disabled={retrying} onClick={() => void retryTask()}>{retrying ? "正在重试…" : "重新执行任务"}</button> : null}
         </> : null}

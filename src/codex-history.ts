@@ -162,9 +162,13 @@ export interface CodexHistoryUsageAccount {
     resetCredits?: CodexAccountResetCredit[] | null;
   };
   tokenUsage?: CodexAccountTokenUsageResponse;
+  tokenUsageUpdatedAt?: string;
   errors?: {
     quota?: string;
     tokenUsage?: string;
+  };
+  stale?: {
+    tokenUsage?: boolean;
   };
 }
 
@@ -172,6 +176,28 @@ export interface CodexHistoryUsageResponse {
   generatedAt: string;
   dataSource: "codex-app-server";
   accounts: CodexHistoryUsageAccount[];
+  globalDailyUsageBuckets: CodexHistoryUsageDailyBucket[];
+}
+
+export interface CodexHistoryUsageDailyBucket {
+  startDate: string;
+  tokens: number;
+}
+
+export interface CodexHistoryUsageSnapshot {
+  snapshotDate: string;
+  capturedAt: string;
+  tokenUsage: CodexAccountTokenUsageResponse;
+}
+
+export interface CodexHistoryUsageSnapshotStore {
+  getCodexUsageSnapshot(homeId: string): CodexHistoryUsageSnapshot | null;
+  saveCodexUsageSnapshot(
+    homeId: string,
+    snapshot: CodexHistoryUsageSnapshot,
+    finalizedDailyBuckets: CodexHistoryUsageDailyBucket[],
+  ): void;
+  listCodexUsageDailyBuckets(homeId: string): CodexHistoryUsageDailyBucket[];
 }
 
 export interface CodexHistoryDetailResponse {
@@ -327,6 +353,8 @@ export interface CodexHistoryServiceOptions {
   threadHomePreferenceStore?: CodexHistoryThreadHomePreferenceStore;
   /** Optional Bridge DB receipts and metadata for recoverable history continuations. */
   runStore?: CodexHistoryRunStore;
+  /** Optional Bridge DB storage for account token snapshots and finalized daily buckets. */
+  usageSnapshotStore?: CodexHistoryUsageSnapshotStore;
   /** Injectable clock for deterministic attachment lifecycle tests. */
   now?: () => number;
 }
@@ -412,6 +440,7 @@ export class CodexHistoryService {
   }>();
   private readonly listRefreshes = new Map<string, Promise<CodexThread[]>>();
   private readonly recoveryChecks = new Map<string, Promise<CodexHistoryRunRecoveryStatus>>();
+  private readonly usageRefreshes = new Map<string, Promise<CodexHistoryUsageAccount>>();
 
   constructor(options: CodexHistoryServiceOptions) {
     this.options = options;
@@ -609,39 +638,142 @@ export class CodexHistoryService {
   }
 
   public async readUsage(homeId?: string): Promise<CodexHistoryUsageResponse> {
-    const generatedAt = new Date().toISOString();
+    const generatedAt = new Date(this.now()).toISOString();
+    const snapshotDate = generatedAt.slice(0, 10);
     const homes = this.resolveHomes();
     const selectedHomes = homeId ? homes.filter((home) => home.id === homeId) : homes;
     if (homeId && selectedHomes.length === 0) throw new Error("找不到 Codex home");
-    const accounts = await Promise.all(selectedHomes.map(async (home) => {
-      const checkedAt = new Date().toISOString();
-      if (!home.available) {
-        return {
-          homeId: home.id,
-          label: home.label,
-          available: false,
-          checkedAt,
-          errors: { quota: "Codex home 不可用。", tokenUsage: "Codex home 不可用。" },
-        } satisfies CodexHistoryUsageAccount;
+    const accounts = await Promise.all(selectedHomes.map((home) => this.readUsageAccount(home, snapshotDate)));
+    const dailyTotals = new Map<string, number>();
+    for (const account of accounts) {
+      for (const bucket of account.tokenUsage?.dailyUsageBuckets ?? []) {
+        dailyTotals.set(bucket.startDate, (dailyTotals.get(bucket.startDate) ?? 0) + bucket.tokens);
+      }
+    }
+    const globalDailyUsageBuckets = [...dailyTotals.entries()]
+      .map(([startDate, tokens]) => ({ startDate, tokens }))
+      .sort((left, right) => left.startDate.localeCompare(right.startDate));
+    return { generatedAt, dataSource: "codex-app-server", accounts, globalDailyUsageBuckets };
+  }
+
+  private async readUsageAccount(home: ResolvedCodexHistoryHome, snapshotDate: string): Promise<CodexHistoryUsageAccount> {
+    const checkedAt = new Date(this.now()).toISOString();
+    const store = this.options.usageSnapshotStore;
+    let cached: CodexHistoryUsageSnapshot | null = null;
+    try {
+      cached = store?.getCodexUsageSnapshot(home.id) ?? null;
+    } catch {
+      // Keep account usage available when the optional persistence layer is unhealthy.
+    }
+
+    if (!home.available) {
+      return {
+        homeId: home.id,
+        label: home.label,
+        available: false,
+        checkedAt,
+        errors: { quota: "Codex home 不可用。", ...(cached ? {} : { tokenUsage: "Codex home 不可用。" }) },
+        ...(cached ? this.accountUsageFromSnapshot(home, cached, true) : {}),
+      };
+    }
+
+    let account: CodexHistoryUsageAccount;
+    if (cached?.snapshotDate === snapshotDate) {
+      account = await this.readCachedUsageAccount(home, cached, checkedAt);
+    } else {
+      const existingRefresh = this.usageRefreshes.get(home.id);
+      if (existingRefresh) {
+        account = await existingRefresh;
+      } else {
+        const refresh = this.refreshUsageAccount(home, snapshotDate, checkedAt, cached);
+        this.usageRefreshes.set(home.id, refresh);
+        try {
+          account = await refresh;
+        } finally {
+          if (this.usageRefreshes.get(home.id) === refresh) this.usageRefreshes.delete(home.id);
+        }
+      }
+    }
+
+    return account;
+  }
+
+  private async readCachedUsageAccount(
+    home: ResolvedCodexHistoryHome,
+    snapshot: CodexHistoryUsageSnapshot,
+    checkedAt: string,
+  ): Promise<CodexHistoryUsageAccount> {
+    let client: CodexAppServerQueryClient | null = null;
+    try {
+      client = this.createClient(home);
+      if (!client.readAccountRateLimits) throw new Error("account/rateLimits/read is unavailable");
+      const quota = publicQuotaResponse(await client.readAccountRateLimits());
+      return {
+        homeId: home.id,
+        label: home.label,
+        available: true,
+        checkedAt,
+        quota,
+        ...this.accountUsageFromSnapshot(home, snapshot, false),
+      };
+    } catch {
+      return {
+        homeId: home.id,
+        label: home.label,
+        available: true,
+        checkedAt,
+        errors: { quota: "读取额度失败，请确认该账户的 Codex 登录状态和网络连接。" },
+        ...this.accountUsageFromSnapshot(home, snapshot, false),
+      };
+    } finally {
+      if (client) await client.close().catch(() => undefined);
+    }
+  }
+
+  private async refreshUsageAccount(
+    home: ResolvedCodexHistoryHome,
+    snapshotDate: string,
+    checkedAt: string,
+    previousSnapshot: CodexHistoryUsageSnapshot | null,
+  ): Promise<CodexHistoryUsageAccount> {
+    let client: CodexAppServerQueryClient | null = null;
+    try {
+      client = this.createClient(home);
+      const quotaRequest = client.readAccountRateLimits
+        ? client.readAccountRateLimits()
+        : Promise.reject(new Error("account/rateLimits/read is unavailable"));
+      const tokenUsageRequest = client.readAccountTokenUsage
+        ? client.readAccountTokenUsage()
+        : Promise.reject(new Error("account/usage/read is unavailable"));
+      const [quotaResult, tokenUsageResult] = await Promise.allSettled([quotaRequest, tokenUsageRequest]);
+      const errors: NonNullable<CodexHistoryUsageAccount["errors"]> = {};
+      const quota = quotaResult.status === "fulfilled" ? publicQuotaResponse(quotaResult.value) : undefined;
+      if (quotaResult.status === "rejected") {
+        errors.quota = "读取额度失败，请确认该账户的 Codex 登录状态和网络连接。";
       }
 
-      let client: CodexAppServerQueryClient | null = null;
-      try {
-        client = this.createClient(home);
-        const quotaRequest = client.readAccountRateLimits
-          ? client.readAccountRateLimits()
-          : Promise.reject(new Error("account/rateLimits/read is unavailable"));
-        const tokenUsageRequest = client.readAccountTokenUsage
-          ? client.readAccountTokenUsage()
-          : Promise.reject(new Error("account/usage/read is unavailable"));
-        const [quotaResult, tokenUsageResult] = await Promise.allSettled([quotaRequest, tokenUsageRequest]);
-        const errors: NonNullable<CodexHistoryUsageAccount["errors"]> = {};
-        const quota = quotaResult.status === "fulfilled" ? publicQuotaResponse(quotaResult.value) : undefined;
-        if (quotaResult.status === "rejected") {
-          errors.quota = "读取额度失败，请确认该账户的 Codex 登录状态和网络连接。";
+      if (tokenUsageResult.status === "fulfilled") {
+        const tokenUsage = publicTokenUsageResponse(tokenUsageResult.value);
+        const snapshot: CodexHistoryUsageSnapshot = {
+          snapshotDate,
+          capturedAt: checkedAt,
+          tokenUsage,
+        };
+        const finalizedBuckets = new Map<string, number>();
+        for (const bucket of previousSnapshot?.tokenUsage.dailyUsageBuckets ?? []) {
+          if (bucket.startDate < snapshotDate) finalizedBuckets.set(bucket.startDate, bucket.tokens);
         }
-        if (tokenUsageResult.status === "rejected") {
-          errors.tokenUsage = "账户每日 Token 统计暂不可用。";
+        for (const bucket of tokenUsage.dailyUsageBuckets ?? []) {
+          if (bucket.startDate < snapshotDate) finalizedBuckets.set(bucket.startDate, bucket.tokens);
+        }
+        try {
+          this.options.usageSnapshotStore?.saveCodexUsageSnapshot(
+            home.id,
+            snapshot,
+            [...finalizedBuckets.entries()].map(([startDate, tokens]) => ({ startDate, tokens })),
+          );
+        } catch {
+          // Return the fresh app-server response even if the optional cache write fails.
         }
         return {
           homeId: home.id,
@@ -649,27 +781,65 @@ export class CodexHistoryService {
           available: true,
           checkedAt,
           ...(quota ? { quota } : {}),
-          ...(tokenUsageResult.status === "fulfilled"
-            ? { tokenUsage: publicTokenUsageResponse(tokenUsageResult.value) }
-            : {}),
+          ...this.accountUsageFromSnapshot(home, snapshot, false),
           ...(Object.keys(errors).length > 0 ? { errors } : {}),
-        } satisfies CodexHistoryUsageAccount;
-      } catch {
-        return {
-          homeId: home.id,
-          label: home.label,
-          available: true,
-          checkedAt,
-          errors: {
-            quota: "读取额度失败，请确认该账户的 Codex 登录状态和网络连接。",
-            tokenUsage: "账户每日 Token 统计暂不可用。",
-          },
-        } satisfies CodexHistoryUsageAccount;
-      } finally {
-        if (client) await client.close().catch(() => undefined);
+        };
       }
-    }));
-    return { generatedAt, dataSource: "codex-app-server", accounts };
+
+      if (!previousSnapshot) errors.tokenUsage = "账户每日 Token 统计暂不可用。";
+      return {
+        homeId: home.id,
+        label: home.label,
+        available: true,
+        checkedAt,
+        ...(quota ? { quota } : {}),
+        ...(previousSnapshot ? this.accountUsageFromSnapshot(home, previousSnapshot, true) : {}),
+        ...(Object.keys(errors).length > 0 ? { errors } : {}),
+      };
+    } catch {
+      return {
+        homeId: home.id,
+        label: home.label,
+        available: true,
+        checkedAt,
+        ...(previousSnapshot ? this.accountUsageFromSnapshot(home, previousSnapshot, true) : {}),
+        errors: {
+          quota: "读取额度失败，请确认该账户的 Codex 登录状态和网络连接。",
+          ...(previousSnapshot ? {} : { tokenUsage: "账户每日 Token 统计暂不可用。" }),
+        },
+      };
+    } finally {
+      if (client) await client.close().catch(() => undefined);
+    }
+  }
+
+  private accountUsageFromSnapshot(
+    home: ResolvedCodexHistoryHome,
+    snapshot: CodexHistoryUsageSnapshot,
+    stale: boolean,
+  ): Pick<CodexHistoryUsageAccount, "tokenUsage" | "tokenUsageUpdatedAt" | "stale"> {
+    const store = this.options.usageSnapshotStore;
+    let storedBuckets: CodexHistoryUsageDailyBucket[] = [];
+    try {
+      storedBuckets = store?.listCodexUsageDailyBuckets(home.id) ?? [];
+    } catch {
+      // The snapshot still carries its original daily buckets.
+    }
+    const dailyBuckets = new Map(storedBuckets.map((bucket) => [bucket.startDate, bucket.tokens]));
+    for (const bucket of snapshot.tokenUsage.dailyUsageBuckets ?? []) {
+      if (!dailyBuckets.has(bucket.startDate)) dailyBuckets.set(bucket.startDate, bucket.tokens);
+    }
+    const tokenUsage: CodexAccountTokenUsageResponse = {
+      ...snapshot.tokenUsage,
+      dailyUsageBuckets: [...dailyBuckets.entries()]
+        .map(([startDate, tokens]) => ({ startDate, tokens }))
+        .sort((left, right) => left.startDate.localeCompare(right.startDate)),
+    };
+    return {
+      tokenUsage,
+      tokenUsageUpdatedAt: snapshot.capturedAt,
+      ...(stale ? { stale: { tokenUsage: true } } : {}),
+    };
   }
 
   public async consumeResetCredit(

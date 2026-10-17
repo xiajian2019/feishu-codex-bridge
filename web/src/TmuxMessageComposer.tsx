@@ -44,6 +44,68 @@ const TmuxShortcutPalette = lazy(() => import("./TmuxShortcutPalette.js").then((
 const API_ROOT = "/tmux-dashboard/api";
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
+function macComposerTerminalShortcut(event: KeyboardEvent, composerEmpty: boolean): TerminalShortcut | null {
+  if (
+    typeof navigator === "undefined"
+    || !navigator.platform.toLowerCase().startsWith("mac")
+    || event.isComposing
+    || event.metaKey
+    || event.altKey
+    || event.shiftKey
+  ) return null;
+
+  if (event.ctrlKey) {
+    const key = event.key.toLowerCase();
+    if (key === "c") return "codex-interrupt";
+    if (!composerEmpty) return null;
+    if (key === "l") return "ctrl-l";
+    if (key === "r") return "ctrl-r";
+    return null;
+  }
+
+  if (!composerEmpty) return null;
+  switch (event.key) {
+    case "Escape": return "codex-escape";
+    case "ArrowUp": return "codex-up";
+    case "ArrowDown": return "codex-down";
+    case "Enter": return "codex-enter";
+    default: return null;
+  }
+}
+
+type CodexSkillOption = {
+  skillName: string;
+  descriptionZh: string;
+};
+
+async function fetchSessionCodexSkills(
+  sessionId: string,
+  query: string,
+  signal: AbortSignal,
+): Promise<{ skills: CodexSkillOption[]; refreshing: boolean }> {
+  const params = new URLSearchParams();
+  if (query.trim()) params.set("q", query.trim());
+  const queryString = params.size > 0 ? "?" + params.toString() : "";
+  const response = await fetch(API_ROOT + "/sessions/" + encodeURIComponent(sessionId) + "/skills" + queryString, {
+    headers: { Accept: "application/json" },
+    signal,
+  });
+  const payload = await response.json() as { skills?: unknown; error?: string; refreshing?: unknown };
+  if (!response.ok || !Array.isArray(payload.skills)) {
+    throw new Error(payload.error || "Could not load Codex skills.");
+  }
+  const skills = payload.skills.flatMap((value): CodexSkillOption[] => {
+    if (typeof value !== "object" || value === null) return [];
+    const skill = value as Partial<CodexSkillOption>;
+    if (typeof skill.skillName !== "string") return [];
+    return [{
+      skillName: skill.skillName,
+      descriptionZh: typeof skill.descriptionZh === "string" ? skill.descriptionZh : "",
+    }];
+  });
+  return { skills, refreshing: payload.refreshing === true };
+}
+
 export type ComposerSubmissionResult = { ok: boolean; message?: string };
 export type { TerminalShortcut };
 export type SessionFileForwardRequest = { id: string; sessionId: string; text: string };
@@ -200,11 +262,26 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
   const [shortcutCategory, setShortcutCategory] = useState<ShortcutCategory>("favorites");
   const [shortcutStore, setShortcutStore] = useState<ShortcutStore>(() => readShortcutConfigCache() ?? { groups: [], shortcuts: [] });
   const [previewFile, setPreviewFile] = useState<File | null>(null);
+  const [codexSkills, setCodexSkills] = useState<CodexSkillOption[]>([]);
+  const [skillsLoading, setSkillsLoading] = useState(false);
+  const [skillsLoadError, setSkillsLoadError] = useState<string | null>(null);
+  const [skillsPickerOpen, setSkillsPickerOpen] = useState(false);
+  const [skillSearchQuery, setSkillSearchQuery] = useState("");
+  const [activeSkillIndex, setActiveSkillIndex] = useState(0);
+  const skillsRequestRef = useRef<AbortController | null>(null);
+  const skillsRequestSequenceRef = useRef(0);
+  const skillsRefreshTimerRef = useRef<number | null>(null);
+  const skillsSearchTimerRef = useRef<number | null>(null);
   const [debugLogActive, setDebugLogActive] = useState(() => isDebugLogCaptureActive());
   const [debugLogBusy, setDebugLogBusy] = useState(false);
   const controlsDisabled = disabled || sending || preparing || debugLogBusy;
   const debugLogControlsDisabled = sending || preparing || debugLogBusy || (disabled && !debugLogActive);
   const composerFormRef = useRef<HTMLFormElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const skillButtonRef = useRef<HTMLButtonElement | null>(null);
+  const skillSearchRef = useRef<HTMLInputElement | null>(null);
+  const skillPickerRef = useRef<HTMLDivElement | null>(null);
+  const inputSelectionRef = useRef<{ start: number; end: number } | null>(null);
   const diagnosticActiveRef = useRef(diagnosticSessionActive);
   diagnosticActiveRef.current = diagnosticSessionActive;
   const composerShortcuts = useMemo(() => {
@@ -218,6 +295,158 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
       : [...DEFAULT_COMPOSER_SHORTCUTS];
     return source.filter((shortcut) => shortcut.enabled).sort((left, right) => left.sortOrder - right.sortOrder);
   }, [shortcutStore]);
+
+  const filteredCodexSkills = codexSkills;
+
+  const loadCodexSkills = (targetSessionId: string, query = ""): void => {
+    if (skillsRefreshTimerRef.current !== null) {
+      window.clearTimeout(skillsRefreshTimerRef.current);
+      skillsRefreshTimerRef.current = null;
+    }
+    if (skillsSearchTimerRef.current !== null) {
+      window.clearTimeout(skillsSearchTimerRef.current);
+      skillsSearchTimerRef.current = null;
+    }
+    skillsRequestRef.current?.abort();
+    const controller = new AbortController();
+    skillsRequestRef.current = controller;
+    const requestSequence = ++skillsRequestSequenceRef.current;
+    setSkillsLoading(true);
+    setSkillsLoadError(null);
+    const fetchLatest = (refreshAttempt: number): void => {
+      void fetchSessionCodexSkills(targetSessionId, query, controller.signal)
+        .then(({ skills, refreshing }) => {
+          if (controller.signal.aborted || requestSequence !== skillsRequestSequenceRef.current) return;
+          setCodexSkills(skills);
+          setSkillsLoading(false);
+          if (refreshing && refreshAttempt < 8) {
+            skillsRefreshTimerRef.current = window.setTimeout(() => {
+              skillsRefreshTimerRef.current = null;
+              fetchLatest(refreshAttempt + 1);
+            }, 750);
+          } else {
+            skillsRequestRef.current = null;
+          }
+        })
+        .catch((error: unknown) => {
+          if (controller.signal.aborted || requestSequence !== skillsRequestSequenceRef.current) return;
+          setSkillsLoadError(error instanceof Error ? error.message : "Could not load Codex skills.");
+          setSkillsLoading(false);
+          skillsRequestRef.current = null;
+        });
+    };
+    fetchLatest(0);
+  };
+
+  useEffect(() => {
+    skillsRequestSequenceRef.current += 1;
+    if (skillsRefreshTimerRef.current !== null) {
+      window.clearTimeout(skillsRefreshTimerRef.current);
+      skillsRefreshTimerRef.current = null;
+    }
+    if (skillsSearchTimerRef.current !== null) {
+      window.clearTimeout(skillsSearchTimerRef.current);
+      skillsSearchTimerRef.current = null;
+    }
+    skillsRequestRef.current?.abort();
+    skillsRequestRef.current = null;
+    setSkillsPickerOpen(false);
+    setSkillSearchQuery("");
+    setActiveSkillIndex(0);
+    inputSelectionRef.current = null;
+    setCodexSkills([]);
+    setSkillsLoading(false);
+    setSkillsLoadError(null);
+    return () => {
+      skillsRequestSequenceRef.current += 1;
+      if (skillsRefreshTimerRef.current !== null) {
+        window.clearTimeout(skillsRefreshTimerRef.current);
+        skillsRefreshTimerRef.current = null;
+      }
+      if (skillsSearchTimerRef.current !== null) {
+        window.clearTimeout(skillsSearchTimerRef.current);
+        skillsSearchTimerRef.current = null;
+      }
+      skillsRequestRef.current?.abort();
+      skillsRequestRef.current = null;
+    };
+  }, [sessionId]);
+
+  const rememberComposerSelection = (): void => {
+    const input = inputRef.current;
+    if (!input) return;
+    inputSelectionRef.current = { start: input.selectionStart, end: input.selectionEnd };
+  };
+
+  const insertCodexSkill = (skill: CodexSkillOption): void => {
+    const text = aui.composer.getState().text;
+    const input = inputRef.current;
+    const savedSelection = inputSelectionRef.current;
+    const start = Math.max(0, Math.min(text.length, savedSelection?.start ?? input?.selectionStart ?? text.length));
+    const end = Math.max(start, Math.min(text.length, savedSelection?.end ?? input?.selectionEnd ?? start));
+    const before = text.slice(0, start);
+    const after = text.slice(end);
+    const token = "$" + skill.skillName;
+    const separator = /^\s/u.test(after) ? "" : " ";
+    const nextText = before + token + separator + after;
+    const nextCursor = before.length + token.length + separator.length;
+    aui.composer.setText(nextText);
+    setSkillsPickerOpen(false);
+    setSkillSearchQuery("");
+    inputSelectionRef.current = null;
+    window.requestAnimationFrame(() => {
+      const currentInput = inputRef.current;
+      if (!currentInput) return;
+      currentInput.focus();
+      currentInput.setSelectionRange(nextCursor, nextCursor);
+    });
+  };
+
+  const closeSkillPicker = (returnFocus = true): void => {
+    setSkillsPickerOpen(false);
+    if (returnFocus) window.requestAnimationFrame(() => skillButtonRef.current?.focus());
+  };
+
+  useEffect(() => {
+    if (!skillsPickerOpen) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (!window.matchMedia("(pointer: coarse)").matches) skillSearchRef.current?.focus();
+    });
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      event.preventDefault();
+      setSkillsPickerOpen(false);
+      window.requestAnimationFrame(() => skillButtonRef.current?.focus());
+    };
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (skillPickerRef.current?.contains(target) || skillButtonRef.current?.contains(target)) return;
+      setSkillsPickerOpen(false);
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("keydown", closeOnEscape);
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+    };
+  }, [skillsPickerOpen]);
+
+  useEffect(() => {
+    if (skillsPickerOpen) return;
+    skillsRequestSequenceRef.current += 1;
+    if (skillsRefreshTimerRef.current !== null) {
+      window.clearTimeout(skillsRefreshTimerRef.current);
+      skillsRefreshTimerRef.current = null;
+    }
+    if (skillsSearchTimerRef.current !== null) {
+      window.clearTimeout(skillsSearchTimerRef.current);
+      skillsSearchTimerRef.current = null;
+    }
+    skillsRequestRef.current?.abort();
+    skillsRequestRef.current = null;
+  }, [skillsPickerOpen]);
 
   useEffect(() => subscribeDebugLogCapture((active) => setDebugLogActive(active)), []);
 
@@ -497,6 +726,8 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
     switch (shortcut.actionKey) {
       case "attachment":
         return <ComposerPrimitive.AddAttachment key={shortcut.id} className="dashboard-keybar-button is-attachment" type="button" multiple disabled={controlsDisabled} onClick={track}>{shortcut.title === "附件" ? "＋" : shortcut.title}</ComposerPrimitive.AddAttachment>;
+      case "skill-picker":
+        return <button key={shortcut.id} ref={skillButtonRef} className="dashboard-keybar-button is-skill-picker" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.detail || shortcut.title} aria-haspopup="dialog" aria-expanded={skillsPickerOpen} disabled={!sessionId || controlsDisabled} onPointerDown={rememberComposerSelection} onClick={() => { track(); openSkillsPicker(); }}>{shortcut.title || "$"}</button>;
       case "scroll-top":
         return <button key={shortcut.id} className="dashboard-keybar-button is-icon is-scroll-jump" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.title} disabled={controlsDisabled} onClick={() => { track(); onScrollToTop(); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 19V8m0 0-5 5m5-5 5 5" /></svg></button>;
       case "scroll-bottom":
@@ -523,12 +754,28 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
     }
   };
 
+  const skillPickerId = "tmux-skill-picker-" + (sessionId ?? "none").replace(/[^A-Za-z0-9_-]/g, "-");
+  const skillPickerListId = skillPickerId + "-list";
+  const openSkillsPicker = (): void => {
+    if (skillsPickerOpen) {
+      closeSkillPicker(false);
+      return;
+    }
+    if (document.activeElement === inputRef.current) rememberComposerSelection();
+    inputRef.current?.blur();
+    setSkillSearchQuery("");
+    setActiveSkillIndex(0);
+    if (sessionId) loadCodexSkills(sessionId);
+    setSkillsPickerOpen(true);
+  };
+
   return (
     <>
       <ComposerPrimitive.Root
         className="dashboard-composer"
         ref={composerFormRef}
         onSubmit={() => {
+          setSkillsPickerOpen(false);
           if (aui.composer.getState().isEmpty) return;
           setShortcutsOpen(false);
           onSendStart();
@@ -554,25 +801,141 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
             )}
           </ComposerPrimitive.Attachments>
         </div>
-        <ComposerPrimitive.Input
-          className="dashboard-composer-input"
-          aria-label="Message the Codex session"
-          placeholder={placeholder}
-          maxLength={8_000}
-          minRows={2}
-          maxRows={6}
-          disabled={controlsDisabled}
-          submitMode="enter"
-          unstable_insertNewlineOnTouchEnter
-          unstable_focusOnRunStart={false}
-          unstable_focusOnScrollToBottom={false}
-          unstable_focusOnThreadSwitched={false}
-          onFocus={() => {
-            if (!shortcutsOpen) return;
-            logDebugDiagnostic("tmux-shortcut", "composer-focus-close", { category: shortcutCategory });
-            setShortcutsOpen(false);
-          }}
-        />
+        <div className="dashboard-composer-input-slot">
+          <ComposerPrimitive.Input
+            className="dashboard-composer-input"
+            ref={inputRef}
+            aria-label="Message the Codex session"
+            placeholder={placeholder}
+            maxLength={8_000}
+            minRows={2}
+            maxRows={6}
+            disabled={controlsDisabled}
+            submitMode="enter"
+            unstable_insertNewlineOnTouchEnter
+            unstable_focusOnRunStart={false}
+            unstable_focusOnScrollToBottom={false}
+            unstable_focusOnThreadSwitched={false}
+            onKeyDown={(event) => {
+              const shortcut = macComposerTerminalShortcut(
+                event.nativeEvent,
+                aui.composer.getState().isEmpty,
+              );
+              if (!shortcut) return;
+              event.preventDefault();
+              event.stopPropagation();
+              void onTerminalShortcut(shortcut);
+            }}
+            onBlur={(event) => {
+              inputSelectionRef.current = {
+                start: event.currentTarget.selectionStart,
+                end: event.currentTarget.selectionEnd,
+              };
+            }}
+            onFocus={() => {
+              if (!shortcutsOpen) return;
+              logDebugDiagnostic("tmux-shortcut", "composer-focus-close", { category: shortcutCategory });
+              setShortcutsOpen(false);
+            }}
+          />
+          {skillsPickerOpen ? (
+            <div
+              ref={skillPickerRef}
+              id={skillPickerId}
+              className="dashboard-skill-suggestions"
+              role="dialog"
+              aria-label="选择 Codex 技能"
+            >
+              <input
+                ref={skillSearchRef}
+                className="dashboard-skill-picker-search"
+                type="search"
+                aria-label="筛选技能"
+                aria-autocomplete="list"
+                aria-controls={skillPickerListId}
+                aria-activedescendant={filteredCodexSkills[activeSkillIndex]
+                  ? skillPickerListId + "-" + activeSkillIndex
+                  : undefined}
+                placeholder="搜索技能"
+                value={skillSearchQuery}
+                onChange={(event) => {
+                  const query = event.currentTarget.value;
+                  setSkillSearchQuery(query);
+                  setActiveSkillIndex(0);
+                  if (skillsRefreshTimerRef.current !== null) {
+                    window.clearTimeout(skillsRefreshTimerRef.current);
+                    skillsRefreshTimerRef.current = null;
+                  }
+                  if (skillsSearchTimerRef.current !== null) window.clearTimeout(skillsSearchTimerRef.current);
+                  skillsRequestSequenceRef.current += 1;
+                  skillsRequestRef.current?.abort();
+                  skillsRequestRef.current = null;
+                  setCodexSkills([]);
+                  setSkillsLoading(true);
+                  setSkillsLoadError(null);
+                  if (sessionId) {
+                    skillsSearchTimerRef.current = window.setTimeout(() => {
+                      skillsSearchTimerRef.current = null;
+                      loadCodexSkills(sessionId, query);
+                    }, 180);
+                  }
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    closeSkillPicker();
+                    return;
+                  }
+                  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                    if (filteredCodexSkills.length === 0) return;
+                    event.preventDefault();
+                    const direction = event.key === "ArrowDown" ? 1 : -1;
+                    setActiveSkillIndex((current) => (
+                      current + direction + filteredCodexSkills.length
+                    ) % filteredCodexSkills.length);
+                  } else if (event.key === "Enter") {
+                    event.preventDefault();
+                    const selected = filteredCodexSkills[activeSkillIndex];
+                    if (selected) insertCodexSkill(selected);
+                  }
+                }}
+              />
+              <div id={skillPickerListId} className="dashboard-skill-suggestions-list" role="listbox" aria-label="技能列表">
+                {skillsLoading ? (
+                  <div className="dashboard-skill-picker-message" role="status">正在读取技能…</div>
+                ) : skillsLoadError ? (
+                  <div className="dashboard-skill-picker-message is-error" role="status">{skillsLoadError}</div>
+                ) : filteredCodexSkills.length === 0 ? (
+                  <div className="dashboard-skill-picker-message" role="status">没有匹配的技能</div>
+                ) : (
+                  filteredCodexSkills.map((skill, index) => {
+                    return (
+                      <button
+                        key={skill.skillName}
+                        id={skillPickerListId + "-" + index}
+                        className={"dashboard-skill-suggestion" + (index === activeSkillIndex ? " is-active" : "")}
+                        type="button"
+                        role="option"
+                        aria-selected={index === activeSkillIndex}
+                        onPointerDown={(event) => event.preventDefault()}
+                        onPointerMove={() => setActiveSkillIndex(index)}
+                        onClick={() => insertCodexSkill(skill)}
+                      >
+                        <span className="dashboard-skill-suggestion-heading">
+                          <span className="dashboard-skill-suggestion-name">{skill.skillName}</span>
+                        </span>
+                        <span className="dashboard-skill-suggestion-description">
+                          {skill.descriptionZh}
+                        </span>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          ) : null}
+        </div>
         <div className="dashboard-composer-actions">
           <div className="dashboard-composer-keybar" role="toolbar" aria-label="Quick terminal keys">
             {shortcutsOpen ? (

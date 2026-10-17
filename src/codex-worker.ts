@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import { verifyTaskWorkspace } from "./git-workspaces.js";
 import { loadConfig } from "./config.js";
 import { isSingleBinaryRuntime } from "./portable-runtime.js";
 import { StateDatabase } from "./db.js";
@@ -116,8 +117,16 @@ export async function runWorker(args: WorkerArguments): Promise<WorkerResult> {
       codexPathOverride: config.codex.cliPath,
       env: buildCodexEnvironment(config),
     });
+    const workspace = task.origin === "web" ? db.getTaskWorkspace(task.task_guid) : null;
+    let workingDirectory = task.repo;
+    if (workspace) {
+      if ((workspace.status !== "ready" && workspace.status !== "retained") || workspace.followups_closed_at) {
+        throw new Error("任务工作区当前不可执行或已经归档。");
+      }
+      workingDirectory = await verifyTaskWorkspace(workspace);
+    }
     const threadOptions = {
-      workingDirectory: task.repo,
+      workingDirectory,
       sandboxMode: mode.sandboxMode,
       approvalPolicy: "never" as const,
       ...(attachments.length > 0 ? { additionalDirectories: [dirname(attachments[0]!.local_path)] } : {}),

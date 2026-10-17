@@ -79,6 +79,11 @@ export function codexPathCandidates(
     for (const appBundlePath of chatGptAppBundlePaths(options)) {
       addCandidate(
         candidates,
+        join(appBundlePath, "Contents", "Resources", "codex-cli", "bin", "codex"),
+        "chatgpt-app",
+      );
+      addCandidate(
+        candidates,
         join(appBundlePath, "Contents", "Resources", "codex"),
         "chatgpt-app",
       );
