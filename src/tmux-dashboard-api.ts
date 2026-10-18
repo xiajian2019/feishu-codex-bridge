@@ -25,6 +25,7 @@ const CODEX_SKILL_SOURCE_MAX_AGE_MS = 30 * 60 * 1_000;
 const CODEX_SKILL_REFRESH_RETRY_MS = 60 * 1_000;
 const SUBMIT_FAST_FLUSH_WINDOW_MS = 5_000;
 const SUBMIT_FAST_FLUSH_IDLE_MS = 250;
+const MAX_TERMINAL_INPUT_BYTES = 32 * 1024;
 const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.freeze({
   "codex-escape": "\u001b",
   "codex-interrupt": "\u0003",
@@ -1061,10 +1062,6 @@ export class TmuxDashboardApi {
         return;
       }
       const chunks = outputQueue.splice(0);
-      if (chunks.length === 1) {
-        client.send(chunks[0]!);
-        return;
-      }
       client.send(Buffer.concat(chunks.map((chunk) => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))));
     };
     const queueOutput = (output: string | Uint8Array): void => {
@@ -1104,6 +1101,32 @@ export class TmuxDashboardApi {
       }
       if (typeof payload !== "object" || payload === null) return;
       const control = payload as { type?: unknown; data?: unknown; text?: unknown; key?: unknown; requestId?: unknown; cols?: unknown; rows?: unknown };
+      if (control.type === "input") {
+        const input = validateTerminalInput(control.data);
+        if (!input) {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+              type: "input-error",
+              message: "终端输入单次不能超过 32 KiB。",
+            }));
+          }
+          return;
+        }
+        if (!data.terminal) return;
+        try {
+          // Raw terminal data intentionally bypasses the message history. It may
+          // contain passwords and is emitted once per key stroke.
+          data.terminal.write(input);
+        } catch {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+              type: "input-error",
+              message: "无法写入当前 tmux Session。",
+            }));
+          }
+        }
+        return;
+      }
       if (
         control.type === "scroll"
         && typeof control.data === "string"
@@ -1332,8 +1355,8 @@ export class TmuxDashboardApi {
       data.terminal = child.terminal;
       const initialScreen = await captureInitialScreen(data.sessionId, data.rows);
       if (cleanedUp || client.readyState !== WebSocket.OPEN) return;
-      client.send(initialScreen);
       initialScreenReady = true;
+      client.send(Buffer.from(initialScreen));
       void child.exited.then((exitCode) => {
         if (client.readyState === WebSocket.OPEN) {
           flushOutput();
@@ -1402,6 +1425,11 @@ export function hasNewSubmissionEcho(before: string, after: string, submittedTex
     countOccurrences(afterNormalized, expectedSnippet) > countOccurrences(beforeNormalized, expectedSnippet)
     || countOccurrences(afterCompact, expectedCompactSnippet) > countOccurrences(beforeCompact, expectedCompactSnippet)
   );
+}
+
+export function validateTerminalInput(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return Buffer.byteLength(value, "utf8") <= MAX_TERMINAL_INPUT_BYTES ? value : null;
 }
 
 function countOccurrences(value: string, snippet: string): number {

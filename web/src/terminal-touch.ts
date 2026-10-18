@@ -487,7 +487,6 @@ export function bindMobileTerminalTouch(
     if (selectedRange) updateSelectionControls(selectedRange);
   });
   const onTouchStart = (event: TouchEvent): void => {
-    if (event.cancelable) event.preventDefault();
     if (activeTouchIdentifier !== null) return;
     clearLongPressTimer();
     const touch = event.changedTouches[0] ?? event.touches[0];

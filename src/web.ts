@@ -2,7 +2,7 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { lstat, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
 
@@ -72,6 +72,10 @@ const TASK_FILE_TEXT_EXTENSIONS = new Set([
   "c", "cc", "conf", "cpp", "css", "csv", "go", "h", "hpp", "html", "ini", "java", "js", "json", "jsx",
   "log", "lua", "md", "markdown", "mjs", "py", "rb", "rs", "sh", "sql", "svg", "toml", "ts", "tsx", "txt", "xml", "yaml", "yml",
 ]);
+
+const LOCAL_DEMO_PROXY_TARGETS = [
+  { prefix: "/api/local-demos/food-photo", hostname: "127.0.0.1", port: 3000 },
+] as const;
 
 interface TaskFileContext {
   rootPath: string;
@@ -309,6 +313,12 @@ export class DashboardServer {
       response,
       publicWebRequest || url.pathname === "/healthz",
     )) return;
+    const localDemoTarget = LOCAL_DEMO_PROXY_TARGETS.find(({ prefix }) =>
+      url.pathname === prefix || url.pathname.startsWith(`${prefix}/`));
+    if (localDemoTarget) {
+      await this.proxyLocalDemo(request, response, url, localDemoTarget);
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/api/session") {
       sendJson(response, 200, { actionToken: this.actionToken });
       return;
@@ -2523,6 +2533,61 @@ export class DashboardServer {
     }
   }
 
+  private async proxyLocalDemo(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    target: (typeof LOCAL_DEMO_PROXY_TARGETS)[number],
+  ): Promise<void> {
+    const suffix = url.pathname.slice(target.prefix.length) || "/";
+    const targetPath = `${suffix}${url.search}`;
+    await new Promise<void>((resolve) => {
+      const headers = { ...request.headers };
+      delete headers.host;
+      delete headers.connection;
+      delete headers.cookie;
+      delete headers.authorization;
+      delete headers["x-bridge-action-token"];
+      delete headers["x-forwarded-for"];
+      delete headers["x-forwarded-host"];
+      delete headers["x-forwarded-proto"];
+      const upstream = httpRequest({
+        hostname: target.hostname,
+        port: target.port,
+        method: request.method,
+        path: targetPath,
+        headers,
+      }, (upstreamResponse) => {
+        response.statusCode = upstreamResponse.statusCode ?? 502;
+        for (const [name, value] of Object.entries(upstreamResponse.headers)) {
+          if (
+            value === undefined
+            || name === "connection"
+            || name === "keep-alive"
+            || name === "transfer-encoding"
+            || name === "set-cookie"
+          ) continue;
+          response.setHeader(name, value);
+        }
+        upstreamResponse.pipe(response);
+        upstreamResponse.once("end", resolve);
+        upstreamResponse.once("error", resolve);
+      });
+      upstream.setTimeout(10_000, () => upstream.destroy(new Error("local demo proxy timeout")));
+      upstream.once("error", (error) => {
+        this.options.logger?.warn("local demo proxy failed", {
+          target: target.prefix,
+          error: error.message,
+        });
+        if (!response.headersSent) sendJson(response, 502, { error: "本机 Demo 未启动或暂时不可用" });
+        else response.destroy(error);
+        resolve();
+      });
+      request.once("aborted", () => upstream.destroy());
+      request.pipe(upstream);
+    });
+  }
+
   private async serveAsset(requestPath: string, response: ServerResponse): Promise<void> {
     let decodedPath: string;
     try {
@@ -2679,6 +2744,7 @@ function isSpaRoute(pathname: string): boolean {
     || pathname === "/system-management/projects"
     || /^\/tasks\/(?:desk|direct|aamp)\/[^/]+$/.test(pathname)
     || pathname === "/codex-history"
+    || pathname === "/demos"
     || pathname === "/tmux-dashboard"
     || (pathname.startsWith("/tmux-dashboard/")
       && !pathname.startsWith("/tmux-dashboard/api/")

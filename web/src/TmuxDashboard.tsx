@@ -255,6 +255,7 @@ export function TmuxDashboard(): ReactElement {
   const [search, setSearch] = useState("");
   const [backendStatus, setBackendStatus] = useState<"connecting" | "online" | "offline">("connecting");
   const [terminalStatus, setTerminalStatus] = useState("IDLE");
+  const [terminalInputEnabled, setTerminalInputEnabled] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
@@ -547,6 +548,7 @@ export function TmuxDashboard(): ReactElement {
   const selectSession = (sessionId: string): void => {
     sessionsLoadSequenceRef.current += 1;
     restoreSessionDetailRef.current = false;
+    if (sessionId !== selectedId) setTerminalInputEnabled(false);
     setSelectedId(sessionId);
     if (window.matchMedia("(max-width: 760px)").matches) {
       setNavigationCollapsed(true);
@@ -569,6 +571,7 @@ export function TmuxDashboard(): ReactElement {
   useEffect(() => {
     if (backendStatus !== "online" || !selectedId || sessions.some((session) => session.id === selectedId)) return;
     setSelectedId(null);
+    setTerminalInputEnabled(false);
     setMobileView("sessions");
     setNavigationCollapsed(false);
   }, [backendStatus, sessions, selectedId, setNavigationCollapsed]);
@@ -591,9 +594,9 @@ export function TmuxDashboard(): ReactElement {
     }
 
     const terminal = new Terminal({
-      cursorBlink: false,
-      cursorInactiveStyle: "none",
-      disableStdin: true,
+      cursorBlink: terminalInputEnabled,
+      cursorInactiveStyle: terminalInputEnabled ? "block" : "none",
+      disableStdin: !terminalInputEnabled,
       convertEol: false,
       fontSize: 13,
       fontFamily: '"SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace',
@@ -616,9 +619,8 @@ export function TmuxDashboard(): ReactElement {
       console.warn("xterm canvas renderer unavailable; keeping the DOM renderer.", error);
     }
     if (terminal.textarea) {
-      // This terminal is a read-only screen snapshot. Typing belongs in the composer.
-      terminal.textarea.readOnly = true;
-      terminal.textarea.inputMode = "none";
+      terminal.textarea.readOnly = !terminalInputEnabled;
+      terminal.textarea.inputMode = terminalInputEnabled ? "text" : "none";
     }
     terminalInstanceRef.current = terminal;
     setTerminalSelection(null);
@@ -675,6 +677,12 @@ export function TmuxDashboard(): ReactElement {
         || visualHeight < initialViewportHeight * 0.82;
     };
 
+    const inputSubscription = terminalInputEnabled
+      ? terminal.onData((input) => {
+        if (disposed || socket?.readyState !== WebSocket.OPEN) return;
+        socket.send(JSON.stringify({ type: "input", data: input }));
+      })
+      : null;
     const removeTouchScrolling = bindMobileTerminalTouch(host, terminal, setTerminalSelection);
 
     const diagnosticOutputDecoder = new TextDecoder("utf-8");
@@ -822,6 +830,8 @@ export function TmuxDashboard(): ReactElement {
             if (message.type === "error") {
               setTerminalStatus("ERROR");
               setToast({ message: message.message || "Could not attach to the selected session.", isError: true });
+            } else if (message.type === "input-error") {
+              setToast({ message: message.message || "终端输入失败。", isError: true, isTop: true });
             } else if (message.type === "exit") {
               setTerminalStatus("DETACHED");
             }
@@ -923,6 +933,7 @@ export function TmuxDashboard(): ReactElement {
       disposed = true;
       window.clearTimeout(reconnectTimer);
       window.clearTimeout(keyboardCloseTimer);
+      inputSubscription?.dispose();
       window.cancelAnimationFrame(resizeFrame);
       window.removeEventListener("resize", onWindowResize);
       window.removeEventListener("focusout", onComposerFocusOut, true);
@@ -941,7 +952,7 @@ export function TmuxDashboard(): ReactElement {
       if (terminalInstanceRef.current === terminal) terminalInstanceRef.current = null;
       terminal.dispose();
     };
-  }, [selectedSession?.id]);
+  }, [selectedSession?.id, terminalInputEnabled]);
 
   useEffect(() => {
     if (!toast) return;
@@ -959,6 +970,11 @@ export function TmuxDashboard(): ReactElement {
     }
     if (sendingMessage) return { ok: false, message: "A message is already being sent." };
     if (!messageText.trim()) return { ok: false, message: "Enter a message or attach an image." };
+    if (terminalInputEnabled) {
+      const result = await sendTerminalCommand(messageText);
+      if (result.ok) setToast({ message: "命令已发送到终端。", isError: false, isTop: true });
+      return result;
+    }
 
     setSendingMessage(true);
     try {
@@ -1156,6 +1172,7 @@ export function TmuxDashboard(): ReactElement {
       sessionsLoadSequenceRef.current += 1;
       restoreSessionDetailRef.current = false;
       setSessions((current) => [result.session, ...current.filter((session) => session.id !== result.session.id)]);
+      setTerminalInputEnabled(false);
       setSelectedId(result.session.id);
       setToast({ message: `Session “${result.session.name}” created.`, isError: false });
       void loadSessions();
@@ -1228,6 +1245,7 @@ export function TmuxDashboard(): ReactElement {
         sessionsLoadSequenceRef.current += 1;
         restoreSessionDetailRef.current = false;
         setSelectedId(null);
+        setTerminalInputEnabled(false);
       }
       if (wasSelected && window.matchMedia("(max-width: 760px)").matches) {
         setMobileView("sessions");
@@ -1371,7 +1389,7 @@ export function TmuxDashboard(): ReactElement {
               aria-label="筛选 session"
               placeholder="Filter sessions"
               value={search}
-              onChange={(event) => { setSearch(event.target.value); setSelectedId(null); }}
+              onChange={(event) => { setSearch(event.target.value); setSelectedId(null); setTerminalInputEnabled(false); }}
             />
           </label>
           <div className="dashboard-session-list" aria-live="polite">
@@ -1407,6 +1425,31 @@ export function TmuxDashboard(): ReactElement {
             <div className="dashboard-active-session"><span className="dashboard-terminal-glyph">⌘</span><div><strong>{selectedSession?.name ?? "No session selected"}</strong><span title={selectedSession?.cwd}>{selectedSession?.workspaceBranch ? `任务分支 ${selectedSession.workspaceBranch} · ${selectedSession.workspaceStatus ?? "工作区"} · ` : ""}{selectedSession?.cwd ?? "Choose a session to open its terminal"}</span></div></div>
             {selectedSession ? (
               <div className="dashboard-codex-inline" aria-label="Session 账号与操作">
+                <button
+                  className={`dashboard-terminal-mode-toggle${terminalInputEnabled ? " is-active" : ""}`}
+                  type="button"
+                  disabled={terminalStatus !== "ATTACHED"}
+                  aria-pressed={terminalInputEnabled}
+                  aria-label={terminalInputEnabled ? "关闭终端输入，返回只读输出" : "开启终端输入"}
+                  title={terminalInputEnabled ? "关闭终端输入；返回只读输出" : "开启终端输入；按键会直接发送到当前 tmux Session"}
+                  onClick={() => setTerminalInputEnabled((current) => !current)}
+                >
+                  {terminalInputEnabled ? (
+                    <svg className="dashboard-terminal-mode-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                      <rect x="3" y="4" width="18" height="15" rx="2" />
+                      <path d="m7 9 3 3-3 3" />
+                      <path d="M13 15h3M17 8v6" />
+                    </svg>
+                  ) : (
+                    <svg className="dashboard-terminal-mode-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                      <rect x="3" y="4" width="18" height="15" rx="2" />
+                      <path d="m7 9 3 3-3 3" />
+                      <path d="M13 15h2" />
+                      <rect x="15" y="13" width="6" height="6" rx="1.2" />
+                      <path d="M17 13v-1a2 2 0 0 1 4 0v1" />
+                    </svg>
+                  )}
+                </button>
                 <button
                   className="dashboard-codex-usage-trigger"
                   type="button"
@@ -1452,7 +1495,7 @@ export function TmuxDashboard(): ReactElement {
               <button type="button" onClick={() => void refreshSelectedSession()} disabled={!selectedSession}>立即刷新</button>
             </div>
           ) : null}
-          <div className={`dashboard-terminal-frame${selectedSession ? "" : " is-empty"}`}>
+          <div className={`dashboard-terminal-frame${selectedSession ? "" : " is-empty"}${selectedSession && terminalInputEnabled ? " is-terminal-interactive" : ""}`}>
             {selectedSession && terminalSelection?.text ? (
               <button
                 className="dashboard-terminal-copy-selection"
@@ -1476,7 +1519,7 @@ export function TmuxDashboard(): ReactElement {
             diagnosticSessionActive={Boolean(selectedSession) && mobileView === "terminal" && terminalStatus === "ATTACHED"}
             disabled={!selectedSession || terminalStatus !== "ATTACHED"}
             sending={sendingMessage}
-            placeholder={selectedSession ? "Message the Codex session…" : "Select a session to start messaging"}
+            placeholder={selectedSession ? (terminalInputEnabled ? "输入终端命令…" : "Message the Codex session…") : "Select a session to start messaging"}
             onSubmit={sendMessage}
             onAttachmentError={showAttachmentError}
             onOpenFiles={() => {

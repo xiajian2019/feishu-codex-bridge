@@ -7,6 +7,7 @@ const PAGES = [
   { to: "/", label: "任务面板", end: true },
   { to: "/codex-history", label: "Codex 历史", end: true },
   { to: "/tmux-dashboard", label: "Tmux", end: false },
+  { to: "/demos", label: "Demo", end: true },
 ] as const;
 
 const SYSTEM_PAGES = [

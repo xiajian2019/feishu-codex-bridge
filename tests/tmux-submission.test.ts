@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { StateDatabase } from "../src/db.js";
-import { hasNewSubmissionEcho, submissionFingerprint } from "../src/tmux-dashboard-api.js";
+import { hasNewSubmissionEcho, submissionFingerprint, validateTerminalInput } from "../src/tmux-dashboard-api.js";
 
 const attachmentDirectory = join(tmpdir(), "feishu-codex-bridge", "tmux-dashboard-attachments");
 const files: string[] = [];
@@ -124,5 +124,14 @@ describe("tmux submission deduplication", () => {
       db.close();
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("tmux raw terminal input", () => {
+  it("preserves control sequences and UTF-8 text without treating them as a prompt", () => {
+    const input = "\u001b[200~echo 中文\u001b[201~\r\u0003";
+    expect(validateTerminalInput(input)).toBe(input);
+    expect(validateTerminalInput("")).toBeNull();
+    expect(validateTerminalInput("x".repeat(32 * 1024 + 1))).toBeNull();
   });
 });

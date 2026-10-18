@@ -14,9 +14,10 @@
 | 飞书 Direct | 从飞书提交文字、图片或文件任务，查看执行状态、续问或取消任务。 |
 | Web Task Desk | 从浏览器为已登记项目创建 Codex 任务，查看运行记录、附加文件、续问和处理支持的重试/审核操作。 |
 | Codex History | 搜索不同 Codex home 的会话，并通过 Codex SDK 继续已有会话。 |
+| 本机 Demo | 从统一目录发现并打开 Bridge 主机上运行的本地模型/实验 Demo；入口通过 Bridge 代理，不要求手机直连 Demo 的 Python 端口。 |
 | 设备与运维 | 配对和撤销浏览器设备，查看运行状态，并创建、校验和恢复数据备份。 |
 
-Tmux Dashboard 的 Composer 是给选中的 Codex session 发送消息，不是可输入任意 shell 命令的终端。它连接的是 Bridge 主机上的 tmux，不会进入 pane 里可能通过 SSH 登录的另一台机器。
+Tmux Dashboard 默认通过 Composer 给选中的 Codex session 发送消息；需要执行 Shell 命令或操作全屏终端程序时，可以显式开启“终端输入”模式，让 xterm 按键直接进入当前 tmux session。两种输入入口彼此独立。它连接的是 Bridge 主机上的 tmux，不会进入 pane 里可能通过 SSH 登录的另一台机器。
 
 ## 工作方式
 
@@ -73,6 +74,8 @@ feishu-codex-bridge install
 2. 在 Mac 上运行 `feishu-codex-bridge web:pair`，按命令提示完成浏览器配对。
 3. 在 iPhone Safari 打开配对时显示的 Bridge 地址，并进入 `/tmux-dashboard`。
 
+配对后也可以进入 `/demos`，从“本机 Demo”目录打开本机实验页面。当前食物拍照 Demo 通过 Bridge 代理访问，Python 服务只需在 Bridge 主机本机启动即可；新增 Demo 时登记代理目标和目录卡片即可复用这条入口。
+
 Bridge 的生产服务默认只监听本机回环地址。若确实需要从局域网访问，必须显式启用 LAN 监听（`FEISHU_CODEX_BRIDGE_LAN_BIND=1`），同时仍需配对认证。不要将服务直接暴露到公网；按所在组织的网络和安全要求配置访问。
 
 ## 数据与安全边界
@@ -81,7 +84,7 @@ Bridge 的生产服务默认只监听本机回环地址。若确实需要从局�
 - 数据库、任务状态和 Bridge 管理的附件保存在运行 Bridge 的主机上。
 - 飞书任务内容会经过飞书服务；Codex 提示和附件会按当前 Codex 配置发送给相应服务处理。因此，自托管不等于离线或所有数据都只在本机流转。
 - 处理公司代码前，先确认公司关于 Codex、飞书、网络访问和数据分类的要求。
-- Composer 只把消息发给选中的 Codex session；服务端按 session 工作目录确定文件页根目录，并校验文件路径。
+- Composer 只把消息发给选中的 Codex session；“终端输入”模式会把原始按键直接发给当前 tmux PTY。服务端按 session 工作目录确定文件页根目录，并校验文件路径。
 
 ## 可选运行模式
 

@@ -139,7 +139,7 @@ describe("DashboardServer", () => {
     const actionToken = /name="bridge-action-token" content="([^"]+)"/.exec(page)?.[1];
     expect(actionToken).toBeTruthy();
 
-    for (const route of ["/tmux-dashboard"]) {
+    for (const route of ["/tmux-dashboard", "/demos"]) {
       const routedPage = await fetch(url + route);
       expect(routedPage.status).toBe(200);
       expect(await routedPage.text()).toContain('id="root"');

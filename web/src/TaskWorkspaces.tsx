@@ -104,11 +104,11 @@ export function TaskWorkspaces(): ReactElement {
   };
 
   return <main className="page-main task-workspace-manager">
-    <header className="page-header">
+    <header className="page-header task-workspace-page-header">
       <h1>Git 工作区</h1>
-      <button type="button" onClick={() => void load()} disabled={loading}>刷新</button>
+      <button className="task-workspace-refresh" type="button" onClick={() => void load()} disabled={loading}>刷新</button>
     </header>
-    <p className="muted">Bridge 管理的任务 worktree 与 tmux session 关联状态。预览不会 fetch、prune 或修改 Git。</p>
+    <p className="muted task-workspace-intro">Bridge 管理的任务 worktree 与 tmux session 关联状态。预览不会 fetch、prune 或修改 Git。</p>
     {error ? <div className="error" role="alert">{error}</div> : null}
     {!inventory.tmuxStatusKnown ? <div className="task-workspace-warning" role="status">无法确认当前 tmux session 状态；清理操作会被阻止。</div> : null}
     <section className="task-workspace-section" aria-labelledby="managed-task-workspaces-title">

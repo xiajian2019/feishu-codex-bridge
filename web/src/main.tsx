@@ -21,6 +21,7 @@ const SystemHealth = lazy(() => import("./SystemHealth.js").then((module) => ({ 
 const SystemBackups = lazy(() => import("./SystemBackups.js").then((module) => ({ default: module.SystemBackups })));
 const TaskWorkspaces = lazy(() => import("./TaskWorkspaces.js").then((module) => ({ default: module.TaskWorkspaces })));
 const SystemSettings = lazy(() => import("./SystemSettings.js").then((module) => ({ default: module.SystemSettings })));
+const DemoCatalog = lazy(() => import("./DemoCatalog.js").then((module) => ({ default: module.DemoCatalog })));
 
 function LegacyDirectTasksRedirect() {
   const location = useLocation();
@@ -197,6 +198,7 @@ async function mountApp(): Promise<void> {
                   <Route path="/direct-tasks" element={<LegacyDirectTasksRedirect />} />
                   <Route path="/codex-history" element={<CodexHistory />} />
                   <Route path="/codex-history/:homeId/:threadId" element={<CodexHistory />} />
+                  <Route path="/demos" element={<DemoCatalog />} />
                   <Route path="/tmux-dashboard/history" element={<TmuxSessionHistory />} />
                   <Route path="/tmux-dashboard/files/:sessionId" element={<TmuxSessionFiles />} />
                   <Route path="/tmux-dashboard/*" element={<TmuxDashboard />} />
