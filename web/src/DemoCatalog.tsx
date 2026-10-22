@@ -38,6 +38,17 @@ const LOCAL_DEMOS: LocalDemo[] = [
     startPath: "/api/local-demos/openai-clip/start",
     logsPath: "/api/local-demos/openai-clip/logs",
   },
+  {
+    id: "sqlite-vec-admin",
+    title: "SQLite-vec 索引管理",
+    category: "数据管理 · DATASET",
+    description: "通过 Datasette 浏览同一个 SQLite-vec 数据库、vec0 表和 SQL 查询；图片关联样本仍可从 CLIP Demo 查看。",
+    steps: ["SQLite 表", "vec0 SQL", "关联图片"],
+    openPath: "/api/local-demos/sqlite-vec-admin/",
+    healthPath: "/api/local-demos/sqlite-vec-admin/.json",
+    startPath: "/api/local-demos/sqlite-vec-admin/start",
+    logsPath: "/api/local-demos/sqlite-vec-admin/logs",
+  },
 ];
 
 const STATUS_LABELS: Record<DemoState, string> = {

@@ -94,6 +94,15 @@ const LOCAL_DEMO_PROXY_TARGETS = [
     startScript: "start.sh",
     startArgs: ["--host", "127.0.0.1", "--port", "43128"],
   },
+  {
+    id: "sqlite-vec-admin",
+    prefix: "/api/local-demos/sqlite-vec-admin",
+    hostname: "127.0.0.1",
+    port: 8001,
+    workingDirectory: "openai-clip-sqlite-vec",
+    startScript: "start_datasette.sh",
+    startArgs: [],
+  },
 ] as const;
 
 function localDemoRoot(): string {
