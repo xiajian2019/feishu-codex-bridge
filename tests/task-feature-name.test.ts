@@ -22,6 +22,7 @@ describe("Task feature names", () => {
       const executable = join(root, "codex");
       writeFileSync(executable, [
         "#!/bin/sh",
+        "cat >/dev/null",
         "output=",
         "previous=",
         "for arg in \"$@\"; do",

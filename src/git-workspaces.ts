@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { lstat, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readFile, realpath, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -10,6 +11,7 @@ const GIT_COMMAND_TIMEOUT_MS = 20_000;
 const GIT_OUTPUT_LIMIT_BYTES = 1_048_576;
 const GIT_CHANGE_PATCH_LIMIT_BYTES = 512 * 1024;
 const MAX_UNTRACKED_FILE_PATCH_BYTES = 256 * 1024;
+const MAX_GIT_FILE_PREVIEW_BYTES = 512 * 1024;
 const LOCK_TIMEOUT_MS = 15_000;
 
 export const TASK_BASE_REF = "master";
@@ -204,6 +206,8 @@ export interface GitChangeFile {
   status: GitChangeStatus;
   staged: boolean;
   unstaged: boolean;
+  sizeBytes: number | null;
+  downloadable: boolean;
 }
 
 export interface GitChangesInspection {
@@ -220,18 +224,30 @@ export async function inspectGitChanges(directory: string): Promise<GitChangesIn
   const canonicalDirectoryPath = await canonicalDirectory(directory, "当前 Session 目录");
   const repositoryRoot = await gitRoot(canonicalDirectoryPath);
   const [head, branch, status] = await Promise.all([
-    git(canonicalDirectoryPath, ["rev-parse", "--verify", "HEAD^{commit}"]),
-    git(canonicalDirectoryPath, ["branch", "--show-current"]),
-    git(canonicalDirectoryPath, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"]),
+    git(repositoryRoot, ["rev-parse", "--verify", "HEAD^{commit}"]),
+    git(repositoryRoot, ["branch", "--show-current"]),
+    git(repositoryRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"]),
   ]);
   if (head.exitCode !== 0 || status.exitCode !== 0) throw new GitWorkspaceError("无法读取当前 Session 的 Git 状态。");
   const headCommit = singleLine(head.stdout);
   if (!/^[a-f\d]{40,64}$/i.test(headCommit)) throw new GitWorkspaceError("当前 Session 没有可用的 Git 提交。");
   const files = parseGitStatusPorcelain(status.stdout);
+  // Collect sizes without reading file contents; previews are fetched only on selection.
+  for (let offset = 0; offset < files.length; offset += 16) {
+    await Promise.all(files.slice(offset, offset + 16).map(async (file) => {
+      try {
+        const safeFile = await repositoryFile(repositoryRoot, file.path);
+        file.sizeBytes = safeFile.info.size;
+        file.downloadable = true;
+      } catch {
+        // Deleted files, submodules and unavailable/unsafe paths still appear in status.
+      }
+    }));
+  }
   let patch = "";
   let patchTruncated = false;
   try {
-    const diff = await git(canonicalDirectoryPath, ["diff", "--no-ext-diff", "--no-color", "--unified=3", "HEAD", "--"]);
+    const diff = await git(repositoryRoot, ["-c", "core.quotepath=false", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=3", "HEAD", "--"]);
     if (diff.exitCode !== 0) throw gitFailure("无法读取 Git 变更", diff);
     patch = diff.stdout;
   } catch (error) {
@@ -264,35 +280,147 @@ export async function inspectGitChanges(directory: string): Promise<GitChangesIn
   };
 }
 
+function validateGitFilePath(path: string): void {
+  if (!path || isAbsolute(path) || /^[A-Za-z]:[\\/]/.test(path) || path.includes("\0")
+    || path.split("/").some((part) => part === ".." || part.toLowerCase() === ".git")) {
+    throw new GitWorkspaceError("请选择当前仓库内的变更文件。", 400);
+  }
+}
+
+async function repositoryFile(repositoryRoot: string, path: string) {
+  validateGitFilePath(path);
+  const candidate = resolve(repositoryRoot, path);
+  const info = await lstat(candidate);
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw new GitWorkspaceError("该路径不是可读取的普通文件。", 403);
+  }
+  const absolutePath = await realpath(candidate);
+  if (!isPathInside(repositoryRoot, absolutePath)
+    || relative(repositoryRoot, absolutePath).split(sep).some((part) => part.toLowerCase() === ".git")) {
+    throw new GitWorkspaceError("文件实际路径位于当前仓库之外或属于 Git 内部目录。", 403);
+  }
+  return { absolutePath, info };
+}
+
+async function openRepositoryFile(repositoryRoot: string, path: string): Promise<{ handle: FileHandle; sizeBytes: number }> {
+  const file = await repositoryFile(repositoryRoot, path);
+  const handle = await open(file.absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const info = await handle.stat();
+    const checked = await repositoryFile(repositoryRoot, path);
+    if (!info.isFile() || info.dev !== checked.info.dev || info.ino !== checked.info.ino
+      || checked.absolutePath !== file.absolutePath) {
+      throw new GitWorkspaceError("文件已变化，请刷新后重试。", 409);
+    }
+    return { handle, sizeBytes: info.size };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+/** Resolve the repository from the live pane, then open only a current changed file. */
+export async function openGitChangeFile(
+  directory: string,
+  path: string,
+  expectedGitRoot?: string,
+): Promise<{ handle: FileHandle; sizeBytes: number }> {
+  validateGitFilePath(path);
+  const repositoryRoot = await gitRoot(await canonicalDirectory(directory, "当前 Session 目录"));
+  if (expectedGitRoot && expectedGitRoot !== repositoryRoot) {
+    throw new GitWorkspaceError("Session 已切换仓库，请刷新变更列表。", 409);
+  }
+  const status = await git(repositoryRoot, [
+    "--literal-pathspecs", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all", "--", path,
+  ]);
+  if (status.exitCode !== 0) throw gitFailure("无法读取变更文件状态", status);
+  if (!parseGitStatusPorcelain(status.stdout).some((file) => file.path === path)) {
+    throw new GitWorkspaceError("该文件已不在当前 Git 变更列表中，请刷新。", 404);
+  }
+  return openRepositoryFile(repositoryRoot, path);
+}
+
+export interface GitChangeFilePreview {
+  path: string;
+  sizeBytes: number;
+  kind: "text" | "binary";
+  text: string | null;
+  truncated: boolean;
+}
+
+async function readFilePrefix(handle: FileHandle, maxBytes: number): Promise<{ content: Buffer; truncated: boolean }> {
+  const buffer = Buffer.alloc(maxBytes + 1);
+  let length = 0;
+  while (length < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+    if (!bytesRead) break;
+    length += bytesRead;
+  }
+  return { content: buffer.subarray(0, Math.min(length, maxBytes)), truncated: length > maxBytes };
+}
+
+function decodeGitText(content: Buffer, truncated: boolean): string | null {
+  // BOM-marked UTF-16 is text too; do not mistake its zero bytes for binary data.
+  const encoding = content[0] === 0xff && content[1] === 0xfe ? "utf-16le"
+    : content[0] === 0xfe && content[1] === 0xff ? "utf-16be" : "utf-8";
+  try {
+    const text = new TextDecoder(encoding, { fatal: true }).decode(content, { stream: truncated });
+    return /[\u0000-\u0008\u000b\u000e-\u001f]/.test(text) ? null : text;
+  } catch {
+    return null;
+  }
+}
+
+export async function previewGitChangeFile(directory: string, path: string, expectedGitRoot?: string): Promise<GitChangeFilePreview> {
+  const file = await openGitChangeFile(directory, path, expectedGitRoot);
+  try {
+    const { content, truncated } = await readFilePrefix(file.handle, MAX_GIT_FILE_PREVIEW_BYTES);
+    const text = decodeGitText(content, truncated);
+    return { path, sizeBytes: file.sizeBytes, kind: text === null ? "binary" : "text", text, truncated };
+  } finally {
+    await file.handle.close();
+  }
+}
+
 async function untrackedFilePatch(repositoryRoot: string, path: string): Promise<string | null> {
-  const absolutePath = resolve(repositoryRoot, path);
-  if (!isPathInside(repositoryRoot, absolutePath)) return null;
-  const info = await lstat(absolutePath).catch(() => null);
-  if (!info?.isFile() || info.size > MAX_UNTRACKED_FILE_PATCH_BYTES) return null;
-  const content = await readFile(absolutePath);
-  if (content.includes(0)) return null;
-  const lines = content.toString("utf8").replace(/\r\n/g, "\n").split("\n");
-  if (lines.at(-1) === "") lines.pop();
-  const displayPath = path.replaceAll("\\", "/").replaceAll("\n", "\\n");
-  const header = [
-    "diff --git a/" + displayPath + " b/" + displayPath,
-    "new file mode 100644",
-    "--- /dev/null",
-    "+++ b/" + displayPath,
-    "@@ -0,0 +1," + lines.length + " @@",
-  ].join("\n");
-  return header + "\n" + lines.map((line) => "+" + line).join("\n") + "\n";
+  let file: Awaited<ReturnType<typeof openRepositoryFile>>;
+  try { file = await openRepositoryFile(repositoryRoot, path); } catch { return null; }
+  try {
+    if (file.sizeBytes > MAX_UNTRACKED_FILE_PATCH_BYTES) return null;
+    const { content, truncated } = await readFilePrefix(file.handle, MAX_UNTRACKED_FILE_PATCH_BYTES);
+    const text = decodeGitText(content, truncated);
+    if (truncated || text === null) return null;
+    const lines = text.replace(/\r\n/g, "\n").split("\n");
+    if (lines.at(-1) === "") lines.pop();
+    const header = [
+      "diff --git " + gitPatchPath("a/" + path) + " " + gitPatchPath("b/" + path),
+      "new file mode 100644",
+      "--- /dev/null",
+      "+++ " + gitPatchPath("b/" + path),
+      "@@ -0,0 +1," + lines.length + " @@",
+    ].join("\n");
+    return header + "\n" + lines.map((line) => "+" + line).join("\n") + "\n";
+  } finally {
+    await file.handle.close();
+  }
+}
+
+function gitPatchPath(path: string): string {
+  return /["\\\t\r\n]/.test(path) ? JSON.stringify(path) : path;
 }
 
 function parseGitStatusPorcelain(output: string): GitChangeFile[] {
-  return output.split(/\r?\n/).filter(Boolean).map((line) => {
-    const indexCode = line[0] ?? " ";
-    const worktreeCode = line[1] ?? " ";
-    const rawPath = line.slice(3);
-    const renameSeparator = rawPath.indexOf(" -> ");
-    const hasRename = indexCode === "R" || indexCode === "C" || worktreeCode === "R" || worktreeCode === "C";
-    const oldPath = hasRename && renameSeparator >= 0 ? decodeGitStatusPath(rawPath.slice(0, renameSeparator)) : null;
-    const path = decodeGitStatusPath(hasRename && renameSeparator >= 0 ? rawPath.slice(renameSeparator + 4) : rawPath);
+  const entries = output.split("\0");
+  const files: GitChangeFile[] = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]!;
+    if (!entry) continue;
+    const indexCode = entry[0] ?? " ";
+    const worktreeCode = entry[1] ?? " ";
+    const hasRename = [indexCode, worktreeCode].some((code) => code === "R" || code === "C");
+    const path = entry.slice(3);
+    // In -z output, Git writes the destination first, then the original path.
+    const oldPath = hasRename ? entries[++index] ?? null : null;
     const status: GitChangeStatus = indexCode === "?" || worktreeCode === "?"
       ? "untracked"
       : indexCode === "D" || worktreeCode === "D"
@@ -304,22 +432,17 @@ function parseGitStatusPorcelain(output: string): GitChangeFile[] {
             : indexCode === "A" || worktreeCode === "A"
               ? "added"
               : "modified";
-    return {
+    files.push({
       path,
       oldPath,
       status,
       staged: indexCode !== " " && indexCode !== "?" && indexCode !== "!",
-      unstaged: indexCode === "?" || worktreeCode === "?"
-        ? true
-        : worktreeCode !== " " && worktreeCode !== "!",
-    };
-  });
-}
-
-function decodeGitStatusPath(value: string): string {
-  if (!value.startsWith("\"") || !value.endsWith("\"")) return value;
-  try { return JSON.parse(value) as string; }
-  catch { return value; }
+      unstaged: indexCode === "?" || worktreeCode === "?" ? true : worktreeCode !== " " && worktreeCode !== "!",
+      sizeBytes: null,
+      downloadable: false,
+    });
+  }
+  return files;
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {

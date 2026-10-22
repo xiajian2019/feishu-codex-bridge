@@ -2874,18 +2874,32 @@ button.secondary,
 .tmux-git-changes-files { align-self: start; max-height: calc(100vh - 230px); overflow: auto; }
 .tmux-git-changes-files-heading, .tmux-git-changes-diff > header { display: flex; min-height: 40px; align-items: center; justify-content: space-between; gap: 8px; padding: 0 11px; border-bottom: 1px solid var(--line); background: var(--paper); }
 .tmux-git-changes-files-heading span { color: var(--muted); font-size: 10px; }
-.tmux-git-change-file { display: grid; width: 100%; min-width: 0; gap: 3px; padding: 9px 11px; border: 0; border-bottom: 1px solid var(--line); color: var(--ink); background: transparent; text-align: left; cursor: pointer; }
-.tmux-git-change-file:last-child { border-bottom: 0; }
-.tmux-git-change-file:hover, .tmux-git-change-file.is-selected { background: var(--paper); }
+.tmux-git-changes-files-toolbar { position: sticky; top: 0; z-index: 1; display: flex; min-width: 0; align-items: center; gap: 8px; padding: 0 0 0 10px; border-bottom: 1px solid var(--line); background: var(--card); }
+.tmux-git-changes-files-toolbar .tmux-git-changes-files-heading { display: flex; min-width: max-content; min-height: 40px; align-items: center; justify-content: flex-start; gap: 8px; padding: 0; border-bottom: 0; background: transparent; }
+.tmux-git-changes-search { display: block; min-width: 0; flex: 1 1 auto; padding: 0; border-bottom: 0; }
+.tmux-git-changes-search input { width: 100%; min-width: 0; min-height: 34px; padding: 6px 8px; border-radius: 7px 0 0 7px; font-size: 16px; }
+.tmux-git-changes-page .tmux-git-changes-files .tmux-git-change-file { display: grid; width: 100%; min-width: 0; gap: 3px; padding: 9px 11px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; color: var(--ink); background: transparent; text-align: left; cursor: pointer; }
+.tmux-git-changes-page .tmux-git-changes-files .tmux-git-change-file:last-child { border-bottom: 0; }
+.tmux-git-changes-page .tmux-git-changes-files .tmux-git-change-file:hover,
+.tmux-git-changes-page .tmux-git-changes-files .tmux-git-change-file.is-selected { background: var(--paper); }
 .tmux-git-change-file.is-selected { box-shadow: inset 3px 0 var(--accent); }
+.tmux-git-change-file:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .tmux-git-change-file-status { color: var(--accent); font-size: 10px; font-weight: 800; }
 .tmux-git-change-file-path { overflow: hidden; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
-.tmux-git-change-file-scope { color: var(--muted); font-size: 9px; }
-.tmux-git-changes-diff { display: flex; min-height: 420px; flex-direction: column; }
-.tmux-git-changes-diff > header { justify-content: flex-start; }
-.tmux-git-changes-diff > header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tmux-git-changes-diff > header span { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.tmux-git-change-code { flex: 1; min-height: 0; margin: 0; padding: 12px 14px; overflow: auto; color: #d8dee9; background: #10141a; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; tab-size: 4; -webkit-text-size-adjust: none; text-size-adjust: none; }
+.tmux-git-change-file-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 10px; }
+.tmux-git-changes-diff { display: flex; min-height: 420px; flex-direction: column; border: 1px solid var(--line); border-radius: 9px; }
+.tmux-git-changes-diff > header { flex: 0 0 auto; flex-wrap: wrap; padding-top: 6px; padding-bottom: 6px; border-radius: 0; }
+.tmux-git-changes-file-heading { display: grid; min-width: 0; flex: 1 1 180px; gap: 3px; }
+.tmux-git-changes-file-heading strong { overflow-wrap: anywhere; font-size: 13px; }
+.tmux-git-changes-file-heading > span { color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.tmux-git-changes-file-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; }
+.tmux-git-changes-file-actions > span { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.tmux-git-changes-file-actions a, .tmux-git-changes-file-actions button { display: inline-flex; align-items: center; justify-content: center; min-height: 32px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 4px; color: var(--ink); background: var(--card); font-size: 12px; text-decoration: none; }
+.tmux-git-changes-file-actions button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+.tmux-git-changes-message { margin: 0; padding: 12px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.tmux-git-changes-message.is-error { color: var(--danger); }
+.tmux-git-changes-diff > .tmux-code-editor { flex: 1; height: min(64dvh, 720px); min-height: 320px; overflow: hidden; border: 0; border-radius: 0; }
+.tmux-git-change-code { flex: 1; min-height: 0; margin: 0; padding: 12px 14px; overflow: auto; border: 0; border-radius: 0; color: #d8dee9; background: #10141a; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; tab-size: 4; -webkit-text-size-adjust: none; text-size-adjust: none; }
 .tmux-git-change-line { display: block; width: max-content; min-width: 100%; box-sizing: border-box; white-space: pre; -webkit-text-size-adjust: none; text-size-adjust: none; }
 .tmux-git-change-code code { display: block; min-width: max-content; font: inherit; }
 .tmux-git-change-line.is-add { color: #b9f2c8; background: #173422; }

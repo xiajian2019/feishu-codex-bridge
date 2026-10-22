@@ -134,6 +134,9 @@ async function runCodexNameCommand(
       stdoutBytes += chunk.length;
       if (stdoutBytes <= TASK_FEATURE_OUTPUT_LIMIT) stdout.push(chunk);
     });
+    child.stdin.on("error", (error) => {
+      if ((error as NodeJS.ErrnoException).code !== "EPIPE") fail(error);
+    });
     child.once("error", fail);
     child.once("close", (exitCode) => finish({ exitCode, stdout: Buffer.concat(stdout).toString("utf8") }));
     const timer = setTimeout(() => {

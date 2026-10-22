@@ -10,7 +10,7 @@ import type { Duplex } from "node:stream";
 import { getBunRuntime, type BunSubprocess, type BunTerminal } from "./bun-runtime.js";
 import { discoverCodexHistoryHomes, type CodexHistoryHome } from "./codex-history.js";
 import { codexSkillScopeKeys, discoverCodexSkills, type CodexSkillScope } from "./codex-skills.js";
-import { GitWorkspaceError, inspectGitChanges, inspectTaskSourceDirectory, resolveGitCommonDirectory, resolveGitRoot, verifyTaskWorkspace } from "./git-workspaces.js";
+import { GitWorkspaceError, inspectGitChanges, openGitChangeFile, previewGitChangeFile, inspectTaskSourceDirectory, resolveGitCommonDirectory, resolveGitRoot, verifyTaskWorkspace } from "./git-workspaces.js";
 import type { StateDatabase } from "./db.js";
 import type { StoredTask, StoredTmuxSessionAction, WebTaskSubmission } from "./types.js";
 import * as tmux from "./tmux-dashboard.js";
@@ -580,6 +580,48 @@ export class TmuxDashboardApi {
       } catch (error) {
         if (error instanceof GitWorkspaceError) sendJson(response, error.statusCode, { error: error.message });
         else sendDashboardError(response, error);
+      }
+      return;
+    }
+    const gitFileMatch = /^\/sessions\/([^/]+)\/git-changes\/(content|download)$/.exec(apiPath);
+    if (request.method === "GET" && gitFileMatch) {
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(gitFileMatch[1]!); }
+      catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
+      try {
+        const session = await this.operations.findSession(sessionId);
+        if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        const directory = this.operations.getCurrentPanePath
+          ? await this.operations.getCurrentPanePath(sessionId, session)
+          : session.cwd;
+        const path = url.searchParams.get("path") ?? "";
+        const expectedGitRoot = url.searchParams.get("expectedGitRoot") ?? undefined;
+        if (gitFileMatch[2] === "content") {
+          sendJson(response, 200, await previewGitChangeFile(directory, path, expectedGitRoot));
+        } else {
+          const file = await openGitChangeFile(directory, path, expectedGitRoot);
+          try {
+            const fileName = basename(path);
+            const fallbackName = fileName.replace(/[^\x20-\x7e]|[\\";]/g, "_") || "download";
+            const encodedName = encodeURIComponent(fileName).replace(/[!'()*]/g, (character) => "%" + character.charCodeAt(0).toString(16).toUpperCase());
+            response.setHeader("Cache-Control", "private, no-store");
+            response.setHeader("X-Content-Type-Options", "nosniff");
+            response.setHeader("Referrer-Policy", "no-referrer");
+            response.setHeader("Content-Type", "application/octet-stream");
+            response.setHeader("Content-Length", String(file.sizeBytes));
+            response.setHeader("Content-Disposition", "attachment; filename=\"" + fallbackName + "\"; filename*=UTF-8''" + encodedName);
+            const stream = file.handle.createReadStream();
+            stream.on("error", () => response.destroy());
+            response.on("close", () => stream.destroy());
+            stream.pipe(response);
+          } catch (error) {
+            await file.handle.close();
+            throw error;
+          }
+        }
+      } catch (error) {
+        if (error instanceof GitWorkspaceError) sendJson(response, error.statusCode, { error: error.message });
+        else sendSessionFileError(response, error);
       }
       return;
     }
