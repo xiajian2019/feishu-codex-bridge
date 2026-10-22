@@ -12,6 +12,7 @@ import "./styles.css";
 const TmuxDashboard = lazy(() => import("./TmuxDashboard.js").then((module) => ({ default: module.TmuxDashboard })));
 const TmuxSessionFiles = lazy(() => import("./TmuxSessionFiles.js").then((module) => ({ default: module.TmuxSessionFiles })));
 const TmuxSessionHistory = lazy(() => import("./TmuxSessionHistory.js").then((module) => ({ default: module.TmuxSessionHistory })));
+const TmuxGitChanges = lazy(() => import("./TmuxGitChanges.js").then((module) => ({ default: module.TmuxGitChanges })));
 const CodexHistory = lazy(() => import("./CodexHistory.js").then((module) => ({ default: module.CodexHistory })));
 const ShortcutManagement = lazy(() => import("./ShortcutManagement.js").then((module) => ({ default: module.ShortcutManagement })));
 const CodexUsage = lazy(() => import("./CodexUsage.js").then((module) => ({ default: module.CodexUsage })));
@@ -19,7 +20,10 @@ const ProjectManagement = lazy(() => import("./ProjectManagement.js").then((modu
 const TaskDetailPage = lazy(() => import("./TaskDetailPage.js").then((module) => ({ default: module.TaskDetailPage })));
 const SystemHealth = lazy(() => import("./SystemHealth.js").then((module) => ({ default: module.SystemHealth })));
 const SystemBackups = lazy(() => import("./SystemBackups.js").then((module) => ({ default: module.SystemBackups })));
+const TaskWorkspaces = lazy(() => import("./TaskWorkspaces.js").then((module) => ({ default: module.TaskWorkspaces })));
 const SystemSettings = lazy(() => import("./SystemSettings.js").then((module) => ({ default: module.SystemSettings })));
+const DemoCatalog = lazy(() => import("./DemoCatalog.js").then((module) => ({ default: module.DemoCatalog })));
+const LinkTools = lazy(() => import("./LinkTools.js").then((module) => ({ default: module.LinkTools })));
 
 function LegacyDirectTasksRedirect() {
   const location = useLocation();
@@ -196,7 +200,10 @@ async function mountApp(): Promise<void> {
                   <Route path="/direct-tasks" element={<LegacyDirectTasksRedirect />} />
                   <Route path="/codex-history" element={<CodexHistory />} />
                   <Route path="/codex-history/:homeId/:threadId" element={<CodexHistory />} />
+                  <Route path="/demos" element={<DemoCatalog />} />
+                  <Route path="/link-tools" element={<LinkTools />} />
                   <Route path="/tmux-dashboard/history" element={<TmuxSessionHistory />} />
+                  <Route path="/tmux-dashboard/git-changes/:sessionId" element={<TmuxGitChanges />} />
                   <Route path="/tmux-dashboard/files/:sessionId" element={<TmuxSessionFiles />} />
                   <Route path="/tmux-dashboard/*" element={<TmuxDashboard />} />
                   <Route path="/system-management" element={<Navigate to="/system-management/devices" replace />} />
@@ -206,6 +213,7 @@ async function mountApp(): Promise<void> {
                   <Route path="/system-management/usage" element={<CodexUsage />} />
                   <Route path="/system-management/health" element={<SystemHealth />} />
                   <Route path="/system-management/backups" element={<SystemBackups />} />
+                  <Route path="/system-management/workspaces" element={<TaskWorkspaces />} />
                   <Route path="/system-management/settings" element={<SystemSettings />} />
                   <Route path="/pair-admin" element={<Navigate to="/system-management/devices" replace />} />
                   <Route path="*" element={<Navigate to="/" replace />} />

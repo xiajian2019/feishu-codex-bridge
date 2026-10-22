@@ -120,6 +120,15 @@ export async function findSession(id: string): Promise<TmuxSession | undefined> 
   return (await listSessions()).find((session) => session.id === id);
 }
 
+export async function getCurrentPanePath(id: string, knownSession?: TmuxSession): Promise<string> {
+  if (!isSessionId(id)) throw new ValidationError("Invalid tmux session id.");
+  if (!knownSession && !(await findSession(id))) throw new SessionNotFoundError("Session no longer exists.");
+  const cwd = resolve(await runTmux(["display-message", "-p", "-t", id, "#{pane_current_path}"]));
+  const cwdStat = await stat(cwd).catch(() => null);
+  if (!cwdStat?.isDirectory()) throw new ValidationError("The tmux pane working directory is unavailable.");
+  return cwd;
+}
+
 export async function setCodexHomeForSession(id: string, codexHomePath: string | null): Promise<void> {
   if (!isSessionId(id)) throw new ValidationError("Invalid tmux session id.");
   if (!(await findSession(id))) throw new SessionNotFoundError("Session no longer exists.");
@@ -130,9 +139,12 @@ export async function setCodexHomeForSession(id: string, codexHomePath: string |
   }
 }
 
-export async function inspectCodexHome(id: string): Promise<{ status: "running" | "not-running" | "unavailable"; path?: string }> {
+export async function inspectCodexHome(
+  id: string,
+  knownSession?: TmuxSession,
+): Promise<{ status: "running" | "not-running" | "unavailable"; path?: string }> {
   if (!isSessionId(id)) throw new ValidationError("Invalid tmux session id.");
-  if (!(await findSession(id))) throw new SessionNotFoundError("Session no longer exists.");
+  if (!knownSession && !(await findSession(id))) throw new SessionNotFoundError("Session no longer exists.");
 
   try {
     const panePid = Number(await runTmux(["display-message", "-p", "-t", id, "#{pane_pid}"]));

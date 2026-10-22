@@ -4,6 +4,7 @@ release/
 .pnpm-store/
 tmp/
 .DS_Store
+.playwright-mcp/
 runtime/*
 !runtime/
 runtime/logs/*

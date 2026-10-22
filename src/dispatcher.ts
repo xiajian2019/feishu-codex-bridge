@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import { WebTaskSubmissionConflictError } from "./types.js";
 import { StateDatabase } from "./db.js";
 import { computeInputHash, parseTaskInput, serializeTaskInput } from "./fingerprint.js";
 import type { GitWorkspaceSnapshot } from "./run-artifacts.js";
+import { defaultTaskWorktreeRoot, GitWorkspaceError, prepareTaskWorkspace, provisionTaskWorkspace } from "./git-workspaces.js";
+import { fallbackTaskFeatureName, summarizeTaskFeatureName } from "./task-feature-name.js";
 import {
   buildRunPrompt,
   formatBlockedComment,
@@ -45,6 +48,15 @@ export interface DispatcherOptions {
   serviceInstanceId?: string;
   logger?: Logger;
   captureWorkspaceSnapshot?: (directory: string) => Promise<GitWorkspaceSnapshot>;
+  worktreeRoot?: string;
+  taskFeatureNameResolver?: (input: { summary: string; description: string }) => Promise<string | null>;
+}
+
+export interface WebTaskWorkspaceSource {
+  directory: string;
+  tmuxSessionId: string;
+  expectedDirectory: string;
+  expectedBaseSha: string;
 }
 
 export class Dispatcher {
@@ -56,6 +68,8 @@ export class Dispatcher {
   private readonly serviceInstanceId: string;
   private readonly logger: Logger;
   private readonly captureWorkspaceSnapshot?: (directory: string) => Promise<GitWorkspaceSnapshot>;
+  private readonly worktreeRoot: string;
+  private readonly taskFeatureNameResolver?: DispatcherOptions["taskFeatureNameResolver"];
   private readonly queue: string[] = [];
   private readonly queuedRunIds = new Set<string>();
   private readonly active = new Map<string, ActiveRun>();
@@ -72,6 +86,8 @@ export class Dispatcher {
     this.serviceInstanceId = options.serviceInstanceId ?? randomUUID();
     this.logger = options.logger ?? consoleLogger;
     this.captureWorkspaceSnapshot = options.captureWorkspaceSnapshot;
+    this.worktreeRoot = resolve(options.worktreeRoot ?? defaultTaskWorktreeRoot());
+    this.taskFeatureNameResolver = options.taskFeatureNameResolver;
   }
 
   public async observe(task: LarkTask): Promise<void> {
@@ -178,7 +194,7 @@ export class Dispatcher {
     await this.pump();
   }
 
-  public async submitWebTask(input: WebTaskSubmission): Promise<StoredTask> {
+  public async submitWebTask(input: WebTaskSubmission, source?: WebTaskWorkspaceSource): Promise<StoredTask> {
     const description = input.description.trim();
     const summary = input.summary?.trim() || summarizeTaskDescription(description);
     if (summary.length > 300) throw new Error("任务标题不能超过 300 个字符。");
@@ -195,15 +211,21 @@ export class Dispatcher {
     }
     // Preserve the submitted intent, including an omitted default mode. Configuration
     // changes must not prevent replaying a request the server already accepted.
+    const createWorktree = input.createWorktree === true || Boolean(source);
     const normalizedRequestJson = JSON.stringify({
       summary, description, projectKey, mode: input.mode?.trim() || null, attachmentIds,
+      ...(createWorktree ? { createWorktree: true } : {}),
+      ...(source ? { sourceTmuxSessionId: source.tmuxSessionId } : {}),
     });
     const previous = this.db.getWebTaskSubmission(idempotencyKey);
     if (previous) {
       if (previous.normalized_request_json !== normalizedRequestJson) throw new WebTaskSubmissionConflictError();
       const task = this.db.getTask(previous.task_guid);
       if (!task) throw new Error("已确认的任务记录不存在。");
-      this.enqueueWebRun(previous.run_id);
+      if (task.state === "QUEUED") {
+        const ready = await this.ensureTaskWorkspaceReady(task.task_guid, previous.run_id);
+        if (ready) this.enqueueWebRun(previous.run_id);
+      }
       await this.pump();
       return this.db.getTask(previous.task_guid)!;
     }
@@ -214,8 +236,30 @@ export class Dispatcher {
     const project = this.db.getAvailableProject(projectKey);
     if (!project) throw new Error("所选项目不存在、未启用或路径不可用。");
     const { key: modeKey, value: mode } = resolveWebMode(this.config, input.mode);
+    const taskGuid = `web-${randomUUID()}`;
+    if (source && resolve(source.directory) !== resolve(source.expectedDirectory)) {
+      throw new GitWorkspaceError("Session 工作目录已变化，请刷新任务表单后重试。", 409);
+    }
+    const featureName = createWorktree
+      ? await this.resolveTaskFeatureName(summary, description)
+      : undefined;
+    const preparedWorkspace = createWorktree
+      ? await prepareTaskWorkspace({
+        workspaceRoot: this.worktreeRoot,
+        workspaceId: randomUUID(),
+        taskGuid,
+        projectKey,
+        projectRoot: project.path,
+        summary,
+        featureName,
+        ...(source ? { sourceDirectory: source.directory, sourceTmuxSessionId: source.tmuxSessionId } : {}),
+      })
+      : undefined;
+    if (source && preparedWorkspace?.sourceSha !== source.expectedBaseSha) {
+      throw new GitWorkspaceError("Session 来源提交已变化，请刷新任务表单后重试。", 409);
+    }
     const routedTask: RoutedTask = {
-      taskGuid: `web-${randomUUID()}`,
+      taskGuid,
       summary,
       description,
       projectKey,
@@ -233,14 +277,24 @@ export class Dispatcher {
       origin: "web",
     };
     const basePrompt = buildRunPrompt(routedTask.input, null, false);
-    const promptText = attachments.length === 0
-      ? basePrompt
-      : [
-          basePrompt,
-          "",
-          "本次任务附带以下本地文件，请按需查看；图片会作为图像输入一并发送：",
-          ...attachments.map((attachment) => `- ${attachment.file_name} (${attachment.mime_type})：${attachment.local_path}`),
-        ].join("\n");
+    const promptSections = [basePrompt];
+    if (preparedWorkspace) {
+      promptSections.push(
+        "",
+        `本任务使用独立 Git worktree：${preparedWorkspace.worktreePath}`,
+        `任务分支：${preparedWorkspace.branch}`,
+        `基准分支：${preparedWorkspace.baseRef}`,
+        `基准提交：${preparedWorkspace.baseSha}`,
+      );
+    }
+    if (attachments.length > 0) {
+      promptSections.push(
+        "",
+        "本次任务附带以下本地文件，请按需查看；图片会作为图像输入一并发送：",
+        ...attachments.map((attachment) => `- ${attachment.file_name} (${attachment.mime_type})：${attachment.local_path}`),
+      );
+    }
+    const promptText = promptSections.join("\n");
     const submission = this.db.claimWebTaskSubmission({
       idempotencyKey,
       normalizedRequestJson,
@@ -248,12 +302,14 @@ export class Dispatcher {
       inputText: serializeTaskInput(routedTask.input),
       promptText,
       attachmentIds,
+      ...(preparedWorkspace ? { workspace: preparedWorkspace } : {}),
     });
     const runId = submission.status === "created" ? submission.claim.runId : submission.submission.run_id;
-    const taskGuid = submission.status === "created" ? submission.claim.taskGuid : submission.submission.task_guid;
-    this.enqueueWebRun(runId);
+    const claimedTaskGuid = submission.status === "created" ? submission.claim.taskGuid : submission.submission.task_guid;
+    const ready = await this.ensureTaskWorkspaceReady(claimedTaskGuid, runId);
+    if (ready) this.enqueueWebRun(runId);
     await this.pump();
-    const task = this.db.getTask(taskGuid);
+    const task = this.db.getTask(claimedTaskGuid);
     if (!task) throw new Error("任务已提交，但没有读取到本地任务记录。");
     return task;
   }
@@ -274,11 +330,15 @@ export class Dispatcher {
       ) {
         throw new WebTaskSubmissionConflictError();
       }
-      this.enqueueWebRun(previousSubmission.run_id);
-      await this.pump();
       const task = this.db.getTask(taskGuid);
-      if (!task) throw new Error("已确认的重试记录不存在对应任务。");
-      return task;
+      if (task?.state === "QUEUED") {
+        const ready = await this.ensureTaskWorkspaceReady(taskGuid, previousSubmission.run_id);
+        if (ready) this.enqueueWebRun(previousSubmission.run_id);
+      }
+      await this.pump();
+      const replayedTask = this.db.getTask(taskGuid);
+      if (!replayedTask) throw new Error("已确认的重试记录不存在对应任务。");
+      return replayedTask;
     }
 
     const existing = this.db.getTask(taskGuid);
@@ -292,6 +352,7 @@ export class Dispatcher {
     if (!project || project.path !== existing.repo) {
       throw new Error("原项目不可用或目录已变更，请检查配置后再重试。");
     }
+    await this.ensureExistingTaskWorkspace(existing.task_guid);
     const { value: mode } = resolveWebMode(this.config, existing.mode);
     const previousRun = this.db.getLatestRun(taskGuid);
     if (!previousRun) throw new Error("原任务没有可重试的运行记录。");
@@ -353,9 +414,15 @@ export class Dispatcher {
       if (previousSubmission.task_guid !== taskGuid || previousSubmission.normalized_request_json !== normalizedRequestJson) {
         throw new WebTaskSubmissionConflictError();
       }
-      this.enqueueWebRun(previousSubmission.run_id);
+      const task = this.db.getTask(taskGuid);
+      if (task?.state === "QUEUED") {
+        const ready = await this.ensureTaskWorkspaceReady(taskGuid, previousSubmission.run_id);
+        if (ready) this.enqueueWebRun(previousSubmission.run_id);
+      }
       await this.pump();
-      return this.db.getTask(taskGuid)!;
+      const replayedTask = this.db.getTask(taskGuid);
+      if (!replayedTask) throw new Error("已确认的续问记录不存在对应任务。");
+      return replayedTask;
     }
     const existing = this.db.getTask(taskGuid);
     if (!existing || existing.origin !== "web") throw new Error("Bridge 网页任务不存在。");
@@ -366,6 +433,7 @@ export class Dispatcher {
     if (description.length > 20_000) throw new Error("追加后任务描述超过 20000 个字符。");
     const project = this.db.getAvailableProject(existing.project_key);
     if (!project || project.path !== existing.repo) throw new Error("原项目不可用或目录已变更，请新建任务。");
+    await this.ensureExistingTaskWorkspace(existing.task_guid);
     const { value: mode } = resolveWebMode(this.config, existing.mode);
     const input = { ...previousInput, description };
     const routedTask: RoutedTask = {
@@ -382,7 +450,8 @@ export class Dispatcher {
         : buildRunPrompt(input, previousInput, false),
     });
     const runId = submission.status === "created" ? submission.claim.runId : submission.submission.run_id;
-    this.enqueueWebRun(runId);
+    const ready = await this.ensureTaskWorkspaceReady(taskGuid, runId);
+    if (ready) this.enqueueWebRun(runId);
     await this.pump();
     return this.db.getTask(taskGuid)!;
   }
@@ -521,8 +590,13 @@ export class Dispatcher {
         const run = this.db.getRun(runId);
         if (!run || run.state !== "QUEUED") continue;
         const task = this.db.getTask(run.task_guid);
+        const workspace = task?.origin === "web" ? this.db.getTaskWorkspace(task.task_guid) : null;
+        if (task?.origin === "web" && workspace && !(await this.ensureTaskWorkspaceReady(task.task_guid, runId))) {
+          continue;
+        }
         if (task?.origin === "web" && this.captureWorkspaceSnapshot) {
-          await this.recordWorkspaceSnapshot(runId, "before", task.repo);
+          const workingDirectory = workspace?.working_directory ?? task.repo;
+          await this.recordWorkspaceSnapshot(runId, "before", workingDirectory);
         }
 
         let handle: WorkerHandle;
@@ -608,8 +682,9 @@ export class Dispatcher {
     const run = this.db.getRun(active.runId);
     const task = this.db.getTask(active.taskGuid);
     if (run && task) {
+      const workspace = task.origin === "web" ? this.db.getTaskWorkspace(task.task_guid) : null;
       if (task.origin === "web" && this.captureWorkspaceSnapshot) {
-        await this.recordWorkspaceSnapshot(active.runId, "after", task.repo);
+        await this.recordWorkspaceSnapshot(active.runId, "after", workspace?.working_directory ?? task.repo);
       }
       if (result.status === "succeeded") {
         const threadId = result.threadId ?? run.thread_id ?? task.thread_id;
@@ -656,6 +731,72 @@ export class Dispatcher {
       this.db.saveRunWorkspaceSnapshot(runId, stage, await this.captureWorkspaceSnapshot(repo));
     } catch (error) {
       this.logger.warn("could not capture Web run workspace metadata", { runId, stage, error: safeErrorMessage(error) });
+    }
+  }
+
+  private async resolveTaskFeatureName(summary: string, description: string): Promise<string> {
+    const resolved = this.taskFeatureNameResolver
+      ? await this.taskFeatureNameResolver({ summary, description })
+      : await summarizeTaskFeatureName({
+        codexPath: this.config.codex.cliPath,
+        summary,
+        description,
+        env: this.config.codex.env,
+      });
+    const fallback = fallbackTaskFeatureName(summary) || "task";
+    if (resolved) return resolved;
+    this.logger.warn("could not summarize task feature name with gpt-5.6-luna; using a deterministic short name", {
+      fallback,
+    });
+    return fallback;
+  }
+
+  private async ensureExistingTaskWorkspace(taskGuid: string): Promise<void> {
+    const workspace = this.db.getTaskWorkspace(taskGuid);
+    if (!workspace) return;
+    if (workspace.status === "removed" || workspace.followups_closed_at) {
+      throw new Error("任务工作区已归档或移除，不能继续该任务。");
+    }
+    try {
+      await provisionTaskWorkspace(workspace);
+      this.db.markTaskWorkspaceReady(workspace.workspace_id);
+    } catch (error) {
+      const message = safeErrorMessage(error);
+      this.db.markTaskWorkspaceFailed(workspace.workspace_id, message);
+      throw error;
+    }
+  }
+
+  private async ensureTaskWorkspaceReady(taskGuid: string, runId: string): Promise<boolean> {
+    const workspace = this.db.getTaskWorkspace(taskGuid);
+    if (!workspace) return true;
+    const queuedTask = this.db.getTask(taskGuid);
+    if (queuedTask?.state !== "QUEUED" || queuedTask.active_run_id !== runId) return true;
+    if (workspace.status === "removed" || workspace.followups_closed_at) {
+      const message = "任务工作区已归档或移除，不能启动本轮执行。";
+      this.db.markTaskWorkspaceFailed(workspace.workspace_id, message);
+      const task = this.db.getTask(taskGuid);
+      if (task?.state === "QUEUED" && task.active_run_id === runId) {
+        this.db.finishRun(runId, { status: "failed", error: message });
+      }
+      return false;
+    }
+    try {
+      await provisionTaskWorkspace(workspace);
+      const currentTask = this.db.getTask(taskGuid);
+      if (currentTask?.state === "QUEUED" && currentTask.active_run_id === runId) {
+        this.db.markTaskWorkspaceReady(workspace.workspace_id);
+      }
+      return true;
+    } catch (error) {
+      const message = safeErrorMessage(error);
+      const task = this.db.getTask(taskGuid);
+      if (task?.state === "QUEUED" && task.active_run_id === runId) {
+        this.db.markTaskWorkspaceFailed(workspace.workspace_id, message);
+        this.db.finishRun(runId, { status: "failed", error: message });
+      }
+      this.logger.error("could not provision task worktree", { taskGuid, runId, error: message });
+      return false;
     }
   }
 

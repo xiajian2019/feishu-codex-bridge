@@ -17,7 +17,7 @@ describe("SQLite shortcut configuration", () => {
     databases.push(database);
     const config = database.getShortcutConfig();
     expect(config.groups.map((group) => group.id)).toEqual(["favorites", "tmux", "codex", "ctrl", "keyboard", "composer"]);
-    expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "composer")).toHaveLength(13);
+    expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "composer")).toHaveLength(14);
     expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "tmux").map((shortcut) => shortcut.id)).toContain("command-tmuxctl");
     expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "tmux").map((shortcut) => shortcut.id)).toContain("tmux-resize-pane-5-right");
     expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "codex").map((shortcut) => shortcut.value)).toContain("/keymap");

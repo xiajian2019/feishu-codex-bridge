@@ -2,7 +2,8 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { lstat, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { spawn, type ChildProcess } from "node:child_process";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
 
@@ -30,8 +31,10 @@ import {
 import { writeProjectRegistrySnapshot } from "./project-registry.js";
 import type { TmuxDashboardApi } from "./tmux-dashboard-api.js";
 import { resolveBridgeProjectRoot } from "./portable-runtime.js";
+import { GitWorkspaceError, inspectTaskWorkspace, inspectUnmanagedWorktree, listGitWorktrees, removeTaskWorkspaceDirectory, resolveGitRoot, verifyTaskWorkspace } from "./git-workspaces.js";
 import { readSystemHealth } from "./system-health.js";
 import { parseTaskInput } from "./fingerprint.js";
+import { LinkToolError, LinkToolsService, type LinkToolProxySettings } from "./link-tools.js";
 import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import {
   WebTaskSubmissionConflictError,
@@ -72,6 +75,43 @@ const TASK_FILE_TEXT_EXTENSIONS = new Set([
   "log", "lua", "md", "markdown", "mjs", "py", "rb", "rs", "sh", "sql", "svg", "toml", "ts", "tsx", "txt", "xml", "yaml", "yml",
 ]);
 
+const LOCAL_DEMO_PROXY_TARGETS = [
+  {
+    id: "food-photo",
+    prefix: "/api/local-demos/food-photo",
+    hostname: "127.0.0.1",
+    port: 43127,
+    workingDirectory: "food-photo-fast-path",
+    startScript: "start_real.sh",
+    startArgs: ["--host", "127.0.0.1", "--port", "43127"],
+  },
+  {
+    id: "openai-clip",
+    prefix: "/api/local-demos/openai-clip",
+    hostname: "127.0.0.1",
+    port: 43128,
+    workingDirectory: "openai-clip-sqlite-vec",
+    startScript: "start.sh",
+    startArgs: ["--host", "127.0.0.1", "--port", "43128"],
+  },
+  {
+    id: "sqlite-vec-admin",
+    prefix: "/api/local-demos/sqlite-vec-admin",
+    hostname: "127.0.0.1",
+    port: 8001,
+    workingDirectory: "openai-clip-sqlite-vec",
+    startScript: "start_datasette.sh",
+    startArgs: [],
+  },
+] as const;
+
+function localDemoRoot(): string {
+  return resolve(
+    process.env.FEISHU_CODEX_DEMO_ROOT?.trim()
+      || join(process.cwd(), "..", "ai_work", "demo"),
+  );
+}
+
 interface TaskFileContext {
   rootPath: string;
   absolutePath: string;
@@ -96,6 +136,7 @@ export interface DashboardServerOptions {
   modes: string[];
   projectRegistrySnapshotPath?: string;
   taskAttachmentsDirectory?: string;
+  linkToolProxy?: LinkToolProxySettings;
   webRoot?: string;
   auth?: WebPairingAuth;
   tmuxDashboard?: TmuxDashboardApi;
@@ -120,10 +161,14 @@ export class DashboardServer {
   private readonly auth: WebPairingAuth;
   private readonly webRoot: string;
   private readonly taskAttachmentsDirectory: string;
+  private readonly linkTools: LinkToolsService;
   private readonly eventClients = new Set<ServerResponse>();
   private server: Server | null = null;
   private unsubscribeFromDatabase: (() => void) | null = null;
   private eventSequence = 0;
+  private readonly localDemoProcesses = new Map<string, ChildProcess>();
+  private readonly localDemoLogs = new Map<string, string[]>();
+  private readonly localDemoErrors = new Map<string, string>();
 
   constructor(options: DashboardServerOptions) {
     this.options = options;
@@ -133,6 +178,7 @@ export class DashboardServer {
     this.taskAttachmentsDirectory = resolve(
       options.taskAttachmentsDirectory ?? join(process.cwd(), "runtime", "task-attachments"),
     );
+    this.linkTools = new LinkToolsService({ proxy: options.linkToolProxy });
   }
 
   public async start(): Promise<string> {
@@ -177,7 +223,7 @@ export class DashboardServer {
     });
   }
 
-  public stop(): Promise<void> {
+  public async stop(): Promise<void> {
     const server = this.server;
     this.server = null;
     this.unsubscribeFromDatabase?.();
@@ -185,8 +231,13 @@ export class DashboardServer {
     for (const client of this.eventClients) client.end();
     this.eventClients.clear();
     this.options.tmuxDashboard?.stop();
-    if (!server) return Promise.resolve();
-    return new Promise((resolve, reject) => {
+    for (const [id, child] of this.localDemoProcesses) {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      this.localDemoProcesses.delete(id);
+    }
+    await this.linkTools.dispose();
+    if (!server) return;
+    await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
       server.closeIdleConnections();
     });
@@ -277,7 +328,10 @@ export class DashboardServer {
       if (
         request.method === "POST"
         && (/^\/tmux-dashboard\/api\/sessions\/[^/]+\/files\/upload$/.test(url.pathname)
-          || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/codex-account(?:\/check)?$/.test(url.pathname))
+          || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/codex-account(?:\/check)?$/.test(url.pathname)
+          || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/tasks$/.test(url.pathname)
+          || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/open$/.test(url.pathname)
+          || /^\/tmux-dashboard\/api\/workspaces\/[^/]+\/session$/.test(url.pathname))
         && !this.requireActionAuthorization(request, response)
       ) return;
       await this.options.tmuxDashboard.handleRequest(request, response, this.auth.currentDeviceId(request));
@@ -306,6 +360,36 @@ export class DashboardServer {
       response,
       publicWebRequest || url.pathname === "/healthz",
     )) return;
+    const localDemoStartMatch = /^\/api\/local-demos\/([^/]+)\/start$/.exec(url.pathname);
+    if (request.method === "POST" && localDemoStartMatch) {
+      if (!this.requireActionAuthorization(request, response)) return;
+      this.startLocalDemo(decodeURIComponent(localDemoStartMatch[1]), response);
+      return;
+    }
+    const localDemoLogsMatch = /^\/api\/local-demos\/([^/]+)\/logs$/.exec(url.pathname);
+    if (request.method === "GET" && localDemoLogsMatch) {
+      this.localDemoLog(decodeURIComponent(localDemoLogsMatch[1]), response);
+      return;
+    }
+    const localDemoTarget = LOCAL_DEMO_PROXY_TARGETS.find(({ prefix }) =>
+      url.pathname === prefix || url.pathname.startsWith(`${prefix}/`));
+    if (localDemoTarget) {
+      await this.proxyLocalDemo(request, response, url, localDemoTarget);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/link-tools/preview") {
+      await this.previewLinkTool(request, response);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/link-tools/download") {
+      await this.downloadLinkTool(request, response);
+      return;
+    }
+    const linkToolPreviewMatch = /^\/api\/link-tools\/previews\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "GET" && linkToolPreviewMatch) {
+      await this.serveLinkToolPreview(decodeURIComponent(linkToolPreviewMatch[1]!), response);
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/api/session") {
       sendJson(response, 200, { actionToken: this.actionToken });
       return;
@@ -382,6 +466,71 @@ export class DashboardServer {
     }
     if (request.method === "GET" && url.pathname === "/api/projects") {
       sendJson(response, 200, { projects: this.listProjects() });
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/skills") {
+      const scopePriority: Record<string, number> = {
+        project: 0,
+        codex_home: 1,
+        user: 2,
+        plugin: 3,
+        system: 4,
+      };
+      const byName = new Map<string, ReturnType<StateDatabase["listCodexSkills"]>[number]>();
+      for (const skill of this.options.db.listCodexSkills().sort((left, right) =>
+        (scopePriority[left.scope] ?? 9) - (scopePriority[right.scope] ?? 9)
+          || left.skillName.localeCompare(right.skillName),
+      )) {
+        const key = skill.skillName.toLocaleLowerCase("en-US");
+        if (!byName.has(key)) byName.set(key, skill);
+      }
+      const skills = [...byName.values()].sort((left, right) =>
+        Number(right.pinned) - Number(left.pinned)
+          || left.sortOrder - right.sortOrder
+          || left.skillName.localeCompare(right.skillName),
+      );
+      sendJson(response, 200, { skills });
+      return;
+    }
+    if (request.method === "PATCH" && url.pathname === "/api/skills/preferences") {
+      if (!this.requireActionAuthorization(request, response)) return;
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonBody(request);
+      } catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+        return;
+      }
+      if (!Array.isArray(body.skills) || body.skills.length > 1_000) {
+        sendJson(response, 400, { error: "skills must be an array of at most 1000 items" });
+        return;
+      }
+      const knownNames = new Set(this.options.db.listCodexSkills().map((skill) => skill.skillName.toLocaleLowerCase("en-US")));
+      const seenNames = new Set<string>();
+      const preferences: Array<{ skillName: string; pinned: boolean; sortOrder: number }> = [];
+      for (const value of body.skills) {
+        if (typeof value !== "object" || value === null) {
+          sendJson(response, 400, { error: "each skill preference must be an object" });
+          return;
+        }
+        const item = value as Record<string, unknown>;
+        const skillName = typeof item.skillName === "string" ? item.skillName.trim() : "";
+        const key = skillName.toLocaleLowerCase("en-US");
+        if (!skillName || skillName.length > 160 || !knownNames.has(key) || seenNames.has(key)
+          || typeof item.pinned !== "boolean" || !Number.isInteger(item.sortOrder)
+          || Number(item.sortOrder) < 0 || Number(item.sortOrder) > 1_000_000) {
+          sendJson(response, 400, { error: "invalid or duplicate skill preference" });
+          return;
+        }
+        seenNames.add(key);
+        preferences.push({ skillName, pinned: item.pinned, sortOrder: Number(item.sortOrder) });
+      }
+      try {
+        this.options.db.saveCodexSkillPreferences(preferences);
+        sendJson(response, 200, { ok: true });
+      } catch (error) {
+        sendJson(response, 422, { error: error instanceof Error ? error.message : "skill preference update failed" });
+      }
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/codex/usage") {
@@ -631,6 +780,26 @@ export class DashboardServer {
     }
     if (request.method === "GET" && url.pathname === "/api/tasks") {
       this.listTasks(url, response);
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/task-workspaces") {
+      await this.listTaskWorkspaces(response);
+      return;
+    }
+    const workspaceArchiveMatch = /^\/api\/task-workspaces\/([^/]+)\/archive$/.exec(url.pathname);
+    if (request.method === "POST" && workspaceArchiveMatch) {
+      let workspaceId: string;
+      try { workspaceId = decodeURIComponent(workspaceArchiveMatch[1]!); }
+      catch { sendJson(response, 400, { error: "invalid workspace selector" }); return; }
+      await this.archiveTaskWorkspace(workspaceId, request, response);
+      return;
+    }
+    const workspaceDeleteMatch = /^\/api\/task-workspaces\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "DELETE" && workspaceDeleteMatch) {
+      let workspaceId: string;
+      try { workspaceId = decodeURIComponent(workspaceDeleteMatch[1]!); }
+      catch { sendJson(response, 400, { error: "invalid workspace selector" }); return; }
+      await this.removeTaskWorkspace(workspaceId, request, response);
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/task-panel") {
@@ -1379,6 +1548,10 @@ export class DashboardServer {
       sendJson(response, 400, { error: "mode must be a string" });
       return;
     }
+    if (body.createWorktree !== undefined && typeof body.createWorktree !== "boolean") {
+      sendJson(response, 400, { error: "createWorktree must be a boolean" });
+      return;
+    }
     if ("executionBackend" in body || "tmuxSessionId" in body) {
       sendJson(response, 400, { error: "task execution target selection is no longer supported" });
       return;
@@ -1399,6 +1572,7 @@ export class DashboardServer {
         projectKey: body.projectKey,
         mode: typeof body.mode === "string" ? body.mode : undefined,
         attachmentIds: attachmentIds as string[],
+        createWorktree: body.createWorktree === true,
       };
       const task = await create(input);
       sendJson(response, 201, {
@@ -1539,9 +1713,14 @@ export class DashboardServer {
       throw new TaskFileRequestError(404, "task working directory is unavailable");
     }
 
-    const rootPath = await realpath(task.repo).catch(() => {
-      throw new TaskFileRequestError(404, "task working directory is unavailable");
-    });
+    const workspace = task.origin === "web" ? this.options.db.getTaskWorkspace(taskGuid) : null;
+    const rootPath = workspace
+      ? await verifyTaskWorkspace(workspace).catch(() => {
+        throw new TaskFileRequestError(404, "task working directory is unavailable");
+      })
+      : await realpath(task.repo).catch(() => {
+        throw new TaskFileRequestError(404, "task working directory is unavailable");
+      });
     const relativePath = normalizeTaskRelativePath(requestedPath);
     const candidatePath = resolve(rootPath, relativePath);
     if (!isTaskPathInside(rootPath, candidatePath)) {
@@ -1647,13 +1826,19 @@ export class DashboardServer {
       sendJson(response, 404, { error: "task not found" });
       return;
     }
+    const workspace = task.origin === "web" ? this.options.db.getTaskWorkspace(taskGuid) : null;
+    const workspaceAcceptsFollowup = !workspace || (!workspace.followups_closed_at && workspace.status !== "removed");
     sendJson(response, 200, {
       task: { ...task, input: parseTaskInput(task.input_text) },
       can_followup: task.origin === "web"
-        ? Boolean(this.options.actions?.appendWebFollowup && task.state !== "RUNNING" && task.state !== "QUEUED")
+        ? Boolean(this.options.actions?.appendWebFollowup && workspaceAcceptsFollowup && task.state !== "RUNNING" && task.state !== "QUEUED")
         : Boolean(this.options.actions?.appendFeedback),
       can_retry: task.origin === "web" && (task.state === "FAILED" || task.state === "CANCELED")
+        && workspaceAcceptsFollowup
         && Boolean(this.options.actions?.retryWebTask),
+      workspace,
+      can_archive_workspace: Boolean(workspace && !workspace.followups_closed_at && workspace.status !== "removed"
+        && task.state !== "RUNNING" && task.state !== "QUEUED"),
       runs: this.options.db.listRunsForTask(taskGuid).map((run) => ({
         ...run,
         events: this.options.db.listRunEvents(run.run_id),
@@ -1928,6 +2113,163 @@ export class DashboardServer {
       ...project,
       available: this.options.db.getAvailableProject(project.name) !== null,
     }));
+  }
+
+  private async listTaskWorkspaces(response: ServerResponse): Promise<void> {
+    let tmuxStatusKnown = true;
+    let liveSessionPaths: Array<{ sessionId: string; currentPath: string }> = [];
+    try {
+      if (!this.options.tmuxDashboard) throw new Error("Tmux Dashboard API is unavailable");
+      liveSessionPaths = await this.options.tmuxDashboard.getWorkspaceSessionSnapshot();
+    } catch (error) {
+      tmuxStatusKnown = false;
+      this.options.logger?.warn("could not refresh tmux sessions before workspace inventory", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    const records = this.options.db.listTaskWorkspaces();
+    const managedPaths = new Set(records.map((workspace) => resolve(workspace.worktree_path)));
+    const workspaces = await Promise.all(records.map(async (workspace) => {
+      const task = this.options.db.getTask(workspace.task_guid);
+      const inspection = await inspectTaskWorkspace(workspace);
+      const linkedSessionIds = new Set(this.options.db.listTmuxSessionsForWorkspace(workspace.workspace_id)
+        .filter((session) => !session.ended_at).map((session) => session.tmux_session_id));
+      const canonicalWorktree = await realpath(workspace.worktree_path).catch(() => resolve(workspace.worktree_path));
+      const paneMatches = liveSessionPaths
+        .filter((session) => isTaskPathInside(canonicalWorktree, resolve(session.currentPath)))
+        .map((session) => session.sessionId);
+      const activeSessionIds = new Set([...linkedSessionIds, ...paneMatches]);
+      const activeSessionCount = activeSessionIds.size;
+      const activeTask = task?.state === "RUNNING" || task?.state === "QUEUED";
+      const blockers: string[] = [];
+      if (activeTask) blockers.push("任务仍在排队或执行");
+      if (!workspace.followups_closed_at) blockers.push("任务仍允许续问；请先归档任务工作区");
+      if (inspection.dirtyEntryCount > 0) blockers.push(`有 ${inspection.dirtyEntryCount} 项未提交改动`);
+      if (activeSessionCount > 0) blockers.push(`有 ${activeSessionCount} 个关联或正在使用此目录的 tmux session`);
+      if (!tmuxStatusKnown) blockers.push("当前无法确认 tmux session 是否仍活动");
+      if (inspection.error && inspection.error !== "Git worktree list 中不存在此目录。") blockers.push(inspection.error);
+      const missingFromGit = inspection.error === "Git worktree list 中不存在此目录。";
+      const canRemoveDirectory = Boolean(
+        workspace.status !== "removed"
+        &&
+        workspace.followups_closed_at
+        && !activeTask
+        && activeSessionCount === 0
+        && tmuxStatusKnown
+        && inspection.dirtyEntryCount === 0
+        && (!inspection.error || missingFromGit),
+      );
+      const canDeleteBranch = canRemoveDirectory
+        && inspection.remoteBranches.length === 0
+        && (inspection.mergedIntoBase === true || inspection.commitsAheadOfBase === 0);
+      const parsedInput = task ? parseTaskInput(task.input_text) : null;
+      return {
+        ...workspace,
+        task_state: task?.state ?? null,
+        task_summary: parsedInput?.summary ?? task?.task_guid ?? "任务记录不可用",
+        active_session_count: activeSessionCount,
+        inspection,
+        blockers,
+        can_remove_directory: canRemoveDirectory,
+        can_delete_branch: canDeleteBranch,
+      };
+    }));
+
+    const unmanaged: Array<{
+      projectKey: string;
+      path: string;
+      branch: string | null;
+      commit: string | null;
+      prunable: boolean;
+      inspection: Awaited<ReturnType<typeof inspectUnmanagedWorktree>>;
+    }> = [];
+    const seenUnmanagedPaths = new Set<string>();
+    for (const project of this.options.db.listAvailableProjects()) {
+      try {
+        const root = await resolveGitRoot(project.path);
+        for (const entry of await listGitWorktrees(root)) {
+          const path = resolve(entry.path);
+          if (path === root || managedPaths.has(path) || seenUnmanagedPaths.has(path)) continue;
+          seenUnmanagedPaths.add(path);
+          unmanaged.push({
+            projectKey: project.name,
+            path,
+            branch: entry.branch,
+            commit: entry.commit,
+            prunable: entry.prunable,
+            inspection: await inspectUnmanagedWorktree(root, entry),
+          });
+        }
+      } catch (error) {
+        this.options.logger?.warn("could not inspect Git worktrees for project inventory", {
+          projectKey: project.name,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    sendJson(response, 200, { workspaces, unmanaged, tmuxStatusKnown });
+  }
+
+  private async archiveTaskWorkspace(workspaceId: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    try {
+      const workspace = this.options.db.archiveTaskWorkspace(workspaceId);
+      if (!workspace) { sendJson(response, 404, { error: "task workspace not found" }); return; }
+      sendJson(response, 200, { workspace });
+    } catch (error) {
+      sendJson(response, error instanceof GitWorkspaceError ? error.statusCode : 409, {
+        error: error instanceof Error ? error.message : "could not archive task workspace",
+      });
+    }
+  }
+
+  private async removeTaskWorkspace(workspaceId: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try { body = await readJsonBody(request); }
+    catch (error) { sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" }); return; }
+    if (body.deleteBranch !== undefined && typeof body.deleteBranch !== "boolean") {
+      sendJson(response, 400, { error: "deleteBranch must be a boolean" });
+      return;
+    }
+    const workspace = this.options.db.getTaskWorkspaceById(workspaceId);
+    if (!workspace) { sendJson(response, 404, { error: "task workspace not found" }); return; }
+    if (workspace.status === "removed") { sendJson(response, 200, { workspace, branchDeleted: false }); return; }
+    const task = this.options.db.getTask(workspace.task_guid);
+    if (!task) { sendJson(response, 409, { error: "task record is unavailable; workspace is retained" }); return; }
+    if (task.state === "QUEUED" || task.state === "RUNNING") {
+      sendJson(response, 409, { error: "任务仍在排队或执行，不能清理工作区。" });
+      return;
+    }
+    if (!workspace.followups_closed_at) {
+      sendJson(response, 409, { error: "请先在任务详情归档工作区并关闭后续续问。" });
+      return;
+    }
+    try {
+      if (!this.options.tmuxDashboard) throw new Error("Tmux Dashboard API is unavailable");
+      const liveSessionPaths = await this.options.tmuxDashboard.getWorkspaceSessionSnapshot();
+      const worktreePath = await realpath(workspace.worktree_path).catch(() => resolve(workspace.worktree_path));
+      const paneMatches = liveSessionPaths.filter((item) => isTaskPathInside(worktreePath, resolve(item.currentPath)));
+      const linkedSessionIds = new Set(this.options.db.listTmuxSessionsForWorkspace(workspaceId)
+        .filter((session) => !session.ended_at).map((session) => session.tmux_session_id));
+      const activeSessionIds = new Set([...linkedSessionIds, ...paneMatches.map((item) => item.sessionId)]);
+      if (activeSessionIds.size > 0) {
+        sendJson(response, 409, { error: `${activeSessionIds.size} 个 tmux session 仍关联或正在使用此工作区；请先显式结束它们。` });
+        return;
+      }
+    } catch (error) {
+      sendJson(response, 503, { error: `无法确认 tmux session 状态，工作区已保留：${error instanceof Error ? error.message : String(error)}` });
+      return;
+    }
+    try {
+      const result = await removeTaskWorkspaceDirectory(workspace, { deleteBranch: body.deleteBranch === true });
+      const updated = this.options.db.markTaskWorkspaceRemoved(workspaceId, result.branchError);
+      sendJson(response, 200, { workspace: updated, branchDeleted: result.branchDeleted, branchError: result.branchError ?? null });
+    } catch (error) {
+      sendJson(response, error instanceof GitWorkspaceError ? error.statusCode : 409, {
+        error: error instanceof Error ? error.message : "could not remove task workspace",
+      });
+    }
   }
 
   private sendShortcutConfig(response: ServerResponse): void {
@@ -2262,6 +2604,223 @@ export class DashboardServer {
     }
   }
 
+  private async previewLinkTool(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(request);
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+      return;
+    }
+    if (typeof body.url !== "string") {
+      sendJson(response, 400, { error: "url is required" });
+      return;
+    }
+    try {
+      const result = await this.linkTools.preview(body.url);
+      sendJson(response, 200, {
+        ...result,
+        previewUrl: `/api/link-tools/previews/${encodeURIComponent(result.token)}`,
+      });
+    } catch (error) {
+      const failure = linkToolErrorDetails(error);
+      sendJson(response, failure.status, { error: failure.message });
+    }
+  }
+
+  private async downloadLinkTool(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(request);
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+      return;
+    }
+    if (typeof body.url !== "string") {
+      sendJson(response, 400, { error: "url is required" });
+      return;
+    }
+    try {
+      sendJson(response, 200, await this.linkTools.download(body.url));
+    } catch (error) {
+      const failure = linkToolErrorDetails(error);
+      sendJson(response, failure.status, { error: failure.message });
+    }
+  }
+
+  private async serveLinkToolPreview(token: string, response: ServerResponse): Promise<void> {
+    const preview = await this.linkTools.getPreview(token);
+    if (!preview) {
+      sendJson(response, 404, { error: "preview expired or not found" });
+      return;
+    }
+    const unsafeContentType = preview.contentType === "text/html"
+      || preview.contentType === "application/xhtml+xml"
+      || preview.contentType === "image/svg+xml";
+    setSecurityHeaders(response);
+    response.statusCode = 200;
+    response.setHeader("Content-Type", unsafeContentType ? "text/plain; charset=utf-8" : preview.contentType);
+    response.setHeader("Content-Length", String(preview.sizeBytes));
+    response.setHeader("Cache-Control", "private, no-store");
+    response.setHeader("Content-Disposition", attachmentDisposition(preview.fileName, true));
+    response.setHeader(
+      "Content-Security-Policy",
+      "default-src 'none'; frame-ancestors 'self'; img-src 'self'; object-src 'self'",
+    );
+    const stream = createReadStream(preview.path);
+    stream.on("error", () => response.destroy());
+    stream.pipe(response);
+  }
+
+  private startLocalDemo(id: string, response: ServerResponse): void {
+    const target = LOCAL_DEMO_PROXY_TARGETS.find((item) => item.id === id);
+    if (!target) {
+      sendJson(response, 404, { error: "未知的本机 Demo" });
+      return;
+    }
+    const current = this.localDemoProcesses.get(id);
+    if (current && current.exitCode === null && current.signalCode === null) {
+      sendJson(response, 200, { ok: true, id, status: "running", port: target.port });
+      return;
+    }
+    this.localDemoLogs.set(id, []);
+    this.localDemoErrors.delete(id);
+    const root = localDemoRoot();
+    const workingDirectory = resolve(root, target.workingDirectory);
+    const startScript = resolve(workingDirectory, target.startScript);
+    if (!existsSync(workingDirectory) || !existsSync(startScript)) {
+      const message = `本机 Demo 文件不存在：${startScript}`;
+      this.localDemoErrors.set(id, message);
+      this.appendLocalDemoLog(id, `[error] ${message}`);
+      sendJson(response, 503, {
+        error: message,
+        hint: "可设置 FEISHU_CODEX_DEMO_ROOT 指向 ai_work/demo。",
+      });
+      return;
+    }
+    try {
+      this.appendLocalDemoLog(id, `[launcher] cwd=${workingDirectory}`);
+      this.appendLocalDemoLog(id, `[launcher] ${startScript} ${target.startArgs.join(" ")}`);
+      const child = spawn(startScript, target.startArgs, {
+        cwd: workingDirectory,
+        env: { ...process.env, PYTHONUNBUFFERED: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      child.stdout?.on("data", (chunk: Buffer) => {
+        this.appendLocalDemoLog(id, chunk.toString());
+        this.options.logger?.info("local demo stdout", { id, output: chunk.toString().trimEnd() });
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        this.appendLocalDemoLog(id, `[stderr] ${chunk.toString()}`);
+        this.options.logger?.warn("local demo stderr", { id, output: chunk.toString().trimEnd() });
+      });
+      child.once("error", (error) => {
+        this.localDemoErrors.set(id, error.message);
+        this.appendLocalDemoLog(id, `[error] ${error.message}`);
+        this.options.logger?.warn("local demo process failed", { id, error: error.message });
+        if (this.localDemoProcesses.get(id) === child) this.localDemoProcesses.delete(id);
+      });
+      child.once("exit", (code, signal) => {
+        this.appendLocalDemoLog(id, `[exit] code=${code ?? "null"} signal=${signal ?? "none"}`);
+        this.options.logger?.info("local demo process exited", { id, code, signal });
+      });
+      this.localDemoProcesses.set(id, child);
+      sendJson(response, 202, { ok: true, id, status: "starting", port: target.port });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "本机 Demo 启动失败";
+      this.localDemoErrors.set(id, message);
+      this.appendLocalDemoLog(id, `[error] ${message}`);
+      sendJson(response, 503, { error: message });
+    }
+  }
+
+  private localDemoLog(id: string, response: ServerResponse): void {
+    const target = LOCAL_DEMO_PROXY_TARGETS.find((item) => item.id === id);
+    if (!target) {
+      sendJson(response, 404, { error: "未知的本机 Demo" });
+      return;
+    }
+    const child = this.localDemoProcesses.get(id);
+    sendJson(response, 200, {
+      id,
+      root: localDemoRoot(),
+      workingDirectory: resolve(localDemoRoot(), target.workingDirectory),
+      command: [target.startScript, ...target.startArgs],
+      processRunning: Boolean(child && child.exitCode === null && child.signalCode === null),
+      pid: child?.pid ?? null,
+      exitCode: child?.exitCode ?? null,
+      signal: child?.signalCode ?? null,
+      error: this.localDemoErrors.get(id) ?? null,
+      lines: this.localDemoLogs.get(id) ?? [],
+    });
+  }
+
+  private appendLocalDemoLog(id: string, chunk: string): void {
+    const lines = this.localDemoLogs.get(id) ?? [];
+    for (const line of chunk.split(/\r?\n/).map((item) => item.trimEnd()).filter(Boolean)) {
+      lines.push(`${new Date().toISOString()} ${line}`);
+    }
+    if (lines.length > 200) lines.splice(0, lines.length - 200);
+    this.localDemoLogs.set(id, lines);
+  }
+
+  private async proxyLocalDemo(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    target: (typeof LOCAL_DEMO_PROXY_TARGETS)[number],
+  ): Promise<void> {
+    const suffix = url.pathname.slice(target.prefix.length) || "/";
+    const targetPath = `${suffix}${url.search}`;
+    await new Promise<void>((resolve) => {
+      const headers = { ...request.headers };
+      delete headers.host;
+      delete headers.connection;
+      delete headers.cookie;
+      delete headers.authorization;
+      delete headers["x-bridge-action-token"];
+      delete headers["x-forwarded-for"];
+      delete headers["x-forwarded-host"];
+      delete headers["x-forwarded-proto"];
+      const upstream = httpRequest({
+        hostname: target.hostname,
+        port: target.port,
+        method: request.method,
+        path: targetPath,
+        headers,
+      }, (upstreamResponse) => {
+        response.statusCode = upstreamResponse.statusCode ?? 502;
+        for (const [name, value] of Object.entries(upstreamResponse.headers)) {
+          if (
+            value === undefined
+            || name === "connection"
+            || name === "keep-alive"
+            || name === "transfer-encoding"
+            || name === "set-cookie"
+          ) continue;
+          response.setHeader(name, value);
+        }
+        upstreamResponse.pipe(response);
+        upstreamResponse.once("end", resolve);
+        upstreamResponse.once("error", resolve);
+      });
+      upstream.setTimeout(10_000, () => upstream.destroy(new Error("local demo proxy timeout")));
+      upstream.once("error", (error) => {
+        this.options.logger?.warn("local demo proxy failed", {
+          target: target.prefix,
+          error: error.message,
+        });
+        if (!response.headersSent) sendJson(response, 502, { error: "本机 Demo 未启动或暂时不可用" });
+        else response.destroy(error);
+        resolve();
+      });
+      request.once("aborted", () => upstream.destroy());
+      request.pipe(upstream);
+    });
+  }
+
   private async serveAsset(requestPath: string, response: ServerResponse): Promise<void> {
     let decodedPath: string;
     try {
@@ -2403,6 +2962,11 @@ export class DashboardServer {
   }
 }
 
+function linkToolErrorDetails(error: unknown): { status: number; message: string } {
+  if (error instanceof LinkToolError) return { status: error.statusCode, message: error.message };
+  return { status: 502, message: "链接访问失败，请检查链接、VPN 或代理设置。" };
+}
+
 function isSpaRoute(pathname: string): boolean {
   return pathname === "/"
     || pathname === "/index.html"
@@ -2413,10 +2977,13 @@ function isSpaRoute(pathname: string): boolean {
     || pathname === "/system-management/usage"
     || pathname === "/system-management/health"
     || pathname === "/system-management/backups"
+    || pathname === "/system-management/workspaces"
     || pathname === "/direct-tasks"
     || pathname === "/system-management/projects"
     || /^\/tasks\/(?:desk|direct|aamp)\/[^/]+$/.test(pathname)
     || pathname === "/codex-history"
+    || pathname === "/demos"
+    || pathname === "/link-tools"
     || pathname === "/tmux-dashboard"
     || (pathname.startsWith("/tmux-dashboard/")
       && !pathname.startsWith("/tmux-dashboard/api/")

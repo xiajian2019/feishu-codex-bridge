@@ -1,5 +1,7 @@
 import type { Terminal } from "@xterm/xterm";
 
+import { openTerminalUrl, terminalLinkAtBufferCell, type TerminalLinkMatch } from "./terminal-links.js";
+
 function cellPosition(terminal: Terminal, element: HTMLElement, clientX: number, clientY: number): { col: number; row: number } {
   const screen = element.querySelector<HTMLElement>(".xterm-screen");
   const rect = (screen ?? element).getBoundingClientRect();
@@ -12,6 +14,7 @@ function cellPosition(terminal: Terminal, element: HTMLElement, clientX: number,
 type BufferCell = { column: number; row: number };
 type BufferRange = { start: number; end: number };
 export type TerminalSelectionDisplay = { text: string; left: number; top: number };
+type TerminalTouchOptions = { enableDesktopSelection?: boolean };
 const LONG_PRESS_DELAY_MS = 1_500;
 const LONG_PRESS_MOVE_CANCEL_PX = 20;
 const TOUCH_SCROLL_PIXELS_PER_LINE = 10;
@@ -180,6 +183,14 @@ function selectBufferRange(terminal: Terminal, range: BufferRange): void {
   terminal.select(start % columns, Math.floor(start / columns), end - start);
 }
 
+function selectionRangeFromTerminal(terminal: Terminal): BufferRange | null {
+  const position = terminal.getSelectionPosition();
+  if (!position) return null;
+  const start = Math.max(0, (position.start.y - 1) * terminal.cols + position.start.x - 1);
+  const end = Math.max(start + 1, (position.end.y - 1) * terminal.cols + position.end.x - 1);
+  return { start, end };
+}
+
 function setHandlePosition(
   terminal: Terminal,
   host: HTMLElement,
@@ -236,7 +247,9 @@ export function bindMobileTerminalTouch(
   host: HTMLElement,
   terminal: Terminal,
   onSelectionChange: (selection: TerminalSelectionDisplay | null) => void,
+  options: TerminalTouchOptions = {},
 ): () => void {
+  const enableDesktopSelection = options.enableDesktopSelection === true;
   let lastWheelSampleAt = 0;
   let wheelPixelRemainder = 0;
   let lastViewportSampleAt = 0;
@@ -347,6 +360,14 @@ export function bindMobileTerminalTouch(
   let scrollTrace: ScrollTrace | null = null;
   let selectedRange: BufferRange | null = null;
   let dragHandle: "start" | "end" | null = null;
+  let mouseSelecting = false;
+  let mouseSelectionAnchor: number | null = null;
+  let mouseStartX = 0;
+  let mouseStartY = 0;
+  let selectionMode: "touch" | "mouse" | "native" | null = null;
+  let touchLink: TerminalLinkMatch | null = null;
+  let touchLinkStartX = 0;
+  let touchLinkStartY = 0;
   const cancelTouchInertia = (): void => {
     if (inertiaFrame) window.cancelAnimationFrame(inertiaFrame);
     inertiaFrame = 0;
@@ -445,9 +466,10 @@ export function bindMobileTerminalTouch(
     window.clearTimeout(longPressTimer);
     longPressTimer = 0;
   };
-  const updateSelectionControls = (range: BufferRange | null): void => {
+  const updateSelectionControls = (range: BufferRange | null, showHandles = selectionMode !== "mouse"): void => {
     selectedRange = range;
     if (!range) {
+      selectionMode = null;
       startHandle.hidden = true;
       endHandle.hidden = true;
       onSelectionChange(null);
@@ -455,13 +477,16 @@ export function bindMobileTerminalTouch(
     }
     const text = terminal.getSelection();
     if (!text) {
-      startHandle.hidden = true;
-      endHandle.hidden = true;
-      onSelectionChange(null);
+      updateSelectionControls(null);
       return;
     }
-    setHandlePosition(terminal, host, startHandle, range.start);
-    setHandlePosition(terminal, host, endHandle, range.end, true);
+    if (showHandles) {
+      setHandlePosition(terminal, host, startHandle, range.start);
+      setHandlePosition(terminal, host, endHandle, range.end, true);
+    } else {
+      startHandle.hidden = true;
+      endHandle.hidden = true;
+    }
     const position = selectionDisplayPosition(terminal, host, range);
     onSelectionChange({ text, ...position });
   };
@@ -486,8 +511,19 @@ export function bindMobileTerminalTouch(
     wheelPixelRemainder = 0;
     if (selectedRange) updateSelectionControls(selectedRange);
   });
+  const emitNativeSelection = (): void => {
+    if (selectedRange || !terminal.hasSelection()) return;
+    const range = selectionRangeFromTerminal(terminal);
+    const text = terminal.getSelection();
+    if (!range || !text) return;
+    selectionMode = "native";
+    const position = selectionDisplayPosition(terminal, host, range);
+    onSelectionChange({ text, ...position });
+  };
+  const nativeSelectionChange = terminal.onSelectionChange(emitNativeSelection);
+  const nativeSelectionScroll = terminal.onScroll(emitNativeSelection);
+  const nativeSelectionResize = terminal.onResize(emitNativeSelection);
   const onTouchStart = (event: TouchEvent): void => {
-    if (event.cancelable) event.preventDefault();
     if (activeTouchIdentifier !== null) return;
     clearLongPressTimer();
     const touch = event.changedTouches[0] ?? event.touches[0];
@@ -511,6 +547,16 @@ export function bindMobileTerminalTouch(
     if (selectedRange && (handleSide === "start" || handleSide === "end")) {
       scrollTrace = null;
       dragHandle = handleSide;
+      event.preventDefault();
+      return;
+    }
+    const linkCell = bufferCellPosition(terminal, host, touch.clientX, touch.clientY);
+    touchLink = terminalLinkAtBufferCell(terminal, linkCell.column, linkCell.row);
+    if (touchLink) {
+      touchLinkStartX = touch.clientX;
+      touchLinkStartY = touch.clientY;
+      scrollTrace = null;
+      dragHandle = null;
       event.preventDefault();
       return;
     }
@@ -560,15 +606,85 @@ export function bindMobileTerminalTouch(
         return;
       }
       longPressTriggered = true;
+      selectionMode = "touch";
       selectBufferRange(terminal, range);
       updateSelectionControls(range);
       logScrollDiagnostic("long-press-selected", { elapsedMs, selectedCells: range.end - range.start });
     }, LONG_PRESS_DELAY_MS);
   };
+  const pointerSelectionOffset = (event: MouseEvent): number => {
+    const position = bufferCellPosition(terminal, host, event.clientX, event.clientY);
+    const maxOffset = Math.max(0, terminal.buffer.active.length * terminal.cols - 1);
+    return Math.max(0, Math.min(maxOffset, position.row * terminal.cols + position.column));
+  };
+  const updateMouseSelection = (event: MouseEvent): void => {
+    if (mouseSelectionAnchor === null) return;
+    const offset = pointerSelectionOffset(event);
+    const range = mouseSelectionAnchor <= offset
+      ? { start: mouseSelectionAnchor, end: offset + 1 }
+      : { start: offset, end: mouseSelectionAnchor + 1 };
+    selectionMode = "mouse";
+    selectBufferRange(terminal, range);
+    updateSelectionControls(range);
+  };
+  const finishMouseSelection = (): void => {
+    mouseSelecting = false;
+    mouseSelectionAnchor = null;
+    mouseStartX = 0;
+    mouseStartY = 0;
+  };
+  const onMouseDown = (event: MouseEvent): void => {
+    if (!enableDesktopSelection || event.button !== 0) return;
+    const target = event.target instanceof Element
+      ? event.target.closest("[data-terminal-selection-handle]")
+      : null;
+    if (target) return;
+    mouseSelecting = false;
+    mouseSelectionAnchor = pointerSelectionOffset(event);
+    mouseStartX = event.clientX;
+    mouseStartY = event.clientY;
+  };
+  const onMouseMove = (event: MouseEvent): void => {
+    if (mouseSelectionAnchor === null) return;
+    if ((event.buttons & 1) === 0) {
+      finishMouseSelection();
+      return;
+    }
+    if (!mouseSelecting) {
+      if (Math.hypot(event.clientX - mouseStartX, event.clientY - mouseStartY) < 4) return;
+      mouseSelecting = true;
+      selectionMode = "mouse";
+      terminal.clearSelection();
+    }
+    updateMouseSelection(event);
+    event.preventDefault();
+    event.stopPropagation();
+  };
+  const onMouseUp = (event: MouseEvent): void => {
+    if (mouseSelectionAnchor === null) return;
+    if (!mouseSelecting) {
+      finishMouseSelection();
+      return;
+    }
+    updateMouseSelection(event);
+    finishMouseSelection();
+    event.preventDefault();
+    event.stopPropagation();
+  };
   const onTouchMove = (event: TouchEvent): void => {
     const touch = Array.from(event.touches).find((candidate) => candidate.identifier === activeTouchIdentifier);
     if (!touch || previousY === null) return;
     if (event.cancelable) event.preventDefault();
+    if (touchLink) {
+      const linkMovement = Math.hypot(touch.clientX - touchLinkStartX, touch.clientY - touchLinkStartY);
+      if (linkMovement < 8) return;
+      touchLink = null;
+      touchLinkStartX = 0;
+      touchLinkStartY = 0;
+      previousY = touch.clientY;
+      lastTouchMoveY = touch.clientY;
+      lastTouchMoveAt = performance.now();
+    }
     if (!longPressTriggered && touchStartX !== null && touchStartY !== null && longPressTimer) {
       const movementDistancePx = Math.hypot(touch.clientX - touchStartX, touch.clientY - touchStartY);
       if (movementDistancePx < LONG_PRESS_MOVE_CANCEL_PX) {
@@ -702,6 +818,33 @@ export function bindMobileTerminalTouch(
     }
     clearLongPressTimer();
     const now = performance.now();
+    const linkToOpen = touchLink;
+    touchLink = null;
+    if (
+      linkToOpen
+      && event.type === "touchend"
+      && event.touches.length === 0
+      && Math.hypot(endedTouch.clientX - touchLinkStartX, endedTouch.clientY - touchLinkStartY) < 12
+    ) {
+      event.preventDefault();
+      openTerminalUrl(linkToOpen.url);
+      touchLinkStartX = 0;
+      touchLinkStartY = 0;
+      scrollTrace = null;
+      previousY = null;
+      touchStartX = null;
+      touchStartY = null;
+      activeTouchIdentifier = null;
+      lastTouchMoveY = null;
+      lastTouchMoveAt = 0;
+      touchVelocityPxPerMs = 0;
+      longPressTriggered = false;
+      dragHandle = null;
+      cancelTouchInertia();
+      return;
+    }
+    touchLinkStartX = 0;
+    touchLinkStartY = 0;
     const canFinishScroll = event.type === "touchend" && !longPressTriggered && !dragHandle && previousY !== null;
     const finalDelta = previousY === null ? 0 : previousY - endedTouch.clientY;
     let finalRequestedLines = 0;
@@ -788,6 +931,11 @@ export function bindMobileTerminalTouch(
   };
   host.addEventListener("touchstart", onTouchStart, { capture: true, passive: false });
   host.addEventListener("touchmove", onTouchMove, { capture: true, passive: false });
+  if (enableDesktopSelection) {
+    host.addEventListener("mousedown", onMouseDown, { capture: true });
+    host.addEventListener("mousemove", onMouseMove, { capture: true });
+    host.ownerDocument.addEventListener("mouseup", onMouseUp, true);
+  }
   host.ownerDocument.addEventListener("touchend", onTouchEnd, true);
   host.ownerDocument.addEventListener("touchcancel", onTouchEnd, true);
   const screen = host.querySelector<HTMLElement>(".xterm-screen");
@@ -808,10 +956,19 @@ export function bindMobileTerminalTouch(
     selectionChange.dispose();
     selectionScroll.dispose();
     selectionResize.dispose();
+    nativeSelectionChange.dispose();
+    nativeSelectionScroll.dispose();
+    nativeSelectionResize.dispose();
     renderListener.dispose();
     pendingScrollRender = null;
     startHandle.remove();
     endHandle.remove();
+    finishMouseSelection();
+    if (enableDesktopSelection) {
+      host.removeEventListener("mousedown", onMouseDown, true);
+      host.removeEventListener("mousemove", onMouseMove, true);
+      host.ownerDocument.removeEventListener("mouseup", onMouseUp, true);
+    }
     onSelectionChange(null);
     host.removeEventListener("touchstart", onTouchStart, true);
     host.removeEventListener("touchmove", onTouchMove, true);
