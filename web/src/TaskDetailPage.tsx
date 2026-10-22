@@ -15,6 +15,10 @@ const DIRECT_STATUS_LABELS: Record<string, string> = {
 const AAMP_STATUS_LABELS: Record<string, string> = {
   pending: "等待派发", running: "执行中", done: "已完成", failed: "失败", cancelled: "已取消",
 };
+const DESK_STATUS_LABELS: Record<string, string> = {
+  DISCOVERED: "待处理", BLOCKED_CONFIG: "配置阻塞", QUEUED: "排队中", RUNNING: "执行中",
+  WAITING_REVIEW: "待验收", ACCEPTED: "已验收", FAILED: "失败", CANCELED: "已取消",
+};
 
 export function TaskDetailPage(): ReactElement {
   const { source: sourceParam, taskId: taskIdParam } = useParams();
@@ -34,6 +38,7 @@ export function TaskDetailPage(): ReactElement {
   const [detailOffset, setDetailOffset] = useState(0);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const [followupStatus, setFollowupStatus] = useState<string | null>(null);
   const [interrupting, setInterrupting] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [reviewNote, setReviewNote] = useState("");
@@ -59,6 +64,7 @@ export function TaskDetailPage(): ReactElement {
     setCurrentFileTarget(null);
     pendingSubmission.current = null;
     pendingRetry.current = null;
+    setFollowupStatus(null);
     try { setDraft(sessionStorage.getItem(draftKey) ?? ""); } catch { setDraft(""); }
   }, [draftKey]);
 
@@ -113,13 +119,16 @@ export function TaskDetailPage(): ReactElement {
     if (pendingSubmission.current?.text !== text) pendingSubmission.current = { text, key: crypto.randomUUID() };
     setSending(true);
     setError(null);
+    setFollowupStatus("正在提交补充信息…");
     try {
-      await postTaskFollowup(source, taskId, text, pendingSubmission.current.key);
+      const result = await postTaskFollowup(source, taskId, text, pendingSubmission.current.key);
       pendingSubmission.current = null;
       updateDraft("");
       scrollAfterSubmitRef.current = true;
+      setFollowupStatus(result.state === "QUEUED" ? "补充信息已提交，正在排队执行。" : "补充信息已提交，正在执行。");
       setRefresh((value) => value + 1);
     } catch (failure) {
+      setFollowupStatus(null);
       setError(failure instanceof Error ? failure.message : String(failure));
     } finally {
       setSending(false);
@@ -155,7 +164,7 @@ export function TaskDetailPage(): ReactElement {
   const openWorkspaceInTmux = async (): Promise<void> => {
     const workspace = desk?.workspace;
     const taskIsActive = desk?.task.state === "QUEUED" || desk?.task.state === "RUNNING";
-    if (!workspace || workspace.status === "removed" || workspaceBusy || taskIsActive) return;
+    if (!workspace || (workspace.status !== "ready" && workspace.status !== "retained") || workspaceBusy || taskIsActive || workspace.followups_closed_at) return;
     setWorkspaceBusy(true);
     setError(null);
     try {
@@ -217,14 +226,37 @@ export function TaskDetailPage(): ReactElement {
     || (direct?.followups.total === 0 ? directTask?.final_response : null);
   const title = directTask ? directTaskTitle(directTask.text, 180)
     : aampTask ? aampTask.text?.trim() ? directTaskTitle(aampTask.text, 180) : aampTask.image_count ? "（图片任务）" : "（无标题）"
-      : deskTask?.input?.summary || (loading ? "正在加载任务…" : "任务详情");
+      : deskTask?.input?.summary ? directTaskTitle(deskTask.input.summary, 120) : (loading ? "正在加载任务…" : "任务详情");
   const status = directTask ? DIRECT_STATUS_LABELS[directTask.status] || directTask.status
-    : aampTask ? AAMP_STATUS_LABELS[aampTask.status] || aampTask.status : deskTask?.state ?? "";
+    : aampTask ? AAMP_STATUS_LABELS[aampTask.status] || aampTask.status : (DESK_STATUS_LABELS[deskTask?.state ?? ""] || deskTask?.state || "");
   const canFollowup = source === "direct" ? Boolean(direct?.can_followup) : source === "aamp" ? false : Boolean(desk?.can_followup);
   const active = source === "direct"
     ? directTask?.status === "RUNNING" || directTask?.status === "QUEUED"
     : source === "aamp" ? aampTask?.status === "running" || aampTask?.status === "pending"
       : deskTask?.state === "RUNNING" || deskTask?.state === "QUEUED";
+  const workspace = desk?.workspace;
+  const workspaceOpenDisabled = Boolean(
+    !workspace
+    || workspaceBusy
+    || active
+    || workspace.status === "removed"
+    || workspace.status === "provisioning"
+    || workspace.status === "failed"
+    || workspace.followups_closed_at,
+  );
+  const workspaceOpenHint = workspaceBusy
+    ? "正在准备 Tmux Session。"
+    : active
+      ? "任务正在由 Bridge Codex SDK 执行；执行结束后才会开放可写 Tmux Session。"
+      : workspace?.status === "provisioning"
+        ? "worktree 仍在创建。"
+        : workspace?.status === "failed"
+          ? "worktree 创建或恢复失败，请先查看错误。"
+          : workspace?.status === "removed"
+            ? "worktree 目录已移除。"
+            : workspace?.followups_closed_at
+              ? "任务工作区已归档。"
+              : "打开此任务 worktree 的 Tmux shell。任务本身由 Bridge Codex SDK 执行。";
 
   const openCurrentFile = (path: string): void => {
     fileOpenSequence.current += 1;
@@ -240,25 +272,25 @@ export function TaskDetailPage(): ReactElement {
         <div className="task-detail-page-heading">
           <h1 id="task-detail-page-title">{title}</h1>
           <div className="task-detail-page-meta">
-            <span className="guid">{taskId}</span>
-            <span>{source === "direct" ? "飞书 Direct" : source === "aamp" ? "飞书 AAMP + Relay（只读）" : deskTask?.origin === "web" ? "Bridge 看板" : "飞书任务"}</span>
-            {status ? <span>{status}</span> : null}
-            {directTask ? <span>{directTask.attempt} 次执行</span> : deskTask ? <span>{desk?.runs.length ?? 0} 次运行</span> : null}
-            {(directTask?.thread_id || deskTask?.thread_id) ? <span className="guid">Thread：{directTask?.thread_id || deskTask?.thread_id}</span> : null}
+            {status ? <span className="task-detail-status">{status}</span> : null}
           </div>
         </div>
         <button className="task-detail-page-refresh" type="button" onClick={() => setRefresh((value) => value + 1)} disabled={loading} aria-label="刷新详情" title="刷新详情">↻</button>
       </header>
-      {source === "desk" && desk?.workspace ? <section className="task-workspace-card" aria-label="Git worktree 工作区">
+      {source === "desk" && workspace ? <section className="task-workspace-card" aria-label="Git worktree 工作区">
         <div className="task-workspace-copy">
-          <strong>Git worktree · {desk.workspace.branch}</strong>
-          <span>{desk.workspace.status === "provisioning" ? "正在创建" : desk.workspace.status === "failed" ? "创建或恢复失败" : desk.workspace.status === "removed" ? "目录已移除" : desk.workspace.followups_closed_at ? "已归档" : "保留中"}</span>
-          <code title={desk.workspace.worktree_path}>{desk.workspace.worktree_path}</code>
-          <small>基准提交：{desk.workspace.base_sha.slice(0, 12)} · {desk.workspace.base_ref}</small>
-          {desk.workspace.last_error ? <small className="task-detail-page-error">{desk.workspace.last_error}</small> : null}
+          <div className="task-workspace-heading"><strong>Git worktree</strong><span>{workspace.status === "provisioning" ? "正在创建" : workspace.status === "failed" ? "创建或恢复失败" : workspace.status === "removed" ? "目录已移除" : workspace.followups_closed_at ? "已归档" : active ? "Codex SDK 执行中" : "已保留，可在 Tmux 打开"}</span></div>
+          <small>Codex SDK 执行 · Tmux 用于查看或继续编辑</small>
+          <details className="task-workspace-details">
+            <summary>查看分支、路径与基准</summary>
+            <code title={workspace.worktree_path}>{workspace.branch}</code>
+            <code title={workspace.worktree_path}>{workspace.worktree_path}</code>
+            <small>基准提交：{workspace.base_sha.slice(0, 12)} · {workspace.base_ref}</small>
+          </details>
+          {workspace.last_error ? <small className="task-detail-page-error">{workspace.last_error}</small> : null}
         </div>
         <div className="task-workspace-actions">
-          <button type="button" disabled={workspaceBusy || active || desk.workspace.status === "removed" || desk.workspace.followups_closed_at !== null} onClick={() => void openWorkspaceInTmux()}>
+          <button type="button" disabled={workspaceOpenDisabled} title={workspaceOpenHint} aria-label={`在 Tmux 打开任务 worktree（${workspaceOpenHint}）`} onClick={() => void openWorkspaceInTmux()}>
             {workspaceBusy ? "处理中…" : "在 Tmux 打开"}
           </button>
           {desk.can_archive_workspace ? <button type="button" disabled={workspaceBusy} onClick={() => void archiveWorkspace()}>归档并关闭续问</button> : null}
@@ -310,7 +342,7 @@ export function TaskDetailPage(): ReactElement {
             : <div className="task-detail-message is-user"><small>任务描述</small><div>{deskTask.input?.description || "（无描述）"}</div></div>}
           {deskTask.origin === "web" && desk.runs[0]?.state === "WAITING_REVIEW" ? <section className="task-review" aria-label="人工验收">
             <h2>人工验收</h2>
-            <p className="muted">验收记录与 Codex 执行状态分别保存；后续追加信息会生成新一轮运行。</p>
+            <p className="muted">追加信息会生成新一轮运行。</p>
             <textarea aria-label="验收意见" value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} maxLength={1000} rows={2} placeholder="需要修改时请填写具体问题；验收通过可留空" disabled={reviewBusy} />
             <div className="task-review-actions">
               <button type="button" disabled={reviewBusy} onClick={() => void saveReview("accepted")}>验收通过</button>
@@ -325,6 +357,7 @@ export function TaskDetailPage(): ReactElement {
           {desk.can_retry ? <button type="button" disabled={retrying} onClick={() => void retryTask()}>{retrying ? "正在重试…" : "重新执行任务"}</button> : null}
         </> : null}
       </div>
+      {followupStatus ? <div className="task-detail-followup-status" role="status">{followupStatus}</div> : null}
       {source !== "aamp" ? <form className="task-detail-composer" onSubmit={(event) => void submit(event)}>
         <textarea aria-label="追加信息" value={draft} onChange={(event) => updateDraft(event.target.value)} maxLength={2000}
           placeholder={canFollowup ? "向当前任务追加信息…" : "当前任务暂时不能追加信息"}

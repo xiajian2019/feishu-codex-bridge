@@ -1,12 +1,18 @@
 import { spawn } from "node:child_process";
-import { mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 import type { StoredTaskWorkspace } from "./types.js";
+import { fallbackTaskFeatureName } from "./task-feature-name.js";
 
 const GIT_COMMAND_TIMEOUT_MS = 20_000;
 const GIT_OUTPUT_LIMIT_BYTES = 1_048_576;
+const GIT_CHANGE_PATCH_LIMIT_BYTES = 512 * 1024;
+const MAX_UNTRACKED_FILE_PATCH_BYTES = 256 * 1024;
 const LOCK_TIMEOUT_MS = 15_000;
+
+export const TASK_BASE_REF = "master";
 
 export class GitWorkspaceError extends Error {
   constructor(message: string, public readonly statusCode = 422) {
@@ -27,6 +33,7 @@ export interface PreparedTaskWorkspace {
   branch: string;
   baseRef: string;
   baseSha: string;
+  sourceSha: string;
   sourceTmuxSessionId: string | null;
 }
 
@@ -54,6 +61,8 @@ export interface TaskSourceInspection {
   gitRoot: string;
   branch: string | null;
   baseSha: string;
+  targetBaseRef: string;
+  targetBaseSha: string;
   dirtyEntryCount: number;
 }
 
@@ -82,6 +91,7 @@ export async function prepareTaskWorkspace(input: {
   projectKey: string;
   projectRoot: string;
   summary: string;
+  featureName?: string;
   sourceDirectory?: string;
   sourceTmuxSessionId?: string;
 }): Promise<PreparedTaskWorkspace> {
@@ -104,36 +114,32 @@ export async function prepareTaskWorkspace(input: {
     throw new GitWorkspaceError(`任务源目录有 ${dirtyEntries.length} 项未提交改动；新 worktree 只会从 HEAD 创建，不会复制这些改动。`);
   }
 
-  const baseResult = await git(sourceDirectory, ["rev-parse", "--verify", "HEAD^{commit}"]);
-  if (baseResult.exitCode !== 0) throw gitFailure("任务源目录没有可用的 Git 提交", baseResult);
-  const baseSha = singleLine(baseResult.stdout);
-  if (!/^[a-f\d]{40,64}$/i.test(baseSha)) throw new GitWorkspaceError("无法确认任务源目录的基准提交。");
+  const sourceResult = await git(sourceDirectory, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  if (sourceResult.exitCode !== 0) throw gitFailure("任务源目录没有可用的 Git 提交", sourceResult);
+  const sourceSha = singleLine(sourceResult.stdout);
+  if (!/^[a-f\d]{40,64}$/i.test(sourceSha)) throw new GitWorkspaceError("无法确认任务源目录的当前提交。");
 
-  const branchResult = await git(sourceDirectory, ["branch", "--show-current"]);
-  const baseRef = branchResult.exitCode === 0 && singleLine(branchResult.stdout)
-    ? singleLine(branchResult.stdout)
-    : baseSha;
+  const { baseRef, baseSha } = await resolveTaskBase(projectGitRoot);
   const rootDirectory = await ensureWorkspaceRoot(input.workspaceRoot, projectGitRoot);
   const projectSlug = slug(input.projectKey, 36) || "project";
-  const taskSlug = slug(input.summary, 40) || "task";
-  const uniqueSuffix = input.taskGuid.replace(/[^a-f\d]/gi, "").slice(-10).toLowerCase() || input.workspaceId.slice(0, 10);
+  const featureName = fallbackTaskFeatureName(input.featureName ?? input.summary) || "task";
+  const shortFeatureName = featureName.split("-").slice(0, 2).join("-") || "task";
   const worktreeParent = resolve(rootDirectory, projectSlug);
   await mkdir(worktreeParent, { recursive: true, mode: 0o700 });
   const canonicalParent = await realpath(worktreeParent);
   if (!isPathInside(rootDirectory, canonicalParent)) {
     throw new GitWorkspaceError("worktree 根目录中的符号链接越过了配置目录。");
   }
-  const worktreePath = resolve(canonicalParent, `${taskSlug}-${uniqueSuffix}`);
-  if (!isPathInside(canonicalParent, worktreePath)) throw new GitWorkspaceError("计算出的 worktree 路径无效。");
-  if (await pathExists(worktreePath)) throw new GitWorkspaceError("worktree 目标路径已存在，请刷新后重试。", 409);
-
-  const branchBase = `bridge/tasks/${taskSlug}-${uniqueSuffix}`;
+  const branchBase = `xiajian/agent/${featureName}`;
   let branch = branchBase;
+  let worktreePath = resolve(canonicalParent, `wt-${shortFeatureName}`);
   let suffix = 2;
-  while (await branchExists(projectGitRoot, branch)) {
+  while (await branchExists(projectGitRoot, branch) || await pathExists(worktreePath)) {
     branch = `${branchBase}-${suffix}`;
+    worktreePath = resolve(canonicalParent, `wt-${shortFeatureName}-${suffix}`);
     suffix += 1;
   }
+  if (!isPathInside(canonicalParent, worktreePath)) throw new GitWorkspaceError("计算出的 worktree 路径无效。");
   const format = await git(projectGitRoot, ["check-ref-format", "--branch", branch]);
   if (format.exitCode !== 0) throw new GitWorkspaceError("任务描述无法生成有效的 Git 分支名。");
 
@@ -155,6 +161,7 @@ export async function prepareTaskWorkspace(input: {
     branch,
     baseRef,
     baseSha,
+    sourceSha,
     sourceTmuxSessionId: input.sourceTmuxSessionId ?? null,
   };
 }
@@ -168,15 +175,155 @@ export async function inspectTaskSourceDirectory(directory: string): Promise<Tas
     git(canonicalDirectoryPath, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"]),
   ]);
   if (head.exitCode !== 0 || status.exitCode !== 0) throw new GitWorkspaceError("无法读取当前 Session 的 Git 状态。");
-  const baseSha = singleLine(head.stdout);
-  if (!/^[a-f\d]{40,64}$/i.test(baseSha)) throw new GitWorkspaceError("当前 Session 没有可用的 Git 提交。");
+  const sourceSha = singleLine(head.stdout);
+  if (!/^[a-f\d]{40,64}$/i.test(sourceSha)) throw new GitWorkspaceError("当前 Session 没有可用的 Git 提交。");
+  const targetBase = await resolveTaskBase(repositoryRoot);
   return {
     directory: canonicalDirectoryPath,
     gitRoot: repositoryRoot,
     branch: branch.exitCode === 0 ? singleLine(branch.stdout) || null : null,
-    baseSha,
+    // Keep baseSha as the source HEAD used by the existing Tmux submit API.
+    // The actual worktree base is exposed separately so the UI cannot confuse
+    // the optimistic source snapshot with the branch used for creation.
+    baseSha: sourceSha,
+    targetBaseRef: targetBase.baseRef,
+    targetBaseSha: targetBase.baseSha,
     dirtyEntryCount: status.stdout.split("\0").filter(Boolean).length,
   };
+}
+
+export function defaultTaskWorktreeRoot(): string {
+  return resolve(homedir(), ".codex", "worktrees");
+}
+
+export type GitChangeStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "untracked";
+
+export interface GitChangeFile {
+  path: string;
+  oldPath: string | null;
+  status: GitChangeStatus;
+  staged: boolean;
+  unstaged: boolean;
+}
+
+export interface GitChangesInspection {
+  directory: string;
+  gitRoot: string;
+  branch: string | null;
+  headCommit: string;
+  files: GitChangeFile[];
+  patch: string;
+  patchTruncated: boolean;
+}
+
+export async function inspectGitChanges(directory: string): Promise<GitChangesInspection> {
+  const canonicalDirectoryPath = await canonicalDirectory(directory, "当前 Session 目录");
+  const repositoryRoot = await gitRoot(canonicalDirectoryPath);
+  const [head, branch, status] = await Promise.all([
+    git(canonicalDirectoryPath, ["rev-parse", "--verify", "HEAD^{commit}"]),
+    git(canonicalDirectoryPath, ["branch", "--show-current"]),
+    git(canonicalDirectoryPath, ["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"]),
+  ]);
+  if (head.exitCode !== 0 || status.exitCode !== 0) throw new GitWorkspaceError("无法读取当前 Session 的 Git 状态。");
+  const headCommit = singleLine(head.stdout);
+  if (!/^[a-f\d]{40,64}$/i.test(headCommit)) throw new GitWorkspaceError("当前 Session 没有可用的 Git 提交。");
+  const files = parseGitStatusPorcelain(status.stdout);
+  let patch = "";
+  let patchTruncated = false;
+  try {
+    const diff = await git(canonicalDirectoryPath, ["diff", "--no-ext-diff", "--no-color", "--unified=3", "HEAD", "--"]);
+    if (diff.exitCode !== 0) throw gitFailure("无法读取 Git 变更", diff);
+    patch = diff.stdout;
+  } catch (error) {
+    if (!(error instanceof GitWorkspaceError) || !error.message.includes("输出超过安全上限")) throw error;
+    patchTruncated = true;
+  }
+  if (Buffer.byteLength(patch, "utf8") > GIT_CHANGE_PATCH_LIMIT_BYTES) {
+    patch = truncateUtf8(patch, GIT_CHANGE_PATCH_LIMIT_BYTES);
+    patchTruncated = true;
+  }
+  for (const file of files.filter((candidate) => candidate.status === "untracked")) {
+    if (patchTruncated) break;
+    const extra = await untrackedFilePatch(repositoryRoot, file.path);
+    if (!extra) continue;
+    const next = patch ? patch + "\n" + extra : extra;
+    if (Buffer.byteLength(next, "utf8") > GIT_CHANGE_PATCH_LIMIT_BYTES) {
+      patchTruncated = true;
+      break;
+    }
+    patch = next;
+  }
+  return {
+    directory: canonicalDirectoryPath,
+    gitRoot: repositoryRoot,
+    branch: branch.exitCode === 0 ? singleLine(branch.stdout) || null : null,
+    headCommit,
+    files,
+    patch,
+    patchTruncated,
+  };
+}
+
+async function untrackedFilePatch(repositoryRoot: string, path: string): Promise<string | null> {
+  const absolutePath = resolve(repositoryRoot, path);
+  if (!isPathInside(repositoryRoot, absolutePath)) return null;
+  const info = await lstat(absolutePath).catch(() => null);
+  if (!info?.isFile() || info.size > MAX_UNTRACKED_FILE_PATCH_BYTES) return null;
+  const content = await readFile(absolutePath);
+  if (content.includes(0)) return null;
+  const lines = content.toString("utf8").replace(/\r\n/g, "\n").split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  const displayPath = path.replaceAll("\\", "/").replaceAll("\n", "\\n");
+  const header = [
+    "diff --git a/" + displayPath + " b/" + displayPath,
+    "new file mode 100644",
+    "--- /dev/null",
+    "+++ b/" + displayPath,
+    "@@ -0,0 +1," + lines.length + " @@",
+  ].join("\n");
+  return header + "\n" + lines.map((line) => "+" + line).join("\n") + "\n";
+}
+
+function parseGitStatusPorcelain(output: string): GitChangeFile[] {
+  return output.split(/\r?\n/).filter(Boolean).map((line) => {
+    const indexCode = line[0] ?? " ";
+    const worktreeCode = line[1] ?? " ";
+    const rawPath = line.slice(3);
+    const renameSeparator = rawPath.indexOf(" -> ");
+    const hasRename = indexCode === "R" || indexCode === "C" || worktreeCode === "R" || worktreeCode === "C";
+    const oldPath = hasRename && renameSeparator >= 0 ? decodeGitStatusPath(rawPath.slice(0, renameSeparator)) : null;
+    const path = decodeGitStatusPath(hasRename && renameSeparator >= 0 ? rawPath.slice(renameSeparator + 4) : rawPath);
+    const status: GitChangeStatus = indexCode === "?" || worktreeCode === "?"
+      ? "untracked"
+      : indexCode === "D" || worktreeCode === "D"
+        ? "deleted"
+        : indexCode === "R" || worktreeCode === "R"
+          ? "renamed"
+          : indexCode === "C" || worktreeCode === "C"
+            ? "copied"
+            : indexCode === "A" || worktreeCode === "A"
+              ? "added"
+              : "modified";
+    return {
+      path,
+      oldPath,
+      status,
+      staged: indexCode !== " " && indexCode !== "?" && indexCode !== "!",
+      unstaged: indexCode === "?" || worktreeCode === "?"
+        ? true
+        : worktreeCode !== " " && worktreeCode !== "!",
+    };
+  });
+}
+
+function decodeGitStatusPath(value: string): string {
+  if (!value.startsWith("\"") || !value.endsWith("\"")) return value;
+  try { return JSON.parse(value) as string; }
+  catch { return value; }
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  return Buffer.from(value, "utf8").subarray(0, maxBytes).toString("utf8");
 }
 
 export async function provisionTaskWorkspace(workspace: StoredTaskWorkspace): Promise<void> {
@@ -530,6 +677,21 @@ async function branchExists(repositoryRoot: string, branch: string): Promise<boo
   if (result.exitCode === 0) return true;
   if (result.exitCode === 1) return false;
   throw gitFailure("无法检查任务分支是否已存在", result);
+}
+
+async function resolveTaskBase(repositoryRoot: string): Promise<{ baseRef: string; baseSha: string }> {
+  const result = await git(repositoryRoot, ["rev-parse", "--verify", `refs/heads/${TASK_BASE_REF}^{commit}`]);
+  if (result.exitCode !== 0) {
+    throw new GitWorkspaceError(
+      `登记项目没有本地 ${TASK_BASE_REF} 分支；任务 worktree 不会从当前分支或其他分支兜底创建。`,
+      409,
+    );
+  }
+  const baseSha = singleLine(result.stdout);
+  if (!/^[a-f\d]{40,64}$/i.test(baseSha)) {
+    throw new GitWorkspaceError(`无法确认 ${TASK_BASE_REF} 分支的基准提交。`, 409);
+  }
+  return { baseRef: TASK_BASE_REF, baseSha };
 }
 
 async function pathExists(path: string): Promise<boolean> {

@@ -38,6 +38,7 @@ import {
   saveDraftMetadata,
   type DraftAttachment,
 } from "./tmux-draft-store.js";
+import { readCodexSkillCache, writeCodexSkillCache } from "./skill-cache.js";
 
 const TmuxShortcutPalette = lazy(() => import("./TmuxShortcutPalette.js").then((module) => ({ default: module.TmuxShortcutPalette })));
 
@@ -73,37 +74,56 @@ function macComposerTerminalShortcut(event: KeyboardEvent, composerEmpty: boolea
   }
 }
 
+function isCodexSkillTrigger(event: KeyboardEvent): boolean {
+  if (event.isComposing || event.metaKey || event.ctrlKey || event.altKey) return false;
+  return event.key === "$" || (event.key === "4" && event.shiftKey);
+}
+
 type CodexSkillOption = {
   skillName: string;
   descriptionZh: string;
 };
 
+function isCodexSkillList(value: unknown): value is CodexSkillOption[] {
+  return Array.isArray(value) && value.every((item) => (
+    typeof item === "object"
+    && item !== null
+    && typeof (item as { skillName?: unknown }).skillName === "string"
+    && typeof (item as { descriptionZh?: unknown }).descriptionZh === "string"
+  ));
+}
+
+function filterCodexSkills(skills: CodexSkillOption[], query: string): CodexSkillOption[] {
+  const normalized = query.trim().toLocaleLowerCase("en-US");
+  if (!normalized) return skills;
+  return skills.filter((skill) => skill.skillName.toLocaleLowerCase("en-US").includes(normalized));
+}
+
 async function fetchSessionCodexSkills(
   sessionId: string,
-  query: string,
   signal: AbortSignal,
-): Promise<{ skills: CodexSkillOption[]; refreshing: boolean }> {
-  const params = new URLSearchParams();
-  if (query.trim()) params.set("q", query.trim());
-  const queryString = params.size > 0 ? "?" + params.toString() : "";
-  const response = await fetch(API_ROOT + "/sessions/" + encodeURIComponent(sessionId) + "/skills" + queryString, {
-    headers: { Accept: "application/json" },
-    signal,
-  });
-  const payload = await response.json() as { skills?: unknown; error?: string; refreshing?: unknown };
-  if (!response.ok || !Array.isArray(payload.skills)) {
+): Promise<{ skills: CodexSkillOption[]; refreshing: boolean; fresh: boolean }> {
+  const response = await fetch(
+    API_ROOT + "/sessions/" + encodeURIComponent(sessionId) + "/skills?all=1",
+    {
+      headers: { Accept: "application/json" },
+      signal,
+    },
+  );
+  const payload = await response.json() as {
+    skills?: unknown;
+    error?: string;
+    refreshing?: unknown;
+    fresh?: unknown;
+  };
+  if (!response.ok || !isCodexSkillList(payload.skills)) {
     throw new Error(payload.error || "Could not load Codex skills.");
   }
-  const skills = payload.skills.flatMap((value): CodexSkillOption[] => {
-    if (typeof value !== "object" || value === null) return [];
-    const skill = value as Partial<CodexSkillOption>;
-    if (typeof skill.skillName !== "string") return [];
-    return [{
-      skillName: skill.skillName,
-      descriptionZh: typeof skill.descriptionZh === "string" ? skill.descriptionZh : "",
-    }];
-  });
-  return { skills, refreshing: payload.refreshing === true };
+  return {
+    skills: payload.skills,
+    refreshing: payload.refreshing === true,
+    fresh: payload.fresh === true,
+  };
 }
 
 export type ComposerSubmissionResult = { ok: boolean; message?: string };
@@ -282,6 +302,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
   const skillSearchRef = useRef<HTMLInputElement | null>(null);
   const skillPickerRef = useRef<HTMLDivElement | null>(null);
   const inputSelectionRef = useRef<{ start: number; end: number } | null>(null);
+  const skillTriggerRangeRef = useRef<{ start: number; end: number } | null>(null);
   const diagnosticActiveRef = useRef(diagnosticSessionActive);
   diagnosticActiveRef.current = diagnosticSessionActive;
   const composerShortcuts = useMemo(() => {
@@ -296,9 +317,12 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
     return source.filter((shortcut) => shortcut.enabled).sort((left, right) => left.sortOrder - right.sortOrder);
   }, [shortcutStore]);
 
-  const filteredCodexSkills = codexSkills;
+  const filteredCodexSkills = useMemo(
+    () => filterCodexSkills(codexSkills, skillSearchQuery),
+    [codexSkills, skillSearchQuery],
+  );
 
-  const loadCodexSkills = (targetSessionId: string, query = ""): void => {
+  const loadCodexSkills = (targetSessionId: string): void => {
     if (skillsRefreshTimerRef.current !== null) {
       window.clearTimeout(skillsRefreshTimerRef.current);
       skillsRefreshTimerRef.current = null;
@@ -311,13 +335,23 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
     const controller = new AbortController();
     skillsRequestRef.current = controller;
     const requestSequence = ++skillsRequestSequenceRef.current;
+    const cacheKey = "tmux-session:" + targetSessionId;
+    const cached = readCodexSkillCache(cacheKey, isCodexSkillList);
+    if (cached) {
+      setCodexSkills(cached);
+      setSkillsLoading(false);
+      setSkillsLoadError(null);
+      skillsRequestRef.current = null;
+      return;
+    }
     setSkillsLoading(true);
     setSkillsLoadError(null);
     const fetchLatest = (refreshAttempt: number): void => {
-      void fetchSessionCodexSkills(targetSessionId, query, controller.signal)
-        .then(({ skills, refreshing }) => {
+      void fetchSessionCodexSkills(targetSessionId, controller.signal)
+        .then(({ skills, refreshing, fresh }) => {
           if (controller.signal.aborted || requestSequence !== skillsRequestSequenceRef.current) return;
           setCodexSkills(skills);
+          if (fresh) writeCodexSkillCache(cacheKey, skills);
           setSkillsLoading(false);
           if (refreshing && refreshAttempt < 8) {
             skillsRefreshTimerRef.current = window.setTimeout(() => {
@@ -354,6 +388,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
     setSkillSearchQuery("");
     setActiveSkillIndex(0);
     inputSelectionRef.current = null;
+    skillTriggerRangeRef.current = null;
     setCodexSkills([]);
     setSkillsLoading(false);
     setSkillsLoadError(null);
@@ -382,8 +417,14 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
     const text = aui.composer.getState().text;
     const input = inputRef.current;
     const savedSelection = inputSelectionRef.current;
-    const start = Math.max(0, Math.min(text.length, savedSelection?.start ?? input?.selectionStart ?? text.length));
-    const end = Math.max(start, Math.min(text.length, savedSelection?.end ?? input?.selectionEnd ?? start));
+    const triggerRange = skillTriggerRangeRef.current;
+    const triggerIsCurrent = triggerRange !== null
+      && triggerRange.start >= 0
+      && triggerRange.end === triggerRange.start + 1
+      && text.slice(triggerRange.start, triggerRange.end) === "$";
+    const selection = triggerIsCurrent ? triggerRange : savedSelection;
+    const start = Math.max(0, Math.min(text.length, selection?.start ?? input?.selectionStart ?? text.length));
+    const end = Math.max(start, Math.min(text.length, selection?.end ?? input?.selectionEnd ?? start));
     const before = text.slice(0, start);
     const after = text.slice(end);
     const token = "$" + skill.skillName;
@@ -394,6 +435,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
     setSkillsPickerOpen(false);
     setSkillSearchQuery("");
     inputSelectionRef.current = null;
+    skillTriggerRangeRef.current = null;
     window.requestAnimationFrame(() => {
       const currentInput = inputRef.current;
       if (!currentInput) return;
@@ -404,6 +446,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
 
   const closeSkillPicker = (returnFocus = true): void => {
     setSkillsPickerOpen(false);
+    skillTriggerRangeRef.current = null;
     if (returnFocus) window.requestAnimationFrame(() => skillButtonRef.current?.focus());
   };
 
@@ -416,6 +459,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
       if (event.key !== "Escape" || event.defaultPrevented) return;
       event.preventDefault();
       setSkillsPickerOpen(false);
+      skillTriggerRangeRef.current = null;
       window.requestAnimationFrame(() => skillButtonRef.current?.focus());
     };
     const closeOnOutsidePointer = (event: PointerEvent): void => {
@@ -423,6 +467,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
       if (!(target instanceof Node)) return;
       if (skillPickerRef.current?.contains(target) || skillButtonRef.current?.contains(target)) return;
       setSkillsPickerOpen(false);
+      skillTriggerRangeRef.current = null;
     };
     document.addEventListener("keydown", closeOnEscape);
     document.addEventListener("pointerdown", closeOnOutsidePointer);
@@ -756,12 +801,18 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
 
   const skillPickerId = "tmux-skill-picker-" + (sessionId ?? "none").replace(/[^A-Za-z0-9_-]/g, "-");
   const skillPickerListId = skillPickerId + "-list";
-  const openSkillsPicker = (): void => {
+  const openSkillsPicker = (triggerRange?: { start: number; end: number }): void => {
     if (skillsPickerOpen) {
       closeSkillPicker(false);
       return;
     }
-    if (document.activeElement === inputRef.current) rememberComposerSelection();
+    if (triggerRange) {
+      skillTriggerRangeRef.current = triggerRange;
+      inputSelectionRef.current = { start: triggerRange.end, end: triggerRange.end };
+    } else {
+      skillTriggerRangeRef.current = null;
+      if (document.activeElement === inputRef.current) rememberComposerSelection();
+    }
     inputRef.current?.blur();
     setSkillSearchQuery("");
     setActiveSkillIndex(0);
@@ -776,6 +827,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
         ref={composerFormRef}
         onSubmit={() => {
           setSkillsPickerOpen(false);
+          skillTriggerRangeRef.current = null;
           if (aui.composer.getState().isEmpty) return;
           setShortcutsOpen(false);
           onSendStart();
@@ -817,6 +869,20 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
             unstable_focusOnScrollToBottom={false}
             unstable_focusOnThreadSwitched={false}
             onKeyDown={(event) => {
+              if (isCodexSkillTrigger(event.nativeEvent)) {
+                const input = event.currentTarget;
+                const text = aui.composer.getState().text;
+                const start = Math.max(0, Math.min(text.length, input.selectionStart ?? text.length));
+                const end = Math.max(start, Math.min(text.length, input.selectionEnd ?? start));
+                const nextText = text.slice(0, start) + "$" + text.slice(end);
+                event.preventDefault();
+                aui.composer.setText(nextText);
+                const triggerRange = { start, end: start + 1 };
+                inputSelectionRef.current = { start: triggerRange.end, end: triggerRange.end };
+                skillTriggerRangeRef.current = triggerRange;
+                openSkillsPicker(triggerRange);
+                return;
+              }
               const shortcut = macComposerTerminalShortcut(
                 event.nativeEvent,
                 aui.composer.getState().isEmpty,
@@ -859,26 +925,8 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
                 placeholder="搜索技能"
                 value={skillSearchQuery}
                 onChange={(event) => {
-                  const query = event.currentTarget.value;
-                  setSkillSearchQuery(query);
+                  setSkillSearchQuery(event.currentTarget.value);
                   setActiveSkillIndex(0);
-                  if (skillsRefreshTimerRef.current !== null) {
-                    window.clearTimeout(skillsRefreshTimerRef.current);
-                    skillsRefreshTimerRef.current = null;
-                  }
-                  if (skillsSearchTimerRef.current !== null) window.clearTimeout(skillsSearchTimerRef.current);
-                  skillsRequestSequenceRef.current += 1;
-                  skillsRequestRef.current?.abort();
-                  skillsRequestRef.current = null;
-                  setCodexSkills([]);
-                  setSkillsLoading(true);
-                  setSkillsLoadError(null);
-                  if (sessionId) {
-                    skillsSearchTimerRef.current = window.setTimeout(() => {
-                      skillsSearchTimerRef.current = null;
-                      loadCodexSkills(sessionId, query);
-                    }, 180);
-                  }
                 }}
                 onKeyDown={(event) => {
                   if (event.key === "Escape") {

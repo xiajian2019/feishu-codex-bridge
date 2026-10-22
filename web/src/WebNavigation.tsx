@@ -18,6 +18,7 @@ const SYSTEM_PAGES = [
   { to: "/system-management/shortcuts", label: "快捷键与技能管理" },
   { to: "/system-management/usage", label: "Codex 用量" },
   { to: "/system-management/workspaces", label: "Git 工作区" },
+  { to: "/link-tools", label: "链接工具" },
   { to: "/system-management/settings", label: "系统设置" },
 ] as const;
 

@@ -3,6 +3,7 @@ import { createReadStream, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { lstat, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { spawn, type ChildProcess } from "node:child_process";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
 
@@ -33,6 +34,7 @@ import { resolveBridgeProjectRoot } from "./portable-runtime.js";
 import { GitWorkspaceError, inspectTaskWorkspace, inspectUnmanagedWorktree, listGitWorktrees, removeTaskWorkspaceDirectory, resolveGitRoot, verifyTaskWorkspace } from "./git-workspaces.js";
 import { readSystemHealth } from "./system-health.js";
 import { parseTaskInput } from "./fingerprint.js";
+import { LinkToolError, LinkToolsService, type LinkToolProxySettings } from "./link-tools.js";
 import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import {
   WebTaskSubmissionConflictError,
@@ -74,8 +76,32 @@ const TASK_FILE_TEXT_EXTENSIONS = new Set([
 ]);
 
 const LOCAL_DEMO_PROXY_TARGETS = [
-  { prefix: "/api/local-demos/food-photo", hostname: "127.0.0.1", port: 3000 },
+  {
+    id: "food-photo",
+    prefix: "/api/local-demos/food-photo",
+    hostname: "127.0.0.1",
+    port: 43127,
+    workingDirectory: "food-photo-fast-path",
+    startScript: "start_real.sh",
+    startArgs: ["--host", "127.0.0.1", "--port", "43127"],
+  },
+  {
+    id: "openai-clip",
+    prefix: "/api/local-demos/openai-clip",
+    hostname: "127.0.0.1",
+    port: 43128,
+    workingDirectory: "openai-clip-sqlite-vec",
+    startScript: "start.sh",
+    startArgs: ["--host", "127.0.0.1", "--port", "43128"],
+  },
 ] as const;
+
+function localDemoRoot(): string {
+  return resolve(
+    process.env.FEISHU_CODEX_DEMO_ROOT?.trim()
+      || join(process.cwd(), "..", "ai_work", "demo"),
+  );
+}
 
 interface TaskFileContext {
   rootPath: string;
@@ -101,6 +127,7 @@ export interface DashboardServerOptions {
   modes: string[];
   projectRegistrySnapshotPath?: string;
   taskAttachmentsDirectory?: string;
+  linkToolProxy?: LinkToolProxySettings;
   webRoot?: string;
   auth?: WebPairingAuth;
   tmuxDashboard?: TmuxDashboardApi;
@@ -125,10 +152,14 @@ export class DashboardServer {
   private readonly auth: WebPairingAuth;
   private readonly webRoot: string;
   private readonly taskAttachmentsDirectory: string;
+  private readonly linkTools: LinkToolsService;
   private readonly eventClients = new Set<ServerResponse>();
   private server: Server | null = null;
   private unsubscribeFromDatabase: (() => void) | null = null;
   private eventSequence = 0;
+  private readonly localDemoProcesses = new Map<string, ChildProcess>();
+  private readonly localDemoLogs = new Map<string, string[]>();
+  private readonly localDemoErrors = new Map<string, string>();
 
   constructor(options: DashboardServerOptions) {
     this.options = options;
@@ -138,6 +169,7 @@ export class DashboardServer {
     this.taskAttachmentsDirectory = resolve(
       options.taskAttachmentsDirectory ?? join(process.cwd(), "runtime", "task-attachments"),
     );
+    this.linkTools = new LinkToolsService({ proxy: options.linkToolProxy });
   }
 
   public async start(): Promise<string> {
@@ -182,7 +214,7 @@ export class DashboardServer {
     });
   }
 
-  public stop(): Promise<void> {
+  public async stop(): Promise<void> {
     const server = this.server;
     this.server = null;
     this.unsubscribeFromDatabase?.();
@@ -190,8 +222,13 @@ export class DashboardServer {
     for (const client of this.eventClients) client.end();
     this.eventClients.clear();
     this.options.tmuxDashboard?.stop();
-    if (!server) return Promise.resolve();
-    return new Promise((resolve, reject) => {
+    for (const [id, child] of this.localDemoProcesses) {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      this.localDemoProcesses.delete(id);
+    }
+    await this.linkTools.dispose();
+    if (!server) return;
+    await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
       server.closeIdleConnections();
     });
@@ -284,6 +321,7 @@ export class DashboardServer {
         && (/^\/tmux-dashboard\/api\/sessions\/[^/]+\/files\/upload$/.test(url.pathname)
           || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/codex-account(?:\/check)?$/.test(url.pathname)
           || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/tasks$/.test(url.pathname)
+          || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/open$/.test(url.pathname)
           || /^\/tmux-dashboard\/api\/workspaces\/[^/]+\/session$/.test(url.pathname))
         && !this.requireActionAuthorization(request, response)
       ) return;
@@ -313,10 +351,34 @@ export class DashboardServer {
       response,
       publicWebRequest || url.pathname === "/healthz",
     )) return;
+    const localDemoStartMatch = /^\/api\/local-demos\/([^/]+)\/start$/.exec(url.pathname);
+    if (request.method === "POST" && localDemoStartMatch) {
+      if (!this.requireActionAuthorization(request, response)) return;
+      this.startLocalDemo(decodeURIComponent(localDemoStartMatch[1]), response);
+      return;
+    }
+    const localDemoLogsMatch = /^\/api\/local-demos\/([^/]+)\/logs$/.exec(url.pathname);
+    if (request.method === "GET" && localDemoLogsMatch) {
+      this.localDemoLog(decodeURIComponent(localDemoLogsMatch[1]), response);
+      return;
+    }
     const localDemoTarget = LOCAL_DEMO_PROXY_TARGETS.find(({ prefix }) =>
       url.pathname === prefix || url.pathname.startsWith(`${prefix}/`));
     if (localDemoTarget) {
       await this.proxyLocalDemo(request, response, url, localDemoTarget);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/link-tools/preview") {
+      await this.previewLinkTool(request, response);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/link-tools/download") {
+      await this.downloadLinkTool(request, response);
+      return;
+    }
+    const linkToolPreviewMatch = /^\/api\/link-tools\/previews\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "GET" && linkToolPreviewMatch) {
+      await this.serveLinkToolPreview(decodeURIComponent(linkToolPreviewMatch[1]!), response);
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/session") {
@@ -2533,6 +2595,168 @@ export class DashboardServer {
     }
   }
 
+  private async previewLinkTool(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(request);
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+      return;
+    }
+    if (typeof body.url !== "string") {
+      sendJson(response, 400, { error: "url is required" });
+      return;
+    }
+    try {
+      const result = await this.linkTools.preview(body.url);
+      sendJson(response, 200, {
+        ...result,
+        previewUrl: `/api/link-tools/previews/${encodeURIComponent(result.token)}`,
+      });
+    } catch (error) {
+      const failure = linkToolErrorDetails(error);
+      sendJson(response, failure.status, { error: failure.message });
+    }
+  }
+
+  private async downloadLinkTool(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.requireActionAuthorization(request, response)) return;
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(request);
+    } catch (error) {
+      sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+      return;
+    }
+    if (typeof body.url !== "string") {
+      sendJson(response, 400, { error: "url is required" });
+      return;
+    }
+    try {
+      sendJson(response, 200, await this.linkTools.download(body.url));
+    } catch (error) {
+      const failure = linkToolErrorDetails(error);
+      sendJson(response, failure.status, { error: failure.message });
+    }
+  }
+
+  private async serveLinkToolPreview(token: string, response: ServerResponse): Promise<void> {
+    const preview = await this.linkTools.getPreview(token);
+    if (!preview) {
+      sendJson(response, 404, { error: "preview expired or not found" });
+      return;
+    }
+    const unsafeContentType = preview.contentType === "text/html"
+      || preview.contentType === "application/xhtml+xml"
+      || preview.contentType === "image/svg+xml";
+    setSecurityHeaders(response);
+    response.statusCode = 200;
+    response.setHeader("Content-Type", unsafeContentType ? "text/plain; charset=utf-8" : preview.contentType);
+    response.setHeader("Content-Length", String(preview.sizeBytes));
+    response.setHeader("Cache-Control", "private, no-store");
+    response.setHeader("Content-Disposition", attachmentDisposition(preview.fileName, true));
+    response.setHeader(
+      "Content-Security-Policy",
+      "default-src 'none'; frame-ancestors 'self'; img-src 'self'; object-src 'self'",
+    );
+    const stream = createReadStream(preview.path);
+    stream.on("error", () => response.destroy());
+    stream.pipe(response);
+  }
+
+  private startLocalDemo(id: string, response: ServerResponse): void {
+    const target = LOCAL_DEMO_PROXY_TARGETS.find((item) => item.id === id);
+    if (!target) {
+      sendJson(response, 404, { error: "未知的本机 Demo" });
+      return;
+    }
+    const current = this.localDemoProcesses.get(id);
+    if (current && current.exitCode === null && current.signalCode === null) {
+      sendJson(response, 200, { ok: true, id, status: "running", port: target.port });
+      return;
+    }
+    this.localDemoLogs.set(id, []);
+    this.localDemoErrors.delete(id);
+    const root = localDemoRoot();
+    const workingDirectory = resolve(root, target.workingDirectory);
+    const startScript = resolve(workingDirectory, target.startScript);
+    if (!existsSync(workingDirectory) || !existsSync(startScript)) {
+      const message = `本机 Demo 文件不存在：${startScript}`;
+      this.localDemoErrors.set(id, message);
+      this.appendLocalDemoLog(id, `[error] ${message}`);
+      sendJson(response, 503, {
+        error: message,
+        hint: "可设置 FEISHU_CODEX_DEMO_ROOT 指向 ai_work/demo。",
+      });
+      return;
+    }
+    try {
+      this.appendLocalDemoLog(id, `[launcher] cwd=${workingDirectory}`);
+      this.appendLocalDemoLog(id, `[launcher] ${startScript} ${target.startArgs.join(" ")}`);
+      const child = spawn(startScript, target.startArgs, {
+        cwd: workingDirectory,
+        env: { ...process.env, PYTHONUNBUFFERED: "1" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      child.stdout?.on("data", (chunk: Buffer) => {
+        this.appendLocalDemoLog(id, chunk.toString());
+        this.options.logger?.info("local demo stdout", { id, output: chunk.toString().trimEnd() });
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        this.appendLocalDemoLog(id, `[stderr] ${chunk.toString()}`);
+        this.options.logger?.warn("local demo stderr", { id, output: chunk.toString().trimEnd() });
+      });
+      child.once("error", (error) => {
+        this.localDemoErrors.set(id, error.message);
+        this.appendLocalDemoLog(id, `[error] ${error.message}`);
+        this.options.logger?.warn("local demo process failed", { id, error: error.message });
+        if (this.localDemoProcesses.get(id) === child) this.localDemoProcesses.delete(id);
+      });
+      child.once("exit", (code, signal) => {
+        this.appendLocalDemoLog(id, `[exit] code=${code ?? "null"} signal=${signal ?? "none"}`);
+        this.options.logger?.info("local demo process exited", { id, code, signal });
+      });
+      this.localDemoProcesses.set(id, child);
+      sendJson(response, 202, { ok: true, id, status: "starting", port: target.port });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "本机 Demo 启动失败";
+      this.localDemoErrors.set(id, message);
+      this.appendLocalDemoLog(id, `[error] ${message}`);
+      sendJson(response, 503, { error: message });
+    }
+  }
+
+  private localDemoLog(id: string, response: ServerResponse): void {
+    const target = LOCAL_DEMO_PROXY_TARGETS.find((item) => item.id === id);
+    if (!target) {
+      sendJson(response, 404, { error: "未知的本机 Demo" });
+      return;
+    }
+    const child = this.localDemoProcesses.get(id);
+    sendJson(response, 200, {
+      id,
+      root: localDemoRoot(),
+      workingDirectory: resolve(localDemoRoot(), target.workingDirectory),
+      command: [target.startScript, ...target.startArgs],
+      processRunning: Boolean(child && child.exitCode === null && child.signalCode === null),
+      pid: child?.pid ?? null,
+      exitCode: child?.exitCode ?? null,
+      signal: child?.signalCode ?? null,
+      error: this.localDemoErrors.get(id) ?? null,
+      lines: this.localDemoLogs.get(id) ?? [],
+    });
+  }
+
+  private appendLocalDemoLog(id: string, chunk: string): void {
+    const lines = this.localDemoLogs.get(id) ?? [];
+    for (const line of chunk.split(/\r?\n/).map((item) => item.trimEnd()).filter(Boolean)) {
+      lines.push(`${new Date().toISOString()} ${line}`);
+    }
+    if (lines.length > 200) lines.splice(0, lines.length - 200);
+    this.localDemoLogs.set(id, lines);
+  }
+
   private async proxyLocalDemo(
     request: IncomingMessage,
     response: ServerResponse,
@@ -2729,6 +2953,11 @@ export class DashboardServer {
   }
 }
 
+function linkToolErrorDetails(error: unknown): { status: number; message: string } {
+  if (error instanceof LinkToolError) return { status: error.statusCode, message: error.message };
+  return { status: 502, message: "链接访问失败，请检查链接、VPN 或代理设置。" };
+}
+
 function isSpaRoute(pathname: string): boolean {
   return pathname === "/"
     || pathname === "/index.html"
@@ -2745,6 +2974,7 @@ function isSpaRoute(pathname: string): boolean {
     || /^\/tasks\/(?:desk|direct|aamp)\/[^/]+$/.test(pathname)
     || pathname === "/codex-history"
     || pathname === "/demos"
+    || pathname === "/link-tools"
     || pathname === "/tmux-dashboard"
     || (pathname.startsWith("/tmux-dashboard/")
       && !pathname.startsWith("/tmux-dashboard/api/")

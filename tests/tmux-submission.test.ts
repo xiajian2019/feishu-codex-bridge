@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { StateDatabase } from "../src/db.js";
-import { hasNewSubmissionEcho, submissionFingerprint, validateTerminalInput } from "../src/tmux-dashboard-api.js";
+import { hasNewSubmissionEcho, submissionFingerprint, validateTerminalInput, writePastedTextThenEnter } from "../src/tmux-dashboard-api.js";
 
 const attachmentDirectory = join(tmpdir(), "feishu-codex-bridge", "tmux-dashboard-attachments");
 const files: string[] = [];
@@ -70,6 +70,37 @@ describe("tmux submission deduplication", () => {
     }
   });
 
+  it("keeps ended session history and sorts active sessions ahead of archived ones", () => {
+    const db = new StateDatabase(":memory:");
+    try {
+      const active = db.recordTmuxSession({ id: "$1", name: "active", cwd: "/tmp", createdAt: 1 });
+      const ended = db.recordTmuxSession({ id: "$2", name: "ended", cwd: "/tmp", createdAt: 2 });
+      db.recordTmuxSessionOpen(active.tmux_session_id);
+      db.recordTmuxSessionOpen(ended.tmux_session_id);
+      db.recordTmuxSessionOpen(ended.tmux_session_id);
+      db.recordTmuxSessionOpen(ended.tmux_session_id);
+      db.markTmuxSessionEnded(ended.tmux_session_id);
+
+      const action = db.beginTmuxSessionAction({
+        sessionRecordId: ended.record_id,
+        deviceId: null,
+        actionType: "terminal_command",
+        requestId: "ended-history",
+        content: "history remains",
+      });
+      db.finishTmuxSessionAction(action.actionId, "sent");
+
+      const dashboardSessions = db.listTmuxSessionsForDashboard();
+      expect(dashboardSessions.map((session) => session.tmux_session_id)).toEqual(["$1", "$2"]);
+      expect(dashboardSessions[0]?.open_count).toBe(1);
+      expect(dashboardSessions[1]?.open_count).toBe(3);
+      expect(db.recordTmuxSessionOpen(ended.tmux_session_id)).toBeNull();
+      expect(db.listTmuxSessionActions({ tmuxSessionId: ended.tmux_session_id }).items[0]?.session_ended_at).not.toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
   it("projects timed-out sending actions as delivery-unknown without changing stored status", () => {
     let clock = new Date("2026-10-04T01:00:00.000Z");
     const root = mkdtempSync(join(tmpdir(), "bridge-tmux-restart-test-"));
@@ -128,6 +159,19 @@ describe("tmux submission deduplication", () => {
 });
 
 describe("tmux raw terminal input", () => {
+  it("writes Enter after the bracketed paste has settled", async () => {
+    const writes: string[] = [];
+    const terminal: Parameters<typeof writePastedTextThenEnter>[0] = {
+      write(data) { writes.push(data); },
+      resize() {},
+      close() {},
+    };
+
+    await writePastedTextThenEnter(terminal, "run $skill-name");
+
+    expect(writes).toEqual(["\u001b[200~run $skill-name \u001b[201~", "\r"]);
+  });
+
   it("preserves control sequences and UTF-8 text without treating them as a prompt", () => {
     const input = "\u001b[200~echo 中文\u001b[201~\r\u0003";
     expect(validateTerminalInput(input)).toBe(input);

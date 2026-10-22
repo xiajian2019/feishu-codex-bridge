@@ -2,18 +2,22 @@ import { FitAddon } from "@xterm/addon-fit";
 import { CanvasAddon } from "@xterm/addon-canvas";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
 import { useLocation, useNavigate } from "react-router";
 
 import { bindMobileTerminalViewport } from "./mobile-terminal-viewport.js";
 import { isDebugLogCaptureActive, logDebugDiagnostic } from "./debug-log-capture.js";
 
 import { bindMobileTerminalTouch, downloadTerminalScrollDiagnostics, type TerminalSelectionDisplay } from "./terminal-touch.js";
+import { openTerminalUrl, registerTerminalLinkProvider } from "./terminal-links.js";
 import { TmuxMessageComposer, type SessionFileForwardRequest, type TerminalShortcut } from "./TmuxMessageComposer.js";
 import { fetchCodexUsage, getActionToken } from "./api.js";
 import { CodexUsageDialog, getCodexUsageRemainingPercentages, preserveCodexUsageAccount } from "./CodexUsage.js";
 import type { CodexUsageAccount } from "./types.js";
 import { useSystemNavigation } from "./WebNavigation.js";
+
+const TmuxHistoryInspector = lazy(() => import("./TmuxSessionHistory.js").then((module) => ({ default: module.TmuxSessionHistory })));
+const TmuxGitChangesInspector = lazy(() => import("./TmuxGitChanges.js").then((module) => ({ default: module.TmuxGitChanges })));
 
 type TmuxSession = {
   id: string;
@@ -22,6 +26,9 @@ type TmuxSession = {
   attachedClients: number;
   cwd: string;
   createdAt: number;
+  endedAt: string | null;
+  openCount: number;
+  lastOpenedAt: string | null;
   codexHomeId: string | null;
   workspaceId?: string | null;
   taskGuid?: string | null;
@@ -31,9 +38,21 @@ type TmuxSession = {
 
 type ProjectOption = { name: string; root: string };
 type CodexHomeOption = { id: string; label: string; available: boolean };
-type TaskCreationContext = { sessionId: string; projectKey: string; projectName: string; directory: string; branch: string | null; baseSha: string; dirtyEntryCount: number };
+type TaskCreationContext = {
+  sessionId: string;
+  projectKey: string;
+  projectName: string;
+  directory: string;
+  branch: string | null;
+  baseSha: string;
+  sourceHeadSha: string;
+  baseRef: string;
+  targetBaseSha: string;
+  dirtyEntryCount: number;
+};
 type Toast = { message: string; isError: boolean; durationMs?: number; isTop?: boolean };
 type SubmissionResult = { ok: boolean; message?: string };
+type SessionInspector = { kind: "history"; sessionId: string | null } | { kind: "git"; sessionId: string };
 
 function CodexHomeSelect({
   session,
@@ -122,6 +141,9 @@ function normalizeTmuxSession(value: unknown): TmuxSession | null {
   const attachedClients = Number(record.attachedClients ?? record.attached_clients ?? record.session_attached);
   const cwd = record.cwd ?? record.sessionPath ?? record.session_path;
   const createdAt = Number(record.createdAt ?? record.created_at ?? record.session_created);
+  const endedAt = record.endedAt ?? record.ended_at ?? null;
+  const openCount = Number(record.openCount ?? record.open_count ?? 0);
+  const lastOpenedAt = record.lastOpenedAt ?? record.last_opened_at ?? null;
   const codexHomeId = record.codexHomeId ?? record.codex_home_id ?? null;
   const workspaceId = record.workspaceId ?? record.workspace_id ?? null;
   const taskGuid = record.taskGuid ?? record.task_guid ?? null;
@@ -143,6 +165,9 @@ function normalizeTmuxSession(value: unknown): TmuxSession | null {
       attachedClients,
       cwd,
       createdAt,
+      endedAt: typeof endedAt === "string" ? endedAt : null,
+      openCount: Number.isFinite(openCount) ? openCount : 0,
+      lastOpenedAt: typeof lastOpenedAt === "string" ? lastOpenedAt : null,
       codexHomeId: typeof codexHomeId === "string" ? codexHomeId : null,
       workspaceId: typeof workspaceId === "string" ? workspaceId : null,
       taskGuid: typeof taskGuid === "string" ? taskGuid : null,
@@ -160,6 +185,9 @@ function normalizeTmuxSession(value: unknown): TmuxSession | null {
     attachedClients: Number(composite[4]),
     cwd: composite[5],
     createdAt: Number(composite[6]),
+    endedAt: null,
+    openCount: 0,
+    lastOpenedAt: null,
     codexHomeId: null,
     workspaceId: null,
     taskGuid: null,
@@ -177,12 +205,25 @@ function tmuxSessionsEqual(left: TmuxSession[], right: TmuxSession[]): boolean {
       && next.attachedClients === session.attachedClients
       && next.cwd === session.cwd
       && next.createdAt === session.createdAt
+      && next.endedAt === session.endedAt
+      && next.openCount === session.openCount
+      && next.lastOpenedAt === session.lastOpenedAt
       && next.codexHomeId === session.codexHomeId
       && next.workspaceId === session.workspaceId
       && next.taskGuid === session.taskGuid
       && next.workspaceBranch === session.workspaceBranch
       && next.workspaceStatus === session.workspaceStatus;
   });
+}
+
+function compareTmuxSessions(left: TmuxSession, right: TmuxSession): number {
+  const activeDifference = Number(Boolean(left.endedAt)) - Number(Boolean(right.endedAt));
+  if (activeDifference !== 0) return activeDifference;
+  if (right.openCount !== left.openCount) return right.openCount - left.openCount;
+  const rightOpened = right.lastOpenedAt ?? "";
+  const leftOpened = left.lastOpenedAt ?? "";
+  if (rightOpened !== leftOpened) return rightOpened.localeCompare(leftOpened);
+  return right.createdAt - left.createdAt;
 }
 
 function createSessionName(): string {
@@ -255,6 +296,7 @@ export function TmuxDashboard(): ReactElement {
   const [search, setSearch] = useState("");
   const [backendStatus, setBackendStatus] = useState<"connecting" | "online" | "offline">("connecting");
   const [terminalStatus, setTerminalStatus] = useState("IDLE");
+  const [terminalEverAttached, setTerminalEverAttached] = useState(false);
   const [terminalInputEnabled, setTerminalInputEnabled] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
@@ -273,6 +315,7 @@ export function TmuxDashboard(): ReactElement {
   const [projectActiveIndex, setProjectActiveIndex] = useState(0);
   const [sendingMessage, setSendingMessage] = useState(false);
   const [terminalSelection, setTerminalSelection] = useState<TerminalSelectionDisplay | null>(null);
+  const [sessionInspector, setSessionInspector] = useState<SessionInspector | null>(null);
   const terminalHostRef = useRef<HTMLDivElement | null>(null);
   const projectPickerRef = useRef<HTMLDivElement | null>(null);
   const terminalInstanceRef = useRef<Terminal | null>(null);
@@ -286,6 +329,15 @@ export function TmuxDashboard(): ReactElement {
   const restoreSessionDetailRef = useRef(shouldRestoreSessionDetail);
   const codexUsageRequestSequenceRef = useRef(0);
   const lastAutoCodexUsageKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!sessionInspector) return;
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setSessionInspector(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [sessionInspector]);
 
   useEffect(() => {
     const params = new URLSearchParams(location.search);
@@ -360,7 +412,7 @@ export function TmuxDashboard(): ReactElement {
       setSessions((current) => tmuxSessionsEqual(current, sessionList) ? current : sessionList);
       setBackendStatus("online");
       setError(null);
-      setSelectedId((current) => current && sessionList.some((session) => session.id === current) ? current : null);
+      setSelectedId((current) => current && sessionList.some((session) => session.id === current && !session.endedAt) ? current : null);
     } catch (loadError) {
       if (requestSequence !== sessionsLoadSequenceRef.current) return;
       setBackendStatus("offline");
@@ -467,11 +519,35 @@ export function TmuxDashboard(): ReactElement {
     return () => window.clearInterval(timer);
   }, [loadSessions, mobileView]);
 
+  const recordSessionOpen = useCallback(async (sessionId: string): Promise<void> => {
+    try {
+      await requestApi(`/sessions/${encodeURIComponent(sessionId)}/open`, { method: "POST" });
+      await loadSessions();
+    } catch (openError) {
+      setToast({ message: openError instanceof Error ? openError.message : "无法记录 Session 使用次数。", isError: true });
+    }
+  }, [loadSessions]);
+
+  const openSessionInspector = (kind: "history" | "git", sessionId?: string): void => {
+    const desktop = window.matchMedia("(min-width: 761px)").matches;
+    if (desktop) {
+      if (kind === "git" && sessionId) setSessionInspector({ kind, sessionId });
+      else setSessionInspector({ kind: "history", sessionId: sessionId ?? null });
+      return;
+    }
+    if (kind === "git" && sessionId) {
+      navigate("/tmux-dashboard/git-changes/" + encodeURIComponent(sessionId));
+    } else {
+      navigate(sessionId ? `/tmux-dashboard/history?session=${encodeURIComponent(sessionId)}` : "/tmux-dashboard/history");
+    }
+  };
+
   const filteredSessions = useMemo(() => {
     const query = search.trim().toLowerCase();
+    const ordered = [...sessions].sort(compareTmuxSessions);
     return query
-      ? sessions.filter((session) => `${session.name} ${session.cwd}`.toLowerCase().includes(query))
-      : sessions;
+      ? ordered.filter((session) => `${session.name} ${session.cwd}`.toLowerCase().includes(query))
+      : ordered;
   }, [search, sessions]);
   const filteredProjects = useMemo(() => {
     const query = projectQuery.trim().toLowerCase();
@@ -508,7 +584,7 @@ export function TmuxDashboard(): ReactElement {
     const isMobileDetailVisible = window.matchMedia("(max-width: 760px)").matches
       ? mobileView === "terminal"
       : true;
-    if (!selectedSession || !isMobileDetailVisible) {
+    if (!selectedSession || !isMobileDetailVisible || !terminalEverAttached || terminalStatus !== "ATTACHED") {
       lastAutoCodexUsageKeyRef.current = null;
       codexUsageRequestSequenceRef.current += 1;
       setCodexUsageAccount(null);
@@ -528,12 +604,6 @@ export function TmuxDashboard(): ReactElement {
     if (!selectedSession.codexHomeId) {
       codexUsageRequestSequenceRef.current += 1;
       setCodexUsageLoading(false);
-      setToast({
-        message: "当前 Session 未关联 Codex 账号，暂时无法读取用量。",
-        isError: false,
-        durationMs: 3_000,
-        isTop: true,
-      });
       return;
     }
 
@@ -544,16 +614,23 @@ export function TmuxDashboard(): ReactElement {
       isTop: true,
     });
     void loadCurrentCodexUsage(selectedSession.codexHomeId);
-  }, [loadCurrentCodexUsage, mobileView, selectedCodexHomeLabel, selectedSession?.codexHomeId, selectedSession?.id]);
+  }, [loadCurrentCodexUsage, mobileView, selectedCodexHomeLabel, selectedSession?.codexHomeId, selectedSession?.id, terminalEverAttached, terminalStatus]);
   const selectSession = (sessionId: string): void => {
+    const session = sessions.find((candidate) => candidate.id === sessionId);
+    if (!session || session.endedAt) return;
     sessionsLoadSequenceRef.current += 1;
     restoreSessionDetailRef.current = false;
-    if (sessionId !== selectedId) setTerminalInputEnabled(false);
+    if (sessionId !== selectedId) {
+      setTerminalInputEnabled(false);
+      setTerminalEverAttached(false);
+      setTerminalStatus("CONNECTING");
+    }
     setSelectedId(sessionId);
     if (window.matchMedia("(max-width: 760px)").matches) {
       setNavigationCollapsed(true);
       setMobileView("terminal");
     }
+    void recordSessionOpen(sessionId);
   };
 
   const showSessionsOnMobile = (): void => {
@@ -590,13 +667,24 @@ export function TmuxDashboard(): ReactElement {
     const host = terminalHostRef.current;
     if (!selectedSession || !host) {
       setTerminalStatus("IDLE");
+      setTerminalEverAttached(false);
       return;
     }
+
+    let everAttached = false;
+    setTerminalStatus("CONNECTING");
+    setTerminalEverAttached(false);
 
     const terminal = new Terminal({
       cursorBlink: terminalInputEnabled,
       cursorInactiveStyle: terminalInputEnabled ? "block" : "none",
-      disableStdin: !terminalInputEnabled,
+      // Keep xterm mouse/link handling alive in read-only view; onData below drops input until interactive mode is enabled.
+      disableStdin: false,
+      macOptionClickForcesSelection: true,
+      rightClickSelectsWord: true,
+      linkHandler: {
+        activate: (_event, text) => openTerminalUrl(text),
+      },
       convertEol: false,
       fontSize: 13,
       fontFamily: '"SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace',
@@ -613,6 +701,7 @@ export function TmuxDashboard(): ReactElement {
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(host);
+    const terminalLinks = registerTerminalLinkProvider(terminal);
     try {
       terminal.loadAddon(new CanvasAddon());
     } catch (error) {
@@ -651,6 +740,25 @@ export function TmuxDashboard(): ReactElement {
     const terminalAddress = (): string => `${protocol}//${window.location.host}/tmux-dashboard/terminal?session=${encodeURIComponent(selectedSession.id)}&cols=${terminal.cols}&rows=${terminal.rows}`;
     let socket: WebSocket | null = null;
     let disposed = false;
+    const copyTerminalSelectionOnKeyDown = (event: KeyboardEvent): void => {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "c") return;
+      const text = terminal.getSelection();
+      if (!text) return;
+      event.preventDefault();
+      void copyTextToClipboard(text).then(() => {
+        if (disposed || terminalInstanceRef.current !== terminal) return;
+        terminal.clearSelection();
+        setTerminalSelection(null);
+        setToast({ message: "Copied terminal selection.", isError: false });
+      }).catch((copyError: unknown) => {
+        if (disposed) return;
+        setToast({
+          message: copyError instanceof Error ? copyError.message : "Could not copy terminal selection.",
+          isError: true,
+        });
+      });
+    };
+    host.addEventListener("keydown", copyTerminalSelectionOnKeyDown);
     let reconnectTimer = 0;
     let reconnectAttempt = 0;
     let resizeFrame = 0;
@@ -677,13 +785,13 @@ export function TmuxDashboard(): ReactElement {
         || visualHeight < initialViewportHeight * 0.82;
     };
 
-    const inputSubscription = terminalInputEnabled
-      ? terminal.onData((input) => {
-        if (disposed || socket?.readyState !== WebSocket.OPEN) return;
-        socket.send(JSON.stringify({ type: "input", data: input }));
-      })
-      : null;
-    const removeTouchScrolling = bindMobileTerminalTouch(host, terminal, setTerminalSelection);
+    const inputSubscription = terminal.onData((input) => {
+      if (!terminalInputEnabled || disposed || socket?.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify({ type: "input", data: input }));
+    });
+    const removeTouchScrolling = bindMobileTerminalTouch(host, terminal, setTerminalSelection, {
+      enableDesktopSelection: !terminalInputEnabled,
+    });
 
     const diagnosticOutputDecoder = new TextDecoder("utf-8");
     let lastTerminalRenderDiagnosticAt = 0;
@@ -774,7 +882,7 @@ export function TmuxDashboard(): ReactElement {
       }
       const delay = Math.min(1_000 * 2 ** Math.min(reconnectAttempt, 4), 15_000);
       reconnectAttempt += 1;
-      setTerminalStatus("RECONNECTING");
+      setTerminalStatus(everAttached ? "RECONNECTING" : "CONNECTING");
       reconnectTimer = window.setTimeout(() => {
         reconnectTimer = 0;
         connect();
@@ -787,7 +895,7 @@ export function TmuxDashboard(): ReactElement {
         setTerminalStatus("OFFLINE");
         return;
       }
-      setTerminalStatus("RECONNECTING");
+      setTerminalStatus(everAttached ? "RECONNECTING" : "CONNECTING");
       if (!isKeyboardOpen()) {
         fitTerminal();
         lastHostWidth = host!.clientWidth;
@@ -803,6 +911,8 @@ export function TmuxDashboard(): ReactElement {
           return;
         }
         reconnectAttempt = 0;
+        everAttached = true;
+        setTerminalEverAttached(true);
         setTerminalStatus("ATTACHED");
         if (host!.clientWidth !== lastHostWidth || host!.clientHeight !== lastHostHeight) scheduleResize(true);
       };
@@ -828,8 +938,12 @@ export function TmuxDashboard(): ReactElement {
               return;
             }
             if (message.type === "error") {
-              setTerminalStatus("ERROR");
-              setToast({ message: message.message || "Could not attach to the selected session.", isError: true });
+              if (everAttached) {
+                setTerminalStatus("ERROR");
+                setToast({ message: message.message || "Could not attach to the selected session.", isError: true });
+              } else {
+                setTerminalStatus("CONNECTING");
+              }
             } else if (message.type === "input-error") {
               setToast({ message: message.message || "终端输入失败。", isError: true, isTop: true });
             } else if (message.type === "exit") {
@@ -847,7 +961,7 @@ export function TmuxDashboard(): ReactElement {
         }
       };
       nextSocket.onerror = () => {
-        if (!disposed && socket === nextSocket) setTerminalStatus("RECONNECTING");
+        if (!disposed && socket === nextSocket) setTerminalStatus(everAttached ? "RECONNECTING" : "CONNECTING");
       };
       nextSocket.onclose = () => {
         if (socket === nextSocket) {
@@ -935,6 +1049,7 @@ export function TmuxDashboard(): ReactElement {
       window.clearTimeout(keyboardCloseTimer);
       inputSubscription?.dispose();
       window.cancelAnimationFrame(resizeFrame);
+      host.removeEventListener("keydown", copyTerminalSelectionOnKeyDown);
       window.removeEventListener("resize", onWindowResize);
       window.removeEventListener("focusout", onComposerFocusOut, true);
       window.removeEventListener("online", reconnectNow);
@@ -950,6 +1065,7 @@ export function TmuxDashboard(): ReactElement {
       socket = null;
       removeTouchScrolling();
       if (terminalInstanceRef.current === terminal) terminalInstanceRef.current = null;
+      terminalLinks.dispose();
       terminal.dispose();
     };
   }, [selectedSession?.id, terminalInputEnabled]);
@@ -1174,6 +1290,9 @@ export function TmuxDashboard(): ReactElement {
       setSessions((current) => [result.session, ...current.filter((session) => session.id !== result.session.id)]);
       setTerminalInputEnabled(false);
       setSelectedId(result.session.id);
+      setTerminalEverAttached(false);
+      setTerminalStatus("CONNECTING");
+      void recordSessionOpen(result.session.id);
       setToast({ message: `Session “${result.session.name}” created.`, isError: false });
       void loadSessions();
     } catch (createError) {
@@ -1221,7 +1340,7 @@ export function TmuxDashboard(): ReactElement {
           description,
           idempotencyKey: submission.key,
           sourceDirectory: trackedTaskContext.directory,
-          expectedBaseSha: trackedTaskContext.baseSha,
+          expectedBaseSha: trackedTaskContext.sourceHeadSha,
         }),
       });
       trackedTaskSubmissionRef.current = null;
@@ -1237,7 +1356,7 @@ export function TmuxDashboard(): ReactElement {
   };
 
   const endSession = async (session: TmuxSession | null = selectedSession): Promise<void> => {
-    if (!session || !window.confirm(`确认终结 Session「${session.name}」？这会关闭所有已连接的客户端。`)) return;
+    if (!session || !window.confirm(`确认终结 Session「${session.name}」？这会关闭所有已连接的客户端并归档 Session；历史记录仍可查看。`)) return;
     try {
       await requestApi<void>(`/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
       const wasSelected = selectedId === session.id;
@@ -1313,7 +1432,8 @@ export function TmuxDashboard(): ReactElement {
       : terminalStatus === "ERROR"
         ? "Session 连接发生错误，可以手动刷新连接。"
         : "Session 已断开，可以手动刷新连接。";
-  const showConnectionBanner = Boolean(selectedSession) && terminalStatus !== "ATTACHED" && terminalStatus !== "IDLE";
+  const showConnectionBanner = Boolean(selectedSession && terminalEverAttached)
+    && terminalStatus !== "ATTACHED" && terminalStatus !== "IDLE" && terminalStatus !== "CONNECTING";
 
   return (
     <main className={`dashboard-page${mobileView === "terminal" ? " is-mobile-terminal" : ""}${navigationCollapsed ? " is-navigation-collapsed" : ""}`}>
@@ -1345,7 +1465,7 @@ export function TmuxDashboard(): ReactElement {
               <button
                 className="dashboard-action dashboard-icon-button dashboard-history-top"
                 type="button"
-                onClick={() => navigate("/tmux-dashboard/history")}
+                onClick={() => openSessionInspector("history")}
                 aria-label="查看 Session 操作历史"
                 title="查看 Session 操作历史"
               >
@@ -1396,23 +1516,23 @@ export function TmuxDashboard(): ReactElement {
             {sessions.length === 0 && backendStatus === "online" ? <p className="dashboard-empty-list">No local tmux sessions.</p> : null}
             {sessions.length > 0 && filteredSessions.length === 0 ? <p className="dashboard-empty-list">No matching sessions.</p> : null}
             {filteredSessions.map((session) => (
-              <div key={session.id} className={`dashboard-session-entry${selectedId === session.id ? " is-selected" : ""}`}>
-                <button className="dashboard-session-card" type="button" onClick={() => selectSession(session.id)} aria-current={selectedId === session.id ? "true" : undefined}>
+              <div key={`${session.id}:${session.createdAt}`} className={`dashboard-session-entry${selectedId === session.id ? " is-selected" : ""}${session.endedAt ? " is-archived" : ""}`}>
+                <button className="dashboard-session-card" type="button" disabled={Boolean(session.endedAt)} onClick={() => selectSession(session.id)} aria-current={selectedId === session.id ? "true" : undefined} title={session.endedAt ? "Session 已终结；可继续查看历史记录" : "打开 Session 详情"}>
                   <span className="dashboard-session-top"><strong>{session.name}</strong><span className={session.attachedClients > 0 ? "is-active" : ""} title={session.attachedClients > 0 ? "Attached" : "Detached"} /></span>
                   <span className="dashboard-session-path" title={session.cwd}>{session.cwd}</span>
-                  <span className="dashboard-session-meta">{session.windows} {session.windows === 1 ? "window" : "windows"}<span>{session.attachedClients > 0 ? `${session.attachedClients} attached` : "detached"}</span></span>
+                  <span className="dashboard-session-meta">{session.endedAt ? "已终结" : `${session.windows} ${session.windows === 1 ? "window" : "windows"}`}<span>{session.openCount} 次使用 · {session.endedAt ? "历史可查看" : session.attachedClients > 0 ? `${session.attachedClients} attached` : "detached"}</span></span>
                   {session.workspaceBranch ? <span className="dashboard-session-worktree">任务分支 · {session.workspaceBranch} · {session.workspaceStatus ?? "工作区"}</span> : null}
                 </button>
                 <div className="dashboard-session-actions" aria-label={`${session.name} 操作`}>
                   <CodexHomeSelect
                     session={session}
                     homes={codexHomes}
-                    disabled={savingCodexHomeId === session.id}
+                    disabled={Boolean(session.endedAt) || savingCodexHomeId === session.id}
                     onChange={(target, homeId) => { void updateCodexHome(target, homeId); }}
                   />
-                  <button type="button" onClick={() => selectSession(session.id)}>详情</button>
-                  <button type="button" onClick={() => navigate(`/tmux-dashboard/history?session=${encodeURIComponent(session.id)}`)}>历史</button>
-                  <button className="dashboard-session-end" type="button" onClick={() => void endSession(session)}>终结</button>
+                  {session.endedAt ? <span className="dashboard-session-archived-label">已归档</span> : <button type="button" onClick={() => selectSession(session.id)}>详情</button>}
+                  <button type="button" onClick={() => openSessionInspector("history", session.id)}>历史</button>
+                  {!session.endedAt ? <button className="dashboard-session-end" type="button" onClick={() => void endSession(session)}>终结</button> : null}
                 </div>
               </div>
             ))}
@@ -1453,11 +1573,15 @@ export function TmuxDashboard(): ReactElement {
                 <button
                   className="dashboard-codex-usage-trigger"
                   type="button"
-                  disabled={!selectedSession.codexHomeId}
+                  disabled={!selectedSession.codexHomeId || terminalStatus !== "ATTACHED"}
                   onClick={() => setCodexUsageDialogOpen(true)}
-                  title={selectedSession.codexHomeId ? "查看当前 Codex 用量" : "当前 Session 未关联 Codex 账号"}
+                  title={!selectedSession.codexHomeId
+                    ? "当前 Session 未关联 Codex 账号"
+                    : terminalStatus !== "ATTACHED" ? "终端连接完成后查看 Codex 用量" : "查看当前 Codex 用量"}
                   aria-label={selectedSession.codexHomeId
-                    ? `${selectedCodexHomeLabel} Codex 剩余额度：${currentCodexRemainingPercentages[0]}，${currentCodexRemainingPercentages[1]}，点击查看详情`
+                    ? terminalStatus === "ATTACHED"
+                      ? `${selectedCodexHomeLabel} Codex 剩余额度：${currentCodexRemainingPercentages[0]}，${currentCodexRemainingPercentages[1]}，点击查看详情`
+                      : "终端连接完成后查看 Codex 用量"
                     : "当前 Session 未关联 Codex 账号"}
                 >
                   <span className="dashboard-codex-home-label" title={selectedCodexHomeLabel}>{selectedCodexHomeLabel}</span>
@@ -1468,8 +1592,11 @@ export function TmuxDashboard(): ReactElement {
                 <details className="dashboard-codex-actions">
                   <summary aria-label="Session 操作" title="Session 操作"><span className="menu-chevron" aria-hidden="true" /></summary>
                   <div className="dashboard-codex-actions-panel">
-                    <button type="button" onClick={() => navigate(`/tmux-dashboard/history?session=${encodeURIComponent(selectedSession.id)}`)}>
+                    <button type="button" onClick={() => openSessionInspector("history", selectedSession.id)}>
                       查看历史（当前 Session）
+                    </button>
+                    <button type="button" onClick={() => openSessionInspector("git", selectedSession.id)}>
+                      查看 Git 变更
                     </button>
                     {selectedSession.taskGuid ? <button type="button" onClick={() => navigate(`/tasks/desk/${encodeURIComponent(selectedSession.taskGuid!)}`, { state: { returnTo: `${location.pathname}${location.search}` } })}>打开关联任务</button> : null}
                     <button type="button" onClick={() => void openTrackedTaskDialog()}>从当前目录创建 Bridge 任务</button>
@@ -1479,8 +1606,8 @@ export function TmuxDashboard(): ReactElement {
                       disabled={savingCodexHomeId === selectedSession.id}
                       onChange={(target, homeId) => { void updateCodexHome(target, homeId); }}
                     />
-                    <button type="button" disabled={checkingCodexHomeId === selectedSession.id} onClick={() => void checkCodexHome(selectedSession)}>
-                      {checkingCodexHomeId === selectedSession.id ? "检查中…" : "刷新账号"}
+                    <button type="button" disabled={terminalStatus !== "ATTACHED" || checkingCodexHomeId === selectedSession.id} onClick={() => void checkCodexHome(selectedSession)}>
+                      {checkingCodexHomeId === selectedSession.id ? "检查中…" : terminalStatus === "ATTACHED" ? "刷新账号" : "终端连接后检查账号"}
                     </button>
                     <button type="button" onClick={() => void refreshSelectedSession()}>刷新 Session</button>
                     <button className="dashboard-session-end" type="button" onClick={() => void endSession(selectedSession)}>终结 Session</button>
@@ -1631,9 +1758,9 @@ export function TmuxDashboard(): ReactElement {
         <div className="dashboard-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !trackedTaskBusy) setTrackedTaskOpen(false); }}>
           <form className="dashboard-modal dashboard-task-create-modal" onSubmit={(event) => void createTrackedTask(event)}>
             <div className="dashboard-modal-heading"><div><p className="dashboard-eyebrow">NEW BRIDGE TASK</p><h2>从当前 Session 创建任务</h2></div><button type="button" onClick={() => setTrackedTaskOpen(false)} aria-label="Close" disabled={trackedTaskBusy}>×</button></div>
-            <p className="muted">{trackedTaskContextLoading ? "正在读取当前 pane 目录和 Git 基准…" : trackedTaskContext ? `项目：${trackedTaskContext.projectName} · 来源目录：${trackedTaskContext.directory}` : `Session：${selectedSession.name}`}</p>
-            {trackedTaskContext ? <p className="muted">基准：{trackedTaskContext.branch ?? "detached"} · {trackedTaskContext.baseSha.slice(0, 12)}{trackedTaskContext.dirtyEntryCount ? ` · ${trackedTaskContext.dirtyEntryCount} 项未提交改动` : " · 工作区 clean"}</p> : null}
-            <p className="muted">任务会从当前 pane 的 HEAD 创建独立 worktree；源目录未提交的改动不会复制。</p>
+            <p className="muted">{trackedTaskContextLoading ? "正在读取当前 pane 目录和 master 基准…" : trackedTaskContext ? `项目：${trackedTaskContext.projectName} · 来源目录：${trackedTaskContext.directory}` : `Session：${selectedSession.name}`}</p>
+            {trackedTaskContext ? <p className="muted">来源：{trackedTaskContext.branch ?? "detached"} · HEAD {trackedTaskContext.sourceHeadSha.slice(0, 12)} · 创建基准：{trackedTaskContext.baseRef} {trackedTaskContext.targetBaseSha.slice(0, 12)}{trackedTaskContext.dirtyEntryCount ? ` · ${trackedTaskContext.dirtyEntryCount} 项未提交改动` : " · 工作区 clean"}</p> : null}
+            <p className="muted">任务会从本地 master 创建独立 worktree；当前 pane 只用于确定项目和校验来源 HEAD，源目录未提交的改动不会复制。</p>
             <label className="dashboard-modal-field">任务描述<textarea value={trackedTaskDescription} onChange={(event) => setTrackedTaskDescription(event.target.value)} maxLength={20_000} rows={7} required autoFocus disabled={trackedTaskBusy} placeholder="描述需要完成的工作" /></label>
             {trackedTaskError ? <div className="error" role="alert">{trackedTaskError}</div> : null}
             <div className="dashboard-modal-actions"><button className="dashboard-action" type="button" onClick={() => setTrackedTaskOpen(false)} disabled={trackedTaskBusy}>取消</button><button className="dashboard-submit" type="submit" disabled={trackedTaskBusy || trackedTaskContextLoading || !trackedTaskContext || trackedTaskContext.dirtyEntryCount > 0 || !trackedTaskDescription.trim()}>{trackedTaskBusy ? "提交中…" : trackedTaskContext?.dirtyEntryCount ? "先处理未提交改动" : "创建任务和 worktree"}</button></div>
@@ -1649,6 +1776,24 @@ export function TmuxDashboard(): ReactElement {
           onRefresh={() => loadCurrentCodexUsage(selectedCodexHomeId)}
           onClose={() => setCodexUsageDialogOpen(false)}
         />
+      ) : null}
+      {sessionInspector ? (
+        <div
+          className="dashboard-inspector-backdrop"
+          role="presentation"
+          onMouseDown={(event) => { if (event.target === event.currentTarget) setSessionInspector(null); }}
+        >
+          <section className="dashboard-inspector-modal" role="dialog" aria-modal="true" aria-label={sessionInspector.kind === "history" ? "Session 操作历史" : "Git 变更"}>
+            <button className="dashboard-inspector-close" type="button" onClick={() => setSessionInspector(null)} aria-label="关闭">×</button>
+            <Suspense fallback={<div className="dashboard-inspector-loading">正在加载…</div>}>
+              {sessionInspector.kind === "history" ? (
+                <TmuxHistoryInspector embedded sessionIdOverride={sessionInspector.sessionId} />
+              ) : (
+                <TmuxGitChangesInspector embedded sessionId={sessionInspector.sessionId} />
+              )}
+            </Suspense>
+          </section>
+        </div>
       ) : null}
       {toast ? <div className={`dashboard-toast${toast.isError ? " is-error" : ""}${toast.isTop ? " is-top" : ""}`} role="status">{toast.message}</div> : null}
     </main>

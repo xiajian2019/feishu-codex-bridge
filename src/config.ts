@@ -29,7 +29,7 @@ const aampWorktreeSchema = z.object({
   globalAgentsPath: z.string().trim().min(1),
   taskDir: z.string().trim().min(1),
   worktreeRoot: z.string().trim().min(1),
-  baseRef: z.string().trim().min(1).default("HEAD"),
+  baseRef: z.string().trim().min(1).default("master"),
   branchPrefix: z.string().trim().min(1).default("xiajian/agent"),
 }).strict();
 

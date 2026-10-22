@@ -284,6 +284,8 @@ export interface StoredTmuxSession {
   tmux_created_at: number;
   first_seen_at: string;
   last_seen_at: string;
+  open_count: number;
+  last_opened_at: string | null;
   ended_at: string | null;
   created_by_device_id: string | null;
   workspace_id: string | null;

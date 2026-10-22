@@ -51,12 +51,20 @@ const STATUS_LABELS: Record<TmuxSessionAction["status"], string> = {
   failed: "失败",
 };
 
-export function TmuxSessionHistory(): ReactElement {
+interface TmuxSessionHistoryProps {
+  embedded?: boolean;
+  sessionIdOverride?: string | null;
+}
+
+export function TmuxSessionHistory({ embedded = false, sessionIdOverride }: TmuxSessionHistoryProps = {}): ReactElement {
   const [params, setParams] = useSearchParams();
-  const sessionId = params.get("session") || "";
-  const query = params.get("q") || "";
+  const routeSessionId = params.get("session") || "";
+  const sessionId = sessionIdOverride === undefined ? routeSessionId : sessionIdOverride || "";
+  const [embeddedQuery, setEmbeddedQuery] = useState("");
+  const [embeddedOffset, setEmbeddedOffset] = useState(0);
+  const query = embedded ? embeddedQuery : params.get("q") || "";
   const rawOffset = Number(params.get("offset") || 0);
-  const offset = Number.isSafeInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+  const offset = embedded ? embeddedOffset : Number.isSafeInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
   const [draft, setDraft] = useState(query);
   const [page, setPage] = useState<TmuxSessionActionPage | null>(null);
   const [loading, setLoading] = useState(false);
@@ -91,6 +99,11 @@ export function TmuxSessionHistory(): ReactElement {
   }, [previewImage]);
 
   const updateQuery = (values: Record<string, string>): void => {
+    if (embedded) {
+      if (Object.prototype.hasOwnProperty.call(values, "q")) setEmbeddedQuery(values.q || "");
+      if (Object.prototype.hasOwnProperty.call(values, "offset")) setEmbeddedOffset(Number(values.offset || 0));
+      return;
+    }
     const next = new URLSearchParams(params);
     for (const [key, value] of Object.entries(values)) {
       if (value) next.set(key, value); else next.delete(key);
@@ -100,25 +113,36 @@ export function TmuxSessionHistory(): ReactElement {
   const sessionInfo = page?.session ?? null;
 
   return (
-    <main className="tmux-history-page">
+    <main className={`tmux-history-page${embedded ? " is-embedded" : ""}`}>
       <header className="tmux-history-header">
         <div className="tmux-history-heading">
-          <p className="dashboard-eyebrow">TMUX DASHBOARD / HISTORY</p>
-          <h1>{sessionId ? "操作历史" : "全部 Session 历史"}</h1>
-          {sessionId ? (
-            <div className="tmux-history-session-context">
-              <strong>{sessionInfo?.session_name || sessionId}</strong>
-              <span>{sessionInfo?.project_key || "未关联项目"}</span>
-              <code>{sessionInfo?.working_directory || ""}</code>
+          {embedded ? (
+            <div className="tmux-inspector-compact-heading">
+              <strong>{sessionId ? sessionInfo?.session_name || sessionId : "全部 Session 历史"}</strong>
+              {sessionId && sessionInfo?.project_key ? <span>{sessionInfo.project_key}</span> : null}
             </div>
-          ) : <p>查看所有 Session 的任务提交和终端操作。</p>}
+          ) : (
+            <>
+              <p className="dashboard-eyebrow">TMUX DASHBOARD / HISTORY</p>
+              <h1>{sessionId ? "操作历史" : "全部 Session 历史"}</h1>
+              {sessionId ? (
+                <div className="tmux-history-session-context">
+                  <strong>{sessionInfo?.session_name || sessionId}</strong>
+                  <span>{sessionInfo?.project_key || "未关联项目"}</span>
+                  <code>{sessionInfo?.working_directory || ""}</code>
+                </div>
+              ) : <p>查看所有 Session 的任务提交和终端操作。</p>}
+            </>
+          )}
         </div>
-        <div className="tmux-history-header-actions">
-          <Link to={sessionId ? `/tmux-dashboard?session=${encodeURIComponent(sessionId)}` : "/tmux-dashboard"}>
-            {sessionId ? "返回 Session 详情" : "返回 Sessions"}
-          </Link>
-          <button type="button" disabled={loading} onClick={() => setRefresh((value) => value + 1)}>刷新</button>
-        </div>
+        {!embedded ? (
+          <div className="tmux-history-header-actions">
+            <Link to={sessionId ? `/tmux-dashboard?session=${encodeURIComponent(sessionId)}` : "/tmux-dashboard"}>
+              {sessionId ? "返回 Session 详情" : "返回 Sessions"}
+            </Link>
+            <button type="button" disabled={loading} onClick={() => setRefresh((value) => value + 1)}>刷新</button>
+          </div>
+        ) : null}
       </header>
 
       <form className="tmux-history-filter" onSubmit={(event: FormEvent<HTMLFormElement>) => {

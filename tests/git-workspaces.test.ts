@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +9,7 @@ import { StateDatabase } from "../src/db.js";
 import { Dispatcher } from "../src/dispatcher.js";
 import { DatabaseSync } from "../src/sqlite.js";
 import {
+  inspectGitChanges,
   inspectTaskWorkspace,
   prepareTaskWorkspace,
   provisionTaskWorkspace,
@@ -29,7 +30,7 @@ function git(directory: string, ...args: string[]): string {
 function createRepository(parent: string): string {
   const repository = join(parent, "repo");
   mkdirSync(repository, { recursive: true });
-  git(repository, "init", "-b", "main");
+  git(repository, "init", "-b", "master");
   git(repository, "config", "user.name", "Bridge Test");
   git(repository, "config", "user.email", "bridge-test@example.invalid");
   writeFileSync(join(repository, "README.md"), "base\n");
@@ -64,6 +65,27 @@ function storedWorkspace(prepared: Awaited<ReturnType<typeof prepareTaskWorkspac
 }
 
 describe("Git task workspaces", () => {
+  it("reports tracked, staged, and untracked changes from a repository", async () => {
+    const root = mkdtempSync(join(tmpdir(), "bridge-git-changes-"));
+    fixtures.push(root);
+    const repository = createRepository(root);
+    writeFileSync(join(repository, "README.md"), "changed base\n");
+    writeFileSync(join(repository, "staged.txt"), "staged\n");
+    git(repository, "add", "staged.txt");
+    writeFileSync(join(repository, "untracked.ts"), "export const value = 1;\n");
+
+    const inspection = await inspectGitChanges(repository);
+    expect(inspection.gitRoot).toBe(realpathSync(repository));
+    expect(inspection.branch).toBe("master");
+    expect(inspection.files).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: "README.md", status: "modified", staged: false, unstaged: true }),
+      expect.objectContaining({ path: "staged.txt", status: "added", staged: true, unstaged: false }),
+      expect.objectContaining({ path: "untracked.ts", status: "untracked", staged: false, unstaged: true }),
+    ]));
+    expect(inspection.patch).toContain("changed base");
+    expect(inspection.patch).toContain("+export const value = 1;");
+    expect(inspection.patchTruncated).toBe(false);
+  });
   it("adds workspace links to an existing tmux database without replacing session history", () => {
     const root = mkdtempSync(join(tmpdir(), "bridge-workspace-migration-"));
     fixtures.push(root);
@@ -119,8 +141,10 @@ describe("Git task workspaces", () => {
     await provisionTaskWorkspace(workspace);
 
     expect(await verifyTaskWorkspace(workspace)).toBe(workspace.worktree_path);
-    expect(git(repository, "branch", "--show-current")).toBe("main");
+    expect(git(repository, "branch", "--show-current")).toBe("master");
     expect(git(workspace.worktree_path, "branch", "--show-current")).toBe(workspace.branch);
+    expect(workspace.branch.startsWith("xiajian/agent/")).toBe(true);
+    expect(workspace.worktree_path).toContain("/wt-add-scoped");
     writeFileSync(join(workspace.working_directory, "isolated.txt"), "only in the task worktree\n");
     expect(existsSync(join(repository, "isolated.txt"))).toBe(false);
     expect((await inspectTaskWorkspace(workspace)).dirtyEntryCount).toBe(1);
@@ -132,6 +156,39 @@ describe("Git task workspaces", () => {
     expect(result.branchDeleted).toBe(false);
     expect(existsSync(workspace.worktree_path)).toBe(false);
     expect(git(repository, "show-ref", "--verify", `refs/heads/${workspace.branch}`)).toBe(`${git(repository, "rev-parse", workspace.branch)} refs/heads/${workspace.branch}`);
+  });
+
+  it("always creates a task worktree from the local master branch", async () => {
+    const root = mkdtempSync(join(tmpdir(), "bridge-task-workspace-base-"));
+    fixtures.push(root);
+    const repository = createRepository(root);
+    const masterSha = git(repository, "rev-parse", "master");
+    git(repository, "checkout", "-b", "xiajian/source-feature");
+    writeFileSync(join(repository, "feature.txt"), "source branch change\n");
+    git(repository, "add", "feature.txt");
+    git(repository, "commit", "-m", "source branch change");
+    const sourceSha = git(repository, "rev-parse", "HEAD");
+
+    const prepared = await prepareTaskWorkspace({
+      workspaceRoot: join(root, "managed-worktrees"),
+      workspaceId: "workspace-master-base",
+      taskGuid: "web-master-base-123456",
+      projectKey: "fixture",
+      projectRoot: repository,
+      sourceDirectory: repository,
+      summary: "Use master base",
+      featureName: "use-master-base-branch",
+    });
+
+    expect(prepared.sourceSha).toBe(sourceSha);
+    expect(prepared.baseRef).toBe("master");
+    expect(prepared.baseSha).toBe(masterSha);
+    expect(prepared.branch).toBe("xiajian/agent/use-master-base-branch");
+    expect(prepared.worktreePath).toContain("/wt-use-master");
+    const workspace = storedWorkspace(prepared);
+    await provisionTaskWorkspace(workspace);
+    expect(git(workspace.worktree_path, "rev-parse", "HEAD")).toBe(masterSha);
+    expect(existsSync(join(workspace.worktree_path, "feature.txt"))).toBe(false);
   });
 
   it("rejects dirty source directories and redirects an in-repository worktree root outside the repo", async () => {

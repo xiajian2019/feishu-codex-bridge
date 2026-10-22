@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { WebTaskSubmissionConflictError } from "./types.js";
 import { StateDatabase } from "./db.js";
 import { computeInputHash, parseTaskInput, serializeTaskInput } from "./fingerprint.js";
 import type { GitWorkspaceSnapshot } from "./run-artifacts.js";
-import { GitWorkspaceError, prepareTaskWorkspace, provisionTaskWorkspace } from "./git-workspaces.js";
+import { defaultTaskWorktreeRoot, GitWorkspaceError, prepareTaskWorkspace, provisionTaskWorkspace } from "./git-workspaces.js";
+import { fallbackTaskFeatureName, summarizeTaskFeatureName } from "./task-feature-name.js";
 import {
   buildRunPrompt,
   formatBlockedComment,
@@ -48,6 +49,7 @@ export interface DispatcherOptions {
   logger?: Logger;
   captureWorkspaceSnapshot?: (directory: string) => Promise<GitWorkspaceSnapshot>;
   worktreeRoot?: string;
+  taskFeatureNameResolver?: (input: { summary: string; description: string }) => Promise<string | null>;
 }
 
 export interface WebTaskWorkspaceSource {
@@ -67,6 +69,7 @@ export class Dispatcher {
   private readonly logger: Logger;
   private readonly captureWorkspaceSnapshot?: (directory: string) => Promise<GitWorkspaceSnapshot>;
   private readonly worktreeRoot: string;
+  private readonly taskFeatureNameResolver?: DispatcherOptions["taskFeatureNameResolver"];
   private readonly queue: string[] = [];
   private readonly queuedRunIds = new Set<string>();
   private readonly active = new Map<string, ActiveRun>();
@@ -83,7 +86,8 @@ export class Dispatcher {
     this.serviceInstanceId = options.serviceInstanceId ?? randomUUID();
     this.logger = options.logger ?? consoleLogger;
     this.captureWorkspaceSnapshot = options.captureWorkspaceSnapshot;
-    this.worktreeRoot = resolve(options.worktreeRoot ?? join(process.cwd(), "runtime", "worktrees"));
+    this.worktreeRoot = resolve(options.worktreeRoot ?? defaultTaskWorktreeRoot());
+    this.taskFeatureNameResolver = options.taskFeatureNameResolver;
   }
 
   public async observe(task: LarkTask): Promise<void> {
@@ -236,6 +240,9 @@ export class Dispatcher {
     if (source && resolve(source.directory) !== resolve(source.expectedDirectory)) {
       throw new GitWorkspaceError("Session 工作目录已变化，请刷新任务表单后重试。", 409);
     }
+    const featureName = createWorktree
+      ? await this.resolveTaskFeatureName(summary, description)
+      : undefined;
     const preparedWorkspace = createWorktree
       ? await prepareTaskWorkspace({
         workspaceRoot: this.worktreeRoot,
@@ -244,11 +251,12 @@ export class Dispatcher {
         projectKey,
         projectRoot: project.path,
         summary,
+        featureName,
         ...(source ? { sourceDirectory: source.directory, sourceTmuxSessionId: source.tmuxSessionId } : {}),
       })
       : undefined;
-    if (source && preparedWorkspace?.baseSha !== source.expectedBaseSha) {
-      throw new GitWorkspaceError("Session 基准提交已变化，请刷新任务表单后重试。", 409);
+    if (source && preparedWorkspace?.sourceSha !== source.expectedBaseSha) {
+      throw new GitWorkspaceError("Session 来源提交已变化，请刷新任务表单后重试。", 409);
     }
     const routedTask: RoutedTask = {
       taskGuid,
@@ -275,6 +283,7 @@ export class Dispatcher {
         "",
         `本任务使用独立 Git worktree：${preparedWorkspace.worktreePath}`,
         `任务分支：${preparedWorkspace.branch}`,
+        `基准分支：${preparedWorkspace.baseRef}`,
         `基准提交：${preparedWorkspace.baseSha}`,
       );
     }
@@ -723,6 +732,23 @@ export class Dispatcher {
     } catch (error) {
       this.logger.warn("could not capture Web run workspace metadata", { runId, stage, error: safeErrorMessage(error) });
     }
+  }
+
+  private async resolveTaskFeatureName(summary: string, description: string): Promise<string> {
+    const resolved = this.taskFeatureNameResolver
+      ? await this.taskFeatureNameResolver({ summary, description })
+      : await summarizeTaskFeatureName({
+        codexPath: this.config.codex.cliPath,
+        summary,
+        description,
+        env: this.config.codex.env,
+      });
+    const fallback = fallbackTaskFeatureName(summary) || "task";
+    if (resolved) return resolved;
+    this.logger.warn("could not summarize task feature name with gpt-5.6-luna; using a deterministic short name", {
+      fallback,
+    });
+    return fallback;
   }
 
   private async ensureExistingTaskWorkspace(taskGuid: string): Promise<void> {

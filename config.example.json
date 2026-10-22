@@ -13,7 +13,7 @@
       "globalAgentsPath": "/Users/xiajian/.codex/AGENTS.md",
       "taskDir": "/Users/xiajian/works/ai_work/codex/tasks",
       "worktreeRoot": "/Users/xiajian/.codex/worktrees",
-      "baseRef": "HEAD",
+      "baseRef": "master",
       "branchPrefix": "xiajian/agent"
     }
   },
@@ -64,7 +64,7 @@
     "allowedCreatorOpenIds": []
   },
   "codex": {
-    "cliPath": "/opt/homebrew/bin/codex",
+    "cliPath": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
     "env": {
       "HTTP_PROXY": "http://127.0.0.1:7897",
       "HTTPS_PROXY": "http://127.0.0.1:7897"

@@ -139,7 +139,7 @@ describe("DashboardServer", () => {
     const actionToken = /name="bridge-action-token" content="([^"]+)"/.exec(page)?.[1];
     expect(actionToken).toBeTruthy();
 
-    for (const route of ["/tmux-dashboard", "/demos"]) {
+    for (const route of ["/tmux-dashboard", "/demos", "/link-tools"]) {
       const routedPage = await fetch(url + route);
       expect(routedPage.status).toBe(200);
       expect(await routedPage.text()).toContain('id="root"');
@@ -341,6 +341,9 @@ describe("DashboardServer", () => {
         taskGuid: null,
         workspaceBranch: null,
         workspaceStatus: null,
+        endedAt: null,
+        openCount: 0,
+        lastOpenedAt: null,
       })),
       codexHomes: expect.any(Array),
     });

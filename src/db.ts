@@ -500,6 +500,8 @@ CREATE TABLE IF NOT EXISTS tmux_sessions (
     tmux_created_at INTEGER NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
+    open_count INTEGER NOT NULL DEFAULT 0 CHECK (open_count >= 0),
+    last_opened_at TEXT,
     ended_at TEXT,
     created_by_device_id TEXT,
     workspace_id TEXT,
@@ -4024,6 +4026,22 @@ export class StateDatabase {
     return row ? mapTmuxSession(row) : null;
   }
 
+  public recordTmuxSessionOpen(tmuxSessionId: string): StoredTmuxSession | null {
+    const now = this.timestamp();
+    const result = this.db.prepare(`UPDATE tmux_sessions
+      SET open_count = open_count + 1, last_opened_at = ?
+      WHERE tmux_session_id = ? AND ended_at IS NULL`).run(now, tmuxSessionId);
+    if (result.changes === 0) return null;
+    return this.getLatestTmuxSession(tmuxSessionId);
+  }
+
+  public listTmuxSessionsForDashboard(): StoredTmuxSession[] {
+    const rows = this.db.prepare(`SELECT * FROM tmux_sessions
+      ORDER BY (ended_at IS NULL) DESC, open_count DESC,
+        (last_opened_at IS NULL) ASC, last_opened_at DESC, last_seen_at DESC, first_seen_at DESC`).all() as Record<string, unknown>[];
+    return rows.map(mapTmuxSession);
+  }
+
   public getLatestTmuxSession(tmuxSessionId: string): StoredTmuxSession | null {
     const row = this.db.prepare(`SELECT * FROM tmux_sessions
       WHERE tmux_session_id = ?
@@ -4425,8 +4443,12 @@ export class StateDatabase {
     addColumnIfMissing(this.db, "tmux_session_actions", "submission_fingerprint", "TEXT");
     addColumnIfMissing(this.db, "tmux_sessions", "codex_home_id", "TEXT");
     addColumnIfMissing(this.db, "tmux_sessions", "workspace_id", "TEXT");
+    addColumnIfMissing(this.db, "tmux_sessions", "open_count", "INTEGER NOT NULL DEFAULT 0");
+    addColumnIfMissing(this.db, "tmux_sessions", "last_opened_at", "TEXT");
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tmux_sessions_workspace
       ON tmux_sessions(workspace_id, ended_at, last_seen_at DESC)`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tmux_sessions_dashboard
+      ON tmux_sessions(ended_at, open_count DESC, last_opened_at DESC, last_seen_at DESC)`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tmux_session_actions_fingerprint
       ON tmux_session_actions(session_record_id, submission_fingerprint, created_at DESC)`);
     this.db.exec(`UPDATE tmux_session_actions
@@ -4983,6 +5005,8 @@ function mapTmuxSession(row: Record<string, unknown>): StoredTmuxSession {
     tmux_created_at: Number(row.tmux_created_at),
     first_seen_at: String(row.first_seen_at),
     last_seen_at: String(row.last_seen_at),
+    open_count: Number(row.open_count ?? 0),
+    last_opened_at: nullableString(row.last_opened_at),
     ended_at: nullableString(row.ended_at),
     created_by_device_id: nullableString(row.created_by_device_id),
     workspace_id: nullableString(row.workspace_id),

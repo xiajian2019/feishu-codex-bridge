@@ -21,6 +21,7 @@ import type {
 } from "./types.js";
 import { DEFAULT_COMPOSER_SHORTCUTS, type ShortcutDefinition, type ShortcutDisplayMode, type ShortcutGroup, type ShortcutKind, type ShortcutStore, type ShortcutSurface } from "./tmux-shortcuts.js";
 import { invalidateShortcutConfigCache, observeShortcutConfigServerRevision, readShortcutConfigRevision, recordShortcutConfigServerRevision, writeShortcutConfigCache } from "./shortcut-config-cache.js";
+import { clearCodexSkillCache, readCodexSkillCache, writeCodexSkillCache } from "./skill-cache.js";
 
 export interface TaskQuery {
   q?: string;
@@ -270,14 +271,28 @@ export async function interruptCodexThreadMessage(
   );
 }
 
+const CODEX_SKILLS_CACHE_KEY = "global";
+
+function isCodexSkillRecordList(value: unknown): value is CodexSkillRecord[] {
+  return Array.isArray(value) && value.every((item) => (
+    typeof item === "object"
+    && item !== null
+    && typeof (item as { skillName?: unknown }).skillName === "string"
+  ));
+}
+
 export async function fetchProjects(): Promise<ProjectRecord[]> {
   const result = await getJson<{ projects: ProjectRecord[] }>("/api/projects");
   return result.projects;
 }
 
 export async function fetchCodexSkills(): Promise<CodexSkillRecord[]> {
+  const cached = readCodexSkillCache(CODEX_SKILLS_CACHE_KEY, isCodexSkillRecordList);
+  if (cached) return cached;
   const result = await getJson<{ skills: CodexSkillRecord[] }>("/api/skills");
-  return Array.isArray(result.skills) ? result.skills : [];
+  const skills = Array.isArray(result.skills) ? result.skills : [];
+  if (skills.length > 0) writeCodexSkillCache(CODEX_SKILLS_CACHE_KEY, skills);
+  return skills;
 }
 
 export async function updateCodexSkillPreferences(skills: CodexSkillPreference[]): Promise<void> {
@@ -287,6 +302,7 @@ export async function updateCodexSkillPreferences(skills: CodexSkillPreference[]
     headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
     body: JSON.stringify({ skills }),
   });
+  clearCodexSkillCache(CODEX_SKILLS_CACHE_KEY);
 }
 
 export async function createProject(input: { name: string; path: string; status: ProjectStatus }): Promise<ProjectRecord> {

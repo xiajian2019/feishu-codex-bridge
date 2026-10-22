@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactElement } from "react";
+import { getActionToken, getJson } from "./api.js";
 
-type DemoState = "checking" | "ready" | "unavailable";
+type DemoState = "checking" | "starting" | "ready" | "unavailable";
 
 type LocalDemo = {
   id: string;
@@ -10,6 +11,8 @@ type LocalDemo = {
   steps: readonly string[];
   openPath: string;
   healthPath: string;
+  startPath: string;
+  logsPath: string;
 };
 
 const LOCAL_DEMOS: LocalDemo[] = [
@@ -21,11 +24,25 @@ const LOCAL_DEMOS: LocalDemo[] = [
     steps: ["上传图片", "识别分区", "检索确认"],
     openPath: "/api/local-demos/food-photo/?scene=multidish",
     healthPath: "/api/local-demos/food-photo/api/multidish/health",
+    startPath: "/api/local-demos/food-photo/start",
+    logsPath: "/api/local-demos/food-photo/logs",
+  },
+  {
+    id: "openai-clip",
+    title: "OpenAI CLIP 食物检索",
+    category: "视觉检索 · CLIP",
+    description: "本地 OpenAI CLIP 编码图片，使用 SQLite-vec 检索食物文本向量并返回 Top-K 候选。",
+    steps: ["上传图片", "SQLite 向量", "Top-K 候选"],
+    openPath: "/api/local-demos/openai-clip/",
+    healthPath: "/api/local-demos/openai-clip/api/health",
+    startPath: "/api/local-demos/openai-clip/start",
+    logsPath: "/api/local-demos/openai-clip/logs",
   },
 ];
 
 const STATUS_LABELS: Record<DemoState, string> = {
   checking: "检查中",
+  starting: "启动中",
   ready: "运行中",
   unavailable: "未启动",
 };
@@ -34,6 +51,63 @@ export function DemoCatalog(): ReactElement {
   const [states, setStates] = useState<Record<string, DemoState>>(() =>
     Object.fromEntries(LOCAL_DEMOS.map((demo) => [demo.id, "checking"])),
   );
+  const [logs, setLogs] = useState<Record<string, string[]>>({});
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [copyStates, setCopyStates] = useState<Record<string, "idle" | "copied" | "failed">>({});
+
+  const loadLog = useCallback(async (demo: LocalDemo): Promise<{
+    processRunning: boolean;
+    exitCode: number | null;
+    error: string | null;
+    lines: string[];
+    displayLines: string[];
+  }> => {
+    const result = await getJson<{
+      root: string;
+      workingDirectory: string;
+      command: string[];
+      processRunning: boolean;
+      pid: number | null;
+      exitCode: number | null;
+      signal: string | null;
+      error: string | null;
+      lines: string[];
+    }>(demo.logsPath);
+    const displayLines = [
+      `[root] ${result.root}`,
+      `[cwd] ${result.workingDirectory}`,
+      `[command] ${result.command.join(" ")}`,
+      `[process] running=${result.processRunning} pid=${result.pid ?? "none"} exit=${result.exitCode ?? "none"} signal=${result.signal ?? "none"}`,
+      result.error ? `[error] ${result.error}` : "",
+      ...(result.lines ?? []),
+    ].filter(Boolean);
+    setLogs((current) => ({ ...current, [demo.id]: displayLines }));
+    if (result.error) setErrors((current) => ({ ...current, [demo.id]: result.error as string }));
+    return { ...result, displayLines };
+  }, []);
+
+  const copyLog = useCallback(async (demo: LocalDemo): Promise<void> => {
+    try {
+      const result = await loadLog(demo);
+      const text = result.displayLines.join("\n") || "尚未启动，或暂时没有日志。";
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        if (!document.execCommand("copy")) throw new Error("clipboard copy failed");
+        textarea.remove();
+      }
+      setCopyStates((current) => ({ ...current, [demo.id]: "copied" }));
+      window.setTimeout(() => setCopyStates((current) => ({ ...current, [demo.id]: "idle" })), 1800);
+    } catch {
+      setCopyStates((current) => ({ ...current, [demo.id]: "failed" }));
+    }
+  }, [loadLog]);
 
   const checkDemo = useCallback(async (demo: LocalDemo): Promise<void> => {
     setStates((current) => ({ ...current, [demo.id]: "checking" }));
@@ -43,11 +117,68 @@ export function DemoCatalog(): ReactElement {
     } catch {
       setStates((current) => ({ ...current, [demo.id]: "unavailable" }));
     }
-  }, []);
+    void loadLog(demo).catch(() => undefined);
+  }, [loadLog]);
 
   const checkAll = useCallback((): void => {
     void Promise.all(LOCAL_DEMOS.map((demo) => checkDemo(demo)));
   }, [checkDemo]);
+
+  const openDemoTab = useCallback((demo: LocalDemo, target?: Window | null): boolean => {
+    if (target && !target.closed) {
+      target.location.replace(demo.openPath);
+      return true;
+    }
+    const opened = window.open(demo.openPath, "_blank");
+    if (!opened) {
+      setErrors((current) => ({ ...current, [demo.id]: "浏览器阻止了新标签页，请允许弹窗后重试。" }));
+      return false;
+    }
+    opened.opener = null;
+    return true;
+  }, []);
+
+  const startDemo = useCallback(async (demo: LocalDemo): Promise<void> => {
+    const demoTab = window.open("about:blank", "_blank");
+    if (demoTab) demoTab.opener = null;
+    setStates((current) => ({ ...current, [demo.id]: "starting" }));
+    try {
+      const actionToken = await getActionToken();
+      await getJson(demo.startPath, {
+        method: "POST",
+        headers: { "X-Bridge-Action-Token": actionToken },
+        body: JSON.stringify({}),
+      });
+      setErrors((current) => {
+        const next = { ...current };
+        delete next[demo.id];
+        return next;
+      });
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        const log = await loadLog(demo).catch(() => null);
+        if (log?.error && !log.processRunning && log.exitCode !== null) {
+          throw new Error(log.error);
+        }
+        try {
+          const response = await fetch(demo.healthPath, { cache: "no-store" });
+          if (response.ok) {
+            setStates((current) => ({ ...current, [demo.id]: "ready" }));
+            openDemoTab(demo, demoTab);
+            return;
+          }
+        } catch {
+          // The child process may still be installing dependencies or loading a model.
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+      }
+      throw new Error("Demo 启动后未通过健康检查，请查看启动日志或刷新状态。");
+    } catch (failure) {
+      if (demoTab && !demoTab.closed) demoTab.close();
+      setStates((current) => ({ ...current, [demo.id]: "unavailable" }));
+      setErrors((current) => ({ ...current, [demo.id]: failure instanceof Error ? failure.message : String(failure) }));
+      void loadLog(demo).catch(() => undefined);
+    }
+  }, [loadLog, openDemoTab]);
 
   useEffect(() => { checkAll(); }, [checkAll]);
 
@@ -66,6 +197,8 @@ export function DemoCatalog(): ReactElement {
     <section className="demo-catalog-grid" aria-label="Demo 列表">
       {LOCAL_DEMOS.map((demo) => {
         const state = states[demo.id] ?? "checking";
+        const copyState = copyStates[demo.id] ?? "idle";
+        const copyLabel = copyState === "copied" ? "日志已复制" : copyState === "failed" ? "复制日志失败" : "复制启动日志";
         return <article className="demo-card" key={demo.id}>
           <div className="demo-card-content">
             <div className="demo-card-topline">
@@ -82,10 +215,36 @@ export function DemoCatalog(): ReactElement {
             </div>
             <div className="demo-card-footer">
               <div className="demo-card-actions">
-                <a className="primary" href={demo.openPath}>打开 Demo</a>
+                <button
+                  className="primary"
+                  type="button"
+                  disabled={state === "checking" || state === "starting"}
+                  onClick={() => {
+                    if (state === "ready") openDemoTab(demo);
+                    else void startDemo(demo);
+                  }}
+                >
+                  {state === "ready" ? "打开 Demo" : state === "starting" ? "启动中…" : "启动并打开"}
+                </button>
                 <button type="button" onClick={() => void checkDemo(demo)}>检查状态</button>
               </div>
             </div>
+            <details className="demo-card-log" open={state === "starting" || Boolean(errors[demo.id])}>
+              <summary>启动日志{logs[demo.id]?.length ? `（${logs[demo.id].length} 行）` : ""}</summary>
+              {errors[demo.id] ? <p className="demo-card-log-error">{errors[demo.id]}</p> : null}
+              <div className="demo-card-log-viewer">
+                <pre>{logs[demo.id]?.length ? logs[demo.id].join("\n") : "尚未启动，或暂时没有日志。"}</pre>
+                <button
+                  className={`demo-card-log-copy is-${copyState}`}
+                  type="button"
+                  onClick={() => void copyLog(demo)}
+                  aria-label={copyLabel}
+                  title={copyLabel}
+                >
+                  {copyState === "copied" ? <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6" /></svg> : <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" /></svg>}
+                </button>
+              </div>
+            </details>
           </div>
         </article>;
       })}

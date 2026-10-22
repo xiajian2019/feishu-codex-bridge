@@ -19,7 +19,7 @@ function git(directory: string, ...args: string[]): string {
 function initRepository(parent: string): string {
   const repository = join(parent, "repo");
   mkdirSync(repository, { recursive: true });
-  git(repository, "init", "-b", "main");
+  git(repository, "init", "-b", "master");
   git(repository, "config", "user.name", "Bridge HTTP Test");
   git(repository, "config", "user.email", "bridge-http-test@example.invalid");
   writeFileSync(join(repository, "README.md"), "base\n");
@@ -33,7 +33,12 @@ describe("Task workspace HTTP lifecycle", () => {
     const root = mkdtempSync(join(tmpdir(), "bridge-worktree-http-"));
     const repository = initRepository(root);
     const unmanagedPath = join(root, "manual-worktree");
-    git(repository, "worktree", "add", "-b", "manual/unmanaged", unmanagedPath, "main");
+    git(repository, "worktree", "add", "-b", "manual/unmanaged", unmanagedPath, "master");
+    const masterSha = git(repository, "rev-parse", "master");
+    git(repository, "checkout", "-b", "xiajian/source-feature");
+    writeFileSync(join(repository, "source-feature.txt"), "source feature\n");
+    git(repository, "add", "source-feature.txt");
+    git(repository, "commit", "-m", "source feature");
     const db = new StateDatabase(":memory:");
     db.createProject({ name: "fixture", path: repository });
     const config = parseConfig({
@@ -95,10 +100,22 @@ describe("Task workspace HTTP lifecycle", () => {
 
       const contextResponse = await fetch(`${baseUrl}/tmux-dashboard/api/sessions/%241/task-context`);
       expect(contextResponse.status).toBe(200);
-      const context = await contextResponse.json() as { directory: string; baseSha: string; dirtyEntryCount: number };
+      const context = await contextResponse.json() as { directory: string; branch: string; baseSha: string; sourceHeadSha: string; baseRef: string; targetBaseSha: string; dirtyEntryCount: number };
       expect(context.directory).toBe(realpathSync(repository));
       expect(context.baseSha).toBe(git(repository, "rev-parse", "HEAD"));
+      expect(context.sourceHeadSha).toBe(context.baseSha);
+      expect(context.branch).toBe("xiajian/source-feature");
+      expect(context.baseRef).toBe("master");
+      expect(context.targetBaseSha).toBe(masterSha);
       expect(context.dirtyEntryCount).toBe(0);
+
+      const changesResponse = await fetch(baseUrl + "/tmux-dashboard/api/sessions/%241/git-changes");
+      expect(changesResponse.status).toBe(200);
+      const changes = await changesResponse.json() as { sessionId: string; directory: string; files: unknown[]; patch: string };
+      expect(changes.sessionId).toBe("$1");
+      expect(changes.directory).toBe(realpathSync(repository));
+      expect(changes.files).toEqual([]);
+      expect(changes.patch).toBe("");
 
       const unauthenticatedTask = await fetch(`${baseUrl}/tmux-dashboard/api/sessions/%241/tasks`, {
         method: "POST",
@@ -135,7 +152,10 @@ describe("Task workspace HTTP lifecycle", () => {
       await dispatcher.waitForIdle();
       const workspace = db.getTaskWorkspace(submitted.task.task_guid)!;
       expect(workspace.source_tmux_session_id).toBe("$1");
-      expect(workspace.base_sha).toBe(context.baseSha);
+      expect(workspace.base_ref).toBe("master");
+      expect(workspace.base_sha).toBe(masterSha);
+      expect(workspace.branch.startsWith("xiajian/agent/")).toBe(true);
+      expect(workspace.worktree_path).toContain("/managed-worktrees/fixture/wt-");
       expect(workspace.status).toBe("retained");
       expect(db.getTask(submitted.task.task_guid)?.repo).toBe(repository);
 

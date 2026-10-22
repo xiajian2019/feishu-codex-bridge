@@ -15,6 +15,7 @@
 | Web Task Desk | 从浏览器为已登记项目创建 Codex 任务，查看运行记录、附加文件、续问和处理支持的重试/审核操作。 |
 | Codex History | 搜索不同 Codex home 的会话，并通过 Codex SDK 继续已有会话。 |
 | 本机 Demo | 从统一目录发现并打开 Bridge 主机上运行的本地模型/实验 Demo；入口通过 Bridge 代理，不要求手机直连 Demo 的 Python 端口。 |
+| 链接工具 | 在手机提交链接，由 Mac 通过配置的 VPN/HTTP/SOCKS 代理预览内容或下载到 `~/Downloads`。 |
 | 设备与运维 | 配对和撤销浏览器设备，查看运行状态，并创建、校验和恢复数据备份。 |
 
 Tmux Dashboard 默认通过 Composer 给选中的 Codex session 发送消息；需要执行 Shell 命令或操作全屏终端程序时，可以显式开启“终端输入”模式，让 xterm 按键直接进入当前 tmux session。两种输入入口彼此独立。它连接的是 Bridge 主机上的 tmux，不会进入 pane 里可能通过 SSH 登录的另一台机器。
@@ -74,7 +75,8 @@ feishu-codex-bridge install
 2. 在 Mac 上运行 `feishu-codex-bridge web:pair`，按命令提示完成浏览器配对。
 3. 在 iPhone Safari 打开配对时显示的 Bridge 地址，并进入 `/tmux-dashboard`。
 
-配对后也可以进入 `/demos`，从“本机 Demo”目录打开本机实验页面。当前食物拍照 Demo 通过 Bridge 代理访问，Python 服务只需在 Bridge 主机本机启动即可；新增 Demo 时登记代理目标和目录卡片即可复用这条入口。
+配对后也可以进入 `/demos`，从“本机 Demo”目录启动或打开本机实验页面。当前目录包含食物拍照 Fast Path 和 OpenAI CLIP + SQLite-vec 两个 Demo；Bridge 通过固定代理目标访问，启动按钮只允许启动登记的本机脚本，不接受浏览器传入的任意命令。
+配对后进入 `/link-tools` 即可使用链接工具。它只处理 `http://` 和 `https://`，预览限制为图片、PDF 和文本类内容；HTML 以安全文本显示，不执行远程脚本。下载由 Mac 保存到 `~/Downloads`，优先使用 `codex.env.HTTP_PROXY/HTTPS_PROXY`，未配置时沿用 Bridge 进程的网络环境。
 
 Bridge 的生产服务默认只监听本机回环地址。若确实需要从局域网访问，必须显式启用 LAN 监听（`FEISHU_CODEX_BRIDGE_LAN_BIND=1`），同时仍需配对认证。不要将服务直接暴露到公网；按所在组织的网络和安全要求配置访问。
 

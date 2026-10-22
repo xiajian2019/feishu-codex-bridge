@@ -2,6 +2,10 @@
 
 本文只记录项目级的架构、行为和 UI 约定，用来补充适用的用户级 AGENTS，不复制个人工作流或凭据。Codex 历史 session 用于回溯用户决策，当前源码和配置是实现现状的依据；遇到不一致先核对源码。修改前检查当前分支和工作区，保留已有改动，不要覆盖无关内容，也不要把个人凭据或本机临时状态写入文档。
 
+## GitHub 发布约定
+
+- 本仓库使用 GitHub 作为远程代码托管。提交、推送和创建 Pull Request 时使用 GitHub 发布流程（`github-release` skill）；不要使用面向 GitLab MR 的 `git-publish-branch` skill。
+
 ## 系统服务与实现架构
 
 `src/main.ts` 是进程入口。`execution.mode` 的活动模式为 `aamp-relay` 或 `feishu-sqlite-codex`；`feishu-sqlite-acp` 只是 Direct 的兼容别名。未设置该字段时，旧配置按 `aamp.enabled` 兼容回退，但 `LEGACY_POLLING_ENABLED` 为 `false`，所以旧 Poller 不会启动。不要让同一个 Bot 同时运行 AAMP 和 Direct。
