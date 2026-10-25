@@ -8,6 +8,7 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { Duplex } from "node:stream";
 
 import { StateDatabase } from "./db.js";
+import { WorkbenchError, WorkbenchService } from "./workbench.js";
 import {
   checkBridgeBackupUpgradeCompatibility,
   createBridgeBackup,
@@ -35,6 +36,7 @@ import { GitWorkspaceError, inspectTaskWorkspace, inspectUnmanagedWorktree, list
 import { readSystemHealth } from "./system-health.js";
 import { parseTaskInput } from "./fingerprint.js";
 import { LinkToolError, LinkToolsService, type LinkToolProxySettings } from "./link-tools.js";
+import { JjToolError, JjToolsService } from "./jj-tools.js";
 import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import {
   WebTaskSubmissionConflictError,
@@ -103,6 +105,15 @@ const LOCAL_DEMO_PROXY_TARGETS = [
     startScript: "start_datasette.sh",
     startArgs: [],
   },
+  {
+    id: "food-semantic-search",
+    prefix: "/api/local-demos/food-semantic-search",
+    hostname: "127.0.0.1",
+    port: 43129,
+    workingDirectory: "food-semantic-search",
+    startScript: "start_food_search.sh",
+    startArgs: ["--host", "127.0.0.1", "--port", "43129"],
+  },
 ] as const;
 
 function localDemoRoot(): string {
@@ -137,6 +148,7 @@ export interface DashboardServerOptions {
   projectRegistrySnapshotPath?: string;
   taskAttachmentsDirectory?: string;
   linkToolProxy?: LinkToolProxySettings;
+  jjTools?: JjToolsService;
   webRoot?: string;
   auth?: WebPairingAuth;
   tmuxDashboard?: TmuxDashboardApi;
@@ -162,9 +174,13 @@ export class DashboardServer {
   private readonly webRoot: string;
   private readonly taskAttachmentsDirectory: string;
   private readonly linkTools: LinkToolsService;
-  private readonly eventClients = new Set<ServerResponse>();
+  private readonly jjTools: JjToolsService;
+  private readonly workbench: WorkbenchService;
+  private readonly eventClients = new Map<ServerResponse, () => boolean>();
   private server: Server | null = null;
   private unsubscribeFromDatabase: (() => void) | null = null;
+  private unsubscribeFromAuth: (() => void) | null = null;
+  private authorizationCheckTimer: ReturnType<typeof setInterval> | null = null;
   private eventSequence = 0;
   private readonly localDemoProcesses = new Map<string, ChildProcess>();
   private readonly localDemoLogs = new Map<string, string[]>();
@@ -179,6 +195,9 @@ export class DashboardServer {
       options.taskAttachmentsDirectory ?? join(process.cwd(), "runtime", "task-attachments"),
     );
     this.linkTools = new LinkToolsService({ proxy: options.linkToolProxy });
+    this.jjTools = options.jjTools ?? new JjToolsService();
+    this.workbench = new WorkbenchService({ db: options.db, history: options.codexHistory,
+      tmuxAvailable: Boolean(options.tmuxDashboard), actions: options.actions, logger: options.logger });
   }
 
   public async start(): Promise<string> {
@@ -205,17 +224,30 @@ export class DashboardServer {
       this.handleUpgrade(request, socket, head);
     });
     this.server = server;
-    this.unsubscribeFromDatabase = this.options.db.subscribe((change) => this.publishChange(change));
+    this.unsubscribeFromDatabase = this.options.db.subscribe((change) => {
+      this.publishChange(change);
+      try { this.workbench.onDatabaseChange(change); }
+      catch (error) { this.options.logger?.warn("workbench notification failed", {
+        error: error instanceof Error ? error.message : String(error),
+      }); }
+    });
+    this.unsubscribeFromAuth = this.auth.subscribeToRevocations(() => this.revalidateConnections());
     return new Promise((resolve, reject) => {
       const onError = (error: Error): void => {
         this.server = null;
         this.unsubscribeFromDatabase?.();
         this.unsubscribeFromDatabase = null;
+        this.unsubscribeFromAuth?.();
+        this.unsubscribeFromAuth = null;
         reject(error);
       };
       server.once("error", onError);
       server.listen(this.options.port, this.options.host, () => {
         server.off("error", onError);
+        // Also observe revocations/expiry written by another process sharing this DB.
+        this.authorizationCheckTimer = setInterval(() => this.revalidateConnections(), 1_000);
+        this.authorizationCheckTimer.unref?.();
+        this.workbench.start();
         const address = server.address();
         const port = typeof address === "object" && address ? address.port : this.options.port;
         resolve(`http://${this.options.host}:${port}`);
@@ -228,13 +260,19 @@ export class DashboardServer {
     this.server = null;
     this.unsubscribeFromDatabase?.();
     this.unsubscribeFromDatabase = null;
-    for (const client of this.eventClients) client.end();
+    this.unsubscribeFromAuth?.();
+    this.unsubscribeFromAuth = null;
+    if (this.authorizationCheckTimer) clearInterval(this.authorizationCheckTimer);
+    this.authorizationCheckTimer = null;
+    await this.workbench.stop();
+    for (const client of this.eventClients.keys()) client.end();
     this.eventClients.clear();
     this.options.tmuxDashboard?.stop();
     for (const [id, child] of this.localDemoProcesses) {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
       this.localDemoProcesses.delete(id);
     }
+    await this.jjTools.dispose();
     await this.linkTools.dispose();
     if (!server) return;
     await new Promise<void>((resolve, reject) => {
@@ -245,6 +283,10 @@ export class DashboardServer {
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", "http://localhost");
+    const mutating = request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS";
+    if (mutating && url.pathname.startsWith("/api/auth/") && url.pathname !== "/api/auth/pairing/claim") {
+      if (!this.requireAuthorization(request, response) || !this.requireActionAuthorization(request, response)) return;
+    }
     if (request.method === "GET" && url.pathname === "/api/auth/status") {
       sendJson(response, 200, this.auth.status(request));
       return;
@@ -281,6 +323,18 @@ export class DashboardServer {
         return;
       }
       sendJson(response, 200, { ok: true });
+      return;
+    }
+    const deviceExtendMatch = /^\/api\/auth\/devices\/([^/]+)\/extend$/.exec(url.pathname);
+    if (request.method === "POST" && deviceExtendMatch) {
+      const sessionId = decodeURIComponent(deviceExtendMatch[1]);
+      const expiresAt = this.auth.extendDevice(request, sessionId);
+      if (!expiresAt) {
+        sendJson(response, 404, { error: "device not found or already expired" });
+        return;
+      }
+      this.auth.refreshSessionCookie(request, response);
+      sendJson(response, 200, { ok: true, expiresAt });
       return;
     }
     const deviceRevokeMatch = /^\/api\/auth\/devices\/([^/]+)\/revoke$/.exec(url.pathname);
@@ -325,15 +379,14 @@ export class DashboardServer {
     }
     if (url.pathname.startsWith("/tmux-dashboard/api/") && this.options.tmuxDashboard) {
       if (!this.requireAuthorization(request, response)) return;
-      if (
-        request.method === "POST"
-        && (/^\/tmux-dashboard\/api\/sessions\/[^/]+\/files\/upload$/.test(url.pathname)
-          || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/codex-account(?:\/check)?$/.test(url.pathname)
-          || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/tasks$/.test(url.pathname)
-          || /^\/tmux-dashboard\/api\/sessions\/[^/]+\/open$/.test(url.pathname)
-          || /^\/tmux-dashboard\/api\/workspaces\/[^/]+\/session$/.test(url.pathname))
-        && !this.requireActionAuthorization(request, response)
-      ) return;
+      // Diagnostic export only echoes the caller's payload as a download; it
+      // is a form POST without custom headers and does not mutate server state.
+      const diagnosticExport = request.method === "POST" && url.pathname === "/tmux-dashboard/api/scroll-diagnostics/export";
+      if (mutating && !diagnosticExport && !this.requireActionAuthorization(request, response)) return;
+      if (diagnosticExport && request.headers.origin && !this.isSameOriginAction(request.headers.origin, request)) {
+        sendJson(response, 403, { error: "cross-origin action rejected" });
+        return;
+      }
       await this.options.tmuxDashboard.handleRequest(request, response, this.auth.currentDeviceId(request));
       return;
     }
@@ -360,6 +413,26 @@ export class DashboardServer {
       response,
       publicWebRequest || url.pathname === "/healthz",
     )) return;
+    if (url.pathname === "/api/workbench" || url.pathname.startsWith("/api/workbench/")) {
+      if (mutating && !this.requireActionAuthorization(request, response)) return;
+      try {
+        const body = mutating ? await readJsonBody(request) : {};
+        const result = await this.workbench.request(request.method ?? "GET", url, body);
+        sendJson(response, result.status, result.body);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "workbench request failed";
+        const status = error instanceof WorkbenchError ? error.status
+          : /already|Only queued|领取|resolved|expired|正在|conflict/i.test(message) ? 409
+          : /not found|不存在/i.test(message) ? 404 : 400;
+        sendJson(response, status, { error: message });
+      }
+      return;
+    }
+    if (url.pathname === "/api/jj" || url.pathname.startsWith("/api/jj/")) {
+      if (mutating && !this.requireActionAuthorization(request, response)) return;
+      await this.handleJj(request, response, url);
+      return;
+    }
     const localDemoStartMatch = /^\/api\/local-demos\/([^/]+)\/start$/.exec(url.pathname);
     if (request.method === "POST" && localDemoStartMatch) {
       if (!this.requireActionAuthorization(request, response)) return;
@@ -585,6 +658,37 @@ export class DashboardServer {
     }
     if (request.method === "POST" && url.pathname === "/api/codex/attachments") {
       await this.uploadCodexHistoryAttachment(request, response);
+      return;
+    }
+    const codexForkMatch = /^\/api\/codex\/(?:threads|history)\/([^/]+)\/([^/]+)\/fork$/.exec(url.pathname);
+    const codexSteerMatch = /^\/api\/codex\/threads\/([^/]+)\/([^/]+)\/runs\/([^/]+)\/steer$/.exec(url.pathname);
+    if (request.method === "POST" && (codexForkMatch || codexSteerMatch)) {
+      if (!this.requireActionAuthorization(request, response)) return;
+      const history = this.options.codexHistory;
+      if (!history) { sendJson(response, 501, { error: "Codex history is not configured" }); return; }
+      try {
+        const match = (codexForkMatch ?? codexSteerMatch)!;
+        const selectors = match.slice(1).map((value) => decodeURIComponent(value));
+        const body = await readJsonBody(request);
+        if (codexForkMatch) {
+          if (body.lastTurnId !== undefined && typeof body.lastTurnId !== "string") {
+            sendJson(response, 400, { error: "lastTurnId must be a string" }); return;
+          }
+          const result = await history.forkThread(selectors[0]!, selectors[1]!, {
+            ...(typeof body.lastTurnId === "string" ? { lastTurnId: body.lastTurnId } : {}),
+          });
+          sendJson(response, 201, result);
+        } else {
+          if (typeof body.text !== "string" || !body.text.trim() || body.text.length > 8_000) {
+            sendJson(response, 400, { error: "steer text must contain 1 to 8000 characters" }); return;
+          }
+          sendJson(response, 202, await history.steerMessage(selectors[0]!, selectors[1]!, selectors[2]!, body.text));
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        sendJson(response, error instanceof URIError ? 400 : /找不到 Codex home/.test(message) ? 404
+          : /已过期|已结束|只能|正在/.test(message) ? 409 : 422, { error: message });
+      }
       return;
     }
     const codexThreadHomePreferenceMatch = /^\/api\/codex\/threads\/([^/]+)\/home$/.exec(url.pathname);
@@ -945,6 +1049,12 @@ export class DashboardServer {
   }
 
   private async claimPairing(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    // The initial claim cannot have an Action Token yet; the one-time code is
+    // its credential, but a browser must still claim it from the same origin.
+    if (request.headers.origin && !this.isSameOriginAction(request.headers.origin, request)) {
+      sendJson(response, 403, { error: "cross-origin action rejected" });
+      return;
+    }
     let body: Record<string, unknown>;
     try {
       body = await readJsonBody(request);
@@ -1388,6 +1498,10 @@ export class DashboardServer {
       sendJson(response, 400, { error: "model must be a string" });
       return;
     }
+    if (body.interactive !== undefined && typeof body.interactive !== "boolean") {
+      sendJson(response, 400, { error: "interactive must be a boolean" });
+      return;
+    }
     if (body.reasoningEffort !== undefined
       && (typeof body.reasoningEffort !== "string"
         || !isCodexHistoryReasoningEffort(body.reasoningEffort))) {
@@ -1415,6 +1529,7 @@ export class DashboardServer {
         attachmentIds: attachmentIds as string[],
         ...(typeof body.turnIndex === "number" ? { turnIndex: body.turnIndex } : {}),
         ...(typeof body.model === "string" ? { model: body.model } : {}),
+        ...(typeof body.interactive === "boolean" ? { interactive: body.interactive } : {}),
         ...(typeof body.reasoningEffort === "string"
           ? { reasoningEffort: body.reasoningEffort }
           : {}),
@@ -2410,6 +2525,40 @@ export class DashboardServer {
     }
   }
 
+  private async handleJj(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    response.setHeader("Cache-Control", "no-store");
+    try {
+      if (request.method === "GET" && url.pathname === "/api/jj") {
+        sendJson(response, 200, this.jjTools.list());
+        return;
+      }
+      if (request.method === "POST" && url.pathname === "/api/jj/runs") {
+        let body: Record<string, unknown>;
+        try { body = await readJsonBody(request); } catch { throw new JjToolError("请求内容无效。"); }
+        sendJson(response, 200, this.jjTools.start(body));
+        return;
+      }
+      const match = /^\/api\/jj\/runs\/([a-zA-Z0-9_-]+)(?:\/(input|resize|stop))?$/.exec(url.pathname);
+      if (match && request.method === "GET" && !match[2]) {
+        sendJson(response, 200, this.jjTools.read(match[1]!, Number(url.searchParams.get("offset") ?? 0)));
+        return;
+      }
+      if (match && request.method === "POST" && match[2]) {
+        let body: Record<string, unknown>;
+        try { body = await readJsonBody(request); } catch { throw new JjToolError("请求内容无效。"); }
+        if (match[2] === "input") this.jjTools.input(match[1]!, body);
+        else if (match[2] === "resize") this.jjTools.resize(match[1]!, body);
+        else this.jjTools.stop(match[1]!);
+        sendJson(response, 200, { ok: true });
+        return;
+      }
+      sendJson(response, 404, { error: "JJ 接口不存在。" });
+    } catch (error) {
+      if (!(error instanceof JjToolError)) throw error;
+      sendJson(response, error.statusCode, { error: error.message });
+    }
+  }
+
   private requireActionAuthorization(request: IncomingMessage, response: ServerResponse): boolean {
     const token = request.headers["x-bridge-action-token"];
     if (!constantTimeTokenMatches(typeof token === "string" ? token : "", this.actionToken)) {
@@ -2772,6 +2921,14 @@ export class DashboardServer {
     url: URL,
     target: (typeof LOCAL_DEMO_PROXY_TARGETS)[number],
   ): Promise<void> {
+    const mutating = request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS";
+    const origin = request.headers.origin;
+    // Validate browser writes at the Bridge boundary before removing Origin
+    // for the loopback upstream. Demo APIs do not use the Bridge Action Token.
+    if (mutating && origin && !this.isSameOriginAction(origin, request)) {
+      sendJson(response, 403, { error: "cross-origin action rejected" });
+      return;
+    }
     const suffix = url.pathname.slice(target.prefix.length) || "/";
     const targetPath = `${suffix}${url.search}`;
     await new Promise<void>((resolve) => {
@@ -2784,6 +2941,11 @@ export class DashboardServer {
       delete headers["x-forwarded-for"];
       delete headers["x-forwarded-host"];
       delete headers["x-forwarded-proto"];
+      // The browser origin is the Bridge/Vite page (5173), while the local
+      // Demo upstream listens on its own loopback port. Forwarding that
+      // header makes the upstream same-origin guard reject proxied POSTs;
+      // Bridge has already checked session authorization and write origins.
+      delete headers.origin;
       const upstream = httpRequest({
         hostname: target.hostname,
         port: target.port,
@@ -2852,7 +3014,8 @@ export class DashboardServer {
   }
 
   private handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
-    if (!this.auth.isAuthorized(request)) {
+    const isAuthorized = this.auth.connectionAuthorization(request);
+    if (!isAuthorized()) {
       socket.destroy();
       return;
     }
@@ -2863,6 +3026,7 @@ export class DashboardServer {
         socket,
         head,
         this.auth.currentDeviceId(request),
+        isAuthorized,
       ).catch((error: unknown) => {
         this.options.logger?.warn("tmux dashboard websocket failed", {
           error: error instanceof Error ? error.message : String(error),
@@ -2875,16 +3039,22 @@ export class DashboardServer {
   }
 
   private openEventStream(request: IncomingMessage, response: ServerResponse): void {
+    const isAuthorized = this.auth.connectionAuthorization(request);
+    if (!isAuthorized()) {
+      sendJson(response, 401, { error: "pairing required" });
+      return;
+    }
     setEventStreamHeaders(response);
     response.statusCode = 200;
     response.flushHeaders();
     response.write(`event: ready\ndata: ${JSON.stringify({ ok: true })}\n\n`);
-    this.eventClients.add(response);
+    this.eventClients.set(response, isAuthorized);
 
     const heartbeat = setInterval(() => {
-      if (response.writableEnded || response.destroyed) {
+      if (response.writableEnded || response.destroyed || !isAuthorized()) {
         clearInterval(heartbeat);
         this.eventClients.delete(response);
+        response.end();
         return;
       }
       response.write(`: heartbeat ${Date.now()}\n\n`);
@@ -2912,15 +3082,26 @@ export class DashboardServer {
       aamp_task: aampTask,
     };
     const message = `id: ${++this.eventSequence}\nevent: task.updated\ndata: ${JSON.stringify(payload)}\n\n`;
-    for (const client of this.eventClients) {
-      if (client.writableEnded || client.destroyed) {
+    for (const [client, isAuthorized] of this.eventClients) {
+      if (client.writableEnded || client.destroyed || !isAuthorized()) {
         this.eventClients.delete(client);
+        client.end();
         continue;
       }
       try {
         client.write(message);
       } catch {
         this.eventClients.delete(client);
+      }
+    }
+  }
+
+  private revalidateConnections(): void {
+    this.options.tmuxDashboard?.revalidateClients();
+    for (const [client, isAuthorized] of this.eventClients) {
+      if (!isAuthorized()) {
+        this.eventClients.delete(client);
+        client.end();
       }
     }
   }
@@ -2978,12 +3159,17 @@ function isSpaRoute(pathname: string): boolean {
     || pathname === "/system-management/health"
     || pathname === "/system-management/backups"
     || pathname === "/system-management/workspaces"
+    || pathname === "/system-management/settings"
+    || pathname === "/system-management/automations"
+    || pathname === "/system-management/machines"
     || pathname === "/direct-tasks"
     || pathname === "/system-management/projects"
     || /^\/tasks\/(?:desk|direct|aamp)\/[^/]+$/.test(pathname)
     || pathname === "/codex-history"
+    || /^\/codex-history\/[^/]+\/[^/]+$/.test(pathname)
     || pathname === "/demos"
     || pathname === "/link-tools"
+    || pathname === "/system-management/jj"
     || pathname === "/tmux-dashboard"
     || (pathname.startsWith("/tmux-dashboard/")
       && !pathname.startsWith("/tmux-dashboard/api/")

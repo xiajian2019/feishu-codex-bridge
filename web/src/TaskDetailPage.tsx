@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactElement } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
 import { useLocation, useNavigate, useParams } from "react-router";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -6,6 +6,19 @@ import { fetchTaskDetail, getActionToken, getJson, postTaskAction, postTaskFollo
 import { directTaskTitle } from "./task-title.js";
 import { TaskFileBrowser } from "./TaskFileBrowser.js";
 import type { AampTaskDetailResponse, DirectTaskDetailResponse, RunWorkspaceSnapshot, StoredRun, TaskDetailResponse, WebRunReview, WorkspaceFileFingerprint } from "./types.js";
+import { PromptTemplatePicker } from "./Workbench.js";
+import {
+  addWorkbenchQueueMessage,
+  deleteWorkbenchQueueMessage,
+  fetchWorkbenchPreferences,
+  fetchWorkbenchQueue,
+  patchWorkbenchPreference,
+  patchWorkbenchQueueMessage,
+  sendWorkbenchQueueMessage,
+  type WorkbenchPreference,
+  type WorkbenchQueueMessage,
+  type WorkbenchTarget,
+} from "./workbench-api.js";
 
 const DIRECT_PAGE_SIZE = 50;
 const DIRECT_STATUS_LABELS: Record<string, string> = {
@@ -50,6 +63,7 @@ export function TaskDetailPage(): ReactElement {
   const fileOpenSequence = useRef(0);
   const pendingSubmission = useRef<{ text: string; key: string } | null>(null);
   const pendingRetry = useRef<{ taskId: string; key: string } | null>(null);
+  const workbenchTarget = useMemo<WorkbenchTarget>(() => ({ kind: "task", source, id: taskId }), [source, taskId]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const scrollAfterSubmitRef = useRef(false);
   const draftKey = `bridge-task-draft:${source}:${taskId}`;
@@ -298,6 +312,7 @@ export function TaskDetailPage(): ReactElement {
       </section> : null}
       {error ? <div className="task-detail-page-error" role="alert">{error}</div> : null}
       <div className="task-detail-page-scroll" ref={scrollRef}>
+        <TaskWorkbenchControls target={workbenchTarget} queueAvailable={source !== "aamp"} />
         {loading && !directTask && !deskTask && !aampTask ? <div className="empty">正在读取任务详情…</div> : null}
         {source === "direct" && directTask && direct ? <>
           <div className="task-detail-message is-user"><small>任务描述</small><div>{directTask.text || "（附件任务）"}</div></div>
@@ -331,6 +346,15 @@ export function TaskDetailPage(): ReactElement {
           <p className="muted">AAMP 任务在此处只读。请在原飞书任务卡片中查看或处理。</p>
         </> : null}
         {source === "desk" && deskTask && desk ? <>
+          <div className="workbench-same-config-actions">
+            <button type="button" onClick={() => navigate("/", { state: { newTaskDraft: {
+              source: "task",
+              projectKey: deskTask.project_key,
+              mode: deskTask.mode,
+              description: deskTask.input?.description || deskTask.input_text,
+            } } })}>同配置新建</button>
+            <small>带入项目、mode 和描述；不复制附件，也不会自动提交。</small>
+          </div>
           {desk.runs.length ? desk.runs.slice().reverse().map((run) => <DeskRunTurn
             run={run}
             review={desk.reviews.find((item) => item.run_id === run.run_id)}
@@ -358,6 +382,9 @@ export function TaskDetailPage(): ReactElement {
         </> : null}
       </div>
       {followupStatus ? <div className="task-detail-followup-status" role="status">{followupStatus}</div> : null}
+      {source !== "aamp" ? <div className="workbench-task-template">
+        <PromptTemplatePicker onApply={(text) => updateDraft(appendPromptToDraft(draft, text))} />
+      </div> : null}
       {source !== "aamp" ? <form className="task-detail-composer" onSubmit={(event) => void submit(event)}>
         <textarea aria-label="追加信息" value={draft} onChange={(event) => updateDraft(event.target.value)} maxLength={2000}
           placeholder={canFollowup ? "向当前任务追加信息…" : "当前任务暂时不能追加信息"}
@@ -367,6 +394,254 @@ export function TaskDetailPage(): ReactElement {
       </form> : null}
     </section>
   </main>;
+}
+
+function TaskWorkbenchControls({ target, queueAvailable }: { target: WorkbenchTarget; queueAvailable: boolean }): ReactElement {
+  const targetKey = target.kind === "task" ? `task:${target.source}:${target.id}` : `history:${target.homeId ?? ""}:${target.id}`;
+  const [preference, setPreference] = useState<WorkbenchPreference>({ target, pinned: false, tags: [], unread: false, keepAttention: false });
+  const [preferenceError, setPreferenceError] = useState<string | null>(null);
+  const [preferenceLoading, setPreferenceLoading] = useState(true);
+  const [preferenceBusy, setPreferenceBusy] = useState(false);
+  const [tagsText, setTagsText] = useState("");
+  const [titleText, setTitleText] = useState("");
+  const [messages, setMessages] = useState<WorkbenchQueueMessage[]>([]);
+  const [queueError, setQueueError] = useState<string | null>(null);
+  const [queueLoading, setQueueLoading] = useState(true);
+  const [queueDraft, setQueueDraft] = useState("");
+  const [queueBusyId, setQueueBusyId] = useState<string | null>(null);
+  const [queueRevision, setQueueRevision] = useState(0);
+  const [editingQueueId, setEditingQueueId] = useState<string | null>(null);
+  const [editingQueueText, setEditingQueueText] = useState("");
+  const [queueNotice, setQueueNotice] = useState<string | null>(null);
+  const pendingQueueSubmission = useRef<{ text: string; key: string } | null>(null);
+
+  const loadPreference = useCallback(async (signal?: AbortSignal): Promise<void> => {
+    setPreferenceLoading(true);
+    setPreferenceError(null);
+    try {
+      const result = await fetchWorkbenchPreferences(signal);
+      if (signal?.aborted) return;
+      const found = result.preferences.find((item) => workbenchTargetMatches(item.target, target));
+      const next = found ?? { target, pinned: false, tags: [], unread: false, keepAttention: false };
+      setPreference(next);
+      setTagsText(next.tags.join(", "));
+      setTitleText(next.title ?? "");
+    } catch (failure) {
+      if (!signal?.aborted) setPreferenceError(toWorkbenchError(failure));
+    } finally {
+      if (!signal?.aborted) setPreferenceLoading(false);
+    }
+  }, [target, targetKey]);
+
+  const loadQueue = useCallback(async (signal?: AbortSignal): Promise<void> => {
+    if (!queueAvailable) {
+      setQueueLoading(false);
+      setMessages([]);
+      return;
+    }
+    setQueueLoading(true);
+    setQueueError(null);
+    try {
+      const result = await fetchWorkbenchQueue(target, signal);
+      if (signal?.aborted) return;
+      setMessages(result.messages);
+    } catch (failure) {
+      if (!signal?.aborted) setQueueError(toWorkbenchError(failure));
+    } finally {
+      if (!signal?.aborted) setQueueLoading(false);
+    }
+  }, [queueAvailable, target, targetKey]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadPreference(controller.signal);
+    return () => controller.abort();
+  }, [loadPreference]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadQueue(controller.signal);
+    return () => controller.abort();
+  }, [loadQueue, queueRevision]);
+
+  const patchPreference = async (patch: Partial<Pick<WorkbenchPreference, "pinned" | "tags" | "unread" | "keepAttention">> & { title?: string | null }): Promise<void> => {
+    if (preferenceBusy) return;
+    setPreferenceBusy(true);
+    setPreferenceError(null);
+    try {
+      const result = await patchWorkbenchPreference(target, patch);
+      setPreference(result.preference);
+      setTagsText(result.preference.tags.join(", "));
+      setTitleText(result.preference.title ?? "");
+    } catch (failure) { setPreferenceError(toWorkbenchError(failure)); }
+    finally { setPreferenceBusy(false); }
+  };
+
+  const addToQueue = async (): Promise<void> => {
+    const text = queueDraft.trim();
+    if (!text || queueBusyId) return;
+    if (pendingQueueSubmission.current?.text !== text) pendingQueueSubmission.current = { text, key: createWorkbenchIdempotencyKey() };
+    setQueueBusyId("new");
+    setQueueError(null);
+    setQueueNotice(null);
+    try {
+      await addWorkbenchQueueMessage(target, text, pendingQueueSubmission.current.key);
+      pendingQueueSubmission.current = null;
+      setQueueDraft("");
+      setQueueNotice("已加入队列，原任务空闲后将自动发送；排队不表示正在运行。");
+      setQueueRevision((value) => value + 1);
+    } catch (failure) {
+      setQueueError(`加入队列失败：${toWorkbenchError(failure)}。草稿已保留；重试会沿用同一幂等键。`);
+    } finally { setQueueBusyId(null); }
+  };
+
+  const moveQueueMessage = async (message: WorkbenchQueueMessage, move: "up" | "down"): Promise<void> => {
+    if (message.status !== "queued" || queueBusyId) return;
+    setQueueBusyId(message.id);
+    setQueueError(null);
+    try {
+      await patchWorkbenchQueueMessage(message.id, { move });
+      setQueueRevision((value) => value + 1);
+    } catch (failure) { setQueueError(toWorkbenchError(failure)); }
+    finally { setQueueBusyId(null); }
+  };
+
+  const saveQueueMessage = async (message: WorkbenchQueueMessage): Promise<void> => {
+    const text = editingQueueText.trim();
+    if (!text || queueBusyId || message.status !== "queued") return;
+    setQueueBusyId(message.id);
+    setQueueError(null);
+    try {
+      await patchWorkbenchQueueMessage(message.id, { text });
+      setEditingQueueId(null);
+      setQueueRevision((value) => value + 1);
+    } catch (failure) { setQueueError(toWorkbenchError(failure)); }
+    finally { setQueueBusyId(null); }
+  };
+
+  const removeQueueMessage = async (message: WorkbenchQueueMessage): Promise<void> => {
+    if (queueBusyId || message.status !== "queued" || !window.confirm("删除这条待发消息？")) return;
+    setQueueBusyId(message.id);
+    setQueueError(null);
+    try {
+      await deleteWorkbenchQueueMessage(message.id);
+      setQueueRevision((value) => value + 1);
+    } catch (failure) { setQueueError(toWorkbenchError(failure)); }
+    finally { setQueueBusyId(null); }
+  };
+
+  const sendQueueMessage = async (message: WorkbenchQueueMessage): Promise<void> => {
+    if (queueBusyId || message.status !== "queued") return;
+    if (!window.confirm("确认将这条消息提交到原任务执行链路？提交不代表执行完成。")) return;
+    setQueueBusyId(message.id);
+    setQueueError(null);
+    setQueueNotice(null);
+    try {
+      const result = await sendWorkbenchQueueMessage(message.id);
+      const status = result.message?.status ?? normalizeQueueStatus(result.status);
+      setMessages((current) => current.map((item) => item.id === message.id ? { ...item, status } : item));
+      setQueueNotice(queueSendMessage(status));
+      setQueueRevision((value) => value + 1);
+    } catch (failure) {
+      setMessages((current) => current.map((item) => item.id === message.id ? { ...item, status: "unconfirmed" } : item));
+      setQueueError(`发送结果未知：${toWorkbenchError(failure)}。请刷新并核对原任务状态；不会自动重发。`);
+    } finally { setQueueBusyId(null); }
+  };
+
+  const queuePositions = new Map(messages.filter((item) => item.status === "queued").map((item, index) => [item.id, index]));
+  return <section className="workbench-task-controls" aria-label="任务组织与跟进队列">
+    <details className="task-detail-extra">
+      <summary>组织偏好{preference.pinned ? " · 已置顶" : ""}{preference.keepAttention ? " · 持续关注" : ""}</summary>
+      {preferenceError ? <div className="workbench-inline-error" role="alert"><span>{preferenceError}</span><button type="button" onClick={() => void loadPreference()}>重试</button></div> : null}
+      {preferenceLoading ? <p className="workbench-muted">正在读取偏好…</p> : <>
+        <div className="workbench-preference-toggles">
+          <label><input type="checkbox" checked={preference.pinned} disabled={preferenceBusy} onChange={(event) => void patchPreference({ pinned: event.currentTarget.checked })} />置顶</label>
+          <label><input type="checkbox" checked={preference.unread} disabled={preferenceBusy} onChange={(event) => void patchPreference({ unread: event.currentTarget.checked })} />标记未读</label>
+          <label><input type="checkbox" checked={preference.keepAttention} disabled={preferenceBusy} onChange={(event) => void patchPreference({ keepAttention: event.currentTarget.checked })} />持续关注</label>
+        </div>
+        <label className="workbench-task-meta-field">自定义标题<input value={titleText} maxLength={120} onChange={(event) => setTitleText(event.target.value)} placeholder="留空使用原任务标题" disabled={preferenceBusy} /></label>
+        <label className="workbench-task-meta-field">标签<input value={tagsText} maxLength={500} onChange={(event) => setTagsText(event.target.value)} placeholder="用逗号分隔" disabled={preferenceBusy} /></label>
+        <button type="button" onClick={() => void patchPreference({ title: titleText.trim() || null, tags: [...new Set(tagsText.split(",").map((tag) => tag.trim()).filter(Boolean))] })} disabled={preferenceBusy}>{preferenceBusy ? "保存中…" : "保存组织信息"}</button>
+      </>}
+    </details>
+
+    <details className="task-detail-extra">
+      <summary>{queueAvailable ? `跟进队列（${messages.length}）` : "跟进队列（只读）"}</summary>
+      {!queueAvailable ? <p className="workbench-muted">AAMP 任务在此处只读；请在原飞书任务卡片中处理。</p> : <>
+        <p className="workbench-muted">加入队列即授权在原任务空闲后自动发送；忙碌时可编辑、排序和删除。“立即发送”会尝试派发队首。“已提交”不表示执行已完成。</p>
+        <button type="button" onClick={() => setQueueRevision((value) => value + 1)} disabled={queueLoading}>刷新队列状态</button>
+        {queueError ? <div className="workbench-inline-error" role="alert"><span>{queueError}</span><button type="button" onClick={() => setQueueRevision((value) => value + 1)}>刷新队列</button></div> : null}
+        {queueNotice ? <p className="workbench-muted" role="status">{queueNotice}</p> : null}
+        {queueLoading && !messages.length ? <p className="workbench-muted">正在读取队列…</p> : null}
+        {!queueLoading && !messages.length && !queueError ? <p className="workbench-muted">暂无待发消息。</p> : null}
+        {messages.length ? <ol className="workbench-queue-list">{messages.map((message, index) => <li className="workbench-queue-item" key={message.id}>
+          <header><strong>#{index + 1} · {queueStatusLabel(message.status)}</strong><small>{formatTaskWorkbenchTime(message.createdAt)}</small></header>
+          {editingQueueId === message.id ? <>
+            <textarea value={editingQueueText} maxLength={2000} rows={3} onChange={(event) => setEditingQueueText(event.target.value)} aria-label="编辑队列消息" />
+            <div className="workbench-queue-actions"><button type="button" className="primary" onClick={() => void saveQueueMessage(message)} disabled={queueBusyId === message.id || !editingQueueText.trim()}>保存</button><button type="button" onClick={() => setEditingQueueId(null)}>取消</button></div>
+          </> : <p>{message.text}</p>}
+          {message.error ? <small className="workbench-queue-error">{message.error}</small> : null}
+          {message.status === "unconfirmed" ? <small className="workbench-queue-error">结果未知；先核对任务状态，不要重复提交。</small> : null}
+          {message.status === "queued" ? <div className="workbench-queue-actions">
+            <button type="button" onClick={() => void moveQueueMessage(message, "up")} disabled={queueBusyId !== null || queuePositions.get(message.id) === 0} aria-label="上移队列消息">↑</button>
+            <button type="button" onClick={() => void moveQueueMessage(message, "down")} disabled={queueBusyId !== null || queuePositions.get(message.id) === queuePositions.size - 1} aria-label="下移队列消息">↓</button>
+            <button type="button" onClick={() => { setEditingQueueId(message.id); setEditingQueueText(message.text); }} disabled={queueBusyId !== null}>编辑</button>
+            <button type="button" onClick={() => void removeQueueMessage(message)} disabled={queueBusyId !== null}>删除</button>
+            <button type="button" className="primary" onClick={() => void sendQueueMessage(message)} disabled={queueBusyId !== null || queuePositions.get(message.id) !== 0}>{queueBusyId === message.id ? "提交中…" : "立即发送队首"}</button>
+          </div> : null}
+        </li>)}</ol> : null}
+        <div className="workbench-queue-add">
+          <label>加入待发消息<textarea value={queueDraft} maxLength={2000} rows={3} onChange={(event) => setQueueDraft(event.target.value)} placeholder="加入后，原任务空闲时会自动发送。" /></label>
+          <button type="button" className="primary" onClick={() => void addToQueue()} disabled={!queueDraft.trim() || queueBusyId !== null}>{queueBusyId === "new" ? "保存中…" : "加入队列"}</button>
+        </div>
+      </>}
+    </details>
+  </section>;
+}
+
+function workbenchTargetMatches(left: WorkbenchTarget, right: WorkbenchTarget): boolean {
+  if (left.kind !== right.kind || left.id !== right.id) return false;
+  if (left.kind === "task" && right.kind === "task") return left.source === right.source;
+  return left.kind === "history" && right.kind === "history" && left.homeId === right.homeId;
+}
+
+function queueStatusLabel(status: WorkbenchQueueMessage["status"]): string {
+  if (status === "queued") return "明确排队";
+  if (status === "sending") return "提交中";
+  if (status === "sent") return "已提交";
+  if (status === "failed") return "提交失败";
+  return "结果未确认";
+}
+
+function normalizeQueueStatus(status?: string): WorkbenchQueueMessage["status"] {
+  return status === "sent" || status === "failed" || status === "unconfirmed" || status === "queued" || status === "sending"
+    ? status : "sending";
+}
+
+function queueSendMessage(status: WorkbenchQueueMessage["status"]): string {
+  if (status === "sent") return "消息已提交到原任务链路；Codex 执行状态请查看任务时间线。";
+  if (status === "unconfirmed") return "提交结果未知，请刷新并核对任务状态；不会自动重发。";
+  if (status === "failed") return "提交失败；查看错误后再决定是否重新排队。";
+  return "发送请求已受理；请查看任务时间线确认后续状态。";
+}
+
+function appendPromptToDraft(current: string, inserted: string): string {
+  const draft = current.trimEnd();
+  return draft ? `${draft}\n\n${inserted}` : inserted;
+}
+
+function createWorkbenchIdempotencyKey(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function formatTaskWorkbenchTime(value?: number): string {
+  if (value === undefined) return "时间未知";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function toWorkbenchError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function TaskAgentMessage({ text }: { text: string }): ReactElement {

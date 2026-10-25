@@ -4,6 +4,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 
 import { DatabaseSync as DatabaseSyncConstructor, type SqliteDatabase } from "./sqlite.js";
+import { WorkbenchStore } from "./workbench-store.js";
 import type { CodexSkillScope, CodexSkillSource, DiscoveredCodexSkill } from "./codex-skills.js";
 import { DEFAULT_SHORTCUT_GROUPS, DEFAULT_SHORTCUTS } from "./tmux-shortcut-defaults.js";
 import {
@@ -741,6 +742,7 @@ export interface TaskPanelQuery {
 
 export class StateDatabase {
   private readonly db: SqliteDatabase;
+  public readonly workbench: WorkbenchStore;
   private readonly now: () => Date;
   private readonly changeListeners = new Set<(change: DatabaseChange) => void>();
   private pendingChanges: DatabaseChange[] | null = null;
@@ -758,6 +760,7 @@ export class StateDatabase {
     this.db.exec(SCHEMA);
     this.runMigrations();
     this.seedShortcutDefaults();
+    this.workbench = new WorkbenchStore(this.db, () => this.now().getTime());
   }
 
   public getOrCreateDraftInstallationId(): string {
@@ -1261,13 +1264,21 @@ export class StateDatabase {
           || !Number.isSafeInteger(bucket.tokens)
           || bucket.tokens < 0) continue;
         this.db.prepare(
-          `INSERT OR IGNORE INTO codex_account_usage_daily_buckets
-             (home_id, usage_date, tokens, captured_at) VALUES (?, ?, ?, ?)`,
+          `INSERT INTO codex_account_usage_daily_buckets
+             (home_id, usage_date, tokens, captured_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT(home_id, usage_date) DO UPDATE SET
+             tokens = excluded.tokens,
+             captured_at = excluded.captured_at
+           WHERE excluded.captured_at >= codex_account_usage_daily_buckets.captured_at`,
         ).run(homeId, bucket.startDate, bucket.tokens, snapshot.capturedAt);
       }
       this.db.prepare(
-        `INSERT OR IGNORE INTO codex_account_usage_snapshots (home_id, snapshot_date, captured_at, payload_json)
-         VALUES (?, ?, ?, ?)`,
+        `INSERT INTO codex_account_usage_snapshots (home_id, snapshot_date, captured_at, payload_json)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(home_id, snapshot_date) DO UPDATE SET
+           captured_at = excluded.captured_at,
+           payload_json = excluded.payload_json
+         WHERE excluded.captured_at >= codex_account_usage_snapshots.captured_at`,
       ).run(homeId, snapshot.snapshotDate, snapshot.capturedAt, JSON.stringify(snapshot));
     });
   }
@@ -1584,6 +1595,16 @@ export class StateDatabase {
          ORDER BY created_at ASC, followup_id ASC LIMIT 1`,
       )
       .get(taskId) as Record<string, unknown> | undefined;
+    return row ? mapBridgeTaskFollowup(row) : null;
+  }
+
+  public getBridgeTaskFollowupById(id: string): StoredBridgeTaskFollowup | null {
+    const row = this.db.prepare("SELECT * FROM bridge_task_followups WHERE followup_id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? mapBridgeTaskFollowup(row) : null;
+  }
+
+  public getBridgeTaskFollowupBySourceEvent(sourceEventId: string): StoredBridgeTaskFollowup | null {
+    const row = this.db.prepare("SELECT * FROM bridge_task_followups WHERE source_event_id = ?").get(sourceEventId) as Record<string, unknown> | undefined;
     return row ? mapBridgeTaskFollowup(row) : null;
   }
 
@@ -3905,6 +3926,12 @@ export class StateDatabase {
       .run(deviceName, sessionId);
   }
 
+  public updateWebAuthSessionExpiry(sessionId: string, expiresAt: string): void {
+    this.db
+      .prepare("UPDATE web_auth_sessions SET expires_at = ? WHERE session_id = ? AND revoked_at IS NULL")
+      .run(expiresAt, sessionId);
+  }
+
   public revokeWebAuthSession(sessionId: string, revokedAt: string): void {
     this.db
       .prepare(
@@ -4554,6 +4581,26 @@ export class StateDatabase {
           repairComposerShortcut.run(shortcut.actionKey, shortcut.displayMode ?? "closed", now, shortcut.id);
         }
       }
+
+      // TUI keys used to live behind the slash commands in the Codex group.
+      // Only move built-ins still in that group. Preserve user reordering,
+      // labels, enabled state and counts; untouched array-index orders can use
+      // the new TUI order with answer/back/warnings on the first mobile page.
+      const migrateTuiShortcut = this.db.prepare(
+        `UPDATE shortcuts SET group_id = 'codex-tui',
+          sort_order = CASE WHEN sort_order = ? THEN ? ELSE sort_order END, updated_at = ?
+         WHERE id = ? AND group_id = 'codex' AND built_in = 1`,
+      );
+      for (const [legacySortOrder, shortcut] of DEFAULT_SHORTCUTS.entries()) {
+        if (shortcut.groupId === "codex-tui" && shortcut.id.startsWith("codex-key-")) {
+          migrateTuiShortcut.run(legacySortOrder, shortcut.sortOrder ?? legacySortOrder, now, shortcut.id);
+        }
+      }
+      this.db.prepare(
+        `UPDATE shortcuts SET detail = '回答待处理问题 / 编辑排队消息', updated_at = ?
+         WHERE id IN ('codex-key-edit-queued', 'codex-key-edit-queued-alt') AND built_in = 1
+          AND group_id = 'codex-tui' AND detail = '编辑上一条排队消息'`,
+      ).run(now);
 
       // The first alias implementation used a separate command-line group.
       // Keep its counts, enabled state and any user edits, but place the four

@@ -5,6 +5,7 @@ interface BunTerminal {
 }
 
 interface BunSubprocess {
+  pid?: number;
   stdout?: { text(): Promise<string> };
   stderr?: { text(): Promise<string> };
   exited: Promise<number>;
@@ -25,6 +26,7 @@ interface BunRuntime {
         rows: number;
         name: string;
         data(terminal: BunTerminal, output: string): void;
+        exit?(terminal: BunTerminal, exitCode: number, signal: string | null): void;
       };
     },
   ): BunSubprocess;

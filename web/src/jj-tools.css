@@ -1,0 +1,56 @@
+.jj-page { max-width: 1420px; margin: 0 auto; padding: 12px 20px 28px; }
+.jj-actions, .jj-builds, .jj-run-meta, .jj-console-footer, .jj-log-filter { display: flex; align-items: center; gap: 10px; }
+.jj-card { padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); }
+.jj-tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+.jj-tabs button { min-height: 34px; padding: 5px 14px; background: transparent; }
+.jj-tabs [aria-selected="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.jj-page form, .jj-page label, .jj-namespace { display: grid; gap: 6px; min-width: 0; }
+.jj-page form { gap: 12px; }
+.jj-page label, .jj-namespace { color: var(--muted); font-size: 12px; }
+.jj-page input:not([type="checkbox"]), .jj-page select { width: 100%; min-width: 0; color: var(--ink); background: var(--card); border-color: var(--line); }
+.jj-pod-fields { display: grid; grid-template-columns: minmax(0, 1fr) 104px; gap: 12px; }
+.jj-namespace output { display: flex; align-items: center; min-height: 40px; padding: 8px 11px; border: 1px solid var(--line); border-radius: 9px; color: var(--ink); background: var(--paper); font-size: 16px; }
+.jj-page .jj-check { display: flex; align-items: center; gap: 6px; min-height: 32px; cursor: pointer; }
+.jj-check input { width: 16px; height: 16px; min-height: 16px; margin: 0; accent-color: var(--accent); }
+.jj-actions { flex-wrap: wrap; }
+.jj-page button { min-height: 34px; padding: 5px 11px; }
+.jj-builds { flex-wrap: wrap; padding-top: 12px; border-top: 1px solid var(--line); }
+.jj-builds label { flex: 0 1 240px; }
+.jj-builds button { align-self: flex-end; }
+.jj-error { margin: 12px 0; padding: 10px 12px; border: 1px solid var(--danger); border-radius: 8px; color: var(--danger); background: var(--card); overflow-wrap: anywhere; }
+.jj-console { margin-top: 12px; }
+.jj-console-toolbar { margin-top: 10px; }
+.jj-console-toolbar select { max-width: 100%; text-overflow: ellipsis; }
+.jj-run-meta { align-items: baseline; justify-content: space-between; margin-bottom: 10px; font-size: 12px; }
+.jj-run-meta code { min-width: 0; overflow-wrap: anywhere; }
+.jj-run-meta span { flex-shrink: 0; color: var(--muted); }
+.jj-log-filter { margin-bottom: 10px; }
+.jj-log-filter input { flex: 1; }
+.jj-log-filter > span { flex-shrink: 0; color: var(--muted); font-size: 12px; }
+.jj-terminal-frame { position: relative; overflow: hidden; border-radius: 8px; background: #10141a; }
+.jj-terminal { height: 380px; padding: 10px; touch-action: none; }
+.jj-terminal .xterm { height: 100%; color: #d8dee9; }
+.jj-terminal .xterm-viewport { overscroll-behavior: contain; }
+.jj-filtered-output-wrap { position: absolute; inset: 0; z-index: 10; pointer-events: none; }
+.jj-filtered-output { position: absolute; inset: 0; margin: 0; padding: 10px; overflow: auto; color: #d8dee9; background: #10141a; font: 13px/1.5 "SFMono-Regular", Menlo, Monaco, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; touch-action: pan-y; overscroll-behavior: contain; pointer-events: auto; }
+.jj-filtered-output::selection { color: #fff; background: #41536b; }
+.jj-copy-filtered-log { position: absolute; right: 10px; bottom: 10px; z-index: 11; display: grid; place-items: center; width: 32px; min-width: 32px; height: 32px; min-height: 32px; padding: 0; border: 1px solid #526174; border-radius: 8px; color: #d8dee9; background: #1d2733e6; box-shadow: 0 3px 10px #0006; pointer-events: auto; }
+.jj-copy-filtered-log svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.jj-copy-filtered-log:hover:not(:disabled), .jj-copy-filtered-log:focus-visible { color: #fff; border-color: #8de0bd; background: #24533f; }
+.jj-terminal-placeholder { position: absolute; inset: 0; display: grid; place-items: center; color: #8995a3; pointer-events: none; font-size: 13px; }
+.jj-console-footer { flex-wrap: nowrap; gap: 6px; margin-top: 10px; }
+.jj-console-footer button { display: grid; place-items: center; flex: 0 0 32px; width: 32px; min-width: 32px; height: 32px; min-height: 32px; padding: 0; font: 14px ui-monospace, monospace; }
+.jj-console-footer svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+@media (max-width: 760px) {
+  .jj-page { padding: 10px 10px 24px; }
+  .jj-card { padding: 11px; }
+  .jj-pod-fields { grid-template-columns: minmax(0, 1fr) 96px; gap: 10px; }
+  .jj-builds label { flex: 1; }
+  .jj-terminal { height: 340px; padding: 6px; }
+  .jj-filtered-output { padding: 6px; }
+  .jj-copy-filtered-log { right: 8px; bottom: 8px; }
+  .jj-run-meta { flex-wrap: wrap; gap: 4px; }
+}
+@media (max-width: 360px) {
+  .jj-console-footer { gap: 2px; }
+}

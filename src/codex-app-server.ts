@@ -215,9 +215,9 @@ export interface CodexAppServerQueryClient {
 }
 
 /**
- * Read-only app-server clients must not inherit the user's completion hook.
- * Thread hydration/cleanup can otherwise replay completion notifications while
- * a command such as `/threads` is only listing existing sessions.
+ * Bridge-owned app-server clients must not inherit the user's completion hook.
+ * Thread hydration/cleanup could otherwise replay completion notifications
+ * during a read-only query or an explicitly managed History run.
  */
 export function buildCodexAppServerArgs(): string[] {
   return ["app-server", "-c", "notify=[]", "--listen", "stdio://"];
@@ -512,8 +512,19 @@ export class CodexAppServerClient implements CodexAppServerQueryClient {
     }
     const message = asRecord(raw) as JsonRpcMessage;
     const id = message.id;
-    if (id === undefined || id === null) {
-      if (message.method === "thread/tokenUsage/updated") {
+    if (typeof message.method === "string") {
+      // A server request has both `id` and `method`. Classify it before
+      // looking up client request ids because the two peers may reuse an id.
+      if (id !== undefined && id !== null
+        && (typeof id === "number" || typeof id === "string")) {
+        this.write({
+          id,
+          error: {
+            code: -32601,
+            message: "This bridge client does not accept server-initiated requests.",
+          },
+        });
+      } else if (message.method === "thread/tokenUsage/updated") {
         const usage = parseThreadTokenUsageNotification(message.params);
         if (usage) {
           for (const waiter of this.threadTokenUsageWaiters.get(usage.threadId) ?? []) waiter(usage);
@@ -539,18 +550,6 @@ export class CodexAppServerClient implements CodexAppServerQueryClient {
         return;
       }
 
-      // The server can issue requests while a turn is running. This client is
-      // intentionally read-only, so explicitly decline rather than leaving
-      // the server waiting forever if a future read path triggers one.
-      if (typeof message.method === "string") {
-        this.write({
-          id,
-          error: {
-            code: -32601,
-            message: "This bridge client does not accept server-initiated requests.",
-          },
-        });
-      }
     }
   }
 

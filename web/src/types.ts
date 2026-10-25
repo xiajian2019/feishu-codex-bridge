@@ -222,6 +222,7 @@ export interface CodexHistoryWriterStatus {
     state: "running" | "cancelling";
     cursor: number;
     turnIndex: number;
+    interactive?: boolean;
   };
 }
 

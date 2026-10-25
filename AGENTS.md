@@ -1,10 +1,20 @@
 # Feishu Codex Bridge 项目约定
 
-本文只记录项目级的架构、行为和 UI 约定，用来补充适用的用户级 AGENTS，不复制个人工作流或凭据。Codex 历史 session 用于回溯用户决策，当前源码和配置是实现现状的依据；遇到不一致先核对源码。修改前检查当前分支和工作区，保留已有改动，不要覆盖无关内容，也不要把个人凭据或本机临时状态写入文档。
+本文只记录项目级的架构、行为和 UI 约定，用来补充适用的用户级 AGENTS，不复制个人工作流或凭据。Codex 历史 session 用于回溯用户决策，当前源码和配置是实现现状的依据；同一要求多次修订时采用用户最后确认的版本，及时修正文档中的旧约定。修改前检查当前分支和工作区，保留已有改动，不要覆盖无关内容，也不要把个人凭据或本机临时状态写入文档。下列规则包含验收要求，不代表实现已全部满足；当前缺口见 [2026-10-22 会话复盘与风险评审](doc/session-review-2026-10-22.md)。
 
 ## GitHub 发布约定
 
 - 本仓库使用 GitHub 作为远程代码托管。提交、推送和创建 Pull Request 时使用 GitHub 发布流程（`github-release` skill）；不要使用面向 GitLab MR 的 `git-publish-branch` skill。
+- 明确要求“全部代码都提交”时，范围是当前 checkout 全部已审阅的代码变更，包括其他会话留下的改动；先检查 staged、unstaged 和 untracked，再用显式文件列表提交，不能只提交本轮碰过的文件。凭据、运行数据库、构建包和个人覆盖规则仍不进入提交；提交后复查剩余差异和远端 SHA。
+- 提交/推送、创建 PR、合并、打 tag、构建安装包和部署是不同操作；按本次明确的范围执行。源码回退不等于已安装二进制回退，报告时分开说明。
+
+## 开发服务与部署操作
+
+- 本项目在开发上下文中说“重启当前环境”时，操作当前 checkout 的 API `17310` 和 Vite `5173`。通过 cwd、完整命令行、监听端口、配置和 DB 真实路径核对身份；`7310` 是安装版服务，不能由端口可达或旧发布记录推断为本次目标。
+- 开发启停优先使用 `bun run dev:start|dev:status|dev:stop|dev:restart`；后台进程应在启动命令退出后继续存活。PID 记录缺失或失效时，先核对端口持有者、进程组、启动命令和 cwd，再决定是否接管；不得仅凭 PID 文件或端口直接发送信号，也不能把别的进程返回的 200 当作本次启动成功。
+- `portable:deploy` 会构建、切换安装目录的 `current` 并启停 LaunchAgent，`portable:restart` 也涉及安装版服务。只有明确要求安装版部署/重启时才使用这些入口；不能为重启开发环境自动执行它们。
+- 用户叫停或纠正目标后，终止工具等待不代表子进程已经终止。需要检查命令进程及其子进程是否还在执行，并只读核对安装入口、实际二进制和服务状态，不能仅凭工具显示“terminated”就断言部署未发生。
+- 服务重启后分别核对 API、前端及代理目标；验证最新源码已由目标进程提供。`/healthz` 只证明存活，不证明加载了新构建或手机交互正常。
 
 ## 系统服务与实现架构
 
@@ -17,7 +27,7 @@
 | Web Task Desk | `Dispatcher`、`ChildWorkerRunner`、`codex-worker` | Web 新建任务使用 `tasks/runs/outbox` 状态机和 Codex SDK worker；这条链路与原生直连消息的 `bridge_tasks` 状态机分开。tmux Dashboard 不是 Task Desk 的执行后端。 |
 | 统一 Web 服务 | `DashboardServer`、`web/src/main.tsx` | 生产中由 Bridge 进程内托管；Task Desk、系统管理、Codex History 和 tmux Dashboard 共用一套 Web/API 服务与认证，不再拆成独立 verifier 服务。 |
 | Codex History | `CodexHistoryService`、`CodexAppServerClient` | 通过 Codex app-server 的 `thread/list`/`thread/read` 读取，通过 Codex SDK 恢复会话；不同 `CODEX_HOME` 独立查询。不要直接解析 `auth.json`、Codex SQLite 或 JSONL 代替官方接口。 |
-| tmux Dashboard | `TmuxDashboardApi`、`web/src/TmuxDashboard.tsx` | 连接 Bridge 主机已有的默认 tmux server，提供只读 xterm 输出、输入框控制和 Session 文件页；不创建隔离 tmux server，也不代表 pane 内嵌套 SSH 的目标机。 |
+| tmux Dashboard | `TmuxDashboardApi`、`web/src/TmuxDashboard.tsx` | 连接 Bridge 主机已有的默认 tmux server，默认只读输出，支持显式切换终端输入、composer 控制和 Session 文件页；不创建隔离 tmux server，也不代表 pane 内嵌套 SSH 的目标机。 |
 | 本机 Codex 通知 | `LocalCodexNotificationWatcher` / `LocalCodexNotificationInbox` | `poll` 轮询 Codex app-server，`hook` 接收 Codex 官方 notify hook。只通知本机 Codex CLI/App 的结束状态；Feishu/AAMP 任务已有卡片，不重复发本机通知。 |
 
 - 主任务链路：AAMP 模式由官方 AAMP runtime 持有 Feishu 长连接；Direct 模式由 Lark SDK 收事件并把任务/续问写入 SQLite，再由 Codex SDK 执行，outbox 异步更新飞书卡片。Web Task Desk 是另一条由 `Dispatcher` 排队、`ChildWorkerRunner` 启动 Codex worker 的链路。
@@ -40,6 +50,8 @@
 - Codex app-server 的只读客户端使用 `app-server -c notify=[] --listen stdio://`，避免订阅并重放通用通知。完成提醒只接受带非空 `thread-id` 的 `agent-turn-complete`；不能把 `turn-ended` 或任意 JSON 当成完成事件。
 - Task Desk 和 Direct 中的 Feishu 项目字段必须匹配项目注册表，不能指定任意本地路径。不要为新功能清空或用测试库覆盖用户的 `bridge.db`；Task Desk、Direct 和 AAMP 的任务身份/恢复规则彼此独立，不能互相推断。
 - 本地开发服务重启默认使用生产主库（源码 checkout 中通常由 `runtime/bridge.db` 指向正式数据文件）；只有任务或启动参数明确指定 `runtime/dev/bridge.db` 等开发库时才切换。重启前核实进程的配置和实际 `--db` 路径，不凭 `dev:*` 脚本名称推断数据库。诊断、配对或启停服务前也先确认实际配置和 DB。`web:pair` 不带 `--db` 时连接当前 Bridge 实例的正式库，测试库必须显式传 `--db`。
+- 共用主库是数据选择约定，不代表多个执行器可以安全并行恢复同一批任务。修改恢复逻辑时同时检查 Task Desk、History、Direct 的实例归属与租约，不能把另一活动进程的任务当作崩溃遗留；自动化与故障注入必须使用临时 DB、fixture 项目和 fake worker/tmux。
+- 状态修改的鉴权应覆盖所有入口，包括创建/删除 tmux Session、附件、配对与设备管理；撤销设备还应让该设备现有 WebSocket/SSE 失效，而不仅拒绝下一次 HTTP 请求。当前实现缺口按风险评审处理，不把已有少数路由的防护推断为全局防护。
 - Portable 默认安装根目录为 `~/Applications/Feishu Codex Bridge`，版本目录通过 `current` 切换；升级保留该目录的 `config.json` 和 `runtime` 数据，先校验 SHA-256，再切换并支持回滚。不要把下载目录或仓库 `dist/` 当作长期运行目录。新版 `bun run release` 生成当前架构单一 Bun 二进制；旧 Core/Lite/Direct 多模式只属于 `bun run release:legacy`。
 - `service start` 启动 Direct；AAMP 使用 `aamp:start` 及其对应 lifecycle 命令。若 `aamp.stopOnShutdown=false`，停止 Bridge 不代表 AAMP 已停止，需分别核实。
 - Codex CLI 路径先使用有效配置，再自动发现 ChatGPT App 内置 CLI/系统 CLI；不要假定安装了 Homebrew Codex，也不要硬编码开发机个人路径。上游 AAMP 脚本可能调用 `node`/`npm`/`npx`，项目通过 Bun-backed shim 兼容，实际 runtime 仍是 Bun。
@@ -48,8 +60,22 @@
 
 - 当前 tmux 页面是 `/tmux-dashboard`，服务端由 Bridge 进程内的 `TmuxDashboardApi` 提供。旧的独立 `/tmux` verifier 已退役；不要恢复其页面、API、数据库或启动流程。
 - Dashboard 连接 Bridge 主机上的现有 tmux server。它不代表 tmux pane 里可能通过 SSH 登录的另一台机器，也没有可复用的下游 SSH/SFTP 凭据。
-- xterm 页面是只读的 tmux 输出视图；输入框把消息交给选中的 Codex session。不要把它当作可直接输入任意 shell 命令的终端。
+- xterm 默认是只读的 tmux 输出视图，composer 默认向 Codex 发送任务；只有用户显式开启终端输入后才透传按键/终端命令。两种模式的文案、回执、滚动、复制和链接行为需要分别维护；不能因支持终端输入就取消默认只读体验。
 - 关键入口：服务端路由与鉴权在 `src/web.ts`，tmux API 和终端流在 `src/tmux-dashboard-api.ts`，session 枚举在 `src/tmux-dashboard.ts`；React 路由在 `web/src/main.tsx`。
+
+## Codex 历史与用量
+
+- History 控制项应放在 `/codex-history` 对应详情中；下一轮模型/推理强度由官方模型目录和 SDK 参数实现，不能误加到 tmux 快捷键里。任务面板可以聚合来源，但执行和恢复继续走各自服务。
+- 顶部 Home 选择是列表筛选；列表项/详情中的 Home 是该 thread 的持久偏好。修改单项偏好不能顺带改顶部筛选；跨 Home 查不到原轮次时明确区分历史归属与执行账号，不能承诺切换偏好就会迁移历史。
+- History 列表缓存和偏好使用独立表，不挪用 Direct 的 `bridge_tasks`。详情缓存需有容量、有效期、安装实例/设备作用域和撤销清理策略；新回复后按更新时间刷新，不以整页刷新代替增量更新。
+- 账号 Token 统计按 Home/日期保存，已完成日期保留历史值，额度仍可刷新；显示剩余百分比。官方没有可靠数据的按模型统计已移除，不能再用近期 thread 样本冒充全量账号日统计。
+
+## Demo 与紧凑布局
+
+- Demo 清单目前由前后端代码配置，不在 SQLite 项目注册表中；新增项时核对 id、代理前缀、健康探针、启动脚本和日志入口。启动已受理不等于 Demo 已可访问。
+- 打开或启动 Demo 使用新标签页，保留当前工作页；异步启动应在点击处理器中预先打开空白页，探测 ready 后跳转，失败时关闭空白页并显示原因，处理弹窗被拦截的情况。
+- Demo 日志复制使用日志框内部右下角图标；保留复制成功/失败反馈。页面避免重复的中英文标题、说明、装饰图片和大块空白，操作靠近标题，优先保持信息密度。
+- 全局导航左对齐、宽屏边距等布局要求要落在共享布局，覆盖任务面板、历史、详情和 Tmux。移动端可编辑输入框保持至少 16 px；普通导航文字无需因此统一放大。主题、选中、hover 和错误状态须保持可读对比度。
 
 ## Session 文件页
 
@@ -63,6 +89,7 @@
 - 文本预览使用只读 CodeMirror 6；当前按需高亮 JS/TS、JSON、Markdown、Python、YAML、HTML、CSS、XML。继续维护选中文字与背景色的对比度，不要让预览获得未经请求的写入能力。
 - 深色模式的文件行 hover/active 使用低亮度背景并把背景加在行容器上；错误提示使用深色主题配色。不要让整行透明点击层覆盖文字或使用刺眼的白色选中底色。
 - 文件页标题显示当前目录名和完整路径，返回按钮靠右；路径导航旁放刷新、上传操作，列表保持紧凑。
+- Git 变更页展示当前仓库工作区状态，不能把共享目录所有变更自动归因于某次 Codex 任务。预览/下载仍须重查 Session 当前目录、仓库和变更文件状态，并保留路径校验、只读预览、大小上限及同名/失效提示。
 
 ## Composer 与移动端
 
@@ -71,8 +98,11 @@
 - 移动端快捷键按钮至少保持 32 px 触控尺寸，快捷键之间留出间距；搜索输入字号保持 16 px，避免 iOS 聚焦时自动缩放。
 - tmux snapshot 是为了减少重绘。后续滚动使用 xterm 本地 scrollback；触摸滚动不要发送远端 tmux scroll 事件。
 - 关闭或重连浏览器 WebSocket 只结束 tmux attach 客户端，不得关闭 tmux session 或其中的 Codex 进程；只有用户明确触发“结束 Session”才执行 `kill-session`。
-- 移动端长按选择延迟保持 3 秒；两个选区端点可独立拖动，`Copy` 按钮靠近选区。仅在复制成功后清除选区，复制失败时保留以便重试。
+- 移动端长按选择延迟保持最后确认的 1.5 秒（`LONG_PRESS_DELAY_MS = 1_500`）；两个选区端点可独立拖动，`Copy` 按钮靠近选区。仅在复制成功后清除选区，复制失败时保留以便重试；桌面需要鼠标选择及复制快捷键。
 - 初始 `capture-pane` 快照用于减少重绘；不要把固定 60 ms 描述为最终画面已稳定。若调整捕获时序，分别复现快速输出和用户手动滚动。
+- 2026-10-22 的“原始 attach PTY 替换初始快照”和后续“过滤 alternate-buffer 切换”两轮修改都因手机无法滚动被要求回退。当前恢复为原快照流程；原刷新问题仍待定位，不得把这两轮方案作为已验证修复重新引入。
+- 修改终端输出链路前，记录 xterm buffer 类型、`baseY`/`viewportY`、行列尺寸、接收与 render 范围。alternate buffer 没有本地 scrollback；仅配置 `scrollback` 或过滤少数 ANSI 模式并不能证明触摸滚动可用。
+- 终端改动须分别检查只读/输入模式、首次连接/重连、连续输出、手动上翻、resize/软键盘、1.5 秒长按、复制和链接新页；新输出不能无故把用户从历史位置拉到底部。链接点击也不能误触选择、滚动或输入。
 - 移动端 session 详情会收起侧栏并暂停 session 列表轮询；返回列表时恢复。收起导航后不要留下空白导航行或遮挡点击的容器。
 
 ## 验证
@@ -81,3 +111,5 @@
 - 后端类型检查：`bun run --bun tsc -p tsconfig.json --noEmit`。
 - 前端生产构建：`bun run build:web`；完整构建：`bun run build`。
 - 静态构建结果不代表服务已重启或浏览器行为已验证。涉及 live UI、API、tmux 或文件访问时，单独说明做过的运行时验证；不要把未执行的测试描述为通过。
+- `EADDRINUSE`（包括 port 0）、tmux socket `Operation not permitted`、Git `index.lock` 权限错误可能来自沙箱；先确认真实端口/锁/进程和权限，再在授权上下文复测，不把它们直接定性为业务回归或并发竞态。
+- 提交后的 CI 结论以对应 commit SHA 的 Actions 结果为准。静态、单元/HTTP、浏览器与真机证据分开；触摸滚动和软键盘至少保留真机验收项。完整步骤见 [浏览器冒烟清单](doc/browser-smoke-checklist.md)。

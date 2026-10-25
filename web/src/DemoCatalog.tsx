@@ -9,6 +9,9 @@ type LocalDemo = {
   category: string;
   description: string;
   steps: readonly string[];
+  /** Pinned demos are shown before the regular sort order. */
+  pinned?: boolean;
+  sortOrder: number;
   openPath: string;
   healthPath: string;
   startPath: string;
@@ -22,6 +25,8 @@ const LOCAL_DEMOS: LocalDemo[] = [
     category: "视觉识别 · FAST PATH",
     description: "YOLOE/Core ML 在本机分割一桌菜，按区域裁剪并输出可视化结果。",
     steps: ["上传图片", "识别分区", "检索确认"],
+    pinned: true,
+    sortOrder: 20,
     openPath: "/api/local-demos/food-photo/?scene=multidish",
     healthPath: "/api/local-demos/food-photo/api/multidish/health",
     startPath: "/api/local-demos/food-photo/start",
@@ -33,6 +38,7 @@ const LOCAL_DEMOS: LocalDemo[] = [
     category: "视觉检索 · CLIP",
     description: "本地 OpenAI CLIP 编码图片，使用 SQLite-vec 检索食物文本向量并返回 Top-K 候选。",
     steps: ["上传图片", "SQLite 向量", "Top-K 候选"],
+    sortOrder: 30,
     openPath: "/api/local-demos/openai-clip/",
     healthPath: "/api/local-demos/openai-clip/api/health",
     startPath: "/api/local-demos/openai-clip/start",
@@ -44,12 +50,32 @@ const LOCAL_DEMOS: LocalDemo[] = [
     category: "数据管理 · DATASET",
     description: "通过 Datasette 浏览同一个 SQLite-vec 数据库、vec0 表和 SQL 查询；图片关联样本仍可从 CLIP Demo 查看。",
     steps: ["SQLite 表", "vec0 SQL", "关联图片"],
+    sortOrder: 40,
     openPath: "/api/local-demos/sqlite-vec-admin/",
     healthPath: "/api/local-demos/sqlite-vec-admin/.json",
     startPath: "/api/local-demos/sqlite-vec-admin/start",
     logsPath: "/api/local-demos/sqlite-vec-admin/logs",
   },
+  {
+    id: "food-semantic-search",
+    title: "食物实体与语义搜索",
+    category: "文本检索 · QWEN EMBEDDING",
+    description: "本地规则和 DeepSeek 可选解析，结合 Meilisearch 中文文本检索、千问 Embedding 与 SQLite-vec。",
+    steps: ["输入食物描述", "Meilisearch 文本召回", "主体校验与混合检索"],
+    pinned: true,
+    sortOrder: 10,
+    openPath: "/api/local-demos/food-semantic-search/",
+    healthPath: "/api/local-demos/food-semantic-search/api/health",
+    startPath: "/api/local-demos/food-semantic-search/start",
+    logsPath: "/api/local-demos/food-semantic-search/logs",
+  },
 ];
+
+const ORDERED_LOCAL_DEMOS = [...LOCAL_DEMOS].sort((left, right) =>
+  Number(right.pinned === true) - Number(left.pinned === true)
+  || left.sortOrder - right.sortOrder
+  || left.id.localeCompare(right.id),
+);
 
 const STATUS_LABELS: Record<DemoState, string> = {
   checking: "检查中",
@@ -60,7 +86,7 @@ const STATUS_LABELS: Record<DemoState, string> = {
 
 export function DemoCatalog(): ReactElement {
   const [states, setStates] = useState<Record<string, DemoState>>(() =>
-    Object.fromEntries(LOCAL_DEMOS.map((demo) => [demo.id, "checking"])),
+    Object.fromEntries(ORDERED_LOCAL_DEMOS.map((demo) => [demo.id, "checking"])),
   );
   const [logs, setLogs] = useState<Record<string, string[]>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -132,7 +158,7 @@ export function DemoCatalog(): ReactElement {
   }, [loadLog]);
 
   const checkAll = useCallback((): void => {
-    void Promise.all(LOCAL_DEMOS.map((demo) => checkDemo(demo)));
+    void Promise.all(ORDERED_LOCAL_DEMOS.map((demo) => checkDemo(demo)));
   }, [checkDemo]);
 
   const openDemoTab = useCallback((demo: LocalDemo, target?: Window | null): boolean => {
@@ -206,7 +232,7 @@ export function DemoCatalog(): ReactElement {
     </header>
 
     <section className="demo-catalog-grid" aria-label="Demo 列表">
-      {LOCAL_DEMOS.map((demo) => {
+      {ORDERED_LOCAL_DEMOS.map((demo) => {
         const state = states[demo.id] ?? "checking";
         const copyState = copyStates[demo.id] ?? "idle";
         const copyLabel = copyState === "copied" ? "日志已复制" : copyState === "failed" ? "复制日志失败" : "复制启动日志";
@@ -216,7 +242,10 @@ export function DemoCatalog(): ReactElement {
               <span className="demo-card-category">{demo.category}</span>
               <span className={"demo-card-status is-" + state}><i aria-hidden="true" />{STATUS_LABELS[state]}</span>
             </div>
-            <div className="demo-card-title-row"><h2>{demo.title}</h2></div>
+            <div className="demo-card-title-row">
+              <h2>{demo.title}</h2>
+              {demo.pinned ? <span className="demo-card-pinned">置顶</span> : null}
+            </div>
             <p className="demo-card-description">{demo.description}</p>
             <div className="demo-card-flow" aria-label="处理流程">
               {demo.steps.map((step, index) => <div className="demo-card-flow-step" key={step}>

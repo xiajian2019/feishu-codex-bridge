@@ -87,6 +87,27 @@ describe("WebPairingAuth", () => {
     expect(auth.renameDevice(authenticatedRequest, device!.sessionId, "")).toBe(false);
     db.close();
   });
+
+  it("allows an authenticated admin to extend a device by one calendar year", () => {
+    const start = Date.parse("2026-10-24T12:34:56.000Z");
+    const db = new StateDatabase(":memory:");
+    const auth = new WebPairingAuth({ db, now: () => start });
+    const remote = fakeRequest("203.0.113.24");
+    const pairing = auth.startPairing();
+    const response = fakeResponse();
+    const token = auth.claimPairing(remote, pairing.code);
+    auth.setSessionCookie(remote, response as unknown as ServerResponse, token);
+
+    const authenticatedRequest = fakeRequest("203.0.113.24", response.headers["set-cookie"]);
+    const before = auth.listDevices(authenticatedRequest)?.[0];
+    expect(before?.expiresAt).toBe("2026-11-23T12:34:56.000Z");
+    expect(auth.extendDevice(authenticatedRequest, before!.sessionId)).toBe("2027-11-23T12:34:56.000Z");
+    expect(auth.listDevices(authenticatedRequest)?.[0]?.expiresAt).toBe("2027-11-23T12:34:56.000Z");
+
+    const stored = db.listWebAuthSessions()[0];
+    expect(stored?.expiresAt).toBe("2027-11-23T12:34:56.000Z");
+    db.close();
+  });
 });
 
 function fakeRequest(address: string, cookie?: string): IncomingMessage {

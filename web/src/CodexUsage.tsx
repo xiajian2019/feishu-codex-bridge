@@ -57,7 +57,7 @@ export function CodexUsage(): ReactElement {
         <div className="codex-usage-page-heading">
           <h1>Codex 用量</h1>
           <span className="codex-usage-updated">
-            {snapshot ? `额度于 ${formatTimestamp(snapshot.generatedAt)} 检查 · Token 每天同步` : "额度每分钟检查 · Token 每天同步"}
+            {snapshot ? `额度与 Token 于 ${formatTimestamp(snapshot.generatedAt)} 检查` : "额度与 Token 每分钟检查"}
           </span>
         </div>
         <button className="primary codex-usage-refresh" type="button" onClick={() => void loadUsage()} disabled={loading || refreshing}>
@@ -82,7 +82,7 @@ export function CodexUsage(): ReactElement {
       ) : null}
 
       <p className="codex-usage-note">
-        额度窗口每次读取 Codex app-server；Token 快照按账号及 UTC 日期保存。
+        额度窗口与 Token 数据每次读取 Codex app-server；历史日桶按账号及 UTC 日期保存，并允许服务端回补。
       </p>
     </main>
   );
@@ -258,12 +258,10 @@ function UsageAccountCard({ account, onRefresh, showResetCredits = true, embedde
               <UsageMetric
                 label="累计 Token"
                 value={formatTokenUnit(summary?.lifetimeTokens)}
-                exact={formatExactTokens(summary?.lifetimeTokens)}
               />
               <UsageMetric
                 label="单日峰值"
                 value={formatTokenUnit(summary?.peakDailyTokens)}
-                exact={formatExactTokens(summary?.peakDailyTokens)}
               />
               <UsageMetric label="连续活跃" value={formatDays(summary?.currentStreakDays)} />
             </div>
@@ -537,12 +535,11 @@ function QuotaWindow({ window, label }: { window: CodexUsageRateLimitWindow | nu
   );
 }
 
-function UsageMetric({ label, value, exact }: { label: string; value: string; exact?: string }): ReactElement {
+function UsageMetric({ label, value }: { label: string; value: string }): ReactElement {
   return (
     <div className="codex-usage-metric">
       <span>{label}</span>
       <strong>{value}</strong>
-      {exact ? <small>（{exact}）</small> : null}
     </div>
   );
 }
@@ -583,10 +580,9 @@ function DailyUsageChart({ buckets }: { buckets: Array<{ startDate: string; toke
         {visibleBuckets.map((bucket) => {
           const height = Math.max(3, Math.round((bucket.tokens / maxTokens) * 100));
           return (
-            <div className="codex-usage-chart-day" key={bucket.startDate} title={`${bucket.startDate} · ${formatTokens(bucket.tokens)} Token`}>
+            <div className="codex-usage-chart-day" key={bucket.startDate} title={`${bucket.startDate} · ${formatTokenUnit(bucket.tokens)} Token`}>
               <strong>
                 <span>{formatTokenUnit(bucket.tokens)}</span>
-                <small>（{formatExactTokens(bucket.tokens)}）</small>
               </strong>
               <div className="codex-usage-chart-track"><span style={{ height: `${height}%` }} /></div>
               <span>{bucket.startDate.slice(-5)}</span>
@@ -696,7 +692,6 @@ function GlobalDailyUsageChart({ buckets }: { buckets: Array<{ startDate: string
           <div className="codex-usage-overview-total">
             <span>本页累计</span>
             <strong>{formatTokenUnit(totalTokens)}</strong>
-            <small>（{formatExactTokens(totalTokens)}）</small>
           </div>
         </div>
       </header>
@@ -704,7 +699,7 @@ function GlobalDailyUsageChart({ buckets }: { buckets: Array<{ startDate: string
         {selectedBucket ? (
           <>
             <span>{selectedBucket.startDate}</span>
-            <strong>{formatTokens(selectedBucket.tokens)} Token</strong>
+            <strong>{formatTokenUnit(selectedBucket.tokens)} Token</strong>
           </>
         ) : <span>点击折线上的日期查看当日用量</span>}
       </div>
@@ -715,7 +710,7 @@ function GlobalDailyUsageChart({ buckets }: { buckets: Array<{ startDate: string
         <svg
           viewBox={`0 0 ${width} ${height}`}
           role="group"
-          aria-label={`每日 Token 折线图，${rangeStartDate} 至 ${latestDate}，本页累计 ${formatTokens(totalTokens)}`}
+          aria-label={`每日 Token 折线图，${rangeStartDate} 至 ${latestDate}，本页累计 ${formatTokenUnit(totalTokens)}`}
           onClick={(event) => {
             const bounds = event.currentTarget.getBoundingClientRect();
             if (bounds.width <= 0) return;
@@ -748,7 +743,7 @@ function GlobalDailyUsageChart({ buckets }: { buckets: Array<{ startDate: string
               className={`codex-usage-line-point${selectedDate === point.date ? " is-selected" : ""}`}
               role="button"
               tabIndex={0}
-              aria-label={`${point.date}，${formatTokens(point.tokens)} Token`}
+              aria-label={`${point.date}，${formatTokenUnit(point.tokens)} Token`}
               aria-pressed={selectedDate === point.date}
               onFocus={() => setSelectedDate(point.date)}
               onClick={() => setSelectedDate(point.date)}
@@ -759,7 +754,7 @@ function GlobalDailyUsageChart({ buckets }: { buckets: Array<{ startDate: string
                 }
               }}
             >
-              <title>{point.date} · {formatTokens(point.tokens)} Token</title>
+              <title>{point.date} · {formatTokenUnit(point.tokens)} Token</title>
             </circle>
           ))}
         </svg>
@@ -962,23 +957,12 @@ function formatPercent(value: number): string {
   return `${Math.round(value)}%`;
 }
 
-function formatTokens(value?: number | null): string {
-  const unitValue = formatTokenUnit(value);
-  const exactValue = formatExactTokens(value);
-  return exactValue ? `${unitValue}（${exactValue}）` : unitValue;
-}
-
 function formatTokenUnit(value?: number | null): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "—";
   const isBillions = value >= 100_000_000;
   const divisor = isBillions ? 100_000_000 : 10_000;
   const roundedTenths = Math.round((value / divisor) * 10);
   return `${(roundedTenths / 10).toFixed(1)}${isBillions ? "亿" : "万"}`;
-}
-
-function formatExactTokens(value?: number | null): string | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
-  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(value);
 }
 
 function formatDays(value?: number | null): string {

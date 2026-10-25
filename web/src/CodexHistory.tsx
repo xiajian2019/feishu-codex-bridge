@@ -18,10 +18,35 @@ import {
   type FormEvent,
   type ReactElement,
 } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router";
+import { useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 
 import { CodeTextViewer } from "./CodeTextViewer.js";
 import { getLocalDraftScope } from "./local-draft-scope.js";
+import {
+  extractHistoryMessages,
+  fetchHistoryPreferences,
+  historyPreferenceKey,
+  historyTarget,
+  loadHistoryBookmarks,
+  normalizeHistoryPreference,
+  organizeHistoryItems,
+  saveHistoryBookmarks,
+  saveHistoryPreference,
+  steerCodexHistoryRun,
+  toggleHistoryBookmark,
+  type HistoryOrganizationFilter,
+  type HistoryOrganizationSort,
+  type HistoryWorkbenchPreference,
+  type HistoryWorkbenchPreferencePatch,
+  type HistoryWorkbenchTarget,
+} from "./history-workbench.js";
+import {
+  HistoryMessageActions,
+  HistoryPreferenceControls,
+  HistoryWorkbench,
+  type HistoryDraftInsertion,
+} from "./HistoryWorkbench.js";
+import "./history-workbench.css";
 import {
   codexHistoryRunAttachmentUrl,
   fetchCodexHistory,
@@ -212,6 +237,14 @@ export function CodexHistory(): ReactElement {
   const [error, setError] = useState<string | null>(null);
   const [savingHomeThreadIds, setSavingHomeThreadIds] = useState<Set<string>>(() => new Set());
   const [historyRefreshVersion, setHistoryRefreshVersion] = useState(0);
+  const [preferences, setPreferences] = useState<Map<string, HistoryWorkbenchPreference>>(() => new Map());
+  const [preferencesLoaded, setPreferencesLoaded] = useState(false);
+  const [preferencesError, setPreferencesError] = useState("");
+  const [savingPreferenceKeys, setSavingPreferenceKeys] = useState<Set<string>>(() => new Set());
+  const [organizationFilter, setOrganizationFilter] = useState<HistoryOrganizationFilter>("all");
+  const [organizationSort, setOrganizationSort] = useState<HistoryOrganizationSort>("recent");
+  const [organizationTag, setOrganizationTag] = useState("");
+  const autoMarkReadAttempt = useRef<string | null>(null);
 
   const rememberHome = useCallback((nextHomeId: string): void => {
     persistCodexHistoryHome(nextHomeId);
@@ -223,6 +256,62 @@ export function CodexHistory(): ReactElement {
     setQueryHome(nextHomeId);
     setOffset(0);
   }, [rememberHome]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchHistoryPreferences(controller.signal)
+      .then((nextPreferences) => {
+        if (controller.signal.aborted) return;
+        setPreferences(new Map(nextPreferences.map((preference) => [historyPreferenceKey(preference.target), preference])));
+      })
+      .catch((preferenceError: unknown) => {
+        if (!controller.signal.aborted) setPreferencesError(preferenceError instanceof Error ? preferenceError.message : String(preferenceError));
+      })
+      .finally(() => { if (!controller.signal.aborted) setPreferencesLoaded(true); });
+    return () => controller.abort();
+  }, []);
+
+  const patchPreference = useCallback(async (
+    target: HistoryWorkbenchTarget,
+    patch: HistoryWorkbenchPreferencePatch,
+  ): Promise<void> => {
+    const key = historyPreferenceKey(target);
+    if (savingPreferenceKeys.has(key)) return;
+    const previous = preferences.get(key);
+    const optimistic = normalizeHistoryPreference(target, { ...previous, ...patch });
+    setPreferences((current) => new Map(current).set(key, optimistic));
+    setSavingPreferenceKeys((current) => new Set(current).add(key));
+    setPreferencesError("");
+    try {
+      const saved = await saveHistoryPreference(target, patch);
+      setPreferences((current) => new Map(current).set(key, normalizeHistoryPreference(target, saved)));
+    } catch (preferenceError: unknown) {
+      setPreferences((current) => {
+        const next = new Map(current);
+        if (previous) next.set(key, previous);
+        else next.delete(key);
+        return next;
+      });
+      setPreferencesError(preferenceError instanceof Error ? preferenceError.message : String(preferenceError));
+    } finally {
+      setSavingPreferenceKeys((current) => {
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+    }
+  }, [preferences, savingPreferenceKeys]);
+
+  useEffect(() => {
+    if (!isDetailRoute || !homeId || !threadId) { autoMarkReadAttempt.current = null; return; }
+    if (!preferencesLoaded) return;
+    const target = historyTarget(homeId, threadId);
+    const key = historyPreferenceKey(target);
+    const attemptKey = `${getLocalDraftScope() ?? "anonymous"}:${key}`;
+    if (autoMarkReadAttempt.current === attemptKey) return;
+    autoMarkReadAttempt.current = attemptKey;
+    if (preferences.get(key)?.unread && !savingPreferenceKeys.has(key)) void patchPreference(target, { unread: false });
+  }, [isDetailRoute, homeId, threadId, preferences, preferencesLoaded, savingPreferenceKeys, patchPreference]);
 
   useEffect(() => {
     if (isDetailRoute) {
@@ -324,8 +413,18 @@ export function CodexHistory(): ReactElement {
   const page = Math.floor(offset / PAGE_SIZE) + 1;
   const pageCount = Math.max(1, Math.ceil((result?.total ?? 0) / PAGE_SIZE));
   const homes = result?.homes ?? [];
+  const organizedItems = useMemo(
+    () => organizeHistoryItems(result?.items ?? [], preferences, {
+      filter: organizationFilter,
+      sort: organizationSort,
+      tag: organizationTag,
+    }),
+    [result?.items, preferences, organizationFilter, organizationSort, organizationTag],
+  );
 
   if (isDetailRoute) {
+    const target = historyTarget(homeId!, threadId!);
+    const targetKey = historyPreferenceKey(target);
     return (
       <CodexThreadPage
         homeId={homeId!}
@@ -334,6 +433,10 @@ export function CodexHistory(): ReactElement {
         listCheckedAt={listCheckedAt}
         onBack={backToHistoryList}
         onSwitchHome={switchThreadHome}
+        preference={preferences.get(targetKey) ?? normalizeHistoryPreference(target)}
+        preferenceSaving={savingPreferenceKeys.has(targetKey)}
+        preferencesError={preferencesError}
+        onPreferencePatch={(patch) => { void patchPreference(target, patch); }}
       />
     );
   }
@@ -342,6 +445,7 @@ export function CodexHistory(): ReactElement {
       <main className="page-main codex-history-page">
         <form className="filters codex-history-filters" onSubmit={submitFilters}>
           <input
+            className="codex-history-search"
             aria-label="搜索 Codex 会话"
             type="search"
             placeholder="搜索会话标题或最近消息"
@@ -360,9 +464,21 @@ export function CodexHistory(): ReactElement {
             <option value="">全部状态</option>
             {CODEX_THREAD_STATUS_TYPES.map((status) => <option key={status} value={status}>{STATUS_LABELS[status] || status}</option>)}
           </select>
+          <select aria-label="按组织偏好筛选会话" title="筛选当前页会话" value={organizationFilter} onChange={(event) => setOrganizationFilter(event.currentTarget.value as HistoryOrganizationFilter)}>
+            <option value="all">全部会话</option>
+            <option value="pinned">仅置顶</option>
+            <option value="unread">仅未读</option>
+            <option value="attention">保留关注</option>
+          </select>
+          <select aria-label="会话排序方式" title="排序当前页会话" value={organizationSort} onChange={(event) => setOrganizationSort(event.currentTarget.value as HistoryOrganizationSort)}>
+            <option value="recent">最近更新</option>
+            <option value="pinned">置顶优先</option>
+          </select>
+          <input aria-label="按标签筛选会话" value={organizationTag} onChange={(event) => setOrganizationTag(event.currentTarget.value)} placeholder="按标签筛选" />
           <button className="primary" type="submit">查询</button>
           <div className="codex-filter-total" aria-live="polite">
-            {loading ? "正在读取…" : `共 ${result?.total ?? 0} 个会话 · 显示 ${result?.items.length ? offset + 1 : 0}–${Math.min(offset + (result?.items.length ?? 0), result?.total ?? 0)}`}
+            <span>{loading ? "正在读取…" : `共 ${result?.total ?? 0} 个会话 · 显示 ${result?.items.length ? offset + 1 : 0}–${Math.min(offset + (result?.items.length ?? 0), result?.total ?? 0)}`}</span>
+            <span className="codex-filter-scope">组织筛选与排序仅限当前页</span>
           </div>
         </form>
 
@@ -373,18 +489,29 @@ export function CodexHistory(): ReactElement {
               <button type="button" aria-label="关闭错误信息" title="关闭" onClick={() => setError(null)}>×</button>
             </div>
           ) : null}
+          {preferencesError ? <div className="history-workbench-error" role="alert">会话组织偏好暂不可用：{preferencesError}</div> : null}
           {!error && loading ? <div className="empty">正在读取{selectedHome ? "此 Codex Home" : "所有 Codex Home"}的会话…</div> : null}
           {!error && !loading && result?.items.length === 0 ? <div className="empty">没有符合条件的 Codex 会话。</div> : null}
-          {result?.items.map((item) => (
+          {!error && !loading && result?.items.length && organizedItems.length === 0
+            ? <div className="empty">当前组织筛选没有匹配的会话。</div>
+            : null}
+          {organizedItems.map((item) => {
+            const target = historyTarget(item.preferredHomeId || item.home.id, item.thread.id);
+            const targetKey = historyPreferenceKey(target);
+            return (
             <CodexHistoryRow
               key={`${item.home.id}:${item.thread.id}`}
               item={item}
               homes={homes}
               savingHome={savingHomeThreadIds.has(item.thread.id)}
+              preference={preferences.get(targetKey) ?? normalizeHistoryPreference(target)}
+              preferenceSaving={savingPreferenceKeys.has(targetKey)}
               onOpen={openThread}
               onSwitchHome={saveListItemHome}
+              onPreferencePatch={(patch) => { void patchPreference(target, patch); }}
             />
-          ))}
+            );
+          })}
         </section>
         <CodexPagination
           page={page}
@@ -402,14 +529,20 @@ function CodexHistoryRow({
   item,
   homes,
   savingHome,
+  preference,
+  preferenceSaving,
   onOpen,
   onSwitchHome,
+  onPreferencePatch,
 }: {
   item: CodexHistoryItem;
   homes: CodexHistoryHome[];
   savingHome: boolean;
+  preference: HistoryWorkbenchPreference;
+  preferenceSaving: boolean;
   onOpen: (item: CodexHistoryItem) => void;
   onSwitchHome: (item: CodexHistoryItem, nextHomeId: string) => Promise<void>;
+  onPreferencePatch: (patch: HistoryWorkbenchPreferencePatch) => void;
 }): ReactElement {
   const { thread, home } = item;
   const title = thread.name?.trim() || thread.preview?.trim() || "（无标题）";
@@ -423,8 +556,11 @@ function CodexHistoryRow({
         </div>
         <div className="codex-thread-path" title={thread.cwd || thread.path || ""}>{thread.cwd || thread.path || "—"}</div>
       </button>
-      <div className="codex-history-row-meta">
-        <span className="badge codex-status-badge">{statusLabel(thread)}</span>
+      {preference.unread || preference.tags.length ? <div className="codex-history-row-marks">
+        {preference.unread ? <span className="history-unread-marker" aria-label="未读">未读</span> : null}
+        {preference.tags.map((tag) => <span className="history-tag-chip" key={tag}>{tag}</span>)}
+      </div> : null}
+      <div className="codex-history-row-actions">
         <select
           className="codex-history-row-home-switch"
           aria-label={`切换“${title}”所在的 Codex Home`}
@@ -444,9 +580,9 @@ function CodexHistoryRow({
             </option>
           ))}
         </select>
-        <span>{sourceLabel(thread)}</span>
-        <span>{formatCodexTime(thread.updatedAt ?? thread.recencyAt ?? thread.createdAt)}</span>
+        <HistoryPreferenceControls preference={preference} saving={preferenceSaving} onPatch={onPreferencePatch} />
       </div>
+      <div className="codex-history-row-time">{formatCodexTime(thread.updatedAt ?? thread.recencyAt ?? thread.createdAt)}</div>
     </article>
   );
 }
@@ -477,13 +613,17 @@ function CodexPagination({
   );
 }
 
-function CodexThreadPage({ homeId, threadId, expectedUpdatedAt, listCheckedAt, onBack, onSwitchHome }: {
+function CodexThreadPage({ homeId, threadId, expectedUpdatedAt, listCheckedAt, onBack, onSwitchHome, preference, preferenceSaving, preferencesError, onPreferencePatch }: {
   homeId: string;
   threadId: string;
   expectedUpdatedAt: string | null;
   listCheckedAt: string | null;
   onBack: () => void;
   onSwitchHome: (homeId: string) => Promise<void>;
+  preference: HistoryWorkbenchPreference;
+  preferenceSaving: boolean;
+  preferencesError: string;
+  onPreferencePatch: (patch: HistoryWorkbenchPreferencePatch) => void;
 }): ReactElement {
   return (
     <main className="page-main codex-thread-page codex-thread-page-shell">
@@ -494,19 +634,29 @@ function CodexThreadPage({ homeId, threadId, expectedUpdatedAt, listCheckedAt, o
         listCheckedAt={listCheckedAt}
         onBack={onBack}
         onSwitchHome={onSwitchHome}
+        preference={preference}
+        preferenceSaving={preferenceSaving}
+        preferencesError={preferencesError}
+        onPreferencePatch={onPreferencePatch}
       />
     </main>
   );
 }
 
-function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt, onBack, onSwitchHome }: {
+function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt, onBack, onSwitchHome, preference, preferenceSaving, preferencesError, onPreferencePatch }: {
   homeId: string;
   threadId: string;
   expectedUpdatedAt: string | null;
   listCheckedAt: string | null;
   onBack: () => void;
   onSwitchHome: (homeId: string) => Promise<void>;
+  preference: HistoryWorkbenchPreference;
+  preferenceSaving: boolean;
+  preferencesError: string;
+  onPreferencePatch: (patch: HistoryWorkbenchPreferencePatch) => void;
 }): ReactElement {
+  const location = useLocation();
+  const navigate = useNavigate();
   const [detail, setDetail] = useState<CodexHistoryDetailResponse | null>(null);
   const [homes, setHomes] = useState<CodexHistoryHome[]>([]);
   const [homesLoading, setHomesLoading] = useState(true);
@@ -518,7 +668,42 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
   const [imagePreviews, setImagePreviews] = useState<Record<number, CodexImagePreview[]>>({});
   const [filePreviewTarget, setFilePreviewTarget] = useState<CodexFilePreviewTarget | null>(null);
   const [writerStatus, setWriterStatus] = useState<CodexHistoryWriterStatus | null>(null);
+  const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(() => new Set());
+  const [bookmarks, setBookmarks] = useState<Set<string>>(() => new Set());
+  const [draftInsertion, setDraftInsertion] = useState<HistoryDraftInsertion | null>(null);
   const liveCursorRef = useRef(0);
+  const target = useMemo(() => historyTarget(homeId, threadId), [homeId, threadId]);
+  const targetKey = historyPreferenceKey(target);
+  const draftScope = getLocalDraftScope();
+  const routeDraftInsertion = useMemo(() => readHistoryDraftInsertion(asRecord(location.state).historyDraftInsertion), [location.state]);
+
+  useEffect(() => {
+    setSelectedMessageIds(new Set());
+    setBookmarks(loadHistoryBookmarks(draftScope, target));
+  }, [draftScope, targetKey]);
+
+  useEffect(() => {
+    if (!routeDraftInsertion) return;
+    setDraftInsertion(routeDraftInsertion);
+    navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+  }, [routeDraftInsertion, navigate, location.pathname, location.search]);
+
+  const toggleSelectedMessage = useCallback((messageId: string): void => {
+    setSelectedMessageIds((current) => {
+      const next = new Set(current);
+      if (next.has(messageId)) next.delete(messageId);
+      else next.add(messageId);
+      return next;
+    });
+  }, []);
+
+  const toggleBookmark = useCallback((messageId: string): void => {
+    setBookmarks((current) => {
+      const next = toggleHistoryBookmark(current, messageId);
+      saveHistoryBookmarks(draftScope, target, next);
+      return next;
+    });
+  }, [draftScope, target]);
 
   const changeThreadHome = useCallback(async (nextHomeId: string): Promise<void> => {
     if (nextHomeId === homeId || homeSwitching) return;
@@ -597,8 +782,15 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
         setWriterStatus(next);
         const localRun = next.localRun;
         if (localRun) {
+          const serverInteractive = (localRun as typeof localRun & { interactive?: unknown }).interactive;
           setLiveRun((current) => current?.runId === localRun.runId
-            ? { ...current, state: localRun.state, cursor: Math.max(current.cursor, localRun.cursor), turnIndex: localRun.turnIndex }
+            ? {
+                ...current,
+                state: localRun.state,
+                cursor: Math.max(current.cursor, localRun.cursor),
+                turnIndex: localRun.turnIndex,
+                ...(typeof serverInteractive === "boolean" ? { interactive: serverInteractive } : {}),
+              }
             : {
                 runId: localRun.runId,
                 threadId: localRun.threadId,
@@ -607,6 +799,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
                 cursor: localRun.cursor,
                 turnIndex: localRun.turnIndex,
                 items: [],
+                ...(typeof serverInteractive === "boolean" ? { interactive: serverInteractive } : {}),
               });
         }
       } catch {
@@ -696,13 +889,15 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
     ? homes
     : [detail?.home ?? { id: homeId, label: homeLabel, path: "", available: true }, ...homes];
   const turns = Array.isArray(thread.turns) ? thread.turns : [];
-  const liveTurns = liveRun ? [{
+  const liveTurns = useMemo(() => liveRun ? [{
     items: [
       { type: "userMessage", text: liveRun.userText || "（已发送附件）" },
       ...liveRun.items,
     ],
     ...(liveRun.usage ? { usage: liveRun.usage } : {}),
-  }] : [];
+  }] : [], [liveRun]);
+  const selectableMessages = useMemo(() => extractHistoryMessages(thread, liveTurns), [thread, liveTurns]);
+  const selectableMessageIds = useMemo(() => new Set(selectableMessages.map((message) => message.id)), [selectableMessages]);
   const turnUsages = useMemo<Record<number, CodexHistoryTurnUsage>>(() => {
     const result: Record<number, CodexHistoryTurnUsage> = {};
     for (const { turnIndex, usage } of detail?.turnUsages ?? []) result[turnIndex] = usage;
@@ -733,14 +928,16 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
     turnIndex: number,
   ): Promise<{ ok: boolean; message?: string }> => {
     try {
-      const result = await sendCodexThreadMessage(homeId, threadId, {
+      const messageInput: Parameters<typeof sendCodexThreadMessage>[2] & { interactive?: true } = {
         text,
         attachmentIds,
         turnIndex,
         idempotencyKey,
         ...(settings.model ? { model: settings.model } : {}),
         ...(settings.reasoningEffort ? { reasoningEffort: settings.reasoningEffort } : {}),
-      });
+        ...(settings.interactive ? { interactive: true } : {}),
+      };
+      const result = await sendCodexThreadMessage(homeId, threadId, messageInput);
       removeCodexHistoryDetailCache(homeId, threadId);
       setRunNotice(null);
       const previews = result.attachments
@@ -773,6 +970,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
         cursor: result.cursor,
         turnIndex: result.turnIndex,
         items: [],
+        interactive: settings.interactive === true,
       });
       setError(null);
       window.setTimeout(() => scrollCodexTranscript("bottom"), 0);
@@ -805,6 +1003,22 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
     }
   }, [homeId, threadId, liveRun]);
 
+  const steerRun = useCallback(async (text: string): Promise<{ ok: boolean; message?: string }> => {
+    if (!liveRun || liveRun.state !== "running" || liveRun.interactive !== true) {
+      return { ok: false, message: "当前没有启用交互审批模式的运行中 Codex turn。" };
+    }
+    try {
+      await steerCodexHistoryRun(homeId, threadId, liveRun.runId, text);
+      setRunNotice("引导内容已提交到当前 Codex turn。");
+      setError(null);
+      return { ok: true };
+    } catch (steerError: unknown) {
+      const message = steerError instanceof Error ? steerError.message : String(steerError);
+      setError(message);
+      return { ok: false, message };
+    }
+  }, [homeId, threadId, liveRun]);
+
   return (
     <CODEX_MARKDOWN_LINK_CONTEXT.Provider value={markdownLinkContext}>
       <section className="codex-thread-panel" aria-labelledby="codex-thread-title">
@@ -813,32 +1027,49 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
         <div className="codex-thread-view-content">
           <div className="codex-thread-view-heading">
             <strong id="codex-thread-title" title={title}>{title}</strong>
-            <select
-              className="codex-thread-home-switch"
-              aria-label="切换 Codex Home"
-              title="切换 Codex Home"
-              value={homeId}
-              disabled={homesLoading || homeSwitching || homeOptions.length < 2}
-              onChange={(event) => { void changeThreadHome(event.target.value); }}
-            >
-              {homeOptions.map((home) => (
-                <option key={home.id} value={home.id} disabled={!home.available}>{home.label}</option>
-              ))}
-            </select>
-            <span>{loading ? "" : `${displayedTurnCount} 轮${liveRun?.state === "running" ? " · 正在运行" : liveRun?.state === "cancelling" ? " · 正在中断" : ""}`}</span>
-            <CodexThreadInfo thread={thread} homeLabel={homeLabel} />
+            <span className="codex-thread-turn-count">{loading ? "" : `${displayedTurnCount} 轮${liveRun?.state === "running" ? " · 运行中" : liveRun?.state === "cancelling" ? " · 中断中" : ""}`}</span>
+            <HistoryWorkbench
+              homeId={homeId}
+              thread={thread}
+              title={title}
+              homes={homeOptions}
+              preference={preference}
+              preferenceSaving={preferenceSaving}
+              preferenceError={preferencesError}
+              onPreferencePatch={onPreferencePatch}
+              messages={selectableMessages}
+              selectedMessageIds={selectedMessageIds}
+              bookmarks={bookmarks}
+              writerBusy={writerStatus?.state !== "available" || isLiveRunActive(liveRun?.state)}
+              onInsertDraft={setDraftInsertion}
+              information={<CodexThreadInfo thread={thread} homeLabel={homeLabel} />}
+              homeSwitchDisabled={homesLoading || homeSwitching || homeOptions.length < 2}
+              onSwitchHome={(nextHomeId) => { void changeThreadHome(nextHomeId); }}
+              onForwardTo={(nextTarget, text, sourceTitle) => {
+                const path = `/codex-history/${encodeURIComponent(nextTarget.homeId)}/${encodeURIComponent(nextTarget.id)}`;
+                navigate(path, {
+                  state: {
+                    historyDraftInsertion: {
+                      id: createHistoryRequestId(),
+                      text,
+                      sourceTitle,
+                    },
+                  },
+                });
+              }}
+            />
           </div>
           {busyInOtherLocation ? (
-            <div className="codex-thread-writer-status is-busy" role="status">
-              此 Codex session 正在其他位置使用。发送已暂停，释放后会自动恢复。
+            <div className="codex-thread-writer-status is-busy" role="status" title="此 Codex session 正在其他位置使用。发送已暂停，释放后会自动恢复。">
+              会话占用中，空闲后恢复发送
             </div>
           ) : writerStatus?.state === "unknown" ? (
-            <div className="codex-thread-writer-status" role="status">
-              暂时无法检测此 session 的占用情况，发送时会再检查一次。
+            <div className="codex-thread-writer-status" role="status" title="暂时无法检测此 session 的占用情况，发送时会再检查一次。">
+              暂时无法确认会话占用状态
             </div>
           ) : writerStatus === null && !loading ? (
             <div className="codex-thread-writer-status" role="status">
-              正在检查 Codex session 是否被占用…
+              正在检查会话占用…
             </div>
           ) : null}
           {runNotice ? <div className="codex-thread-run-notice" role="status">{runNotice}</div> : null}
@@ -854,7 +1085,19 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
         <div className="codex-thread-transcript">
           {loading ? <div className="empty">正在读取会话详情…</div> : null}
           {!loading && !error && detail !== null && turns.length === 0 && !liveRun ? <div className="empty">该会话没有可展示的轮次。</div> : null}
-          {!loading && (turns.length > 0 || liveRun) ? <CodexAssistantTranscript thread={thread} extraTurns={liveTurns} imagePreviews={imagePreviews} turnUsages={turnUsages} /> : null}
+          {!loading && (turns.length > 0 || liveRun) ? (
+            <CodexAssistantTranscript
+              thread={thread}
+              extraTurns={liveTurns}
+              imagePreviews={imagePreviews}
+              turnUsages={turnUsages}
+              selectableMessageIds={selectableMessageIds}
+              selectedMessageIds={selectedMessageIds}
+              bookmarks={bookmarks}
+              onToggleSelectedMessage={toggleSelectedMessage}
+              onToggleBookmark={toggleBookmark}
+            />
+          ) : null}
         </div>
         <div className="codex-history-composer-slot" hidden={busyInOtherLocation}>
           <CodexHistoryMessageComposer
@@ -869,7 +1112,10 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
             modelCatalogAvailable={detail?.models !== undefined}
             currentModel={thread.model}
             currentReasoningEffort={thread.reasoningEffort}
+            steerEnabled={liveRun?.interactive === true}
+            draftInsertion={draftInsertion}
             onSubmit={submitMessage}
+            onSteer={steerRun}
             onInterrupt={() => void interruptRun()}
             onAttachmentError={(message) => setError(message)}
             onScrollToTop={() => scrollCodexTranscript("top")}
@@ -893,19 +1139,9 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
 }
 
 function CodexThreadInfo({ thread, homeLabel }: { thread: CodexThread; homeLabel: string }): ReactElement {
-  const [open, setOpen] = useState(false);
   const path = thread.cwd || thread.path || "—";
   return (
-    <>
-      <button
-        className={`codex-thread-info-trigger${open ? " is-open" : ""}`}
-        type="button"
-        aria-label={open ? "收起会话信息" : "展开会话信息"}
-        aria-expanded={open}
-        title={open ? "收起会话信息" : "展开会话信息"}
-        onClick={() => setOpen((current) => !current)}
-      >›</button>
-      {open ? <div className="codex-thread-info-panel">
+      <div className="codex-thread-info-panel">
         <div className="codex-thread-info-row">
           <span className="codex-home-pill">{homeLabel}</span>
           <span className="badge codex-status-badge">{statusLabel(thread)}</span>
@@ -918,8 +1154,7 @@ function CodexThreadInfo({ thread, homeLabel }: { thread: CodexThread; homeLabel
           <span>创建 {formatCodexTime(thread.createdAt)}</span>
           <code title={thread.id}>{thread.id}</code>
         </div>
-      </div> : null}
-    </>
+      </div>
   );
 }
 
@@ -931,6 +1166,7 @@ interface LiveThreadRun {
   cursor: number;
   turnIndex: number;
   items: unknown[];
+  interactive?: boolean;
   usage?: CodexHistoryTurnUsage;
 }
 
@@ -1013,11 +1249,21 @@ function CodexAssistantTranscript({
   extraTurns = [],
   imagePreviews = {},
   turnUsages = {},
+  selectableMessageIds,
+  selectedMessageIds,
+  bookmarks,
+  onToggleSelectedMessage,
+  onToggleBookmark,
 }: {
   thread: CodexThread;
   extraTurns?: unknown[];
   imagePreviews?: Record<number, CodexImagePreview[]>;
   turnUsages?: Record<number, CodexHistoryTurnUsage>;
+  selectableMessageIds: ReadonlySet<string>;
+  selectedMessageIds: ReadonlySet<string>;
+  bookmarks: ReadonlySet<string>;
+  onToggleSelectedMessage: (messageId: string) => void;
+  onToggleBookmark: (messageId: string) => void;
 }): ReactElement {
   const messages = useMemo(
     () => buildCodexMessages(thread, extraTurns, imagePreviews, turnUsages),
@@ -1036,9 +1282,20 @@ function CodexAssistantTranscript({
       <ThreadPrimitive.Root className="codex-assistant-thread">
         <ThreadPrimitive.Viewport autoScroll={false} className="codex-assistant-viewport">
           <ThreadPrimitive.Messages>
-            {({ message }) => message.role === "user"
-              ? <CodexAssistantUserMessage />
-              : <CodexAssistantMessage />}
+            {({ message }) => {
+              const messageId = message.id;
+              const actions = {
+                messageId,
+                showActions: selectableMessageIds.has(messageId),
+                selected: selectedMessageIds.has(messageId),
+                bookmarked: bookmarks.has(messageId),
+                onToggleSelected: onToggleSelectedMessage,
+                onToggleBookmark,
+              };
+              return message.role === "user"
+                ? <CodexAssistantUserMessage {...actions} />
+                : <CodexAssistantMessage {...actions} />;
+            }}
           </ThreadPrimitive.Messages>
         </ThreadPrimitive.Viewport>
       </ThreadPrimitive.Root>
@@ -1046,9 +1303,25 @@ function CodexAssistantTranscript({
   );
 }
 
-function CodexAssistantUserMessage(): ReactElement {
+function CodexAssistantUserMessage({ messageId, showActions, selected, bookmarked, onToggleSelected, onToggleBookmark }: {
+  messageId: string;
+  showActions: boolean;
+  selected: boolean;
+  bookmarked: boolean;
+  onToggleSelected: (messageId: string) => void;
+  onToggleBookmark: (messageId: string) => void;
+}): ReactElement {
   return (
-    <MessagePrimitive.Root className="codex-assistant-message codex-assistant-user-message">
+    <MessagePrimitive.Root id={messageId} className={`codex-assistant-message codex-assistant-user-message${showActions ? " has-message-actions" : ""}`}>
+      {showActions ? (
+        <HistoryMessageActions
+          messageId={messageId}
+          selected={selected}
+          bookmarked={bookmarked}
+          onToggleSelected={onToggleSelected}
+          onToggleBookmark={onToggleBookmark}
+        />
+      ) : null}
       <MessagePrimitive.Parts
         components={{
           data: {
@@ -1074,9 +1347,25 @@ function CodexImagesPart({ data }: { data: { images: CodexImagePreview[] } }): R
   );
 }
 
-function CodexAssistantMessage(): ReactElement {
+function CodexAssistantMessage({ messageId, showActions, selected, bookmarked, onToggleSelected, onToggleBookmark }: {
+  messageId: string;
+  showActions: boolean;
+  selected: boolean;
+  bookmarked: boolean;
+  onToggleSelected: (messageId: string) => void;
+  onToggleBookmark: (messageId: string) => void;
+}): ReactElement {
   return (
-    <MessagePrimitive.Root className="codex-assistant-message codex-assistant-agent-message">
+    <MessagePrimitive.Root id={messageId} className={`codex-assistant-message codex-assistant-agent-message${showActions ? " has-message-actions" : ""}`}>
+      {showActions ? (
+        <HistoryMessageActions
+          messageId={messageId}
+          selected={selected}
+          bookmarked={bookmarked}
+          onToggleSelected={onToggleSelected}
+          onToggleBookmark={onToggleBookmark}
+        />
+      ) : null}
       <MessagePrimitive.Parts
         components={{
           Text: CodexMarkdownText,
@@ -1556,4 +1845,21 @@ function stringValue(value: unknown): string | undefined {
   if (typeof value === "string" && value) return value;
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
   return undefined;
+}
+
+function readHistoryDraftInsertion(value: unknown): HistoryDraftInsertion | null {
+  const record = asRecord(value);
+  if (typeof record.id !== "string" || typeof record.text !== "string") return null;
+  return {
+    id: record.id,
+    text: record.text,
+    ...(typeof record.model === "string" ? { model: record.model } : {}),
+    ...(typeof record.reasoningEffort === "string" ? { reasoningEffort: record.reasoningEffort } : {}),
+  };
+}
+
+function createHistoryRequestId(): string {
+  return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }

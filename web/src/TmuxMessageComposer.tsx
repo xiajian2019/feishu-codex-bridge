@@ -20,7 +20,7 @@ import {
   logDebugDiagnostic,
   subscribeDebugLogCapture,
 } from "./debug-log-capture.js";
-import { fetchShortcutConfig, recordShortcutUse, watchRemoteShortcutConfig } from "./api.js";
+import { fetchShortcutConfig, getActionToken, recordShortcutUse, watchRemoteShortcutConfig } from "./api.js";
 import { readShortcutConfigCache, subscribeShortcutConfigInvalidation } from "./shortcut-config-cache.js";
 import {
   type ShortcutCategory,
@@ -155,6 +155,7 @@ async function uploadAttachment(file: File): Promise<string> {
     headers: {
       "content-type": file.type || "application/octet-stream",
       "x-file-name": encodeURIComponent(file.name),
+      "X-Bridge-Action-Token": await getActionToken(),
     },
     body: file,
   });
@@ -766,7 +767,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
   const renderComposerAction = (shortcut: ShortcutDefinition): ReactElement | null => {
     const track = (): void => { void handleShortcutUse(shortcut.id); };
     const terminalAction = (value: string): ReactElement => (
-      <button key={shortcut.id} className="dashboard-keybar-button is-icon" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.title} disabled={controlsDisabled} onClick={() => { track(); void onTerminalShortcut(value as TerminalShortcut); }}>{shortcut.title}</button>
+      <button key={shortcut.id} className="dashboard-keybar-button is-icon" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.detail || shortcut.title} disabled={controlsDisabled} onClick={() => { track(); void onTerminalShortcut(value as TerminalShortcut); }}>{shortcut.title}</button>
     );
     switch (shortcut.actionKey) {
       case "attachment":
@@ -788,6 +789,14 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
       case "terminal-down":
       case "terminal-enter":
         return terminalAction(shortcut.value);
+      case "terminal-answer":
+        return terminalAction("codex-answer");
+      case "terminal-prompt-back":
+        return terminalAction("codex-prompt-back");
+      case "terminal-warnings":
+        return terminalAction("codex-warnings");
+      case "codex-panel":
+        return <button key={shortcut.id} className="dashboard-keybar-button" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.detail || shortcut.title} aria-expanded={shortcutsOpen && shortcutCategory === "codex-tui"} disabled={controlsDisabled} onClick={() => { track(); openShortcutPalette("codex-tui"); }}>{shortcut.title}</button>;
       case "keyboard-panel":
         return <button key={shortcut.id} className="dashboard-keybar-button is-keyboard" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.title} aria-expanded={shortcutsOpen} disabled={controlsDisabled} onClick={() => { track(); openShortcutPalette("keyboard"); }}>⌨</button>;
       case "ctrl-panel":

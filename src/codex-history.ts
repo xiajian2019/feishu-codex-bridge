@@ -28,6 +28,13 @@ import {
   type CodexThreadSortKey,
   type CodexThreadSourceKind,
 } from "./codex-app-server.js";
+import {
+  CodexAppServerInteractiveProcess,
+  type CodexAppServerInteractiveAction,
+  type CodexAppServerInteractiveActionResponse,
+  type CodexAppServerInteractiveClient,
+  type CodexAppServerInteractiveEvent,
+} from "./codex-interactive.js";
 import { unlinkOwnedCodexHistoryAttachment } from "./codex-history-attachments.js";
 import type { Logger } from "./types.js";
 
@@ -246,6 +253,25 @@ export interface CodexHistoryMessageInput {
   model?: string;
   reasoningEffort?: CodexHistoryReasoningEffort;
   idempotencyKey?: string;
+  /** Opt in to a bidirectional local app-server run for approvals and questions. */
+  interactive?: boolean;
+}
+
+export type CodexHistoryActionResponse = CodexAppServerInteractiveActionResponse;
+
+export interface CodexHistoryPendingAction extends CodexAppServerInteractiveAction {
+  homeId: string;
+  threadId: string;
+  runId: string;
+}
+
+export interface CodexHistoryWorkbenchRun {
+  homeId: string;
+  threadId: string;
+  runId: string;
+  state: CodexHistoryRunState;
+  updatedAt: number;
+  error?: string;
 }
 
 export type CodexHistoryWriterState = "available" | "busy" | "unknown";
@@ -260,6 +286,7 @@ export interface CodexHistoryWriterStatus {
     state: "running" | "cancelling";
     cursor: number;
     turnIndex: number;
+    interactive?: boolean;
   };
 }
 
@@ -342,6 +369,10 @@ export interface CodexHistoryServiceOptions {
   logger?: Logger;
   createClient?: (home: ResolvedCodexHistoryHome) => CodexAppServerQueryClient;
   createAgent?: (home: CodexHistoryHome, environment: Record<string, string>) => CodexHistoryAgent;
+  createInteractiveClient?: (
+    home: CodexHistoryHome,
+    environment: Record<string, string>,
+  ) => CodexAppServerInteractiveClient;
   attachmentsDirectory?: string;
   /** How long completed run attachments remain available for preview. Defaults to 24 hours. */
   attachmentRetentionMs?: number;
@@ -378,9 +409,12 @@ interface LiveCodexHistoryRun {
   attachments: StagedCodexHistoryAttachment[];
   model?: string;
   reasoningEffort?: CodexHistoryReasoningEffort;
+  interactive?: boolean;
+  actions: Map<string, CodexHistoryPendingAction>;
   usage?: CodexHistoryTurnUsage;
   createdAt: number;
   updatedAt: number;
+  lastPersistedAt?: number;
   finishedAt?: number;
   expiryTimer?: ReturnType<typeof setTimeout>;
   abortController: AbortController;
@@ -402,6 +436,7 @@ interface PreparedCodexHistoryMessage {
   turnIndex: number;
   model?: string;
   reasoningEffort?: CodexHistoryReasoningEffort;
+  interactive?: boolean;
   requestFingerprint: string;
   idempotencyKeyHash?: string;
 }
@@ -424,6 +459,7 @@ export class CodexHistoryService {
   private readonly now: () => number;
   private readonly stagedAttachments = new Map<string, StagedCodexHistoryAttachment>();
   private readonly liveRuns = new Map<string, LiveCodexHistoryRun>();
+  private readonly interactiveClients = new Map<string, CodexAppServerInteractiveClient>();
   /** Set only after the directory is created; cleanup is limited to this physical root. */
   private attachmentRootRealPath?: string;
   private readonly modelCatalogCache = new Map<string, { expiresAt: number; models: CodexHistoryModelOption[] }>();
@@ -517,9 +553,11 @@ export class CodexHistoryService {
       attachments,
       ...(persisted.model ? { model: persisted.model } : {}),
       ...(persisted.reasoningEffort ? { reasoningEffort: persisted.reasoningEffort } : {}),
+      actions: new Map(),
       ...(persisted.usage ? { usage: persisted.usage } : {}),
       createdAt: persisted.createdAt,
       updatedAt: persisted.updatedAt,
+      lastPersistedAt: persisted.updatedAt,
       ...(finishedAt === undefined ? {} : { finishedAt }),
       abortController: new AbortController(),
       state,
@@ -542,9 +580,10 @@ export class CodexHistoryService {
   }
 
   private persistRun(run: LiveCodexHistoryRun): void {
+    run.updatedAt = this.now();
+    run.lastPersistedAt = run.updatedAt;
     const store = this.options.runStore;
     if (!store) return;
-    run.updatedAt = this.now();
     try {
       store.saveCodexHistoryRun(toStoredCodexHistoryRun(run));
     } catch (error) {
@@ -677,57 +716,30 @@ export class CodexHistoryService {
       };
     }
 
-    let account: CodexHistoryUsageAccount;
-    if (cached?.snapshotDate === snapshotDate) {
-      account = await this.readCachedUsageAccount(home, cached, checkedAt);
-    } else {
-      const existingRefresh = this.usageRefreshes.get(home.id);
-      if (existingRefresh) {
-        account = await existingRefresh;
-      } else {
-        const refresh = this.refreshUsageAccount(home, snapshotDate, checkedAt, cached);
-        this.usageRefreshes.set(home.id, refresh);
-        try {
-          account = await refresh;
-        } finally {
-          if (this.usageRefreshes.get(home.id) === refresh) this.usageRefreshes.delete(home.id);
-        }
-      }
-    }
+    const existingRead = this.usageRefreshes.get(home.id);
+    if (existingRead) return existingRead;
 
-    return account;
+    const read = cached?.snapshotDate === snapshotDate
+      ? this.readCachedUsageAccount(home, cached, checkedAt, snapshotDate)
+      : this.refreshUsageAccount(home, snapshotDate, checkedAt, cached);
+    this.usageRefreshes.set(home.id, read);
+    try {
+      return await read;
+    } finally {
+      if (this.usageRefreshes.get(home.id) === read) this.usageRefreshes.delete(home.id);
+    }
   }
 
   private async readCachedUsageAccount(
     home: ResolvedCodexHistoryHome,
     snapshot: CodexHistoryUsageSnapshot,
     checkedAt: string,
+    snapshotDate: string,
   ): Promise<CodexHistoryUsageAccount> {
-    let client: CodexAppServerQueryClient | null = null;
-    try {
-      client = this.createClient(home);
-      if (!client.readAccountRateLimits) throw new Error("account/rateLimits/read is unavailable");
-      const quota = publicQuotaResponse(await client.readAccountRateLimits());
-      return {
-        homeId: home.id,
-        label: home.label,
-        available: true,
-        checkedAt,
-        quota,
-        ...this.accountUsageFromSnapshot(home, snapshot, false),
-      };
-    } catch {
-      return {
-        homeId: home.id,
-        label: home.label,
-        available: true,
-        checkedAt,
-        errors: { quota: "读取额度失败，请确认该账户的 Codex 登录状态和网络连接。" },
-        ...this.accountUsageFromSnapshot(home, snapshot, false),
-      };
-    } finally {
-      if (client) await client.close().catch(() => undefined);
-    }
+    // Codex may backfill or revise a previously returned daily bucket. Read
+    // token usage again even when the latest snapshot is from today; the
+    // persistence layer remains the fallback if the RPC fails.
+    return this.refreshUsageAccount(home, snapshotDate, checkedAt, snapshot);
   }
 
   private async refreshUsageAccount(
@@ -825,8 +837,13 @@ export class CodexHistoryService {
     } catch {
       // The snapshot still carries its original daily buckets.
     }
-    const dailyBuckets = new Map(storedBuckets.map((bucket) => [bucket.startDate, bucket.tokens]));
-    for (const bucket of snapshot.tokenUsage.dailyUsageBuckets ?? []) {
+    // The app-server response is authoritative when available. Stored rows
+    // only fill dates omitted by a response or retained for offline fallback;
+    // they must not shadow a later server-side backfill.
+    const dailyBuckets = new Map(
+      (snapshot.tokenUsage.dailyUsageBuckets ?? []).map((bucket) => [bucket.startDate, bucket.tokens]),
+    );
+    for (const bucket of storedBuckets) {
       if (!dailyBuckets.has(bucket.startDate)) dailyBuckets.set(bucket.startDate, bucket.tokens);
     }
     const tokenUsage: CodexAccountTokenUsageResponse = {
@@ -1052,6 +1069,9 @@ export class CodexHistoryService {
     if (input.model !== undefined && typeof input.model !== "string") {
       throw new Error("model must be a string");
     }
+    if (input.interactive !== undefined && typeof input.interactive !== "boolean") {
+      throw new Error("interactive must be a boolean");
+    }
     const text = input.text.trim();
     const model = input.model?.trim();
     if (model && (model.length > 128 || /[\r\n]/.test(model))) {
@@ -1084,6 +1104,7 @@ export class CodexHistoryService {
       turnIndex,
       model: model || undefined,
       reasoningEffort: input.reasoningEffort,
+      ...(input.interactive === true ? { interactive: true } : {}),
     });
     const idempotencyKey = input.idempotencyKey?.trim();
     if (idempotencyKey && !this.options.runStore) {
@@ -1100,6 +1121,7 @@ export class CodexHistoryService {
       turnIndex,
       ...(model ? { model } : {}),
       ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+      ...(input.interactive === true ? { interactive: true } : {}),
       requestFingerprint,
       ...(idempotencyKeyHash ? { idempotencyKeyHash } : {}),
     };
@@ -1113,7 +1135,7 @@ export class CodexHistoryService {
 
   private async submitPreparedMessage(prepared: PreparedCodexHistoryMessage): Promise<CodexHistoryMessageResponse> {
     await this.cleanupExpiredAttachments();
-    const { home, threadId, text, attachmentIds, turnIndex, model, reasoningEffort } = prepared;
+    const { home, threadId, text, attachmentIds, turnIndex, model, reasoningEffort, interactive } = prepared;
     const threadKey = makeThreadKey(home.id, threadId);
     const store = this.options.runStore;
     const keyHash = prepared.idempotencyKeyHash;
@@ -1199,8 +1221,11 @@ export class CodexHistoryService {
         attachments: resolvedAttachments,
         ...(model ? { model } : {}),
         ...(reasoningEffort ? { reasoningEffort } : {}),
+        ...(interactive ? { interactive: true } : {}),
+        actions: new Map(),
         createdAt: now,
         updatedAt: now,
+        lastPersistedAt: now,
         abortController: new AbortController(),
         state: "running",
         cursor: 0,
@@ -1273,6 +1298,110 @@ export class CodexHistoryService {
     };
   }
 
+  /** Return action snapshots for every current or recently completed History run. */
+  public listPendingActions(): CodexHistoryPendingAction[] {
+    return [...this.liveRuns.values()]
+      .flatMap((run) => [...run.actions.values()])
+      .map((action) => ({ ...action, payload: structuredClone(action.payload) }));
+  }
+
+  public getPendingActions(homeId: string, threadId: string): CodexHistoryPendingAction[] {
+    const normalizedThreadId = threadId.trim();
+    if (!normalizedThreadId) throw new Error("threadId is required");
+    return this.listPendingActions().filter((action) =>
+      action.homeId === homeId && action.threadId === normalizedThreadId && action.status === "pending");
+  }
+
+  /** Snapshot run state for the Workbench's periodic notification reconciler. */
+  public listWorkbenchRuns(): CodexHistoryWorkbenchRun[] {
+    return [...this.liveRuns.values()]
+      .map((run) => ({
+        homeId: run.homeId,
+        threadId: run.threadId,
+        runId: run.runId,
+        state: run.state,
+        updatedAt: run.updatedAt,
+        ...(run.error ? { error: run.error } : {}),
+      }))
+      .sort((left, right) => right.updatedAt - left.updatedAt || left.runId.localeCompare(right.runId));
+  }
+
+  public async respondAction(
+    homeId: string,
+    threadId: string,
+    runId: string,
+    actionId: string,
+    response: CodexHistoryActionResponse,
+  ): Promise<{ ok: true; status: "responded" }> {
+    const normalizedThreadId = threadId.trim();
+    const normalizedRunId = runId.trim();
+    const normalizedActionId = actionId.trim();
+    const run = this.liveRuns.get(normalizedRunId);
+    if (!normalizedThreadId || !normalizedRunId || !normalizedActionId
+      || !run
+      || run.homeId !== homeId
+      || run.threadId !== normalizedThreadId
+      || !run.interactive) {
+      throw new Error("找不到与该 action 绑定的原生 History run。");
+    }
+    if (!isActiveRun(run.state)) throw new Error("该 Codex action 已过期。");
+    const action = run.actions.get(normalizedActionId);
+    if (!action || action.status !== "pending") throw new Error("该 Codex action 已过期或已响应。");
+    const client = this.interactiveClients.get(normalizedRunId);
+    if (!client) throw new Error("该 Codex action 所属的 app-server run 已结束。");
+    await client.respondAction(normalizedActionId, response);
+    return { ok: true, status: "responded" };
+  }
+
+  public async forkThread(
+    homeId: string,
+    threadId: string,
+    options: { lastTurnId?: string } = {},
+  ): Promise<{ homeId: string; threadId: string }> {
+    const normalizedThreadId = threadId.trim();
+    if (!normalizedThreadId) throw new Error("threadId is required");
+    const home = this.resolveHomes().find((candidate) => candidate.id === homeId);
+    if (!home) throw new Error(`找不到 Codex home：${homeId}`);
+    if (!home.available) throw new Error(`Codex home 不可用：${home.path}`);
+    const lastTurnId = options.lastTurnId?.trim();
+    if (options.lastTurnId !== undefined && (!lastTurnId || lastTurnId.length > 200)) {
+      throw new Error("lastTurnId must contain 1 to 200 characters");
+    }
+    const source = await this.readThread(homeId, normalizedThreadId, false);
+    if (source.thread.id !== normalizedThreadId) throw new Error("Codex app-server returned a different source thread.");
+    const client = this.createInteractiveClient(home);
+    try {
+      const forkedThreadId = await client.forkThread(normalizedThreadId, lastTurnId);
+      return { homeId, threadId: forkedThreadId };
+    } finally {
+      await client.close();
+    }
+  }
+
+  public async steerMessage(
+    homeId: string,
+    threadId: string,
+    runId: string,
+    text: string,
+  ): Promise<{ runId: string; threadId: string; turnId: string }> {
+    const normalizedThreadId = threadId.trim();
+    const normalizedRunId = runId.trim();
+    const normalizedText = text.trim();
+    const run = this.liveRuns.get(normalizedRunId);
+    if (!normalizedThreadId || !normalizedRunId || !normalizedText
+      || !run
+      || run.homeId !== homeId
+      || run.threadId !== normalizedThreadId
+      || !run.interactive
+      || !isActiveRun(run.state)) {
+      throw new Error("只能向该线程当前由本服务运行的原生 Codex turn 追加消息。");
+    }
+    const client = this.interactiveClients.get(normalizedRunId);
+    if (!client) throw new Error("该 Codex run 已结束，无法 steer。");
+    const turnId = await client.steer(normalizedText);
+    return { runId: normalizedRunId, threadId: normalizedThreadId, turnId };
+  }
+
   public interruptMessage(
     homeId: string,
     threadId: string,
@@ -1337,6 +1466,7 @@ export class CodexHistoryService {
           state: localRun.state,
           cursor: localRun.cursor,
           turnIndex: localRun.turnIndex,
+          interactive: localRun.interactive === true,
         },
       };
     }
@@ -1561,6 +1691,24 @@ export class CodexHistoryService {
     });
   }
 
+  private createInteractiveClient(home: ResolvedCodexHistoryHome): CodexAppServerInteractiveClient {
+    const environment = { ...(this.options.environment ?? {}) };
+    environment.CODEX_HOME = home.path;
+    if (home.sqliteHome) environment.CODEX_SQLITE_HOME = home.sqliteHome;
+    else delete environment.CODEX_SQLITE_HOME;
+    if (this.options.createInteractiveClient) {
+      return this.options.createInteractiveClient(toPublicHome(home), environment);
+    }
+    return new CodexAppServerInteractiveProcess({
+      executable: this.options.executable,
+      cwd: this.options.cwd,
+      env: environment,
+      requestTimeoutMs: this.options.requestTimeoutMs,
+      clientName: "feishu_codex_bridge_history_interactive",
+      clientTitle: "Feishu Codex Bridge (interactive history)",
+    });
+  }
+
   private async readModelCatalog(
     home: ResolvedCodexHistoryHome,
     client: CodexAppServerQueryClient,
@@ -1603,39 +1751,43 @@ export class CodexHistoryService {
     attachments: StagedCodexHistoryAttachment[],
   ): Promise<void> {
     try {
-      const agent = this.createAgent(home);
-      const directories = [...new Set(attachments.map((attachment) => dirname(attachment.localPath)))];
-      const threadOptions: ThreadOptions = {
-        ...(run.workingDirectory ? { workingDirectory: run.workingDirectory } : {}),
-        ...(directories.length > 0 ? { additionalDirectories: directories } : {}),
-        ...(run.model ? { model: run.model } : {}),
-        // model/list is authoritative for the configured Codex executable; the SDK declaration can lag new effort values.
-        ...(run.reasoningEffort
-          ? { modelReasoningEffort: run.reasoningEffort as NonNullable<ThreadOptions["modelReasoningEffort"]> }
-          : {}),
-      };
-      const thread = agent.resumeThread(
-        run.threadId,
-        Object.keys(threadOptions).length > 0 ? threadOptions : undefined,
-      );
-      const { events } = await thread.runStreamed(
-        buildCodexInput(run.userText, attachments),
-        { signal: run.abortController.signal },
-      );
-      for await (const event of events) {
-        this.recordLiveEvent(run, event);
-        if (event.type === "turn.failed") {
-          throw new Error(event.error.message || "Codex turn failed");
+      if (run.interactive) {
+        await this.runInteractiveMessage(home, run, attachments);
+      } else {
+        const agent = this.createAgent(home);
+        const directories = [...new Set(attachments.map((attachment) => dirname(attachment.localPath)))];
+        const threadOptions: ThreadOptions = {
+          ...(run.workingDirectory ? { workingDirectory: run.workingDirectory } : {}),
+          ...(directories.length > 0 ? { additionalDirectories: directories } : {}),
+          ...(run.model ? { model: run.model } : {}),
+          // model/list is authoritative for the configured Codex executable; the SDK declaration can lag new effort values.
+          ...(run.reasoningEffort
+            ? { modelReasoningEffort: run.reasoningEffort as NonNullable<ThreadOptions["modelReasoningEffort"]> }
+            : {}),
+        };
+        const thread = agent.resumeThread(
+          run.threadId,
+          Object.keys(threadOptions).length > 0 ? threadOptions : undefined,
+        );
+        const { events } = await thread.runStreamed(
+          buildCodexInput(run.userText, attachments),
+          { signal: run.abortController.signal },
+        );
+        for await (const event of events) {
+          this.recordLiveEvent(run, event);
+          if (event.type === "turn.failed") {
+            throw new Error(event.error.message || "Codex turn failed");
+          }
+          if (event.type === "error") {
+            throw new Error(event.message || "Codex event stream failed");
+          }
         }
-        if (event.type === "error") {
-          throw new Error(event.message || "Codex event stream failed");
+        if (run.abortController.signal.aborted && run.state !== "completed") {
+          run.state = "cancelled";
+          run.error = "Codex 执行已由用户中断。";
+        } else if (run.state === "running") {
+          run.state = "completed";
         }
-      }
-      if (run.abortController.signal.aborted && run.state !== "completed") {
-        run.state = "cancelled";
-        run.error = "Codex 执行已由用户中断。";
-      } else if (run.state === "running") {
-        run.state = "completed";
       }
     } catch (error) {
       if (run.abortController.signal.aborted) {
@@ -1656,7 +1808,98 @@ export class CodexHistoryService {
     }
   }
 
-  private recordLiveEvent(run: LiveCodexHistoryRun, event: ThreadEvent): void {
+  private async runInteractiveMessage(
+    home: ResolvedCodexHistoryHome,
+    run: LiveCodexHistoryRun,
+    attachments: StagedCodexHistoryAttachment[],
+  ): Promise<void> {
+    const client = this.createInteractiveClient(home);
+    this.interactiveClients.set(run.runId, client);
+    let hasOriginalApprovalPolicy = false;
+    let originalApprovalPolicy: unknown;
+    try {
+      const result = await client.runTurn({
+        runId: run.runId,
+        threadId: run.threadId,
+        input: buildCodexAppServerInput(run.userText, attachments),
+        ...(run.workingDirectory ? { cwd: run.workingDirectory } : {}),
+        ...(run.model ? { model: run.model } : {}),
+        ...(run.reasoningEffort ? { effort: run.reasoningEffort } : {}),
+        signal: run.abortController.signal,
+        onApprovalPolicy: (policy) => {
+          originalApprovalPolicy = structuredClone(policy);
+          hasOriginalApprovalPolicy = true;
+        },
+        onEvent: (event) => this.recordLiveEvent(run, event),
+        onAction: (action) => {
+          const publicAction: CodexHistoryPendingAction = {
+            ...action,
+            homeId: run.homeId,
+            threadId: run.threadId,
+            runId: run.runId,
+          };
+          run.actions.set(action.id, publicAction);
+        },
+        onActionStatus: (actionId, status) => {
+          const action = run.actions.get(actionId);
+          if (action) action.status = status;
+        },
+      });
+      if (result.status === "failed") {
+        run.state = "failed";
+        run.error = result.error || "Codex turn failed";
+      } else if (result.status === "interrupted") {
+        run.state = run.abortController.signal.aborted ? "cancelled" : "interrupted";
+        run.error = run.abortController.signal.aborted
+          ? "Codex 执行已由用户中断。"
+          : "Codex turn was interrupted.";
+      } else if (run.state === "running") {
+        run.state = "completed";
+      }
+    } finally {
+      if (hasOriginalApprovalPolicy) {
+        let restoreFailure: unknown;
+        try {
+          await client.restoreApprovalPolicy(run.threadId, originalApprovalPolicy);
+        } catch {
+          try {
+            const recoveryClient = this.createInteractiveClient(home);
+            try {
+              await recoveryClient.restoreApprovalPolicy(run.threadId, originalApprovalPolicy);
+            } catch (error) {
+              restoreFailure = error;
+            } finally {
+              await recoveryClient.close().catch(() => undefined);
+            }
+          } catch (error) {
+            restoreFailure = error;
+          }
+        }
+        if (restoreFailure) {
+          const message = restoreFailure instanceof Error ? restoreFailure.message : String(restoreFailure);
+          run.error = run.error
+            ? `${run.error}\n恢复原 Codex approval policy 失败：${message}`
+            : `恢复原 Codex approval policy 失败：${message}`;
+          this.options.logger?.warn("failed to restore Codex History approval policy", {
+            threadId: run.threadId,
+            error: message,
+          });
+        }
+      }
+      for (const action of run.actions.values()) {
+        if (action.status === "pending") action.status = "expired";
+      }
+      if (this.interactiveClients.get(run.runId) === client) this.interactiveClients.delete(run.runId);
+      await client.close().catch((error) => {
+        this.options.logger?.warn("failed to close Codex History interactive app-server", {
+          runId: run.runId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+  }
+
+  private recordLiveEvent(run: LiveCodexHistoryRun, event: ThreadEvent | CodexAppServerInteractiveEvent): void {
     const record = asRecord(event);
     const type = typeof record.type === "string" ? record.type : "codex.event";
     const item = record.item;
@@ -1673,10 +1916,23 @@ export class CodexHistoryService {
     run.events.push(update);
     if (run.events.length > 2_000) run.events.shift();
     const itemRecord = asRecord(item);
-    if (itemRecord.type === "agent_message" && typeof itemRecord.text === "string") {
+    if ((itemRecord.type === "agent_message" || itemRecord.type === "agentMessage")
+      && typeof itemRecord.text === "string") {
       run.finalResponse = itemRecord.text;
     }
-    if (type === "turn.completed") run.state = "completed";
+    if (type === "turn.completed") {
+      const turnStatus = asRecord(record.turn).status;
+      if (turnStatus === "failed") {
+        run.state = "failed";
+        const error = asRecord(asRecord(record.turn).error);
+        run.error = typeof error.message === "string" ? error.message : "Codex turn failed";
+      } else if (turnStatus === "interrupted") {
+        run.state = run.abortController.signal.aborted ? "cancelled" : "interrupted";
+        run.error = run.abortController.signal.aborted ? "Codex 执行已由用户中断。" : "Codex turn was interrupted.";
+      } else {
+        run.state = "completed";
+      }
+    }
     if (type === "turn.failed" || type === "error") {
       run.state = "failed";
       const error = asRecord(record.error);
@@ -1684,7 +1940,10 @@ export class CodexHistoryService {
         ? error.message
         : typeof record.message === "string" ? record.message : "Codex turn failed";
     }
-    if (run.state === "completed" || run.state === "failed" || this.now() - run.updatedAt >= 1_000) {
+    const now = this.now();
+    const lastPersistedAt = run.lastPersistedAt ?? run.updatedAt;
+    run.updatedAt = now;
+    if (run.state === "completed" || run.state === "failed" || now - lastPersistedAt >= 1_000) {
       this.persistRun(run);
     }
   }
@@ -2130,6 +2389,7 @@ function fingerprintCodexHistoryMessage(input: {
   turnIndex: number;
   model?: string;
   reasoningEffort?: string;
+  interactive?: boolean;
 }): string {
   return createHash("sha256").update(JSON.stringify({
     text: input.text,
@@ -2137,6 +2397,7 @@ function fingerprintCodexHistoryMessage(input: {
     turnIndex: input.turnIndex,
     model: input.model ?? "",
     reasoningEffort: input.reasoningEffort ?? "",
+    ...(input.interactive === true ? { interactive: true } : {}),
   })).digest("hex");
 }
 
@@ -2210,6 +2471,20 @@ function buildCodexInput(text: string, attachments: StagedCodexHistoryAttachment
     path: attachment.localPath,
   }));
   return [{ type: "text", text: prompt }, ...images];
+}
+
+function buildCodexAppServerInput(
+  text: string,
+  attachments: StagedCodexHistoryAttachment[],
+): Array<Record<string, unknown>> {
+  const sdkInput = buildCodexInput(text, attachments) as UserInput[];
+  return sdkInput.map((value) => {
+    const input = asRecord(value);
+    if (input.type === "local_image" && typeof input.path === "string") {
+      return { type: "localImage", path: input.path };
+    }
+    return { type: "text", text: typeof input.text === "string" ? input.text : "" };
+  });
 }
 
 function escapePromptAttribute(value: string): string {

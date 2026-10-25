@@ -295,6 +295,8 @@ describe("DashboardServer", () => {
       createdAt: 1,
     }];
     const createdSessionDirectories: string[] = [];
+    let codexHomeDiscoveries = 0;
+    let listSessionsCalls = 0;
     const dashboardApi = new TmuxDashboardApi({
       db,
       operations: {
@@ -304,7 +306,15 @@ describe("DashboardServer", () => {
         },
         findSession: async () => undefined,
         killSession: async () => undefined,
-        listSessions: async () => sessions,
+        listSessions: async () => {
+          listSessionsCalls += 1;
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+          return sessions;
+        },
+      },
+      discoverCodexHomes: () => {
+        codexHomeDiscoveries += 1;
+        return [{ id: "test-home", label: "测试账号", path: directory, available: true }];
       },
     });
     const bridge = new DashboardServer({
@@ -323,13 +333,47 @@ describe("DashboardServer", () => {
       projects: [{ name: "food", root: directory }],
     });
 
+    const actionToken = (await (await fetch(bridgeUrl + "/api/session")).json() as { actionToken: string }).actionToken;
     const createSessionResponse = await fetch(bridgeUrl + "/tmux-dashboard/api/sessions", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": actionToken, Origin: bridgeUrl },
       body: JSON.stringify({ name: "db-session", projectKey: "food" }),
     });
     expect(createSessionResponse.status).toBe(201);
     expect(createdSessionDirectories).toEqual([directory]);
+
+    const concurrentSessionResponses = await Promise.all([
+      fetch(bridgeUrl + "/tmux-dashboard/api/sessions?includeHomes=0"),
+      fetch(bridgeUrl + "/tmux-dashboard/api/sessions?includeHomes=0"),
+    ]);
+    expect(concurrentSessionResponses.map((response) => response.status)).toEqual([200, 200]);
+    expect(listSessionsCalls).toBe(1);
+
+    const fastSessionsResponse = await fetch(bridgeUrl + "/tmux-dashboard/api/sessions?includeHomes=0");
+    expect(fastSessionsResponse.status).toBe(200);
+    expect(await fastSessionsResponse.json()).toEqual({
+      sessions: sessions.map((session) => ({
+        ...session,
+        codexHomeId: null,
+        workspaceId: null,
+        taskGuid: null,
+        workspaceBranch: null,
+        workspaceStatus: null,
+        endedAt: null,
+        openCount: 0,
+        lastOpenedAt: null,
+      })),
+    });
+    expect(codexHomeDiscoveries).toBe(0);
+
+    const homesResponse = await fetch(bridgeUrl + "/tmux-dashboard/api/codex-homes");
+    expect(homesResponse.status).toBe(200);
+    expect(await homesResponse.json()).toEqual({
+      codexHomes: [{ id: "test-home", label: "测试账号", available: true }],
+    });
+    const cachedHomesResponse = await fetch(bridgeUrl + "/tmux-dashboard/api/codex-homes");
+    expect(cachedHomesResponse.status).toBe(200);
+    expect(codexHomeDiscoveries).toBe(1);
 
     const sessionsResponse = await fetch(bridgeUrl + "/tmux-dashboard/api/sessions");
     expect(sessionsResponse.status).toBe(200);
@@ -389,9 +433,10 @@ describe("DashboardServer", () => {
     const unauthorizedResponse = await fetch(bridgeUrl + "/api/auth/pairing/start", { method: "POST" });
     expect(unauthorizedResponse.status).toBe(401);
 
+    const actionToken = (await (await fetch(bridgeUrl + "/api/session", { headers: { Cookie: cookie } })).json() as { actionToken: string }).actionToken;
     const pairingResponse = await fetch(bridgeUrl + "/api/auth/pairing/start", {
       method: "POST",
-      headers: { Cookie: cookie },
+      headers: { Cookie: cookie, "X-Bridge-Action-Token": actionToken, Origin: bridgeUrl },
     });
     expect(pairingResponse.status).toBe(200);
     const pairing = await pairingResponse.json() as { pairingUrl: string; expiresAt: number };
@@ -399,13 +444,13 @@ describe("DashboardServer", () => {
     expect(pairing.expiresAt).toBeGreaterThan(Date.now());
 
     const devicesResponse = await fetch(bridgeUrl + "/api/auth/devices", { headers: { Cookie: cookie } });
-    const devices = await devicesResponse.json() as { devices: Array<{ sessionId: string; deviceName: string }> };
+    const devices = await devicesResponse.json() as { devices: Array<{ sessionId: string; deviceName: string; expiresAt: string }> };
     expect(devices.devices[0]?.deviceName).toBe("iPhone / iPad");
     const renameResponse = await fetch(
       bridgeUrl + "/api/auth/devices/" + encodeURIComponent(devices.devices[0]!.sessionId),
       {
         method: "PATCH",
-        headers: { Cookie: cookie, "Content-Type": "application/json" },
+        headers: { Cookie: cookie, "Content-Type": "application/json", "X-Bridge-Action-Token": actionToken, Origin: bridgeUrl },
         body: JSON.stringify({ deviceName: "值班 iPhone" }),
       },
     );
@@ -413,6 +458,16 @@ describe("DashboardServer", () => {
     const renamedDevicesResponse = await fetch(bridgeUrl + "/api/auth/devices", { headers: { Cookie: cookie } });
     const renamedDevices = await renamedDevicesResponse.json() as { devices: Array<{ deviceName: string }> };
     expect(renamedDevices.devices[0]?.deviceName).toBe("值班 iPhone");
+
+    const extendResponse = await fetch(
+      bridgeUrl + "/api/auth/devices/" + encodeURIComponent(devices.devices[0]!.sessionId) + "/extend",
+      { method: "POST", headers: { Cookie: cookie, "X-Bridge-Action-Token": actionToken, Origin: bridgeUrl } },
+    );
+    expect(extendResponse.status).toBe(200);
+    const extension = await extendResponse.json() as { expiresAt: string };
+    const expectedExpiry = new Date(devices.devices[0]!.expiresAt);
+    expectedExpiry.setUTCFullYear(expectedExpiry.getUTCFullYear() + 1);
+    expect(extension.expiresAt).toBe(expectedExpiry.toISOString());
   });
 
   it("lists and reads local Codex history across separate homes", async () => {

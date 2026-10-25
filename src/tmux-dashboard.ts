@@ -1,8 +1,11 @@
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
 import { getBunRuntime } from "./bun-runtime.js";
+import type { ForegroundCodexIdentity } from "./tmux-review.js";
 
 const SESSION_FORMAT = "#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_path}\t#{session_created}";
 
@@ -13,6 +16,15 @@ export interface TmuxSession {
   attachedClients: number;
   cwd: string;
   createdAt: number;
+}
+
+export interface TmuxReviewPaneSnapshot {
+  paneId: string;
+  panePid: number;
+  paneTty: string;
+  currentCommand: string;
+  cwd: string;
+  foregroundCodex: ForegroundCodexIdentity | null;
 }
 
 export class SessionNotFoundError extends Error {}
@@ -66,6 +78,56 @@ async function runTmux(args: string[]): Promise<string> {
   return stdout.trimEnd();
 }
 
+async function runTmuxWithStdin(args: string[], input: string): Promise<void> {
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const env = { ...process.env };
+    delete env.TMUX;
+    delete env.TMUX_PANE;
+    const child = spawn("tmux", args, {
+      env,
+      stdio: ["pipe", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => { stderr = `${stderr}${chunk}`.slice(-2_000); });
+    child.once("error", rejectPromise);
+    child.once("close", (code, signal) => {
+      if (code === 0) resolvePromise();
+      else rejectPromise(new Error(stderr.trim() || `tmux ${args[0]} exited with ${code ?? signal ?? "unknown status"}`));
+    });
+    child.stdin.on("error", () => undefined);
+    child.stdin.end(input);
+  });
+}
+
+function validatePaneId(paneId: string): void {
+  if (!/^%\d+$/.test(paneId)) throw new ValidationError("Invalid tmux pane id.");
+}
+
+/** Paste multiline text through a unique tmux buffer into one explicit pane. */
+export async function pasteTextToPane(
+  paneId: string,
+  text: string,
+  beforePaste?: () => Promise<void>,
+): Promise<void> {
+  validatePaneId(paneId);
+  if (Buffer.byteLength(text, "utf8") > 32 * 1024) throw new ValidationError("The message is too long.");
+  const bufferName = `bridge-review-${randomUUID()}`;
+  try {
+    await runTmuxWithStdin(["load-buffer", "-b", bufferName, "-"], text);
+    await beforePaste?.();
+    await runTmux(["paste-buffer", "-d", "-p", "-r", "-b", bufferName, "-t", paneId]);
+  } finally {
+    await runTmux(["delete-buffer", "-b", bufferName]).catch(() => undefined);
+  }
+}
+
+export async function sendEnterToPane(paneId: string, beforeEnter?: () => Promise<void>): Promise<void> {
+  validatePaneId(paneId);
+  await beforeEnter?.();
+  await runTmux(["send-keys", "-t", paneId, "Enter"]);
+}
+
 async function runCommand(command: string, args: string[]): Promise<string> {
   const child = getBunRuntime().spawn([command, ...args], {
     stdout: "pipe",
@@ -78,6 +140,71 @@ async function runCommand(command: string, args: string[]): Promise<string> {
   ]);
   if (exitCode !== 0) throw new Error(stderr.trim() || `${command} exited with code ${exitCode}`);
   return stdout.trimEnd();
+}
+
+interface ProcessSnapshot {
+  pid: number;
+  ppid: number;
+  processGroup: number;
+  foregroundGroup: number;
+  tty: string;
+  startedAt: string;
+  command: string;
+}
+
+async function findForegroundCodexProcess(panePid: number, paneTty: string, currentCommand: string): Promise<ForegroundCodexIdentity | null> {
+  const processRows = await runCommand("ps", ["-ww", "-axo", "pid=,ppid=,pgid=,tpgid=,tty=,lstart=,command="]);
+  return selectForegroundCodexProcess(processRows, panePid, paneTty, currentCommand);
+}
+
+export function selectForegroundCodexProcess(
+  processRows: string,
+  panePid: number,
+  paneTty: string,
+  currentCommand: string,
+): ForegroundCodexIdentity | null {
+  if (!isCodexProcessName(currentCommand)) return null;
+  const processes = processRows.split(/\r?\n/).flatMap((line) => {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(-?\d+)\s+(\S+)\s+(.{24})\s+(.+)$/.exec(line);
+    if (!match) return [];
+    return [{
+      pid: Number(match[1]),
+      ppid: Number(match[2]),
+      processGroup: Number(match[3]),
+      foregroundGroup: Number(match[4]),
+      tty: match[5]!,
+      startedAt: match[6]!.trim(),
+      command: match[7]!,
+    } satisfies ProcessSnapshot];
+  });
+  const descendants = new Set<number>([panePid]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const process of processes) {
+      if (descendants.has(process.ppid) && !descendants.has(process.pid)) {
+        descendants.add(process.pid);
+        changed = true;
+      }
+    }
+  }
+  const expectedTty = paneTty.replace(/^\/dev\//, "");
+  const foreground = processes
+    .filter((process) => descendants.has(process.pid)
+      && process.tty === expectedTty
+      && process.processGroup > 0
+      && process.processGroup === process.foregroundGroup
+      && isCodexProcessName(process.command))
+    .sort((left, right) => left.pid - right.pid)[0];
+  return foreground
+    ? { pid: foreground.pid, startedAt: foreground.startedAt, command: "codex" }
+    : null;
+}
+
+function isCodexProcessName(value: string): boolean {
+  const firstWord = value.trim().split(/\s+/, 1)[0] ?? "";
+  const name = firstWord.split(/[\\/]/).pop() ?? firstWord;
+  return /^codex(?:\.js)?$/i.test(name);
 }
 
 export async function listSessions(): Promise<TmuxSession[]> {
@@ -127,6 +254,32 @@ export async function getCurrentPanePath(id: string, knownSession?: TmuxSession)
   const cwdStat = await stat(cwd).catch(() => null);
   if (!cwdStat?.isDirectory()) throw new ValidationError("The tmux pane working directory is unavailable.");
   return cwd;
+}
+
+export async function inspectReviewPane(id: string, knownSession?: TmuxSession): Promise<TmuxReviewPaneSnapshot> {
+  if (!isSessionId(id)) throw new ValidationError("Invalid tmux session id.");
+  if (!knownSession && !(await findSession(id))) throw new SessionNotFoundError("Session no longer exists.");
+
+  const details = await runTmux([
+    "display-message",
+    "-p",
+    "-t",
+    id,
+    "#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_current_command}\t#{pane_current_path}",
+  ]);
+  const [paneId, panePidValue, paneTty, currentCommand, ...cwdParts] = details.split("\t");
+  const panePid = Number(panePidValue);
+  const cwd = resolve(cwdParts.join("\t"));
+  if (!paneId || !/^%\d+$/.test(paneId) || !Number.isSafeInteger(panePid) || panePid < 1 || !paneTty || !cwdParts.length) {
+    throw new ValidationError("The active tmux pane is unavailable.");
+  }
+  const cwdStat = await stat(cwd).catch(() => null);
+  if (!cwdStat?.isDirectory()) throw new ValidationError("The tmux pane working directory is unavailable.");
+
+  const foregroundCodex = isCodexProcessName(currentCommand)
+    ? await findForegroundCodexProcess(panePid, paneTty, currentCommand)
+    : null;
+  return { paneId, panePid, paneTty, currentCommand, cwd, foregroundCodex };
 }
 
 export async function setCodexHomeForSession(id: string, codexHomePath: string | null): Promise<void> {

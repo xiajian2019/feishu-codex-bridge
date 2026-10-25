@@ -40,6 +40,7 @@ export interface WebAuthDatabase {
   ): void;
   listWebAuthSessions(): WebAuthSessionRecord[];
   updateWebAuthSessionDeviceName(sessionId: string, deviceName: string): void;
+  updateWebAuthSessionExpiry(sessionId: string, expiresAt: string): void;
   revokeWebAuthSession(sessionId: string, revokedAt: string): void;
   revokeAllWebAuthSessions(revokedAt: string): void;
 }
@@ -94,6 +95,7 @@ export class WebPairingAuth {
   private readonly allowLocalRequests: boolean;
   private readonly localAddresses = collectLocalAddresses();
   private readonly memorySessions = new Map<string, WebAuthSessionRecord>();
+  private readonly revocationListeners = new Set<() => void>();
   private readonly draftInstallationId: string;
   private memoryPairing: PairingState | null = null;
 
@@ -137,6 +139,29 @@ export class WebPairingAuth {
       return null;
     }
     return session.sessionId;
+  }
+
+  /** Bind a long-lived connection to its original cookie, without touching last_seen_at. */
+  public connectionAuthorization(request: IncomingMessage): () => boolean {
+    const token = readCookie(request.headers.cookie, SESSION_COOKIE);
+    if (token) {
+      const tokenHash = hashToken(token);
+      return () => {
+        try {
+          const session = this.getSession(tokenHash);
+          return Boolean(session && session.revokedAt === null && Date.parse(session.expiresAt) > this.now());
+        } catch {
+          return false;
+        }
+      };
+    }
+    const trustedLocal = this.allowLocalRequests && this.isLocalRequest(request);
+    return () => trustedLocal;
+  }
+
+  public subscribeToRevocations(listener: () => void): () => void {
+    this.revocationListeners.add(listener);
+    return () => { this.revocationListeners.delete(listener); };
   }
 
   public status(request: IncomingMessage): PairingStatus {
@@ -223,16 +248,29 @@ export class WebPairingAuth {
     request: IncomingMessage,
     response: ServerResponse,
     token: string,
+    expiresAt?: string,
   ): void {
+    const expiresAtMs = expiresAt === undefined ? this.now() + SESSION_TTL_MS : Date.parse(expiresAt);
+    const maxAgeSeconds = Number.isFinite(expiresAtMs)
+      ? Math.max(1, Math.ceil((expiresAtMs - this.now()) / 1000))
+      : Math.floor(SESSION_TTL_MS / 1000);
     const attributes = [
       SESSION_COOKIE + "=" + token,
       "Path=/",
       "HttpOnly",
       "SameSite=Strict",
-      "Max-Age=" + Math.floor(SESSION_TTL_MS / 1000),
+      "Max-Age=" + maxAgeSeconds,
     ];
     if (isSecureRequest(request)) attributes.push("Secure");
     response.setHeader("Set-Cookie", attributes.join("; "));
+  }
+
+  public refreshSessionCookie(request: IncomingMessage, response: ServerResponse): void {
+    const token = readCookie(request.headers.cookie, SESSION_COOKIE);
+    if (!token) return;
+    const session = this.getSession(hashToken(token));
+    if (!session || session.revokedAt !== null || Date.parse(session.expiresAt) <= this.now()) return;
+    this.setSessionCookie(request, response, token, session.expiresAt);
   }
 
   public clearSession(request: IncomingMessage, response: ServerResponse): void {
@@ -250,11 +288,12 @@ export class WebPairingAuth {
   public revokeAll(): void {
     if (this.db) {
       this.db.revokeAllWebAuthSessions(new Date(this.now()).toISOString());
-      return;
+    } else {
+      for (const session of this.memorySessions.values()) {
+        session.revokedAt = new Date(this.now()).toISOString();
+      }
     }
-    for (const session of this.memorySessions.values()) {
-      session.revokedAt = new Date(this.now()).toISOString();
-    }
+    for (const listener of this.revocationListeners) listener();
   }
 
   public revokeDevice(request: IncomingMessage, sessionId: string): boolean {
@@ -274,6 +313,17 @@ export class WebPairingAuth {
     session.deviceName = normalizedName;
     this.updateSessionDeviceName(sessionId, normalizedName);
     return true;
+  }
+
+  public extendDevice(request: IncomingMessage, sessionId: string): string | null {
+    if (!this.isAuthorized(request)) return null;
+    const session = this.listActiveSessions().find((item) => item.sessionId === sessionId);
+    if (!session) return null;
+    const expiresAt = addCalendarYear(session.expiresAt);
+    if (!expiresAt) return null;
+    session.expiresAt = expiresAt;
+    this.updateSessionExpiry(sessionId, expiresAt);
+    return expiresAt;
   }
 
   private getPairing(): PairingState | null {
@@ -340,12 +390,20 @@ export class WebPairingAuth {
     }
   }
 
+  private updateSessionExpiry(sessionId: string, expiresAt: string): void {
+    if (this.db) this.db.updateWebAuthSessionExpiry(sessionId, expiresAt);
+    for (const session of this.memorySessions.values()) {
+      if (session.sessionId === sessionId) session.expiresAt = expiresAt;
+    }
+  }
+
   private revokeSession(sessionId: string): void {
     const revokedAt = new Date(this.now()).toISOString();
     if (this.db) this.db.revokeWebAuthSession(sessionId, revokedAt);
     for (const session of this.memorySessions.values()) {
       if (session.sessionId === sessionId) session.revokedAt = revokedAt;
     }
+    for (const listener of this.revocationListeners) listener();
   }
 
   private listActiveSessions(): WebAuthSessionRecord[] {
@@ -394,6 +452,14 @@ export class WebPairingAuth {
     }
     current.count += 1;
   }
+}
+
+function addCalendarYear(value: string): string | null {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return null;
+  const date = new Date(timestamp);
+  date.setUTCFullYear(date.getUTCFullYear() + 1);
+  return date.toISOString();
 }
 
 function generatePairingCode(): string {

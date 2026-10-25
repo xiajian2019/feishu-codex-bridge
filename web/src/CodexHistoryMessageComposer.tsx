@@ -26,6 +26,7 @@ export interface CodexHistoryComposerResult {
 export interface CodexHistoryComposerSettings {
   model?: string;
   reasoningEffort?: CodexHistoryReasoningEffort;
+  interactive?: true;
 }
 
 export interface CodexHistoryMessageComposerProps {
@@ -40,6 +41,13 @@ export interface CodexHistoryMessageComposerProps {
   modelCatalogAvailable: boolean;
   currentModel?: string | null;
   currentReasoningEffort?: string | null;
+  steerEnabled: boolean;
+  draftInsertion?: {
+    id: string;
+    text: string;
+    model?: string;
+    reasoningEffort?: string;
+  } | null;
   onSubmit: (
     text: string,
     attachmentIds: string[],
@@ -47,6 +55,7 @@ export interface CodexHistoryMessageComposerProps {
     idempotencyKey: string,
     turnIndex: number,
   ) => Promise<CodexHistoryComposerResult>;
+  onSteer: (text: string) => Promise<CodexHistoryComposerResult>;
   onInterrupt: () => void;
   onAttachmentError: (message: string) => void;
   onScrollToTop: () => void;
@@ -120,7 +129,10 @@ export function CodexHistoryMessageComposer({
   modelCatalogAvailable,
   currentModel,
   currentReasoningEffort,
+  steerEnabled,
+  draftInsertion,
   onSubmit,
+  onSteer,
   onInterrupt,
   onAttachmentError,
   onScrollToTop,
@@ -134,9 +146,11 @@ export function CodexHistoryMessageComposer({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [model, setModel] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState("");
+  const [interactiveApproval, setInteractiveApproval] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
   const currentScopeRef = useRef(settingsScopeKey);
+  const consumedInsertionIdRef = useRef("");
   currentScopeRef.current = settingsScopeKey;
   const latestReadyDraftRef = useRef<{ scopeKey: string; text: string; files: CodexHistoryDraftFile[] } | null>(null);
   const currentDraftReady = draftReady && draftScope === settingsScopeKey;
@@ -173,7 +187,28 @@ export function CodexHistoryMessageComposer({
     setSettingsOpen(false);
     setModel("");
     setReasoningEffort("");
+    setInteractiveApproval(false);
   }, [settingsScopeKey]);
+
+  useEffect(() => {
+    if (!currentDraftReady || !draftInsertion || consumedInsertionIdRef.current === draftInsertion.id) return;
+    consumedInsertionIdRef.current = draftInsertion.id;
+    const insertedText = draftInsertion.text.trim();
+    if (insertedText) {
+      setText((current) => current.trim()
+        ? `${current.replace(/\s+$/, "")}\n\n${insertedText}`
+        : insertedText);
+    }
+    if (draftInsertion.model) setModel(draftInsertion.model);
+    if (draftInsertion.reasoningEffort) setReasoningEffort(draftInsertion.reasoningEffort);
+    window.requestAnimationFrame(() => {
+      textAreaRef.current?.focus();
+      if (textAreaRef.current) {
+        textAreaRef.current.style.height = "auto";
+        textAreaRef.current.style.height = `${Math.min(textAreaRef.current.scrollHeight, 160)}px`;
+      }
+    });
+  }, [currentDraftReady, draftInsertion]);
 
   useEffect(() => {
     let cancelled = false;
@@ -251,12 +286,14 @@ export function CodexHistoryMessageComposer({
     const settings: CodexHistoryComposerSettings = {
       ...(model.trim() ? { model: model.trim() } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(interactiveApproval ? { interactive: true } : {}),
     };
     const signature = JSON.stringify({
       text: submittedText,
       files: submittedFiles.map(({ id, file }) => [id, file.name, file.type, file.size, file.lastModified]),
       model: settings.model ?? "",
       reasoningEffort: settings.reasoningEffort ?? "",
+      ...(settings.interactive ? { interactive: true } : {}),
     });
     setPreparing(true);
     const staged: CodexHistoryAttachment[] = [];
@@ -305,6 +342,27 @@ export function CodexHistoryMessageComposer({
     }
   };
 
+  const steer = async (): Promise<void> => {
+    const submittedText = text.trim();
+    if (!sending || cancelling || controlsDisabled || !submittedText || files.length > 0) return;
+    setPreparing(true);
+    try {
+      const result = await onSteer(submittedText);
+      if (!result.ok) {
+        if (result.message) onAttachmentError(result.message);
+        return;
+      }
+      clearCodexHistoryDraft(settingsScopeKey);
+      latestReadyDraftRef.current = { scopeKey: settingsScopeKey, text: "", files: [] };
+      setText("");
+      if (textAreaRef.current) textAreaRef.current.style.height = "";
+    } catch (error) {
+      onAttachmentError(error instanceof Error ? error.message : "无法引导当前执行。");
+    } finally {
+      setPreparing(false);
+    }
+  };
+
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
     if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
     event.preventDefault();
@@ -340,6 +398,17 @@ export function CodexHistoryMessageComposer({
       </div>
       {settingsOpen ? (
         <div className="codex-history-next-turn-settings" aria-label="下一轮设置">
+          <label className="codex-history-interactive-setting">
+            <input
+              type="checkbox"
+              checked={interactiveApproval}
+              onChange={(event) => setInteractiveApproval(event.currentTarget.checked)}
+            />
+            <span>
+              <strong>交互审批模式</strong>
+              <small>允许 Codex 请求确认或补充信息；默认关闭，普通 SDK 执行保持原样。</small>
+            </span>
+          </label>
           <label className="codex-history-next-turn-field">
             <span>模型</span>
             <select
@@ -439,13 +508,24 @@ export function CodexHistoryMessageComposer({
           </button>
         </div>
         {sending || cancelling ? (
-          <button
-            className="codex-interrupt-button"
-            type="button"
-            disabled={cancelling}
-            aria-label={cancelling ? "正在中断 Codex 执行" : "中断 Codex 执行"}
-            onClick={onInterrupt}
-          >{cancelling ? "中断中…" : "中断"}</button>
+          <div className="codex-history-running-actions">
+            {sending && steerEnabled ? (
+              <button
+                className="codex-history-steer-button"
+                type="button"
+                disabled={controlsDisabled || preparing || cancelling || !text.trim() || files.length > 0}
+                onClick={() => void steer()}
+                title={files.length > 0 ? "引导仅支持文本；请先移除附件" : "把文本追加到当前 Codex 执行"}
+              >引导</button>
+            ) : null}
+            <button
+              className="codex-interrupt-button"
+              type="button"
+              disabled={cancelling}
+              aria-label={cancelling ? "正在中断 Codex 执行" : "中断 Codex 执行"}
+              onClick={onInterrupt}
+            >{cancelling ? "中断中…" : "中断"}</button>
+          </div>
         ) : (
           <button
             className="dashboard-compose-send"

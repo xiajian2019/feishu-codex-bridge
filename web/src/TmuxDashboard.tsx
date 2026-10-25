@@ -1,6 +1,4 @@
-import { FitAddon } from "@xterm/addon-fit";
-import { CanvasAddon } from "@xterm/addon-canvas";
-import { Terminal } from "@xterm/xterm";
+import type { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
 import { useLocation, useNavigate } from "react-router";
@@ -10,12 +8,23 @@ import { isDebugLogCaptureActive, logDebugDiagnostic } from "./debug-log-capture
 
 import { bindMobileTerminalTouch, downloadTerminalScrollDiagnostics, type TerminalSelectionDisplay } from "./terminal-touch.js";
 import { openTerminalUrl, registerTerminalLinkProvider } from "./terminal-links.js";
-import { TmuxMessageComposer, type SessionFileForwardRequest, type TerminalShortcut } from "./TmuxMessageComposer.js";
+import type { SessionFileForwardRequest, TerminalShortcut } from "./TmuxMessageComposer.js";
+import { stripGitReviewMarkers } from "./git-review-drafts.js";
 import { fetchCodexUsage, getActionToken } from "./api.js";
 import { CodexUsageDialog, getCodexUsageRemainingPercentages, preserveCodexUsageAccount } from "./CodexUsage.js";
+import {
+  cacheCodexHomeOptions,
+  mergeCodexHomeOption,
+  normalizeCodexHomeOptions,
+  readCachedCodexHomeOptions,
+  resolveCodexHomeLabel,
+  UNKNOWN_CODEX_HOME_LABEL,
+  type TmuxCodexHomeOption,
+} from "./tmux-codex-account.js";
 import type { CodexUsageAccount } from "./types.js";
 import { useSystemNavigation } from "./WebNavigation.js";
 
+const TmuxMessageComposer = lazy(() => import("./TmuxMessageComposer.js").then((module) => ({ default: module.TmuxMessageComposer })));
 const TmuxHistoryInspector = lazy(() => import("./TmuxSessionHistory.js").then((module) => ({ default: module.TmuxSessionHistory })));
 const TmuxGitChangesInspector = lazy(() => import("./TmuxGitChanges.js").then((module) => ({ default: module.TmuxGitChanges })));
 
@@ -37,7 +46,7 @@ type TmuxSession = {
 };
 
 type ProjectOption = { name: string; root: string };
-type CodexHomeOption = { id: string; label: string; available: boolean };
+type CodexHomeOption = TmuxCodexHomeOption;
 type TaskCreationContext = {
   sessionId: string;
   projectKey: string;
@@ -53,6 +62,15 @@ type TaskCreationContext = {
 type Toast = { message: string; isError: boolean; durationMs?: number; isTop?: boolean };
 type SubmissionResult = { ok: boolean; message?: string };
 type SessionInspector = { kind: "history"; sessionId: string | null } | { kind: "git"; sessionId: string };
+
+export function failPendingTmuxSubmissionsOnDisconnect(
+  waiters: Map<string, (result: SubmissionResult) => void>,
+): void {
+  for (const resolve of waiters.values()) {
+    resolve({ ok: false, message: "终端连接已断开，消息可能已经送达；请先检查 Session，再决定是否重发。" });
+  }
+  waiters.clear();
+}
 
 function CodexHomeSelect({
   session,
@@ -76,7 +94,7 @@ function CodexHomeSelect({
       onChange={(event) => onChange(session, event.target.value || null)}
     >
       <option value="">未标记</option>
-      {session.codexHomeId && !known ? <option value={session.codexHomeId}>已保存账号（不可用）</option> : null}
+      {session.codexHomeId && !known ? <option value={session.codexHomeId}>{UNKNOWN_CODEX_HOME_LABEL}</option> : null}
       {homes.map((home) => (
         <option key={home.id} value={home.id} disabled={!home.available}>
           {home.label}{home.available ? "" : "（不可用）"}
@@ -88,6 +106,8 @@ function CodexHomeSelect({
 
 const API_ROOT = "/tmux-dashboard/api";
 const SESSION_REFRESH_INTERVAL_MS = 5_000;
+const SESSION_REQUEST_TIMEOUT_MS = 15_000;
+const CODEX_USAGE_CACHE_MS = 60_000;
 
 async function requestApi<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
@@ -271,9 +291,10 @@ export function TmuxDashboard(): ReactElement {
   const initialRouteParams = new URLSearchParams(window.location.search);
   const initialSelectedId = initialRouteParams.get("session");
   const shouldRestoreSessionDetail = Boolean(initialSelectedId) && initialRouteParams.get("view") !== "sessions";
+  const [isMobile, setIsMobile] = useState(() => window.matchMedia("(max-width: 760px)").matches);
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
-  const [codexHomes, setCodexHomes] = useState<CodexHomeOption[]>([]);
+  const [codexHomes, setCodexHomes] = useState<CodexHomeOption[]>(() => readCachedCodexHomeOptions());
   const [savingCodexHomeId, setSavingCodexHomeId] = useState<string | null>(null);
   const [checkingCodexHomeId, setCheckingCodexHomeId] = useState<string | null>(null);
   const [codexUsageAccount, setCodexUsageAccount] = useState<CodexUsageAccount | null>(null);
@@ -290,7 +311,11 @@ export function TmuxDashboard(): ReactElement {
     return typeof candidate.id === "string"
       && typeof candidate.sessionId === "string"
       && typeof candidate.text === "string"
-      ? { id: candidate.id, sessionId: candidate.sessionId, text: candidate.text }
+      ? {
+        id: candidate.id,
+        sessionId: candidate.sessionId,
+        text: candidate.text,
+      }
       : null;
   });
   const [search, setSearch] = useState("");
@@ -320,15 +345,24 @@ export function TmuxDashboard(): ReactElement {
   const projectPickerRef = useRef<HTMLDivElement | null>(null);
   const terminalInstanceRef = useRef<Terminal | null>(null);
   const terminalSocketRef = useRef<WebSocket | null>(null);
+  const terminalSocketSessionRef = useRef<string | null>(null);
   const terminalReconnectRef = useRef<(() => void) | null>(null);
   const submissionWaitersRef = useRef(new Map<string, (result: SubmissionResult) => void>());
   const trackedTaskSubmissionRef = useRef<{ sessionId: string; description: string; key: string } | null>(null);
   const sessionsLoadSequenceRef = useRef(0);
+  const sessionsRequestRef = useRef<{ controller: AbortController; promise: Promise<void> } | null>(null);
   const sessionApiResponseRef = useRef("");
   const sessionApiStatusRef = useRef<number | null>(null);
   const restoreSessionDetailRef = useRef(shouldRestoreSessionDetail);
   const codexUsageRequestSequenceRef = useRef(0);
-  const lastAutoCodexUsageKeyRef = useRef<string | null>(null);
+  const codexUsageAbortRef = useRef<AbortController | null>(null);
+  const codexUsageCacheRef = useRef(new Map<string, { at: number; account: CodexUsageAccount }>());
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 760px)");
+    const update = (): void => setIsMobile(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
 
   useEffect(() => {
     if (!sessionInspector) return;
@@ -357,7 +391,12 @@ export function TmuxDashboard(): ReactElement {
 
   useEffect(() => {
     const state = location.state as { sessionFileForward?: unknown } | null;
-    if (!state?.sessionFileForward) return;
+    const incoming = state?.sessionFileForward;
+    if (!incoming || typeof incoming !== "object") return;
+    const forward = incoming as Record<string, unknown>;
+    if (typeof forward.id !== "string" || typeof forward.sessionId !== "string" || typeof forward.text !== "string") return;
+    setSessionFileForward({ id: forward.id, sessionId: forward.sessionId, text: forward.text });
+    setSessionInspector(null);
     navigate(`${location.pathname}${location.search}${location.hash}`, { replace: true, state: null });
   }, [location.hash, location.pathname, location.search, location.state, navigate]);
 
@@ -372,53 +411,121 @@ export function TmuxDashboard(): ReactElement {
     return () => document.documentElement.classList.remove(detailClass);
   }, [mobileView]);
 
-  const loadSessions = useCallback(async (): Promise<void> => {
-    const requestSequence = ++sessionsLoadSequenceRef.current;
-    try {
-      const response = await fetch(API_ROOT + "/sessions", { headers: { Accept: "application/json" } });
-      if (requestSequence !== sessionsLoadSequenceRef.current) return;
-      const rawResponse = await response.text();
-      if (requestSequence !== sessionsLoadSequenceRef.current) return;
-      sessionApiResponseRef.current = rawResponse;
-      sessionApiStatusRef.current = response.status;
-      let result: { sessions?: unknown[]; codexHomes?: unknown[]; error?: string };
-      try {
-        result = JSON.parse(rawResponse) as typeof result;
-      } catch {
-        throw new Error("The sessions API returned invalid JSON.");
-      }
-      if (!response.ok) throw new Error(result.error || "Request failed (" + response.status + ").");
-      if (!Array.isArray(result.sessions)) throw new Error("The sessions API response has no session list.");
-      const normalizedSessions = result.sessions.map(normalizeTmuxSession);
-      if (normalizedSessions.some((session) => session === null)) {
-        throw new Error("The sessions API returned an unrecognized session record.");
-      }
-      const sessionList = normalizedSessions as TmuxSession[];
-      const homeOptions = Array.isArray(result.codexHomes)
-        ? result.codexHomes.flatMap((value): CodexHomeOption[] => {
-          if (typeof value !== "object" || value === null) return [];
-          const home = value as Record<string, unknown>;
-          return typeof home.id === "string" && typeof home.label === "string"
-            ? [{ id: home.id, label: home.label, available: home.available === true }]
-            : [];
-        })
-        : [];
-      setCodexHomes((current) => current.length === homeOptions.length
-        && current.every((home, index) => home.id === homeOptions[index]?.id
-          && home.label === homeOptions[index]?.label
-          && home.available === homeOptions[index]?.available)
-        ? current
-        : homeOptions);
-      setSessions((current) => tmuxSessionsEqual(current, sessionList) ? current : sessionList);
-      setBackendStatus("online");
-      setError(null);
-      setSelectedId((current) => current && sessionList.some((session) => session.id === current && !session.endedAt) ? current : null);
-    } catch (loadError) {
-      if (requestSequence !== sessionsLoadSequenceRef.current) return;
-      setBackendStatus("offline");
-      setError(loadError instanceof Error ? loadError.message : "Could not load tmux sessions.");
-    }
+  const cancelSessionsRequest = useCallback((): void => {
+    sessionsLoadSequenceRef.current += 1;
+    sessionsRequestRef.current?.controller.abort();
+    sessionsRequestRef.current = null;
   }, []);
+
+  const loadSessions = useCallback((force = false): Promise<void> => {
+    if (force) cancelSessionsRequest();
+    if (sessionsRequestRef.current) return sessionsRequestRef.current.promise;
+    const controller = new AbortController();
+    const requestSequence = ++sessionsLoadSequenceRef.current;
+    let timedOut = false;
+    const timeout = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, SESSION_REQUEST_TIMEOUT_MS);
+    const promise = (async (): Promise<void> => {
+      try {
+        // Account discovery is loaded separately and cannot hold up the session list.
+        const response = await fetch(API_ROOT + "/sessions?includeHomes=0", {
+          headers: { Accept: "application/json" }, signal: controller.signal,
+        });
+        const rawResponse = await response.text();
+        if (controller.signal.aborted || requestSequence !== sessionsLoadSequenceRef.current) return;
+        sessionApiResponseRef.current = rawResponse;
+        sessionApiStatusRef.current = response.status;
+        let result: { sessions?: unknown[]; error?: string };
+        try { result = JSON.parse(rawResponse) as typeof result; }
+        catch { throw new Error("The sessions API returned invalid JSON."); }
+        if (!response.ok) throw new Error(result.error || "Request failed (" + response.status + ").");
+        if (!Array.isArray(result.sessions)) throw new Error("The sessions API response has no session list.");
+        const normalizedSessions = result.sessions.map(normalizeTmuxSession);
+        if (normalizedSessions.some((session) => session === null)) {
+          throw new Error("The sessions API returned an unrecognized session record.");
+        }
+        const sessionList = normalizedSessions as TmuxSession[];
+        setSessions((current) => tmuxSessionsEqual(current, sessionList) ? current : sessionList);
+        setBackendStatus("online");
+        setError(null);
+        setSelectedId((current) => current && sessionList.some((session) => session.id === current && !session.endedAt) ? current : null);
+      } catch (loadError) {
+        if (requestSequence !== sessionsLoadSequenceRef.current || (controller.signal.aborted && !timedOut)) return;
+        setBackendStatus("offline");
+        setError(timedOut ? "Session 列表请求超时，请重试。" : loadError instanceof Error ? loadError.message : "Could not load tmux sessions.");
+      } finally {
+        window.clearTimeout(timeout);
+        if (sessionsRequestRef.current?.controller === controller) sessionsRequestRef.current = null;
+      }
+    })();
+    sessionsRequestRef.current = { controller, promise };
+    return promise;
+  }, [cancelSessionsRequest]);
+
+  useEffect(() => {
+    if (codexHomes.length > 0) cacheCodexHomeOptions(codexHomes);
+  }, [codexHomes]);
+
+  useEffect(() => {
+    if (backendStatus !== "online") return;
+    let stopped = false;
+    let inFlight = false;
+    let retryTimer: number | undefined;
+    let requestController: AbortController | null = null;
+
+    const scheduleRetry = (): void => {
+      if (stopped || retryTimer !== undefined) return;
+      retryTimer = window.setTimeout(() => {
+        retryTimer = undefined;
+        void loadHomes();
+      }, SESSION_REFRESH_INTERVAL_MS);
+    };
+    const loadHomes = async (): Promise<void> => {
+      if (stopped || inFlight || document.visibilityState === "hidden") return;
+      inFlight = true;
+      const controller = new AbortController();
+      requestController = controller;
+      const timeout = window.setTimeout(() => controller.abort(), SESSION_REQUEST_TIMEOUT_MS);
+      try {
+        const result = await requestApi<{ codexHomes?: unknown }>("/codex-homes", { signal: controller.signal });
+        const homes = normalizeCodexHomeOptions(result.codexHomes);
+        if (!stopped && !controller.signal.aborted && homes.length > 0) setCodexHomes(homes);
+        if (homes.length === 0) scheduleRetry();
+      } catch {
+        // Keep the last successful/default labels and retry without blocking the terminal.
+        scheduleRetry();
+      } finally {
+        window.clearTimeout(timeout);
+        if (requestController === controller) requestController = null;
+        inFlight = false;
+      }
+    };
+    const refreshWhenVisible = (): void => {
+      if (document.visibilityState !== "hidden") {
+        window.clearTimeout(retryTimer);
+        retryTimer = undefined;
+        void loadHomes();
+      }
+    };
+    const refreshWhenOnline = (): void => {
+      window.clearTimeout(retryTimer);
+      retryTimer = undefined;
+      void loadHomes();
+    };
+
+    void loadHomes();
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    window.addEventListener("online", refreshWhenOnline);
+    return () => {
+      stopped = true;
+      window.clearTimeout(retryTimer);
+      requestController?.abort();
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+      window.removeEventListener("online", refreshWhenOnline);
+    };
+  }, [backendStatus]);
 
   const copySessionsApiResponse = async (): Promise<void> => {
     const rawResponse = sessionApiResponseRef.current;
@@ -433,7 +540,7 @@ export function TmuxDashboard(): ReactElement {
       // Keep the original response text for non-JSON errors.
     }
     const payload = JSON.stringify({
-      request: { method: "GET", url: window.location.origin + API_ROOT + "/sessions" },
+      request: { method: "GET", url: window.location.origin + API_ROOT + "/sessions?includeHomes=0" },
       response: { status: sessionApiStatusRef.current, body },
     }, null, 2);
     try {
@@ -513,20 +620,52 @@ export function TmuxDashboard(): ReactElement {
   }, [projectActiveIndex, projectPickerOpen]);
 
   useEffect(() => {
-    if (mobileView === "terminal") return;
-    void loadSessions();
-    const timer = window.setInterval(() => void loadSessions(), SESSION_REFRESH_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, [loadSessions, mobileView]);
-
-  const recordSessionOpen = useCallback(async (sessionId: string): Promise<void> => {
-    try {
-      await requestApi(`/sessions/${encodeURIComponent(sessionId)}/open`, { method: "POST" });
+    if (isMobile && mobileView === "terminal") return;
+    let stopped = false;
+    let timer: number | undefined;
+    let pollGeneration = 0;
+    const schedulePoll = (generation: number): void => {
+      if (stopped || generation !== pollGeneration || document.visibilityState === "hidden") return;
+      timer = window.setTimeout(() => {
+        timer = undefined;
+        void poll(generation);
+      }, SESSION_REFRESH_INTERVAL_MS);
+    };
+    const poll = async (generation: number): Promise<void> => {
+      if (stopped || generation !== pollGeneration || document.visibilityState === "hidden") return;
       await loadSessions();
+      schedulePoll(generation);
+    };
+    const onVisibility = (): void => {
+      pollGeneration += 1;
+      window.clearTimeout(timer);
+      timer = undefined;
+      cancelSessionsRequest();
+      if (document.visibilityState !== "hidden") void poll(pollGeneration);
+    };
+    void poll(pollGeneration);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stopped = true;
+      pollGeneration += 1;
+      window.clearTimeout(timer);
+      cancelSessionsRequest();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [cancelSessionsRequest, isMobile, loadSessions, mobileView]);
+
+  const recordSessionOpen = useCallback(async (session: TmuxSession): Promise<void> => {
+    try {
+      const result = await requestApi<{ session: { openCount: number; lastOpenedAt: string | null } }>(
+        `/sessions/${encodeURIComponent(session.id)}/open`, { method: "POST" },
+      );
+      setSessions((current) => current.map((item) => item.id === session.id && item.createdAt === session.createdAt
+        ? { ...item, openCount: result.session.openCount, lastOpenedAt: result.session.lastOpenedAt }
+        : item));
     } catch (openError) {
       setToast({ message: openError instanceof Error ? openError.message : "无法记录 Session 使用次数。", isError: true });
     }
-  }, [loadSessions]);
+  }, []);
 
   const openSessionInspector = (kind: "history" | "git", sessionId?: string): void => {
     const desktop = window.matchMedia("(min-width: 761px)").matches;
@@ -557,68 +696,68 @@ export function TmuxDashboard(): ReactElement {
   }, [projectQuery, projects]);
   const selectedProject = projects.find((project) => project.name === newProjectName) ?? null;
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? null;
+  const terminalVisible = Boolean(selectedSession) && (!isMobile || mobileView === "terminal");
   const selectedCodexHomeLabel = selectedSession
-    ? codexHomes.find((home) => home.id === selectedSession.codexHomeId)?.label
-      ?? (selectedSession.codexHomeId ? "账号不可用" : "未标记")
+    ? resolveCodexHomeLabel(selectedSession.codexHomeId, codexHomes, codexUsageAccount)
     : "";
   const selectedCodexHomeId = selectedSession?.codexHomeId ?? null;
   const currentCodexRemainingPercentages = getCodexUsageRemainingPercentages(codexUsageAccount);
-  const loadCurrentCodexUsage = useCallback(async (homeId: string): Promise<void> => {
+  const loadCurrentCodexUsage = useCallback(async (homeId: string, force = false): Promise<void> => {
+    codexUsageAbortRef.current?.abort();
     const requestSequence = ++codexUsageRequestSequenceRef.current;
+    const cached = codexUsageCacheRef.current.get(homeId);
+    if (cached && Date.now() - cached.at < CODEX_USAGE_CACHE_MS && !force) {
+      setCodexUsageAccount(cached.account);
+      setCodexHomes((current) => mergeCodexHomeOption(current, cached.account));
+      setCodexUsageLoading(false);
+      setCodexUsageError(null);
+      return;
+    }
+    const controller = new AbortController();
+    codexUsageAbortRef.current = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 30_000);
     setCodexUsageLoading(true);
     setCodexUsageError(null);
     try {
-      const result = await fetchCodexUsage({ homeId });
+      const result = await fetchCodexUsage({ homeId, signal: controller.signal });
       const account = result.accounts.find((candidate) => candidate.homeId === homeId);
       if (!account) throw new Error("当前 Codex 账号没有返回用量数据。");
-      if (codexUsageRequestSequenceRef.current !== requestSequence) return;
+      if (codexUsageRequestSequenceRef.current !== requestSequence || controller.signal.aborted) return;
+      if (!account.errors?.quota) {
+        codexUsageCacheRef.current.set(homeId, { at: Date.now(), account });
+      }
+      setCodexHomes((current) => mergeCodexHomeOption(current, account));
       setCodexUsageAccount((previous) => preserveCodexUsageAccount(previous, account));
     } catch (requestError: unknown) {
       if (codexUsageRequestSequenceRef.current !== requestSequence) return;
-      setCodexUsageError(requestError instanceof Error ? requestError.message : String(requestError));
+      setCodexUsageError(controller.signal.aborted ? "Codex 用量请求超时，请重试。" : requestError instanceof Error ? requestError.message : String(requestError));
     } finally {
+      window.clearTimeout(timeout);
       if (codexUsageRequestSequenceRef.current === requestSequence) setCodexUsageLoading(false);
+      if (codexUsageAbortRef.current === controller) codexUsageAbortRef.current = null;
     }
   }, []);
   useEffect(() => {
-    const isMobileDetailVisible = window.matchMedia("(max-width: 760px)").matches
-      ? mobileView === "terminal"
-      : true;
-    if (!selectedSession || !isMobileDetailVisible || !terminalEverAttached || terminalStatus !== "ATTACHED") {
-      lastAutoCodexUsageKeyRef.current = null;
-      codexUsageRequestSequenceRef.current += 1;
-      setCodexUsageAccount(null);
-      setCodexUsageLoading(false);
-      setCodexUsageError(null);
-      setCodexUsageDialogOpen(false);
-      return;
-    }
-
-    const queryKey = `${selectedSession.id}\u0000${selectedSession.codexHomeId ?? ""}`;
-    if (lastAutoCodexUsageKeyRef.current === queryKey) return;
-    lastAutoCodexUsageKeyRef.current = queryKey;
     setCodexUsageAccount(null);
+    setCodexUsageLoading(false);
     setCodexUsageError(null);
     setCodexUsageDialogOpen(false);
-
-    if (!selectedSession.codexHomeId) {
+    // ATTACHED is set after xterm has parsed its first frame, not at WebSocket open.
+    const timer = terminalVisible && terminalEverAttached && terminalStatus === "ATTACHED" && selectedCodexHomeId
+      ? window.setTimeout(() => void loadCurrentCodexUsage(selectedCodexHomeId), 1_000)
+      : undefined;
+    return () => {
+      window.clearTimeout(timer);
       codexUsageRequestSequenceRef.current += 1;
-      setCodexUsageLoading(false);
-      return;
-    }
+      codexUsageAbortRef.current?.abort();
+      codexUsageAbortRef.current = null;
+    };
+  }, [loadCurrentCodexUsage, selectedCodexHomeId, selectedSession?.id, terminalEverAttached, terminalStatus, terminalVisible]);
 
-    setToast({
-      message: `正在读取「${selectedCodexHomeLabel}」Codex 用量…`,
-      isError: false,
-      durationMs: 3_000,
-      isTop: true,
-    });
-    void loadCurrentCodexUsage(selectedSession.codexHomeId);
-  }, [loadCurrentCodexUsage, mobileView, selectedCodexHomeLabel, selectedSession?.codexHomeId, selectedSession?.id, terminalEverAttached, terminalStatus]);
   const selectSession = (sessionId: string): void => {
     const session = sessions.find((candidate) => candidate.id === sessionId);
     if (!session || session.endedAt) return;
-    sessionsLoadSequenceRef.current += 1;
+    cancelSessionsRequest();
     restoreSessionDetailRef.current = false;
     if (sessionId !== selectedId) {
       setTerminalInputEnabled(false);
@@ -630,7 +769,7 @@ export function TmuxDashboard(): ReactElement {
       setNavigationCollapsed(true);
       setMobileView("terminal");
     }
-    void recordSessionOpen(sessionId);
+    void recordSessionOpen(session);
   };
 
   const showSessionsOnMobile = (): void => {
@@ -641,8 +780,8 @@ export function TmuxDashboard(): ReactElement {
 
   const refreshSelectedSession = async (): Promise<void> => {
     setToast({ message: "正在刷新 session 连接…", isError: false });
-    await loadSessions();
     terminalReconnectRef.current?.();
+    await loadSessions(true);
   };
 
   useEffect(() => {
@@ -665,15 +804,23 @@ export function TmuxDashboard(): ReactElement {
 
   useEffect(() => {
     const host = terminalHostRef.current;
-    if (!selectedSession || !host) {
+    if (!selectedSession || !host || !terminalVisible) {
       setTerminalStatus("IDLE");
       setTerminalEverAttached(false);
       return;
     }
+    const activeSessionId = selectedSession.id;
 
-    let everAttached = false;
+    let cancelled = false;
+    let disposeTerminal: (() => void) | undefined;
     setTerminalStatus("CONNECTING");
     setTerminalEverAttached(false);
+    const initialize = async (): Promise<void> => {
+      const [{ Terminal }, { FitAddon }, { CanvasAddon }] = await Promise.all([
+        import("@xterm/xterm"), import("@xterm/addon-fit"), import("@xterm/addon-canvas"),
+      ]);
+      if (cancelled) return;
+    let everAttached = false;
 
     const terminal = new Terminal({
       cursorBlink: terminalInputEnabled,
@@ -699,6 +846,7 @@ export function TmuxDashboard(): ReactElement {
       },
     });
     const fit = new FitAddon();
+    disposeTerminal = () => terminal.dispose();
     terminal.loadAddon(fit);
     terminal.open(host);
     const terminalLinks = registerTerminalLinkProvider(terminal);
@@ -737,7 +885,7 @@ export function TmuxDashboard(): ReactElement {
     };
     fitTerminal();
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const terminalAddress = (): string => `${protocol}//${window.location.host}/tmux-dashboard/terminal?session=${encodeURIComponent(selectedSession.id)}&cols=${terminal.cols}&rows=${terminal.rows}`;
+    const terminalAddress = (): string => `${protocol}//${window.location.host}/tmux-dashboard/terminal?session=${encodeURIComponent(activeSessionId)}&cols=${terminal.cols}&rows=${terminal.rows}`;
     let socket: WebSocket | null = null;
     let disposed = false;
     const copyTerminalSelectionOnKeyDown = (event: KeyboardEvent): void => {
@@ -793,36 +941,45 @@ export function TmuxDashboard(): ReactElement {
       enableDesktopSelection: !terminalInputEnabled,
     });
 
-    const diagnosticOutputDecoder = new TextDecoder("utf-8");
     let lastTerminalRenderDiagnosticAt = 0;
-    const writeTerminalOutput = (data: string | Uint8Array): void => {
-      const decodedOutput = typeof data === "string" ? data : diagnosticOutputDecoder.decode(data, { stream: true });
-      const outputMetrics = summarizeUnicodeText(decodedOutput);
-      const rawBytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-      let highBitBytes = 0;
-      for (const byte of rawBytes) if (byte >= 0x80) highBitBytes += 1;
-
+    let paintedSocket: WebSocket | null = null;
+    const writeTerminalOutput = (data: string | Uint8Array, sourceSocket: WebSocket): void => {
+      const needsReady = paintedSocket !== sourceSocket;
+      if (!needsReady && !isDebugLogCaptureActive()) {
+        terminal.write(data);
+        return;
+      }
       terminal.write(data, () => {
+        if (disposed || socket !== sourceSocket) return;
+        if (paintedSocket !== sourceSocket) {
+          paintedSocket = sourceSocket;
+          everAttached = true;
+          setTerminalEverAttached(true);
+          setTerminalStatus("ATTACHED");
+        }
         if (!isDebugLogCaptureActive()) return;
         const now = Date.now();
         if (now - lastTerminalRenderDiagnosticAt < 750) return;
         lastTerminalRenderDiagnosticAt = now;
-
+        // Diagnostics are sampled only when recording, after the frame has been parsed.
+        const decodedOutput = typeof data === "string" ? data : new TextDecoder().decode(data);
+        const rawBytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+        let highBitBytes = 0;
+        for (const byte of rawBytes) if (byte >= 0x80) highBitBytes += 1;
         const buffer = terminal.buffer.active;
         let visibleText = "";
         for (let row = 0; row < terminal.rows; row += 1) {
           const line = buffer.getLine(buffer.viewportY + row);
           if (line) visibleText += line.translateToString(true) + "\n";
         }
-        const fontFamily = terminal.element ? getComputedStyle(terminal.element).fontFamily : "unknown";
         logDebugDiagnostic("tmux-terminal", "render-sample", {
           transportType: typeof data === "string" ? "websocket-text" : "websocket-binary",
           payloadBytes: rawBytes.byteLength,
           highBitBytes,
-          output: outputMetrics,
+          output: summarizeUnicodeText(decodedOutput),
           buffer: { ...summarizeUnicodeText(visibleText), type: buffer.type, viewportY: buffer.viewportY, baseY: buffer.baseY },
           renderer: host.querySelector(".xterm-canvas") ? "canvas" : "dom",
-          fontFamily,
+          fontFamily: terminal.element ? getComputedStyle(terminal.element).fontFamily : "unknown",
           devicePixelRatio: window.devicePixelRatio,
           cols: terminal.cols,
           rows: terminal.rows,
@@ -857,10 +1014,7 @@ export function TmuxDashboard(): ReactElement {
     };
 
     const resolvePendingSubmissions = (): void => {
-      for (const resolve of submissionWaitersRef.current.values()) {
-        resolve({ ok: false, message: "终端连接已断开，消息可能已经送达；请先检查 Session，再决定是否重发。" });
-      }
-      submissionWaitersRef.current.clear();
+      failPendingTmuxSubmissionsOnDisconnect(submissionWaitersRef.current);
     };
 
     const scheduleResize = (force = false): void => {
@@ -904,6 +1058,7 @@ export function TmuxDashboard(): ReactElement {
       const nextSocket = new WebSocket(terminalAddress());
       socket = nextSocket;
       terminalSocketRef.current = nextSocket;
+      terminalSocketSessionRef.current = activeSessionId;
       nextSocket.binaryType = "arraybuffer";
       nextSocket.onopen = () => {
         if (disposed || socket !== nextSocket) {
@@ -911,9 +1066,7 @@ export function TmuxDashboard(): ReactElement {
           return;
         }
         reconnectAttempt = 0;
-        everAttached = true;
-        setTerminalEverAttached(true);
-        setTerminalStatus("ATTACHED");
+        // Wait for the initial frame before enabling input and background usage loading.
         if (host!.clientWidth !== lastHostWidth || host!.clientHeight !== lastHostHeight) scheduleResize(true);
       };
       nextSocket.onmessage = (event) => {
@@ -950,13 +1103,13 @@ export function TmuxDashboard(): ReactElement {
               setTerminalStatus("DETACHED");
             }
           } catch {
-            writeTerminalOutput(event.data);
+            writeTerminalOutput(event.data, nextSocket);
           }
         } else if (event.data instanceof ArrayBuffer) {
-          writeTerminalOutput(new Uint8Array(event.data));
+          writeTerminalOutput(new Uint8Array(event.data), nextSocket);
         } else if (event.data instanceof Blob) {
           void event.data.arrayBuffer().then((output) => {
-            if (!disposed && socket === nextSocket) writeTerminalOutput(new Uint8Array(output));
+            if (!disposed && socket === nextSocket) writeTerminalOutput(new Uint8Array(output), nextSocket);
           });
         }
       };
@@ -966,7 +1119,10 @@ export function TmuxDashboard(): ReactElement {
       nextSocket.onclose = () => {
         if (socket === nextSocket) {
           socket = null;
-          if (terminalSocketRef.current === nextSocket) terminalSocketRef.current = null;
+          if (terminalSocketRef.current === nextSocket) {
+            terminalSocketRef.current = null;
+            terminalSocketSessionRef.current = null;
+          }
         }
         resolvePendingSubmissions();
         if (!disposed) scheduleReconnect();
@@ -1043,7 +1199,7 @@ export function TmuxDashboard(): ReactElement {
     connect();
     scheduleResize(true);
 
-    return () => {
+    disposeTerminal = () => {
       disposed = true;
       window.clearTimeout(reconnectTimer);
       window.clearTimeout(keyboardCloseTimer);
@@ -1060,7 +1216,10 @@ export function TmuxDashboard(): ReactElement {
       resizeObserver.disconnect();
       resolvePendingSubmissions();
       selectionChange.dispose();
-      if (terminalSocketRef.current === socket) terminalSocketRef.current = null;
+      if (terminalSocketRef.current === socket) {
+        terminalSocketRef.current = null;
+        terminalSocketSessionRef.current = null;
+      }
       if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
       socket = null;
       removeTouchScrolling();
@@ -1068,7 +1227,16 @@ export function TmuxDashboard(): ReactElement {
       terminalLinks.dispose();
       terminal.dispose();
     };
-  }, [selectedSession?.id, terminalInputEnabled]);
+
+    };
+    void initialize().catch((failure: unknown) => {
+      disposeTerminal?.();
+      if (cancelled) return;
+      setTerminalStatus("ERROR");
+      setToast({ message: failure instanceof Error ? failure.message : "终端初始化失败。", isError: true });
+    });
+    return () => { cancelled = true; disposeTerminal?.(); };
+  }, [selectedSession?.id, terminalInputEnabled, terminalVisible]);
 
   useEffect(() => {
     if (!toast) return;
@@ -1086,16 +1254,32 @@ export function TmuxDashboard(): ReactElement {
     }
     if (sendingMessage) return { ok: false, message: "A message is already being sent." };
     if (!messageText.trim()) return { ok: false, message: "Enter a message or attach an image." };
+
+    // Git comments are editable composer text, not a separate delivery workflow.
+    // Strip legacy hidden markers without requiring their old process receipts.
+    const outboundText = stripGitReviewMarkers(messageText).trim();
+    if (!outboundText) return { ok: false, message: "Enter a message or attach an image." };
     if (terminalInputEnabled) {
-      const result = await sendTerminalCommand(messageText);
+      const result = await sendTerminalCommand(outboundText);
       if (result.ok) setToast({ message: "命令已发送到终端。", isError: false, isTop: true });
       return result;
     }
 
+    const requestId = ["submit", Date.now(), Math.random()].join("-");
+    const submitPayload = JSON.stringify({
+      type: "submit",
+      requestId,
+      text: outboundText,
+    });
+    if (new TextEncoder().encode(submitPayload).byteLength > 60 * 1024) {
+      const message = "评论锚点和 composer 内容超过 WebSocket 安全上限；请减少本批意见后重试。";
+      setToast({ message, isError: true, isTop: true });
+      return { ok: false, message };
+    }
+
     setSendingMessage(true);
     try {
-      const requestId = ["submit", Date.now(), Math.random()].join("-");
-      logDebugDiagnostic("tmux-submit", "client-send", summarizeUnicodeText(messageText));
+      logDebugDiagnostic("tmux-submit", "client-send", summarizeUnicodeText(outboundText));
       const result = await new Promise<SubmissionResult>((resolve) => {
         const timeout = window.setTimeout(() => {
           if (!submissionWaitersRef.current.has(requestId)) return;
@@ -1108,7 +1292,7 @@ export function TmuxDashboard(): ReactElement {
         });
         try {
           if (socket.readyState !== WebSocket.OPEN) throw new Error("The terminal connection is closed.");
-          socket.send(JSON.stringify({ type: "submit", requestId, text: messageText.trim() }));
+          socket.send(submitPayload);
         } catch (sendError) {
           submissionWaitersRef.current.delete(requestId);
           window.clearTimeout(timeout);
@@ -1118,7 +1302,7 @@ export function TmuxDashboard(): ReactElement {
           });
         }
       });
-      logDebugDiagnostic("tmux-submit", "client-result", { ok: result.ok, message: result.message ?? null, ...summarizeUnicodeText(messageText) });
+      logDebugDiagnostic("tmux-submit", "client-result", { ok: result.ok, message: result.message ?? null, ...summarizeUnicodeText(outboundText) });
       if (!result.ok) {
         setToast({ message: result.message || "Could not send the message to the session.", isError: true, isTop: true });
         return result;
@@ -1285,16 +1469,16 @@ export function TmuxDashboard(): ReactElement {
         setNavigationCollapsed(true);
         setMobileView("terminal");
       }
-      sessionsLoadSequenceRef.current += 1;
+      cancelSessionsRequest();
       restoreSessionDetailRef.current = false;
       setSessions((current) => [result.session, ...current.filter((session) => session.id !== result.session.id)]);
       setTerminalInputEnabled(false);
       setSelectedId(result.session.id);
       setTerminalEverAttached(false);
       setTerminalStatus("CONNECTING");
-      void recordSessionOpen(result.session.id);
+      void recordSessionOpen(result.session);
       setToast({ message: `Session “${result.session.name}” created.`, isError: false });
-      void loadSessions();
+      void loadSessions(true);
     } catch (createError) {
       setToast({ message: createError instanceof Error ? createError.message : "Could not create session.", isError: true });
     } finally {
@@ -1370,7 +1554,7 @@ export function TmuxDashboard(): ReactElement {
         setMobileView("sessions");
         setNavigationCollapsed(false);
       }
-      await loadSessions();
+      await loadSessions(true);
       setToast({ message: `Session「${session.name}」已终结。`, isError: false });
     } catch (endError) {
       setToast({ message: endError instanceof Error ? endError.message : "无法终结 Session。", isError: true });
@@ -1384,7 +1568,7 @@ export function TmuxDashboard(): ReactElement {
         method: "POST",
         body: JSON.stringify({ homeId }),
       });
-      await loadSessions();
+      await loadSessions(true);
       setToast({
         message: homeId
           ? `已将「${session.name}」设为该 Codex 账号；只影响此 Session 后续启动的 Codex。`
@@ -1409,7 +1593,7 @@ export function TmuxDashboard(): ReactElement {
         body: JSON.stringify({}),
       });
       if (result.status === "matched" && result.home) {
-        await loadSessions();
+        await loadSessions(true);
         setToast({ message: `检测到当前 pane 使用「${result.home.label}」，账号标记已同步。`, isError: false });
       } else if (result.status === "not-running") {
         setToast({ message: `「${session.name}」当前 pane 没有运行中的 Codex。`, isError: true });
@@ -1452,7 +1636,7 @@ export function TmuxDashboard(): ReactElement {
               <button
                 className="dashboard-action dashboard-icon-button"
                 type="button"
-                onClick={() => void loadSessions()}
+                onClick={() => void loadSessions(true)}
                 aria-label="刷新 Session 列表"
                 title="刷新 Session 列表"
               >
@@ -1636,7 +1820,7 @@ export function TmuxDashboard(): ReactElement {
               <div className="dashboard-empty-state"><div>&gt;_</div><h2>No session selected</h2><p>Choose a session from the list to attach its terminal.</p><button type="button" onClick={openCreateDialog} disabled={projects.length === 0}>+ New session</button></div>
             )}
           </div>
-          <TmuxMessageComposer
+          {terminalVisible ? <Suspense fallback={null}><TmuxMessageComposer
             key={selectedSession?.id ?? "no-session"}
             sessionId={selectedSession?.id ?? null}
             sessionFileForward={selectedSession?.id === sessionFileForward?.sessionId ? sessionFileForward : null}
@@ -1658,7 +1842,7 @@ export function TmuxDashboard(): ReactElement {
             onScrollToTop={() => terminalInstanceRef.current?.scrollToTop()}
             onScrollToBottom={() => terminalInstanceRef.current?.scrollToBottom()}
             onExportScrollDiagnostics={exportScrollDiagnostics}
-          />
+          /></Suspense> : null}
         </section>
       </section>
       {createOpen ? (
@@ -1773,7 +1957,7 @@ export function TmuxDashboard(): ReactElement {
           account={codexUsageAccount}
           loading={codexUsageLoading}
           error={codexUsageError}
-          onRefresh={() => loadCurrentCodexUsage(selectedCodexHomeId)}
+          onRefresh={() => loadCurrentCodexUsage(selectedCodexHomeId, true)}
           onClose={() => setCodexUsageDialogOpen(false)}
         />
       ) : null}

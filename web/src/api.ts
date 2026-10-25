@@ -202,6 +202,7 @@ export async function sendCodexThreadMessage(
     idempotencyKey: string;
     model?: string;
     reasoningEffort?: CodexHistoryReasoningEffort;
+    interactive?: boolean;
   },
 ): Promise<CodexHistoryMessageResponse> {
   const token = await getActionToken();

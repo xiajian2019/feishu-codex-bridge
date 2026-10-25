@@ -192,6 +192,7 @@ export function TmuxShortcutPalette({
               type="button"
               aria-pressed={category === item.id}
               title={item.title}
+              aria-label={item.title}
               onClick={() => onCategoryChange(item.id)}
             >{item.icon}</button>
           ))}

@@ -4,6 +4,7 @@ import { BrowserRouter, Navigate, Route, Routes, useLocation } from "react-route
 
 import { App } from "./App.js";
 import { SystemNavigationProvider, WebNavigation } from "./WebNavigation.js";
+import { WorkbenchNotifications } from "./Workbench.js";
 import { AuthGate, PairingAdmin } from "./auth.js";
 import { readVConsoleVisible, VCONSOLE_VISIBILITY_CHANGE_EVENT } from "./app-settings.js";
 import { ThemeProvider } from "./theme.js";
@@ -22,7 +23,10 @@ const SystemHealth = lazy(() => import("./SystemHealth.js").then((module) => ({ 
 const SystemBackups = lazy(() => import("./SystemBackups.js").then((module) => ({ default: module.SystemBackups })));
 const TaskWorkspaces = lazy(() => import("./TaskWorkspaces.js").then((module) => ({ default: module.TaskWorkspaces })));
 const SystemSettings = lazy(() => import("./SystemSettings.js").then((module) => ({ default: module.SystemSettings })));
+const Automations = lazy(() => import("./Automations.js").then((module) => ({ default: module.Automations })));
+const ExecutionMachines = lazy(() => import("./ExecutionMachines.js").then((module) => ({ default: module.ExecutionMachines })));
 const DemoCatalog = lazy(() => import("./DemoCatalog.js").then((module) => ({ default: module.DemoCatalog })));
+const JjTools = lazy(() => import("./JjTools.js").then((module) => ({ default: module.JjTools })));
 const LinkTools = lazy(() => import("./LinkTools.js").then((module) => ({ default: module.LinkTools })));
 
 function LegacyDirectTasksRedirect() {
@@ -193,6 +197,7 @@ async function mountApp(): Promise<void> {
           <AuthGate>
             <SystemNavigationProvider>
               <WebNavigation />
+              <WorkbenchNotifications />
               <Suspense fallback={<div className="route-loading">页面加载中…</div>}>
                 <Routes>
                   <Route path="/" element={<App />} />
@@ -202,6 +207,7 @@ async function mountApp(): Promise<void> {
                   <Route path="/codex-history/:homeId/:threadId" element={<CodexHistory />} />
                   <Route path="/demos" element={<DemoCatalog />} />
                   <Route path="/link-tools" element={<LinkTools />} />
+                  <Route path="/system-management/jj" element={<JjTools />} />
                   <Route path="/tmux-dashboard/history" element={<TmuxSessionHistory />} />
                   <Route path="/tmux-dashboard/git-changes/:sessionId" element={<TmuxGitChanges />} />
                   <Route path="/tmux-dashboard/files/:sessionId" element={<TmuxSessionFiles />} />
@@ -215,6 +221,8 @@ async function mountApp(): Promise<void> {
                   <Route path="/system-management/backups" element={<SystemBackups />} />
                   <Route path="/system-management/workspaces" element={<TaskWorkspaces />} />
                   <Route path="/system-management/settings" element={<SystemSettings />} />
+                  <Route path="/system-management/automations" element={<Automations />} />
+                  <Route path="/system-management/machines" element={<ExecutionMachines />} />
                   <Route path="/pair-admin" element={<Navigate to="/system-management/devices" replace />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>
