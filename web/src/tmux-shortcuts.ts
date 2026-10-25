@@ -6,6 +6,7 @@ export type ShortcutDisplayMode = "closed" | "expanded" | "both";
 
 export const COMPOSER_ACTION_OPTIONS = [
   { key: "attachment", label: "选择附件" },
+  { key: "skill-picker", label: "选择 Codex 技能" },
   { key: "scroll-top", label: "滚动到顶部" },
   { key: "scroll-bottom", label: "滚动到底部" },
   { key: "session-files", label: "浏览 Session 文件" },
@@ -15,6 +16,10 @@ export const COMPOSER_ACTION_OPTIONS = [
   { key: "terminal-up", label: "上一条输入" },
   { key: "terminal-down", label: "下一条输入" },
   { key: "terminal-enter", label: "回车" },
+  { key: "terminal-answer", label: "回答问题（Shift+←）" },
+  { key: "terminal-prompt-back", label: "返回输入（Shift+→）" },
+  { key: "terminal-warnings", label: "查看警告（F2）" },
+  { key: "codex-panel", label: "Codex TUI 面板" },
   { key: "keyboard-panel", label: "键盘面板" },
   { key: "close-panel", label: "关闭快捷栏" },
   { key: "ctrl-panel", label: "Ctrl 面板" },
@@ -31,6 +36,9 @@ export type TerminalShortcut =
   | "codex-down"
   | "codex-left"
   | "codex-right"
+  | "codex-answer"
+  | "codex-prompt-back"
+  | "codex-warnings"
   | "ctrl-d"
   | "ctrl-z"
   | "ctrl-l"
@@ -208,7 +216,12 @@ export type ShortcutStore = {
 };
 
 export const DEFAULT_COMPOSER_SHORTCUTS: readonly ShortcutDefinition[] = [
+  { id: "composer-tui-panel", groupId: "composer", title: "TUI", detail: "打开 Codex TUI 按键", kind: "insert", value: "", enabled: true, builtIn: true, dangerous: false, actionKey: "codex-panel", displayMode: "both", sortOrder: 1, operationCount: 0 },
+  { id: "composer-tui-answer", groupId: "composer", title: "答题", detail: "Shift+←：回答待处理问题 / 编辑排队消息", kind: "terminal", value: "codex-answer", enabled: true, builtIn: true, dangerous: false, actionKey: "terminal-answer", displayMode: "expanded", sortOrder: 6, operationCount: 0 },
+  { id: "composer-tui-back", groupId: "composer", title: "返回", detail: "Shift+→：返回输入区域", kind: "terminal", value: "codex-prompt-back", enabled: true, builtIn: true, dangerous: false, actionKey: "terminal-prompt-back", displayMode: "expanded", sortOrder: 6, operationCount: 0 },
+  { id: "composer-tui-warnings", groupId: "composer", title: "F2", detail: "F2：查看警告", kind: "terminal", value: "codex-warnings", enabled: true, builtIn: true, dangerous: false, actionKey: "terminal-warnings", displayMode: "expanded", sortOrder: 6, operationCount: 0 },
   { id: "composer-attachment", groupId: "composer", title: "附件", detail: "选择文件", kind: "insert", value: "", enabled: true, builtIn: true, dangerous: false, actionKey: "attachment", displayMode: "closed", sortOrder: 0, operationCount: 0 },
+  { id: "composer-skill-picker", groupId: "composer", title: "$", detail: "选择 Codex 技能", kind: "insert", value: "", enabled: true, builtIn: true, dangerous: false, actionKey: "skill-picker", displayMode: "expanded", sortOrder: 12, operationCount: 0 },
   { id: "composer-scroll-top", groupId: "composer", title: "顶部", detail: "滚动到顶部", kind: "insert", value: "", enabled: true, builtIn: true, dangerous: false, actionKey: "scroll-top", displayMode: "both", sortOrder: 1, operationCount: 0 },
   { id: "composer-scroll-bottom", groupId: "composer", title: "底部", detail: "滚动到底部", kind: "insert", value: "", enabled: true, builtIn: true, dangerous: false, actionKey: "scroll-bottom", displayMode: "both", sortOrder: 2, operationCount: 0 },
   { id: "composer-session-files", groupId: "composer", title: "文件", detail: "浏览 Session 文件", kind: "insert", value: "", enabled: true, builtIn: true, dangerous: false, actionKey: "session-files", displayMode: "both", sortOrder: 3, operationCount: 0 },

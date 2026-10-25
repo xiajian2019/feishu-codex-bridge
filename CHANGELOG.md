@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 - 2026-10-18
+
+### Added
+
+- Web Task Desk 与 tmux session 的 Git worktree 关联、任务上下文校验和安全清理能力。
+- tmux Dashboard 可显式开启终端输入模式，并新增本机 Demo 目录与 Bridge 代理入口。
+
+### Changed
+
+- 优化 tmux 移动端操作、状态提示、工作区页面和 Demo 卡片布局。
+
 ## 0.4.0 - 2026-09-26
 
 ### Added

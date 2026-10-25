@@ -7,6 +7,7 @@ const PAGES = [
   { to: "/", label: "任务面板", end: true },
   { to: "/codex-history", label: "Codex 历史", end: true },
   { to: "/tmux-dashboard", label: "Tmux", end: false },
+  { to: "/demos", label: "Demo", end: true },
 ] as const;
 
 const SYSTEM_PAGES = [
@@ -14,8 +15,13 @@ const SYSTEM_PAGES = [
   { to: "/system-management/backups", label: "数据备份" },
   { to: "/system-management/devices", label: "设备管理" },
   { to: "/system-management/projects", label: "项目管理" },
-  { to: "/system-management/shortcuts", label: "快捷键管理" },
+  { to: "/system-management/shortcuts", label: "快捷键与技能管理" },
   { to: "/system-management/usage", label: "Codex 用量" },
+  { to: "/system-management/workspaces", label: "Git 工作区" },
+  { to: "/system-management/automations", label: "自动化" },
+  { to: "/system-management/machines", label: "执行机器" },
+  { to: "/link-tools", label: "链接工具" },
+  { to: "/system-management/jj", label: "JJ 工具" },
   { to: "/system-management/settings", label: "系统设置" },
 ] as const;
 
@@ -68,7 +74,7 @@ export function WebNavigation(): ReactElement {
     const trigger = systemTriggerRef.current;
     if (!trigger) return;
     const popoverWidth = 190;
-    const estimatedPopoverHeight = 280;
+    const estimatedPopoverHeight = 320;
     const updatePosition = (): void => {
       const rect = trigger.getBoundingClientRect();
       const maxLeft = Math.max(12, window.innerWidth - popoverWidth - 12);

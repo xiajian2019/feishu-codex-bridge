@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import * as QRCode from "qrcode";
+import { getActionToken } from "./api.js";
 import { clearLocalDraftsAfterDeviceRevocation } from "./local-draft-cleanup.js";
 import { setLocalDraftScope } from "./local-draft-scope.js";
 
@@ -247,7 +248,7 @@ export function PairingAdmin(): ReactElement {
     try {
       const response = await fetch("/api/auth/pairing/start", {
         method: "POST",
-        headers: { Accept: "application/json" },
+        headers: { Accept: "application/json", "X-Bridge-Action-Token": await getActionToken() },
         credentials: "same-origin",
         signal: controller.signal,
       });
@@ -296,6 +297,7 @@ export function PairingAdmin(): ReactElement {
         headers: {
           Accept: "application/json",
           "Content-Type": "application/json",
+          "X-Bridge-Action-Token": await getActionToken(),
         },
         credentials: "same-origin",
         body: JSON.stringify({ deviceName }),
@@ -318,13 +320,39 @@ export function PairingAdmin(): ReactElement {
     }
   };
 
+  const extendDevice = async (device: WebAuthDevice): Promise<void> => {
+    if (!window.confirm(`确认将“${device.deviceName}”的授权延期一年？`)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const response = await fetch("/api/auth/devices/" + encodeURIComponent(device.sessionId) + "/extend", {
+        method: "POST",
+        headers: { Accept: "application/json", "X-Bridge-Action-Token": await getActionToken() },
+        credentials: "same-origin",
+      });
+      const body = await response.json() as { expiresAt?: string } & ApiError;
+      if (!response.ok) {
+        if (response.status === 401) {
+          window.location.assign("/");
+          return;
+        }
+        throw new Error(body.error || "设备授权延期失败（" + response.status + "）");
+      }
+      await loadManagement();
+    } catch (requestError: unknown) {
+      setError(requestError instanceof Error ? requestError.message : String(requestError));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const revokeAll = async (): Promise<void> => {
     setBusy(true);
     setError(null);
     try {
       const response = await fetch("/api/auth/revoke-all", {
         method: "POST",
-        headers: { Accept: "application/json" },
+        headers: { Accept: "application/json", "X-Bridge-Action-Token": await getActionToken() },
         credentials: "same-origin",
       });
       const body = await response.json() as ApiError;
@@ -345,7 +373,7 @@ export function PairingAdmin(): ReactElement {
     try {
       const response = await fetch("/api/auth/devices/" + encodeURIComponent(sessionId) + "/revoke", {
         method: "POST",
-        headers: { Accept: "application/json" },
+        headers: { Accept: "application/json", "X-Bridge-Action-Token": await getActionToken() },
         credentials: "same-origin",
       });
       const body = await response.json() as ApiError;
@@ -428,6 +456,14 @@ export function PairingAdmin(): ReactElement {
                       设置名称
                     </button>
                   ) : null}
+                  <button
+                    className="secondary device-row-action-button device-extend-button"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void extendDevice(device)}
+                  >
+                    延期一年
+                  </button>
                   <button
                     className="device-row-action-button device-revoke-button"
                     type="button"

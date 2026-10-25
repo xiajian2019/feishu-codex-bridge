@@ -3,11 +3,14 @@ import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactElement
 import {
   createShortcut,
   createShortcutGroup,
+  fetchCodexSkills,
   fetchShortcutConfig,
   moveShortcutToEdge,
+  updateCodexSkillPreferences,
   updateShortcut,
   updateShortcutGroup,
   watchRemoteShortcutConfig,
+  type CodexSkillRecord,
 } from "./api.js";
 import { COMPOSER_ACTION_OPTIONS, parseTerminalSequence, type ShortcutDefinition, type ShortcutDisplayMode, type ShortcutGroup, type ShortcutKind, type ShortcutStore, type ShortcutSurface } from "./tmux-shortcuts.js";
 import { readShortcutConfigCache, subscribeShortcutConfigInvalidation } from "./shortcut-config-cache.js";
@@ -37,6 +40,8 @@ const EMPTY_SHORTCUT: ShortcutDraft = { groupId: "", title: "", detail: "", kind
 
 export function ShortcutManagement(): ReactElement {
   const [store, setStore] = useState<ShortcutStore>(() => readShortcutConfigCache() ?? { groups: [], shortcuts: [] });
+  const [skillCatalog, setSkillCatalog] = useState<CodexSkillRecord[]>([]);
+  const [managementView, setManagementView] = useState<"shortcuts" | "skills">("shortcuts");
   const [selectedGroupId, setSelectedGroupId] = useState("");
   const [groupDraft, setGroupDraft] = useState<GroupDraft>(EMPTY_GROUP);
   const [shortcutDraft, setShortcutDraft] = useState<ShortcutDraft>(EMPTY_SHORTCUT);
@@ -45,6 +50,8 @@ export function ShortcutManagement(): ReactElement {
   const [showGroupForm, setShowGroupForm] = useState(false);
   const [showShortcutForm, setShowShortcutForm] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [skillsLoading, setSkillsLoading] = useState(true);
+  const [skillsLoadError, setSkillsLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const loadGeneration = useRef(0);
@@ -52,18 +59,33 @@ export function ShortcutManagement(): ReactElement {
   const load = async (): Promise<void> => {
     const generation = ++loadGeneration.current;
     setLoading(true);
+    setSkillsLoading(true);
     setError(null);
     try {
-      const next = await fetchShortcutConfig();
+      const [shortcutResult, skillResult] = await Promise.allSettled([fetchShortcutConfig(), fetchCodexSkills()]);
       if (generation !== loadGeneration.current) return;
-      setStore(next);
-      setSelectedGroupId((current) => current && next.groups.some((group) => group.id === current) ? current : next.groups[0]?.id ?? "");
-      setShortcutDraft((current) => ({ ...current, groupId: current.groupId || next.groups[0]?.id || "" }));
+      if (shortcutResult.status === "fulfilled") {
+        const next = shortcutResult.value;
+        setStore(next);
+        setSelectedGroupId((current) => current && next.groups.some((group) => group.id === current) ? current : next.groups[0]?.id ?? "");
+        setShortcutDraft((current) => ({ ...current, groupId: current.groupId || next.groups[0]?.id || "" }));
+      } else {
+        setError(shortcutResult.reason instanceof Error ? shortcutResult.reason.message : String(shortcutResult.reason));
+      }
+      if (skillResult.status === "fulfilled") {
+        setSkillCatalog(skillResult.value);
+        setSkillsLoadError(null);
+      } else {
+        setSkillsLoadError(skillResult.reason instanceof Error ? skillResult.reason.message : String(skillResult.reason));
+      }
     } catch (loadError) {
       if (generation !== loadGeneration.current) return;
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
-      if (generation === loadGeneration.current) setLoading(false);
+      if (generation === loadGeneration.current) {
+        setLoading(false);
+        setSkillsLoading(false);
+      }
     }
   };
 
@@ -87,6 +109,12 @@ export function ShortcutManagement(): ReactElement {
       .slice()
       .sort((left, right) => left.sortOrder - right.sortOrder || left.title.localeCompare(right.title)),
     [selectedGroupId, store.shortcuts],
+  );
+  const orderedSkills = useMemo(
+    () => skillCatalog.slice().sort((left, right) => Number(right.pinned) - Number(left.pinned)
+      || left.sortOrder - right.sortOrder
+      || left.skillName.localeCompare(right.skillName)),
+    [skillCatalog],
   );
 
   const run = async (operation: () => Promise<void>, reload = true): Promise<void> => {
@@ -200,14 +228,44 @@ export function ShortcutManagement(): ReactElement {
     }, false);
   };
 
+  const saveSkillOrder = (skills: CodexSkillRecord[]): void => {
+    const ordered = skills.map((skill, sortOrder) => ({ ...skill, sortOrder }));
+    void run(async () => {
+      await updateCodexSkillPreferences(ordered.map(({ skillName, pinned, sortOrder }) => ({ skillName, pinned, sortOrder })));
+      setSkillCatalog(ordered);
+    }, false);
+  };
+
+  const moveSkill = (skill: CodexSkillRecord, direction: -1 | 1): void => {
+    const index = orderedSkills.findIndex((item) => item.skillName === skill.skillName);
+    const targetIndex = index + direction;
+    const neighbor = orderedSkills[targetIndex];
+    if (index < 0 || !neighbor || neighbor.pinned !== skill.pinned) return;
+    const next = orderedSkills.slice();
+    [next[index], next[targetIndex]] = [next[targetIndex]!, next[index]!];
+    saveSkillOrder(next);
+  };
+
+  const toggleSkillPinned = (skill: CodexSkillRecord): void => {
+    const remaining = orderedSkills.filter((item) => item.skillName !== skill.skillName);
+    const toggled = { ...skill, pinned: !skill.pinned };
+    const pinned = remaining.filter((item) => item.pinned);
+    const unpinned = remaining.filter((item) => !item.pinned);
+    const next = skill.pinned
+      ? [...pinned, ...unpinned, toggled]
+      : [toggled, ...pinned, ...unpinned];
+    saveSkillOrder(next);
+  };
+
   return (
     <main className="shortcut-management-page">
       <header className="shortcut-management-header">
-        <h1>快捷键管理</h1>
+        <h1>快捷键与技能管理</h1>
         <button className="primary shortcut-management-refresh" type="button" onClick={() => void load()} disabled={loading || busy}>刷新配置</button>
       </header>
       {error ? <div className="shortcut-management-error" role="alert">{error}</div> : null}
-      <div className="shortcut-management-layout">
+      <div className={`shortcut-management-layout${managementView === "skills" ? " is-skill-view" : ""}`}>
+        {managementView === "shortcuts" ? (
         <section className="shortcut-management-card shortcut-group-card">
           <div className="shortcut-management-card-heading"><strong>分组</strong></div>
           <div className="shortcut-group-list">
@@ -228,20 +286,56 @@ export function ShortcutManagement(): ReactElement {
             ))}
           </div>
         </section>
+        ) : null}
 
         <section className="shortcut-management-card shortcut-list-card">
-          <nav className="shortcut-group-tabs" aria-label="快捷键分组">
-            {groups.map((group) => <button className={selectedGroupId === group.id ? "is-active" : ""} type="button" key={group.id} onClick={() => setSelectedGroupId(group.id)}>{group.icon} {group.title}</button>)}
+          <nav className="shortcut-group-tabs" aria-label="管理内容">
+            <button className={managementView === "shortcuts" ? "is-active" : ""} type="button" onClick={() => setManagementView("shortcuts")}>快捷键</button>
+            <button className={managementView === "skills" ? "is-active" : ""} type="button" onClick={() => setManagementView("skills")}>技能排序 · {orderedSkills.length}</button>
           </nav>
-          <div className="shortcut-list-table">
-            {visibleShortcuts.map((shortcut) => (
-              <article className={`shortcut-config-row${shortcut.enabled ? "" : " is-disabled"}`} key={shortcut.id}>
-                <div className="shortcut-config-head"><div className="shortcut-config-main"><strong>{shortcut.title}</strong><span>{shortcut.detail || "无说明"} · {shortcut.kind}</span><div className="shortcut-config-value"><code>{shortcut.value}</code></div></div></div>
-                <div className="shortcut-row-actions"><span className="shortcut-use-count" title="累计操作次数">{shortcut.operationCount} 次</span><button type="button" onClick={() => moveShortcut(shortcut, -1)} disabled={busy || visibleShortcuts.indexOf(shortcut) === 0} title="移到顶部" aria-label="移到顶部">↑</button><button type="button" onClick={() => moveShortcut(shortcut, 1)} disabled={busy || visibleShortcuts.indexOf(shortcut) === visibleShortcuts.length - 1} title="移到底部" aria-label="移到底部">↓</button><button type="button" onClick={() => toggleShortcut(shortcut)} disabled={busy} aria-label={shortcut.enabled ? "停用快捷键" : "启用快捷键"}>{shortcut.enabled ? "−" : "+"}</button><button type="button" onClick={() => editShortcut(shortcut)} disabled={busy} aria-label="编辑快捷键"><EditIcon /></button></div>
-              </article>
-            ))}
-            {visibleShortcuts.length === 0 ? <p className="shortcut-management-empty">当前分组还没有快捷键。</p> : null}
-          </div>
+          {managementView === "shortcuts" ? (
+            <>
+              <nav className="shortcut-group-tabs" aria-label="快捷键分组">
+                {groups.map((group) => <button className={selectedGroupId === group.id ? "is-active" : ""} type="button" key={group.id} onClick={() => setSelectedGroupId(group.id)}>{group.icon} {group.title}</button>)}
+              </nav>
+              <div className="shortcut-list-table">
+                {visibleShortcuts.map((shortcut) => {
+                  const isComposerAction = groups.find((group) => group.id === shortcut.groupId)?.surface === "composer";
+                  const displayPosition = shortcut.displayMode === "closed" ? "收起时显示"
+                    : shortcut.displayMode === "expanded" ? "展开时显示" : "始终显示";
+                  return (
+                    <article className={`shortcut-config-row${shortcut.enabled ? "" : " is-disabled"}`} key={shortcut.id}>
+                      <div className="shortcut-config-head"><div className="shortcut-config-main"><strong>{shortcut.title}</strong><span>{shortcut.detail || "无说明"} · {shortcut.kind}{isComposerAction ? " · " + displayPosition : ""}</span><div className="shortcut-config-value"><code>{shortcut.value}</code></div></div></div>
+                      <div className="shortcut-row-actions"><span className="shortcut-use-count" title="累计操作次数">{shortcut.operationCount} 次</span><button type="button" onClick={() => moveShortcut(shortcut, -1)} disabled={busy || visibleShortcuts.indexOf(shortcut) === 0} title="移到顶部" aria-label="移到顶部">↑</button><button type="button" onClick={() => moveShortcut(shortcut, 1)} disabled={busy || visibleShortcuts.indexOf(shortcut) === visibleShortcuts.length - 1} title="移到底部" aria-label="移到底部">↓</button><button type="button" onClick={() => toggleShortcut(shortcut)} disabled={busy} aria-label={shortcut.enabled ? "停用快捷键" : "启用快捷键"}>{shortcut.enabled ? "−" : "+"}</button><button type="button" onClick={() => editShortcut(shortcut)} disabled={busy} aria-label="编辑快捷键"><EditIcon /></button></div>
+                    </article>
+                  );
+                })}
+                {visibleShortcuts.length === 0 ? <p className="shortcut-management-empty">当前分组还没有快捷键。</p> : null}
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="shortcut-skill-management-hint">置顶技能会排在列表前面；其余技能按下方顺序显示，技能选择器无需输入文字也能直接选用。</p>
+              {skillsLoadError ? <p className="shortcut-management-empty is-error" role="alert">{skillsLoadError}</p> : null}
+              {skillsLoading ? <p className="shortcut-management-empty">正在读取技能…</p> : null}
+              {!skillsLoading && !skillsLoadError && orderedSkills.length === 0 ? <p className="shortcut-management-empty">尚未同步技能。打开任意 Session 的技能选择器后，这里会显示该 Session 可用的技能。</p> : null}
+              <div className="shortcut-list-table">
+                {orderedSkills.map((skill, index) => {
+                  const sourceLabel = skill.scope === "project" ? "项目" : skill.scope === "codex_home" ? "Codex Home" : skill.scope === "user" ? "用户" : skill.scope === "plugin" ? "插件" : "系统";
+                  return (
+                    <article className="shortcut-config-row is-skill-row" key={skill.skillName}>
+                      <div className="shortcut-config-head"><div className="shortcut-config-main"><strong>{skill.nameZh || skill.skillName}{skill.pinned ? <em className="shortcut-skill-pinned">置顶</em> : null}</strong><span>{skill.skillName} · {sourceLabel}{skill.nameEn && skill.nameEn !== skill.nameZh ? " · " + skill.nameEn : ""}</span><p>{skill.descriptionZh || skill.descriptionEn || "无说明"}</p></div></div>
+                      <div className="shortcut-row-actions">
+                        <button className={skill.pinned ? "is-skill-pinned" : ""} type="button" onClick={() => toggleSkillPinned(skill)} disabled={busy} title={skill.pinned ? "取消置顶" : "置顶技能"} aria-label={skill.pinned ? "取消置顶" : "置顶技能"} aria-pressed={skill.pinned}><PinIcon /></button>
+                        <button type="button" onClick={() => moveSkill(skill, -1)} disabled={busy || index === 0 || orderedSkills[index - 1]?.pinned !== skill.pinned} title="上移" aria-label="上移">↑</button>
+                        <button type="button" onClick={() => moveSkill(skill, 1)} disabled={busy || index === orderedSkills.length - 1 || orderedSkills[index + 1]?.pinned !== skill.pinned} title="下移" aria-label="下移">↓</button>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            </>
+          )}
         </section>
       </div>
 
@@ -289,4 +383,8 @@ export function ShortcutManagement(): ReactElement {
 
 function EditIcon(): ReactElement {
   return <svg className="shortcut-edit-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16.8-.8 3.9 3.9-.8L18.4 7.8a2.2 2.2 0 0 0 0-3.1l-.1-.1a2.2 2.2 0 0 0-3.1 0L4 16.8Zm9.8-10.1 4.3 4.3M4 20.7l3.6-3.6" /></svg>;
+}
+
+function PinIcon(): ReactElement {
+  return <svg className="shortcut-skill-pin-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m15 3 6 6-3.5 1-3 3v4l-2 1-2-5-6 6 6-8-4-2 1-2h4l3-3z" /><path d="m11 13-7 7" /></svg>;
 }

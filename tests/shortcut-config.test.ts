@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { StateDatabase } from "../src/db.js";
 import { DashboardServer } from "../src/web.js";
+import { DEFAULT_SHORTCUTS } from "../src/tmux-shortcut-defaults.js";
+import { DEFAULT_COMPOSER_SHORTCUTS, parseTerminalSequence } from "../web/src/tmux-shortcuts.js";
 
 const databases: StateDatabase[] = [];
 const servers: DashboardServer[] = [];
@@ -16,8 +21,8 @@ describe("SQLite shortcut configuration", () => {
     const database = new StateDatabase(":memory:");
     databases.push(database);
     const config = database.getShortcutConfig();
-    expect(config.groups.map((group) => group.id)).toEqual(["favorites", "tmux", "codex", "ctrl", "keyboard", "composer"]);
-    expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "composer")).toHaveLength(13);
+    expect(config.groups.map((group) => group.id)).toEqual(["favorites", "codex-tui", "tmux", "codex", "ctrl", "keyboard", "composer"]);
+    expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "composer")).toHaveLength(18);
     expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "tmux").map((shortcut) => shortcut.id)).toContain("command-tmuxctl");
     expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "tmux").map((shortcut) => shortcut.id)).toContain("tmux-resize-pane-5-right");
     expect(config.shortcuts.filter((shortcut) => shortcut.group_id === "codex").map((shortcut) => shortcut.value)).toContain("/keymap");
@@ -32,6 +37,54 @@ describe("SQLite shortcut configuration", () => {
     const movedCodexShortcut = database.moveShortcutToEdge(lastCodexShortcut.id, "start")!;
     expect(database.listShortcuts("codex")[0]?.id).toBe(lastCodexShortcut.id);
     expect(movedCodexShortcut.sort_order).toBeLessThan(codexShortcuts[0]!.sort_order);
+  });
+
+  test("puts answer, return and warnings on the first TUI page with navigation keys", () => {
+    const database = new StateDatabase(":memory:");
+    databases.push(database);
+    const firstPage = database.listShortcuts("codex-tui").slice(0, 8);
+    expect(firstPage.map((shortcut) => shortcut.value)).toEqual([
+      "Shift+Left", "Shift+Right", "F2", "codex-escape", "codex-up", "codex-down", "codex-enter", "codex-tab",
+    ]);
+    expect(firstPage.slice(0, 3).map((shortcut) => parseTerminalSequence(shortcut.value)))
+      .toEqual(["\u001b[1;2D", "\u001b[1;2C", "\u001bOQ"]);
+    const fallbackControls = DEFAULT_COMPOSER_SHORTCUTS.filter((shortcut) => shortcut.id.startsWith("composer-tui-"));
+    for (const control of fallbackControls) {
+      expect(database.getShortcut(control.id)).toMatchObject({
+        value: control.value, action_key: control.actionKey, display_mode: control.displayMode,
+      });
+    }
+  });
+
+  test("upgrades old TUI keys once while preserving custom ordering, labels and disabled keys", () => {
+    const root = mkdtempSync(join(tmpdir(), "bridge-tui-shortcut-upgrade-"));
+    const path = join(root, "fixture.db");
+    const now = () => new Date("2026-10-22T00:00:00Z");
+    let database = new StateDatabase(path, now);
+    try {
+      const tuiIds = DEFAULT_SHORTCUTS.filter((shortcut) => shortcut.groupId === "codex-tui" && shortcut.id.startsWith("codex-key-"));
+      for (const shortcut of tuiIds) {
+        database.updateShortcut(shortcut.id, { groupId: "codex", sortOrder: DEFAULT_SHORTCUTS.indexOf(shortcut) });
+      }
+      database.updateShortcut("codex-key-edit-queued", { detail: "编辑上一条排队消息" });
+      database.updateShortcut("codex-key-warnings", { title: "自定义警告", detail: "保留说明", sortOrder: -20, enabled: false });
+      database.recordShortcutUse("codex-key-warnings");
+      const customGroup = database.createShortcutGroup({ title: "我的按键", icon: "K" });
+      database.updateShortcut("codex-key-copy", { groupId: customGroup.id });
+      database.close();
+
+      database = new StateDatabase(path, now);
+      expect(database.getShortcut("codex-key-edit-queued")).toMatchObject({ group_id: "codex-tui", sort_order: 0, detail: "回答待处理问题 / 编辑排队消息" });
+      expect(database.getShortcut("codex-key-warnings")).toMatchObject({ group_id: "codex-tui", title: "自定义警告", detail: "保留说明", sort_order: -20, enabled: false, operation_count: 1 });
+      expect(database.getShortcut("codex-key-copy")?.group_id).toBe(customGroup.id);
+      const config = database.getShortcutConfig();
+      database.close();
+      database = new StateDatabase(path, now);
+      expect(database.getShortcutConfig()).toEqual(config);
+    } finally {
+      database.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("serves CRUD and use-count APIs", async () => {

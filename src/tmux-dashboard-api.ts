@@ -9,18 +9,37 @@ import type { Duplex } from "node:stream";
 
 import { getBunRuntime, type BunSubprocess, type BunTerminal } from "./bun-runtime.js";
 import { discoverCodexHistoryHomes, type CodexHistoryHome } from "./codex-history.js";
+import { codexSkillScopeKeys, discoverCodexSkills, type CodexSkillScope } from "./codex-skills.js";
+import { GitWorkspaceError, inspectGitChanges, openGitChangeFile, previewGitChangeFile, inspectTaskSourceDirectory, resolveGitCommonDirectory, resolveGitRoot, verifyTaskWorkspace } from "./git-workspaces.js";
 import type { StateDatabase } from "./db.js";
-import type { StoredTmuxSessionAction } from "./types.js";
+import type { StoredTask, StoredTmuxSessionAction, WebTaskSubmission } from "./types.js";
+import {
+  parseTmuxReviewAnchor,
+  parseTmuxReviewTarget,
+  reviewAnchorMismatch,
+  tmuxReviewTargetMismatch,
+  type TmuxReviewAnchor,
+  type TmuxReviewTarget,
+} from "./tmux-review.js";
 import * as tmux from "./tmux-dashboard.js";
 
 const API_PREFIX = "/tmux-dashboard/api";
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const MAX_SESSION_FILE_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_SUBMISSION_BYTES = 32 * 1024;
+const MAX_GIT_REVIEW_ANCHORS = 20;
 const MAX_SCROLL_DIAGNOSTIC_EXPORT_BYTES = 5 * 1024 * 1024;
 const MAX_SCROLL_DIAGNOSTIC_ENTRIES = 2_000;
+const CODEX_SKILL_SOURCE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const CODEX_SKILL_REFRESH_RETRY_MS = 60 * 1_000;
+const CODEX_HOME_OPTIONS_CACHE_MS = 30 * 1_000;
 const SUBMIT_FAST_FLUSH_WINDOW_MS = 5_000;
 const SUBMIT_FAST_FLUSH_IDLE_MS = 250;
+const MAX_TERMINAL_INPUT_BYTES = 32 * 1024;
+// Codex's paste-burst handler suppresses Enter briefly after rapid pasted input.
+// Keep the synthetic submit outside that window so it is handled as submit.
+const TERMINAL_PASTE_SETTLE_MS = 180;
+const TERMINAL_HEARTBEAT_INTERVAL_MS = 30_000;
 const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.freeze({
   "codex-escape": "\u001b",
   "codex-interrupt": "\u0003",
@@ -32,6 +51,9 @@ const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.fre
   "codex-down": "\u001b[B",
   "codex-left": "\u001b[D",
   "codex-right": "\u001b[C",
+  "codex-answer": "\u001b[1;2D",
+  "codex-prompt-back": "\u001b[1;2C",
+  "codex-warnings": "\u001bOQ",
   "ctrl-d": "\u0004",
   "ctrl-z": "\u001a",
   "ctrl-l": "\u000c",
@@ -147,26 +169,115 @@ interface TerminalData {
   rows: number;
   terminal?: BunTerminal;
   proc?: BunSubprocess;
+  isAuthorized: () => boolean;
 }
 
 export interface TmuxDashboardApiOptions {
   db: StateDatabase;
+  createTaskFromSession?: (input: WebTaskSubmission, source: {
+    directory: string;
+    tmuxSessionId: string;
+    expectedDirectory: string;
+    expectedBaseSha: string;
+  }) => Promise<StoredTask>;
   operations?: Pick<typeof tmux, "createSession" | "findSession" | "killSession" | "listSessions">
-    & Partial<Pick<typeof tmux, "inspectCodexHome" | "setCodexHomeForSession">>;
+    & Partial<Pick<typeof tmux, "getCurrentPanePath" | "inspectCodexHome" | "setCodexHomeForSession" | "capturePane" | "inspectReviewPane" | "pasteTextToPane" | "sendEnterToPane">>;
+  terminalRuntime?: Pick<ReturnType<typeof getBunRuntime>, "spawn">;
+  /** Internal interval override for bounded connection-liveness tests. */
+  heartbeatIntervalMs?: number;
+  /** Injectable for tests; production discovers the local Codex homes. */
+  discoverCodexHomes?: () => CodexHistoryHome[];
+}
+
+export interface TerminalHeartbeatPeer {
+  readyState: number;
+  ping(): void;
+  terminate(): void;
+  on(event: "pong", listener: () => void): unknown;
+  off(event: "pong", listener: () => void): unknown;
+}
+
+export function startTerminalHeartbeat(
+  peer: TerminalHeartbeatPeer,
+  intervalMs = TERMINAL_HEARTBEAT_INTERVAL_MS,
+  schedule: typeof setInterval = setInterval,
+  cancel: typeof clearInterval = clearInterval,
+  isAuthorized: () => boolean = () => true,
+): () => void {
+  let stopped = false;
+  let awaitingPong = false;
+  let timer: ReturnType<typeof setInterval>;
+  const onPong = (): void => { awaitingPong = false; };
+  const stop = (): void => {
+    if (stopped) return;
+    stopped = true;
+    cancel(timer);
+    peer.off("pong", onPong);
+  };
+  peer.on("pong", onPong);
+  timer = schedule(() => {
+    if (stopped) return;
+    if (peer.readyState !== WebSocket.OPEN) {
+      stop();
+      return;
+    }
+    if (!isAuthorized()) {
+      stop();
+      peer.terminate();
+      return;
+    }
+    if (awaitingPong) {
+      stop();
+      peer.terminate();
+      return;
+    }
+    awaitingPong = true;
+    try { peer.ping(); }
+    catch {
+      stop();
+      peer.terminate();
+    }
+  }, intervalMs);
+  return stop;
 }
 
 export class TmuxDashboardApi {
   private readonly db: StateDatabase;
   private readonly operations: NonNullable<TmuxDashboardApiOptions["operations"]>;
+  private readonly terminalRuntime?: TmuxDashboardApiOptions["terminalRuntime"];
+  private readonly heartbeatIntervalMs: number;
+  private readonly createTaskFromSession?: TmuxDashboardApiOptions["createTaskFromSession"];
+  private readonly discoverCodexHomes: () => CodexHistoryHome[];
   private readonly websocketServer = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
   private readonly clients = new Set<WebSocket>();
+  private readonly clientAuthorizationChecks = new Map<WebSocket, () => boolean>();
+  private readonly skillRefreshes = new Map<string, Promise<void>>();
+  private readonly skillRefreshAttempts = new Map<string, number>();
+  private codexHomeOptionsCache: { at: number; homes: CodexHistoryHome[] } | null = null;
+  private sessionListRefresh: Promise<tmux.TmuxSession[]> | null = null;
   private stopped = false;
   private attachmentStorageReady: Promise<void> | null = null;
 
   constructor(options: TmuxDashboardApiOptions) {
     if (!options.db) throw new Error("TmuxDashboardApi requires the Bridge state database.");
     this.db = options.db;
+    this.terminalRuntime = options.terminalRuntime;
+    this.heartbeatIntervalMs = Number.isSafeInteger(options.heartbeatIntervalMs) && (options.heartbeatIntervalMs ?? 0) >= 10
+      ? options.heartbeatIntervalMs!
+      : TERMINAL_HEARTBEAT_INTERVAL_MS;
+    this.createTaskFromSession = options.createTaskFromSession;
+    this.discoverCodexHomes = options.discoverCodexHomes ?? (() => discoverCodexHistoryHomes());
     this.operations = { ...tmux, ...options.operations };
+  }
+
+  public async getWorkspaceSessionSnapshot(): Promise<Array<{ sessionId: string; currentPath: string }>> {
+    const sessions = await this.listLiveSessions();
+    return Promise.all(sessions.map(async (session) => ({
+      sessionId: session.id,
+      currentPath: this.operations.getCurrentPanePath
+        ? await this.operations.getCurrentPanePath(session.id, session)
+        : session.cwd,
+    })));
   }
 
   public async handleRequest(
@@ -285,6 +396,70 @@ export class TmuxDashboardApi {
         } else {
           sendJson(response, 500, { error: "Could not store the attachment." });
         }
+      }
+      return;
+    }
+    const skillListMatch = /^\/sessions\/([^/]+)\/skills$/.exec(apiPath);
+    if (request.method === "GET" && skillListMatch) {
+      let sessionId: string;
+      try {
+        sessionId = decodeURIComponent(skillListMatch[1]!);
+      } catch {
+        sendJson(response, 400, { error: "Invalid tmux session id." });
+        return;
+      }
+      try {
+        const session = await this.operations.findSession(sessionId);
+        if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        const [codexHomePath, projectCwd] = await Promise.all([
+          this.codexHomePathForSession(sessionId, session),
+          this.operations.getCurrentPanePath
+            ? this.operations.getCurrentPanePath(sessionId, session)
+            : Promise.resolve(session.cwd),
+        ]);
+        const scopeKeys = codexSkillScopeKeys({ codexHomePath, projectCwd });
+        const scopeKey = [...scopeKeys].sort().join("\u0000");
+        const syncStatus = this.db.codexSkillSourceSyncStatus(scopeKeys, CODEX_SKILL_SOURCE_MAX_AGE_MS);
+        const cachedSkills = this.db.listCodexSkills(scopeKeys);
+        if (!syncStatus.fresh) {
+          const refresh = this.scheduleCodexSkillRefresh(codexHomePath, projectCwd, scopeKeys);
+          if (refresh && !syncStatus.initialized && cachedSkills.length === 0) await refresh;
+        }
+        const skillCacheFresh = this.db.codexSkillSourceSyncStatus(scopeKeys, CODEX_SKILL_SOURCE_MAX_AGE_MS).fresh;
+        const scopePriority: Record<CodexSkillScope, number> = {
+          project: 0,
+          codex_home: 1,
+          user: 2,
+          plugin: 3,
+          system: 4,
+        };
+        const query = (url.searchParams.get("q") ?? "").trim().slice(0, 160).toLocaleLowerCase();
+        const allSkills = url.searchParams.get("all") === "1";
+        const resultLimit = allSkills ? 1_000 : query ? 20 : 6;
+        const byName = new Map<string, ReturnType<StateDatabase["listCodexSkills"]>[number]>();
+        for (const skill of this.db.listCodexSkills(scopeKeys).sort((left, right) =>
+          scopePriority[left.scope] - scopePriority[right.scope]
+            || left.skillName.localeCompare(right.skillName),
+        )) {
+          const key = skill.skillName.toLocaleLowerCase("en-US");
+          if (!byName.has(key)) byName.set(key, skill);
+        }
+        const skills = [...byName.values()]
+          .filter((skill) => !query || skill.skillName.toLocaleLowerCase().includes(query))
+          .sort((left, right) => Number(right.pinned) - Number(left.pinned)
+            || left.sortOrder - right.sortOrder
+            || left.skillName.localeCompare(right.skillName))
+          .slice(0, resultLimit);
+        sendJson(response, 200, {
+          skills: skills.map((skill) => ({
+            skillName: skill.skillName,
+            descriptionZh: skill.descriptionZh,
+          })),
+          fresh: skillCacheFresh,
+          refreshing: this.skillRefreshes.has(scopeKey),
+        });
+      } catch (error) {
+        sendDashboardError(response, error);
       }
       return;
     }
@@ -423,19 +598,200 @@ export class TmuxDashboardApi {
       });
       return;
     }
-    if (request.method === "GET" && apiPath === "/sessions") {
+    if (request.method === "GET" && apiPath === "/codex-homes") {
       try {
-        const sessions = await this.operations.listSessions();
-        this.db.syncTmuxSessions(sessions);
         sendJson(response, 200, {
-          sessions: sessions.map((session) => ({
-            ...session,
-            codexHomeId: this.db.getLatestTmuxSession(session.id)?.codex_home_id ?? null,
-          })),
           codexHomes: this.codexHomeOptions().map(({ id, label, available }) => ({ id, label, available })),
         });
       } catch (error) {
         sendDashboardError(response, error);
+      }
+      return;
+    }
+    if (request.method === "GET" && apiPath === "/sessions") {
+      try {
+        const liveSessions = await this.listLiveSessions();
+        const includeHomes = url.searchParams.get("includeHomes") !== "0";
+        const liveByKey = new Map(liveSessions.map((session) => [`${session.id}\u0000${session.createdAt}`, session]));
+        const sessions = this.db.listTmuxSessionsForDashboard().map((saved) => {
+          const live = liveByKey.get(`${saved.tmux_session_id}\u0000${saved.tmux_created_at}`);
+          const workspace = saved.workspace_id ? this.db.getTaskWorkspaceById(saved.workspace_id) : null;
+          return {
+            id: saved.tmux_session_id,
+            name: live?.name ?? saved.session_name,
+            windows: live?.windows ?? 0,
+            attachedClients: live?.attachedClients ?? 0,
+            cwd: live?.cwd ?? saved.working_directory,
+            createdAt: live?.createdAt ?? saved.tmux_created_at,
+            endedAt: saved.ended_at,
+            openCount: saved.open_count,
+            lastOpenedAt: saved.last_opened_at,
+            codexHomeId: saved.codex_home_id,
+            workspaceId: workspace?.workspace_id ?? null,
+            taskGuid: workspace?.task_guid ?? null,
+            workspaceBranch: workspace?.branch ?? null,
+            workspaceStatus: workspace?.status ?? null,
+          };
+        });
+        sendJson(response, 200, includeHomes
+          ? {
+            sessions,
+            codexHomes: this.codexHomeOptions().map(({ id, label, available }) => ({ id, label, available })),
+          }
+          : { sessions });
+      } catch (error) {
+        sendDashboardError(response, error);
+      }
+      return;
+    }
+    const taskContextMatch = /^\/sessions\/([^/]+)\/task-context$/.exec(apiPath);
+    if (request.method === "GET" && taskContextMatch) {
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(taskContextMatch[1]!); }
+      catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
+      try {
+        const session = await this.operations.findSession(sessionId);
+        if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        const directory = this.operations.getCurrentPanePath
+          ? await this.operations.getCurrentPanePath(sessionId, session)
+          : session.cwd;
+        const [project, source] = await Promise.all([
+          this.projectForSession(sessionId, directory),
+          inspectTaskSourceDirectory(directory),
+        ]);
+        sendJson(response, 200, {
+          sessionId,
+          projectKey: project.name,
+          projectName: project.name,
+          directory: source.directory,
+          branch: source.branch,
+          baseSha: source.baseSha,
+          sourceHeadSha: source.baseSha,
+          baseRef: source.targetBaseRef,
+          targetBaseSha: source.targetBaseSha,
+          dirtyEntryCount: source.dirtyEntryCount,
+        });
+      } catch (error) {
+        if (error instanceof GitWorkspaceError) sendJson(response, error.statusCode, { error: error.message });
+        else sendDashboardError(response, error);
+      }
+      return;
+    }
+    const reviewContextMatch = /^\/sessions\/([^/]+)\/git-review\/context$/.exec(apiPath);
+    if (request.method === "GET" && reviewContextMatch) {
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(reviewContextMatch[1]!); }
+      catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
+      try {
+        const context = await this.readReviewContext(sessionId);
+        const expectedGitRoot = url.searchParams.get("expectedGitRoot");
+        if (expectedGitRoot && expectedGitRoot !== context.inspection.gitRoot) {
+          sendJson(response, 409, { error: "The session now points to a different Git repository." });
+          return;
+        }
+        const target: TmuxReviewTarget | null = context.pane.foregroundCodex ? {
+          sessionId,
+          paneId: context.pane.paneId,
+          gitRoot: context.inspection.gitRoot,
+          foregroundCodex: context.pane.foregroundCodex,
+        } : null;
+        sendJson(response, 200, {
+          sessionId,
+          session: { id: context.session.id, name: context.session.name },
+          paneId: context.pane.paneId,
+          gitRoot: context.inspection.gitRoot,
+          foregroundCodex: context.pane.foregroundCodex,
+          status: target ? "ready" : "codex-not-running",
+          target,
+        });
+      } catch (error) {
+        if (error instanceof GitWorkspaceError) sendJson(response, error.statusCode, { error: error.message });
+        else sendDashboardError(response, error);
+      }
+      return;
+    }
+    const reviewRevalidateMatch = /^\/sessions\/([^/]+)\/git-review\/revalidate$/.exec(apiPath);
+    if (request.method === "POST" && reviewRevalidateMatch) {
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(reviewRevalidateMatch[1]!); }
+      catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
+      let body: Record<string, unknown>;
+      try { body = await readJsonBody(request); }
+      catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : "Invalid review request." });
+        return;
+      }
+      try {
+        const validated = await this.validateReviewRequest(sessionId, body.target, body.anchors);
+        sendJson(response, 200, { ok: true, target: validated.target });
+      } catch (error) {
+        sendDashboardError(response, error);
+      }
+      return;
+    }
+    const gitFileMatch = /^\/sessions\/([^/]+)\/git-changes\/(content|download)$/.exec(apiPath);
+    if (request.method === "GET" && gitFileMatch) {
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(gitFileMatch[1]!); }
+      catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
+      try {
+        const session = await this.operations.findSession(sessionId);
+        if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        const directory = this.operations.getCurrentPanePath
+          ? await this.operations.getCurrentPanePath(sessionId, session)
+          : session.cwd;
+        const path = url.searchParams.get("path") ?? "";
+        const expectedGitRoot = url.searchParams.get("expectedGitRoot") ?? undefined;
+        if (gitFileMatch[2] === "content") {
+          sendJson(response, 200, await previewGitChangeFile(directory, path, expectedGitRoot));
+        } else {
+          const file = await openGitChangeFile(directory, path, expectedGitRoot);
+          try {
+            const fileName = basename(path);
+            const fallbackName = fileName.replace(/[^\x20-\x7e]|[\\";]/g, "_") || "download";
+            const encodedName = encodeURIComponent(fileName).replace(/[!'()*]/g, (character) => "%" + character.charCodeAt(0).toString(16).toUpperCase());
+            response.setHeader("Cache-Control", "private, no-store");
+            response.setHeader("X-Content-Type-Options", "nosniff");
+            response.setHeader("Referrer-Policy", "no-referrer");
+            response.setHeader("Content-Type", "application/octet-stream");
+            response.setHeader("Content-Length", String(file.sizeBytes));
+            response.setHeader("Content-Disposition", "attachment; filename=\"" + fallbackName + "\"; filename*=UTF-8''" + encodedName);
+            const stream = file.handle.createReadStream();
+            stream.on("error", () => response.destroy());
+            response.on("close", () => stream.destroy());
+            stream.pipe(response);
+          } catch (error) {
+            await file.handle.close();
+            throw error;
+          }
+        }
+      } catch (error) {
+        if (error instanceof GitWorkspaceError) sendJson(response, error.statusCode, { error: error.message });
+        else sendSessionFileError(response, error);
+      }
+      return;
+    }
+    const gitChangesPrefix = "/sessions/";
+    const gitChangesSuffix = "/git-changes";
+    if (request.method === "GET" && apiPath.startsWith(gitChangesPrefix) && apiPath.endsWith(gitChangesSuffix)) {
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(apiPath.slice(gitChangesPrefix.length, -gitChangesSuffix.length)); }
+      catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
+      try {
+        const session = await this.operations.findSession(sessionId);
+        if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        const directory = this.operations.getCurrentPanePath
+          ? await this.operations.getCurrentPanePath(sessionId, session)
+          : session.cwd;
+        const inspection = await inspectGitChanges(directory);
+        sendJson(response, 200, {
+          sessionId,
+          session: { id: session.id, name: session.name },
+          ...inspection,
+        });
+      } catch (error) {
+        if (error instanceof GitWorkspaceError) sendJson(response, error.statusCode, { error: error.message });
+        else sendDashboardError(response, error);
       }
       return;
     }
@@ -544,6 +900,138 @@ export class TmuxDashboardApi {
       }
       return;
     }
+    const workspaceSessionMatch = /^\/workspaces\/([^/]+)\/session$/.exec(apiPath);
+    if (request.method === "POST" && workspaceSessionMatch) {
+      let workspaceId: string;
+      try { workspaceId = decodeURIComponent(workspaceSessionMatch[1]!); }
+      catch { sendJson(response, 400, { error: "Invalid workspace id." }); return; }
+      let body: Record<string, unknown>;
+      try { body = await readJsonBody(request); }
+      catch (error) { sendJson(response, 400, { error: error instanceof Error ? error.message : "Expected a JSON request body." }); return; }
+      try {
+        const workspace = this.db.getTaskWorkspaceById(workspaceId);
+        if (!workspace || workspace.status === "removed") { sendJson(response, 404, { error: "Task workspace not found." }); return; }
+        if (workspace.followups_closed_at) {
+          sendJson(response, 409, { error: "Task workspace is archived; create a new task to continue editing." });
+          return;
+        }
+        if (workspace.status !== "ready" && workspace.status !== "retained") {
+          sendJson(response, 409, { error: "Task workspace is not ready." });
+          return;
+        }
+        const task = this.db.getTask(workspace.task_guid);
+        if (!task) { sendJson(response, 404, { error: "Task for this workspace no longer exists." }); return; }
+        if (task.state === "QUEUED" || task.state === "RUNNING") {
+          sendJson(response, 409, { error: "任务仍在执行；请等待本轮结束后再打开可写 tmux session。" });
+          return;
+        }
+        const existingRecords = this.db.listTmuxSessionsForWorkspace(workspaceId);
+        for (const record of existingRecords) {
+          if (record.ended_at) continue;
+          const live = await this.operations.findSession(record.tmux_session_id);
+          if (live) {
+            sendJson(response, 200, { session: { ...live, codexHomeId: record.codex_home_id, workspaceId, taskGuid: workspace.task_guid, workspaceBranch: workspace.branch, workspaceStatus: workspace.status } });
+            return;
+          }
+          this.db.markTmuxSessionEnded(record.tmux_session_id);
+        }
+        const requestedName = typeof body.name === "string" ? body.name.trim() : "";
+        const name = requestedName || workspaceSessionName(workspace.branch, workspace.workspace_id);
+        const workingDirectory = await verifyTaskWorkspace(workspace);
+        const session = await this.operations.createSession(name, workingDirectory);
+        this.db.recordTmuxSession(session, {
+          projectKey: workspace.project_key,
+          createdByDeviceId: deviceId,
+          workspaceId,
+        });
+        sendJson(response, 201, {
+          session: { ...session, codexHomeId: null, workspaceId, taskGuid: workspace.task_guid, workspaceBranch: workspace.branch, workspaceStatus: workspace.status },
+        });
+      } catch (error) {
+        sendDashboardError(response, error);
+      }
+      return;
+    }
+    const sessionTaskMatch = /^\/sessions\/([^/]+)\/tasks$/.exec(apiPath);
+    if (request.method === "POST" && sessionTaskMatch) {
+      if (!this.createTaskFromSession) { sendJson(response, 501, { error: "Bridge Task Desk task creation is unavailable." }); return; }
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(sessionTaskMatch[1]!); }
+      catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
+      let body: Record<string, unknown>;
+      try { body = await readJsonBody(request); }
+      catch (error) { sendJson(response, 400, { error: error instanceof Error ? error.message : "Expected a JSON request body." }); return; }
+      if (typeof body.description !== "string" || !body.description.trim() || body.description.length > 20_000) {
+        sendJson(response, 400, { error: "description must contain 1 to 20000 characters" });
+        return;
+      }
+      if (body.summary !== undefined && (typeof body.summary !== "string" || body.summary.length > 300)) {
+        sendJson(response, 400, { error: "summary must be a string up to 300 characters" });
+        return;
+      }
+      if (body.idempotencyKey !== undefined && (typeof body.idempotencyKey !== "string" || !body.idempotencyKey.trim() || body.idempotencyKey.length > 200)) {
+        sendJson(response, 400, { error: "idempotencyKey must contain 1 to 200 characters" });
+        return;
+      }
+      if (typeof body.sourceDirectory !== "string" || !body.sourceDirectory.trim() || body.sourceDirectory.length > 4_096
+        || typeof body.expectedBaseSha !== "string" || !/^[a-f\d]{40,64}$/i.test(body.expectedBaseSha)) {
+        sendJson(response, 400, { error: "sourceDirectory and expectedBaseSha are required" });
+        return;
+      }
+      try {
+        const session = await this.operations.findSession(sessionId);
+        if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        const panePath = this.operations.getCurrentPanePath
+          ? await this.operations.getCurrentPanePath(sessionId, session)
+          : session.cwd;
+        const source = await inspectTaskSourceDirectory(panePath);
+        const project = await this.projectForSession(sessionId, panePath);
+        this.db.recordTmuxSession(session, { projectKey: project.name, createdByDeviceId: deviceId });
+        const task = await this.createTaskFromSession({
+          idempotencyKey: typeof body.idempotencyKey === "string" ? body.idempotencyKey : undefined,
+          summary: typeof body.summary === "string" ? body.summary : undefined,
+          description: body.description,
+          projectKey: project.name,
+          createWorktree: true,
+        }, {
+          directory: source.directory,
+          tmuxSessionId: sessionId,
+          expectedDirectory: body.sourceDirectory,
+          expectedBaseSha: body.expectedBaseSha,
+        });
+        sendJson(response, 201, { task, latest_run: this.db.getLatestRun(task.task_guid) });
+      } catch (error) {
+        if (error instanceof GitWorkspaceError) {
+          sendJson(response, error.statusCode, { error: error.message });
+        } else {
+          sendDashboardError(response, error);
+        }
+      }
+      return;
+    }
+    const sessionOpenMatch = /^\/sessions\/([^/]+)\/open$/.exec(apiPath);
+    if (request.method === "POST" && sessionOpenMatch) {
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(sessionOpenMatch[1]!); }
+      catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
+      try {
+        const session = await this.operations.findSession(sessionId);
+        if (!session) throw new tmux.SessionNotFoundError("Session no longer exists.");
+        const saved = this.db.recordTmuxSessionOpen(sessionId);
+        if (!saved) throw new tmux.SessionNotFoundError("Session record no longer exists.");
+        sendJson(response, 200, {
+          session: {
+            id: session.id,
+            name: session.name,
+            openCount: saved.open_count,
+            lastOpenedAt: saved.last_opened_at,
+          },
+        });
+      } catch (error) {
+        sendDashboardError(response, error);
+      }
+      return;
+    }
     const deleteMatch = /^\/sessions\/(.+)$/.exec(apiPath);
     if (request.method === "DELETE" && deleteMatch) {
       let sessionId: string;
@@ -569,8 +1057,13 @@ export class TmuxDashboardApi {
     request: IncomingMessage,
     socket: Duplex,
     head: Buffer,
-    deviceId: string | null = null,
+    deviceId: string | null,
+    isAuthorized: () => boolean,
   ): Promise<void> {
+    if (!isAuthorized()) {
+      rejectUpgrade(socket, 401, "pairing required");
+      return;
+    }
     const url = new URL(request.url ?? "/", "http://localhost");
     if (url.pathname !== "/tmux-dashboard/terminal") {
       socket.destroy();
@@ -589,6 +1082,10 @@ export class TmuxDashboardApi {
 
     const sessionId = url.searchParams.get("session") || "";
     const session = tmux.isSessionId(sessionId) ? await this.operations.findSession(sessionId) : undefined;
+    if (!isAuthorized()) {
+      rejectUpgrade(socket, 401, "pairing required");
+      return;
+    }
     if (!session) {
       rejectUpgrade(socket, 404, "tmux session not found.");
       return;
@@ -604,6 +1101,7 @@ export class TmuxDashboardApi {
         deviceId,
         cols,
         rows,
+        isAuthorized,
       });
     });
   }
@@ -614,6 +1112,10 @@ export class TmuxDashboardApi {
     for (const client of this.clients) client.close(1001, "Server shutting down");
     this.clients.clear();
     this.websocketServer.close();
+  }
+
+  public revalidateClients(): void {
+    for (const check of this.clientAuthorizationChecks.values()) check();
   }
 
   private ensureAttachmentStorage(): Promise<void> {
@@ -668,8 +1170,155 @@ export class TmuxDashboardApi {
     return null;
   }
 
+  private scheduleCodexSkillRefresh(
+    codexHomePath: string,
+    projectCwd: string,
+    scopeKeys: string[],
+  ): Promise<void> | null {
+    const scopeKey = [...scopeKeys].sort().join("\u0000");
+    if (!scopeKey) return null;
+    const active = this.skillRefreshes.get(scopeKey);
+    if (active) return active;
+
+    const now = Date.now();
+    const lastAttempt = this.skillRefreshAttempts.get(scopeKey) ?? 0;
+    if (now - lastAttempt < CODEX_SKILL_REFRESH_RETRY_MS) return null;
+    this.skillRefreshAttempts.set(scopeKey, now);
+
+    const refresh = (async (): Promise<void> => {
+      const discovery = await discoverCodexSkills({ codexHomePath, projectCwd });
+      this.db.syncCodexSkills(discovery.sources, discovery.skills);
+    })();
+    this.skillRefreshes.set(scopeKey, refresh);
+    void refresh.catch(() => undefined).finally(() => {
+      if (this.skillRefreshes.get(scopeKey) === refresh) this.skillRefreshes.delete(scopeKey);
+    });
+    return refresh;
+  }
+
+  private async validateReviewRequest(
+    sessionId: string,
+    targetValue: unknown,
+    rawAnchors: unknown,
+  ): Promise<{ target: TmuxReviewTarget; anchors: TmuxReviewAnchor[]; pane: tmux.TmuxReviewPaneSnapshot }> {
+    const target = parseTmuxReviewTarget(targetValue);
+    if (!target || target.sessionId !== sessionId) {
+      throw new DashboardBodyError("A valid original Session review target is required.", 400);
+    }
+    if (!Array.isArray(rawAnchors) || rawAnchors.length < 1 || rawAnchors.length > MAX_GIT_REVIEW_ANCHORS) {
+      throw new DashboardBodyError("A review request requires 1..20 line anchors.", 400);
+    }
+    const parsedAnchors = rawAnchors.map(parseTmuxReviewAnchor);
+    if (parsedAnchors.some((anchor) => anchor === null)) {
+      throw new DashboardBodyError("A review anchor is invalid.", 400);
+    }
+    const anchors = parsedAnchors as TmuxReviewAnchor[];
+    const context = await this.readReviewContext(sessionId);
+    const mismatch = tmuxReviewTargetMismatch(target, {
+      sessionExists: true,
+      sessionId,
+      paneId: context.pane.paneId,
+      gitRoot: context.inspection.gitRoot,
+      foregroundCodex: context.pane.foregroundCodex,
+    });
+    if (mismatch) throw new DashboardBodyError(mismatch, 409);
+
+    for (const anchor of anchors) {
+      let untrackedText: string | undefined;
+      const file = context.inspection.files.find((candidate) => candidate.path === anchor.path);
+      if (file?.status === "untracked") {
+        const preview = await previewGitChangeFile(context.pane.cwd, file.path, target.gitRoot);
+        if (preview.kind === "text" && !preview.truncated && typeof preview.text === "string") {
+          untrackedText = preview.text;
+        }
+      }
+      const anchorMismatch = reviewAnchorMismatch(
+        anchor,
+        context.inspection.files,
+        context.inspection.patch,
+        untrackedText,
+      );
+      if (anchorMismatch) throw new DashboardBodyError(`Review anchor is stale: ${anchorMismatch}`, 409);
+    }
+    return { target, anchors, pane: context.pane };
+  }
+
+  private async readReviewContext(sessionId: string): Promise<{
+    session: tmux.TmuxSession;
+    pane: tmux.TmuxReviewPaneSnapshot;
+    inspection: Awaited<ReturnType<typeof inspectGitChanges>>;
+  }> {
+    const session = await this.operations.findSession(sessionId);
+    if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+    if (!this.operations.inspectReviewPane) {
+      throw new DashboardBodyError("Foreground tmux pane inspection is unavailable.", 503);
+    }
+    const pane = await this.operations.inspectReviewPane(sessionId, session);
+    const inspection = await inspectGitChanges(pane.cwd);
+    return { session, pane, inspection };
+  }
+
+  private async listLiveSessions(): Promise<tmux.TmuxSession[]> {
+    if (this.sessionListRefresh) return this.sessionListRefresh;
+    const refresh = this.operations.listSessions().then((sessions) => {
+      this.db.syncTmuxSessions(sessions);
+      return sessions;
+    });
+    this.sessionListRefresh = refresh;
+    try {
+      return await refresh;
+    } finally {
+      if (this.sessionListRefresh === refresh) this.sessionListRefresh = null;
+    }
+  }
+
   private codexHomeOptions(): CodexHistoryHome[] {
-    return discoverCodexHistoryHomes();
+    const now = Date.now();
+    if (this.codexHomeOptionsCache && now - this.codexHomeOptionsCache.at < CODEX_HOME_OPTIONS_CACHE_MS) {
+      return this.codexHomeOptionsCache.homes;
+    }
+    const homes = this.discoverCodexHomes();
+    this.codexHomeOptionsCache = { at: now, homes };
+    return homes;
+  }
+
+  private async projectForSession(sessionId: string, directory: string): Promise<{ name: string; path: string }> {
+    const sessionRecord = this.db.getLatestTmuxSession(sessionId);
+    const registeredProject = sessionRecord?.project_key ? this.db.getAvailableProject(sessionRecord.project_key) : null;
+    const sourceRoot = await resolveGitRoot(directory);
+    const sourceCommonDirectory = await resolveGitCommonDirectory(sourceRoot);
+    const matches: Array<{ name: string; path: string }> = [];
+    for (const project of this.db.listAvailableProjects()) {
+      try {
+        const projectRoot = await resolveGitRoot(project.path);
+        if (await resolveGitCommonDirectory(projectRoot) === sourceCommonDirectory) {
+          matches.push({ name: project.name, path: project.path });
+        }
+      } catch {
+        // A project can be registered while its Git checkout is unavailable.
+      }
+    }
+    const preferred = registeredProject && matches.find((project) => project.name === registeredProject.name);
+    if (preferred) return preferred;
+    if (matches.length === 1) return matches[0]!;
+    if (matches.length > 1) {
+      throw new GitWorkspaceError("此仓库登记了多个项目名称，请先为 tmux Session 指定项目。", 409);
+    }
+    throw new GitWorkspaceError("当前 Session 目录不属于任何可用的登记项目。", 409);
+  }
+
+  private async codexHomePathForSession(sessionId: string, session?: tmux.TmuxSession): Promise<string> {
+    const sessionRecord = this.db.getLatestTmuxSession(sessionId);
+    const savedHome = sessionRecord?.codex_home_id
+      ? this.codexHomeOptions().find((home) => home.id === sessionRecord.codex_home_id)
+      : undefined;
+    if (savedHome) return resolve(savedHome.path);
+
+    const inspection = this.operations.inspectCodexHome
+      ? await this.operations.inspectCodexHome(sessionId, session).catch(() => null)
+      : null;
+    if (inspection?.status === "running" && inspection.path) return resolve(inspection.path);
+    return resolve(process.env.CODEX_HOME ?? join(homedir(), ".codex"));
   }
 
   private async tmuxSessionActionView(item: StoredTmuxSessionAction): Promise<StoredTmuxSessionAction & {
@@ -749,6 +1398,8 @@ export class TmuxDashboardApi {
 
   private async openTerminal(client: WebSocket, data: TerminalData): Promise<void> {
     let cleanedUp = false;
+    let stopHeartbeat: (() => void) | null = null;
+    const capturePane = this.operations.capturePane ?? tmux.capturePane;
     let initialScreenReady = false;
     let outputFlushTimer: ReturnType<typeof setTimeout> | null = null;
     let outputBytes = 0;
@@ -758,19 +1409,15 @@ export class TmuxDashboardApi {
       if (outputFlushTimer) clearTimeout(outputFlushTimer);
       outputFlushTimer = null;
       outputBytes = 0;
-      if (client.readyState !== WebSocket.OPEN || outputQueue.length === 0) {
+      if (!ensureAuthorized() || client.readyState !== WebSocket.OPEN || outputQueue.length === 0) {
         outputQueue.length = 0;
         return;
       }
       const chunks = outputQueue.splice(0);
-      if (chunks.length === 1) {
-        client.send(chunks[0]!);
-        return;
-      }
       client.send(Buffer.concat(chunks.map((chunk) => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))));
     };
     const queueOutput = (output: string | Uint8Array): void => {
-      if (client.readyState !== WebSocket.OPEN) return;
+      if (cleanedUp || client.readyState !== WebSocket.OPEN) return;
       outputQueue.push(output);
       outputBytes += typeof output === "string" ? Buffer.byteLength(output) : output.byteLength;
       if (Date.now() < immediateOutputFlushUntil) {
@@ -788,15 +1435,32 @@ export class TmuxDashboardApi {
       if (cleanedUp) return;
       cleanedUp = true;
       this.clients.delete(client);
+      this.clientAuthorizationChecks.delete(client);
+      stopHeartbeat?.();
+      stopHeartbeat = null;
       if (outputFlushTimer) clearTimeout(outputFlushTimer);
       outputFlushTimer = null;
       outputQueue.length = 0;
-      if (data.proc && !data.proc.killed) data.proc.kill("SIGTERM");
-      data.terminal?.close();
+      try {
+        if (data.proc && !data.proc.killed) data.proc.kill("SIGTERM");
+      } catch {
+        // The attach client may already have exited; never kill the tmux session.
+      }
+      try { data.terminal?.close(); } catch { /* Already closed. */ }
     };
+    const ensureAuthorized = (): boolean => {
+      if (cleanedUp) return false;
+      if (data.isAuthorized()) return true;
+      cleanup();
+      if (client.readyState === WebSocket.OPEN) client.close(1008, "Session authorization expired or revoked");
+      return false;
+    };
+    this.clientAuthorizationChecks.set(client, ensureAuthorized);
     client.once("close", cleanup);
     client.once("error", cleanup);
+    stopHeartbeat = startTerminalHeartbeat(client, this.heartbeatIntervalMs, setInterval, clearInterval, ensureAuthorized);
     client.on("message", async (message, isBinary) => {
+      if (!ensureAuthorized()) return;
       if (isBinary) return;
       let payload: unknown;
       try {
@@ -805,7 +1469,33 @@ export class TmuxDashboardApi {
         return;
       }
       if (typeof payload !== "object" || payload === null) return;
-      const control = payload as { type?: unknown; data?: unknown; text?: unknown; key?: unknown; requestId?: unknown; cols?: unknown; rows?: unknown };
+      const control = payload as { type?: unknown; data?: unknown; text?: unknown; key?: unknown; requestId?: unknown; cols?: unknown; rows?: unknown; review?: unknown };
+      if (control.type === "input") {
+        const input = validateTerminalInput(control.data);
+        if (!input) {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+              type: "input-error",
+              message: "终端输入单次不能超过 32 KiB。",
+            }));
+          }
+          return;
+        }
+        if (!data.terminal) return;
+        try {
+          // Raw terminal data intentionally bypasses the message history. It may
+          // contain passwords and is emitted once per key stroke.
+          data.terminal.write(input);
+        } catch {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+              type: "input-error",
+              message: "无法写入当前 tmux Session。",
+            }));
+          }
+        }
+        return;
+      }
       if (
         control.type === "scroll"
         && typeof control.data === "string"
@@ -819,7 +1509,7 @@ export class TmuxDashboardApi {
           ? control.requestId
           : "";
         const reply = (ok: boolean, message?: string): void => {
-          if (client.readyState === WebSocket.OPEN) {
+          if (ensureAuthorized() && client.readyState === WebSocket.OPEN) {
             client.send(JSON.stringify({
               type: "submission-result",
               requestId,
@@ -925,13 +1615,114 @@ export class TmuxDashboardApi {
           reply(false, "The tmux session is not attached.");
           return;
         }
+        if (Object.hasOwn(control, "review") && control.type !== "submit") {
+          reply(false, "A Git review target is valid only for a Codex submit.");
+          return;
+        }
+        if (control.type === "submit" && Object.hasOwn(control, "review")) {
+          const review = typeof control.review === "object" && control.review !== null
+            ? control.review as Record<string, unknown>
+            : {};
+          const pasteTextToPane = this.operations.pasteTextToPane;
+          const sendEnterToPane = this.operations.sendEnterToPane;
+          if (!pasteTextToPane || !sendEnterToPane) {
+            reply(false, "Explicit tmux pane-targeted review delivery is unavailable.");
+            return;
+          }
+          let initialReview: Awaited<ReturnType<typeof this.validateReviewRequest>>;
+          try {
+            initialReview = await this.validateReviewRequest(data.sessionId, review.target, review.anchors);
+          } catch (error) {
+            reply(false, error instanceof Error ? error.message : "The original Git review target is stale.");
+            return;
+          }
+          if (!ensureAuthorized()) return;
+
+          let actionId: string;
+          try {
+            const fingerprint = await submissionFingerprint(text);
+            if (!ensureAuthorized()) return;
+            const claim = this.db.beginTmuxSessionAction({
+              sessionRecordId: data.sessionRecordId,
+              deviceId: data.deviceId,
+              actionType: "task_submit",
+              requestId: requestId || null,
+              content: text,
+              submissionFingerprint: fingerprint,
+            });
+            if (claim.duplicate) {
+              reply(false, "相同消息近期已提交到此 Session，可能正在处理；请先查看终端或操作历史，避免重复发送。");
+              return;
+            }
+            actionId = claim.actionId;
+          } catch {
+            reply(false, "Could not save session operation history.");
+            return;
+          }
+
+          let pasteAttempted = false;
+          let pasted = false;
+          let enterAttempted = false;
+          try {
+            // The HTTP preflight is advisory. Re-read the original target after
+            // buffering and immediately before the explicit pane-targeted paste.
+            await pasteTextToPane(initialReview.target.paneId, text, async () => {
+              if (!ensureAuthorized()) throw new Error("设备权限已失效，评论未粘贴。");
+              await this.validateReviewRequest(data.sessionId, review.target, review.anchors);
+              if (!ensureAuthorized()) throw new Error("设备权限已失效，评论未粘贴。");
+              pasteAttempted = true;
+            });
+            pasted = true;
+            if (!ensureAuthorized()) {
+              finishHistory(actionId, "unconfirmed", "设备权限在评论粘贴后失效；未继续发送回车。");
+              return;
+            }
+
+            await new Promise<void>((resolve) => setTimeout(resolve, TERMINAL_PASTE_SETTLE_MS));
+            if (!ensureAuthorized()) {
+              finishHistory(actionId, "unconfirmed", "设备权限在评论粘贴后失效；未继续发送回车。");
+              return;
+            }
+            // Enter is targeted to the original pane as well. If Codex exited,
+            // another pane became active, or any anchor moved during the paste,
+            // leave the text unsubmitted and report the outcome as unconfirmed.
+            await sendEnterToPane(initialReview.target.paneId, async () => {
+              if (!ensureAuthorized()) throw new Error("设备权限在评论粘贴后失效；未发送回车。");
+              const beforeEnter = await this.validateReviewRequest(data.sessionId, review.target, review.anchors);
+              if (!ensureAuthorized()) throw new Error("设备权限在评论粘贴后失效；未发送回车。");
+              if (beforeEnter.target.paneId !== initialReview.target.paneId) {
+                throw new Error("The review pane changed during paste; Enter was withheld.");
+              }
+              enterAttempted = true;
+            });
+            if (!ensureAuthorized()) {
+              finishHistory(actionId, "unconfirmed", "回车可能已发送，但设备权限在确认前失效。");
+              return;
+            }
+            finishHistory(actionId, "sent");
+            reply(true);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "Could not send the Git review to its original pane.";
+            const mayHaveReachedPane = pasted || pasteAttempted;
+            finishHistory(actionId, mayHaveReachedPane ? "unconfirmed" : "failed", message);
+            reply(false, enterAttempted
+              ? `${message} 回车是否送达不确定，请检查原 pane 后再决定是否重试。`
+              : mayHaveReachedPane
+                ? `${message} 评论文本可能已粘贴，但没有发送回车。`
+                : message);
+          }
+          return;
+        }
         if (control.type === "command") {
           const actionId = beginHistory("terminal_command", text);
           if (!actionId) return;
           try {
             flushOutput();
             immediateOutputFlushUntil = Date.now() + SUBMIT_FAST_FLUSH_WINDOW_MS;
-            data.terminal.write("\u001b[200~" + text + "\u001b[201~\r");
+            if (!await writePastedTextThenEnter(data.terminal, text, ensureAuthorized)) {
+              finishHistory(actionId, "unconfirmed", "设备权限已失效；消息可能已部分写入，未继续发送回车。");
+              return;
+            }
             finishHistory(actionId, "sent");
             reply(true);
           } catch {
@@ -943,6 +1734,7 @@ export class TmuxDashboardApi {
         let actionId: string;
         try {
           const fingerprint = await submissionFingerprint(text);
+          if (!ensureAuthorized()) return;
           const claim = this.db.beginTmuxSessionAction({
             sessionRecordId: data.sessionRecordId,
             deviceId: data.deviceId,
@@ -960,7 +1752,11 @@ export class TmuxDashboardApi {
           reply(false, "Could not save session operation history.");
           return;
         }
-        const paneBefore = await tmux.capturePane(data.sessionId, 200).catch(() => null);
+        const paneBefore = await capturePane(data.sessionId, 200).catch(() => null);
+        if (!ensureAuthorized()) {
+          finishHistory(actionId, "failed", "设备权限已失效，消息未发送。");
+          return;
+        }
         if (paneBefore === null) {
           finishHistory(actionId, "failed", "无法读取 session 当前状态。");
           reply(false, "消息未发送：无法读取 session 当前状态，请稍后重试。");
@@ -969,8 +1765,11 @@ export class TmuxDashboardApi {
         try {
           flushOutput();
           immediateOutputFlushUntil = Date.now() + SUBMIT_FAST_FLUSH_WINDOW_MS;
-          data.terminal.write("\u001b[200~" + text + "\u001b[201~\r");
-          const confirmed = await waitForPaneChange(data.sessionId, paneBefore, text);
+          if (!await writePastedTextThenEnter(data.terminal, text, ensureAuthorized)) {
+            finishHistory(actionId, "unconfirmed", "设备权限已失效；消息可能已部分写入，未继续发送回车。");
+            return;
+          }
+          const confirmed = await waitForPaneChange(data.sessionId, paneBefore, text, capturePane, ensureAuthorized);
           finishHistory(
             actionId,
             confirmed ? "confirmed" : "unconfirmed",
@@ -1006,12 +1805,13 @@ export class TmuxDashboardApi {
     });
 
     try {
+      if (!ensureAuthorized()) return;
       // LaunchAgents may omit locale variables even when the tmux server is UTF-8.
       // Give this attach client a UTF-8 locale so CJK text is emitted correctly.
       const inheritedUtf8Locale = [process.env.LC_ALL, process.env.LC_CTYPE, process.env.LANG]
         .find((locale) => locale && /UTF-?8/i.test(locale));
       const terminalLocale = inheritedUtf8Locale ?? "C.UTF-8";
-      const child = getBunRuntime().spawn(["tmux", "attach-session", "-t", data.sessionId], {
+      const child = (this.terminalRuntime ?? getBunRuntime()).spawn(["tmux", "attach-session", "-t", data.sessionId], {
         env: {
           ...process.env,
           LC_ALL: process.env.LC_ALL && /UTF-?8/i.test(process.env.LC_ALL) ? process.env.LC_ALL : undefined,
@@ -1032,12 +1832,12 @@ export class TmuxDashboardApi {
       });
       data.proc = child;
       data.terminal = child.terminal;
-      const initialScreen = await captureInitialScreen(data.sessionId, data.rows);
-      if (cleanedUp || client.readyState !== WebSocket.OPEN) return;
-      client.send(initialScreen);
+      const initialScreen = await captureInitialScreen(data.sessionId, data.rows, capturePane);
+      if (!ensureAuthorized() || client.readyState !== WebSocket.OPEN) return;
       initialScreenReady = true;
+      client.send(Buffer.from(initialScreen));
       void child.exited.then((exitCode) => {
-        if (client.readyState === WebSocket.OPEN) {
+        if (ensureAuthorized() && client.readyState === WebSocket.OPEN) {
           flushOutput();
           client.send(JSON.stringify({ type: "exit", code: exitCode }));
           client.close();
@@ -1045,7 +1845,7 @@ export class TmuxDashboardApi {
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not attach to tmux session.";
-      if (client.readyState === WebSocket.OPEN) {
+      if (ensureAuthorized() && client.readyState === WebSocket.OPEN) {
         client.send(JSON.stringify({ type: "error", message }));
         client.close(1011, "Could not attach to tmux session.");
       }
@@ -1053,30 +1853,37 @@ export class TmuxDashboardApi {
   }
 }
 
-async function captureInitialScreen(sessionId: string, rows: number): Promise<string> {
+function workspaceSessionName(branch: string, workspaceId: string): string {
+  const branchName = branch.split("/").at(-1)?.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "") || "task";
+  return `task-${branchName.slice(0, 46)}-${workspaceId.slice(0, 6)}`;
+}
+
+async function captureInitialScreen(sessionId: string, rows: number, capturePane = tmux.capturePane): Promise<string> {
   // Let tmux finish attaching/resizing before taking the snapshot. PTY output
   // during this settling window is intentionally not forwarded to the client.
   await new Promise<void>((resolve) => setTimeout(resolve, 60));
   const snapshotRows = Math.max(rows, 1_000);
   let captured: string;
   try {
-    captured = await tmux.capturePane(sessionId, snapshotRows, {
+    captured = await capturePane(sessionId, snapshotRows, {
       alternateScreen: true,
       includeEscapeSequences: true,
     });
   } catch {
-    captured = await tmux.capturePane(sessionId, snapshotRows, { includeEscapeSequences: true });
+    captured = await capturePane(sessionId, snapshotRows, { includeEscapeSequences: true });
   }
   const screen = captured.replace(/\r\n?/g, "\n").replace(/\n/g, "\r\n");
   // Clear xterm's local history and paint only the current server-side screen.
   return "\u001b[3J\u001b[2J\u001b[H" + screen;
 }
 
-async function waitForPaneChange(sessionId: string, before: string, submittedText: string): Promise<boolean> {
+async function waitForPaneChange(sessionId: string, before: string, submittedText: string, capturePane = tmux.capturePane, shouldContinue = () => true): Promise<boolean> {
   for (const delay of [120, 280, 560, 1_120, 2_240]) {
+    if (!shouldContinue()) return false;
     await new Promise<void>((resolve) => setTimeout(resolve, delay));
+    if (!shouldContinue()) return false;
     try {
-      const after = await tmux.capturePane(sessionId, 200);
+      const after = await capturePane(sessionId, 200);
       if (hasNewSubmissionEcho(before, after, submittedText)) return true;
     } catch {
       return false;
@@ -1099,6 +1906,28 @@ export function hasNewSubmissionEcho(before: string, after: string, submittedTex
     countOccurrences(afterNormalized, expectedSnippet) > countOccurrences(beforeNormalized, expectedSnippet)
     || countOccurrences(afterCompact, expectedCompactSnippet) > countOccurrences(beforeCompact, expectedCompactSnippet)
   );
+}
+
+export async function writePastedTextThenEnter(terminal: BunTerminal, text: string, shouldContinue = () => true): Promise<boolean> {
+  // Codex handles bracketed paste asynchronously. Sending the paste terminator
+  // and Enter in one PTY write, or inside its paste-burst suppression window,
+  // can make the Enter part of the paste event, so the prompt remains visible
+  // until the user presses Enter again.
+  // A trailing skill token also opens Codex's own skill popup; the first Enter
+  // would select that popup item instead of submitting the prompt. A trailing
+  // space dismisses the token popup and is trimmed by Codex on submission.
+  const pastedText = /(?:^|\s)\$[^\s$]+$/u.test(text) ? text + " " : text;
+  if (!shouldContinue()) return false;
+  terminal.write("\u001b[200~" + pastedText + "\u001b[201~");
+  await new Promise<void>((resolve) => setTimeout(resolve, TERMINAL_PASTE_SETTLE_MS));
+  if (!shouldContinue()) return false;
+  terminal.write("\r");
+  return true;
+}
+
+export function validateTerminalInput(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return Buffer.byteLength(value, "utf8") <= MAX_TERMINAL_INPUT_BYTES ? value : null;
 }
 
 function countOccurrences(value: string, snippet: string): number {
@@ -1180,7 +2009,11 @@ async function readBinaryBody(request: IncomingMessage, maxBytes: number, tooLar
 }
 
 function sendDashboardError(response: ServerResponse, error: unknown): void {
-  const status = error instanceof tmux.ValidationError ? 400 : error instanceof tmux.SessionNotFoundError ? 404 : 500;
+  const status = error instanceof DashboardBodyError
+    ? error.statusCode
+    : error instanceof GitWorkspaceError
+      ? error.statusCode
+      : error instanceof tmux.ValidationError ? 400 : error instanceof tmux.SessionNotFoundError ? 404 : 500;
   sendJson(response, status, { error: error instanceof Error ? error.message : "Unexpected server error." });
 }
 

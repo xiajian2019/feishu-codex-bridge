@@ -1,6 +1,6 @@
 {
   "name": "feishu-codex-bridge",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "packageManager": "bun@1.4.2",
   "description": "Run Codex tasks from Feishu using AAMP or the native direct bridge.",

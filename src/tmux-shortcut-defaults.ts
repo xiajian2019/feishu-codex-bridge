@@ -25,6 +25,7 @@ export interface ShortcutSeed {
 
 export const DEFAULT_SHORTCUT_GROUPS: readonly ShortcutGroupSeed[] = [
   { id: "favorites", title: "收藏", icon: "☆", description: "按操作次数显示最常用的 8 个快捷键", layout: "grid", surface: "palette", sortOrder: 0 },
+  { id: "codex-tui", title: "Codex TUI", icon: "TUI", description: "答题、警告与 Codex 界面按键", layout: "grid", surface: "palette", sortOrder: 1 },
   { id: "tmux", title: "Tmux", icon: ">_", description: "tmux 会话操作", layout: "grid", surface: "palette", sortOrder: 1 },
   { id: "codex", title: "Codex", icon: "✳", description: "Codex 命令", layout: "grid", surface: "palette", sortOrder: 2 },
   { id: "ctrl", title: "Ctrl", icon: "⌃", description: "终端控制键", layout: "grid", surface: "palette", sortOrder: 3 },
@@ -183,8 +184,8 @@ const DEFAULT_CODEX_SHORTCUTS: readonly ShortcutSeed[] = [
   { id: "codex-key-voice-mute", title: "Ctrl+X", detail: "切换语音静音", groupId: "codex", kind: "sequence", value: "Ctrl+X" },
   { id: "codex-key-reasoning-down", title: "Alt+,", detail: "降低推理强度", groupId: "codex", kind: "sequence", value: "Alt+," },
   { id: "codex-key-reasoning-up", title: "Alt+.", detail: "提高推理强度", groupId: "codex", kind: "sequence", value: "Alt+." },
-  { id: "codex-key-edit-queued", title: "Shift+←", detail: "编辑上一条排队消息", groupId: "codex", kind: "sequence", value: "Shift+Left" },
-  { id: "codex-key-edit-queued-alt", title: "Alt+↑", detail: "编辑上一条排队消息", groupId: "codex", kind: "sequence", value: "Alt+Up" },
+  { id: "codex-key-edit-queued", title: "Shift+←", detail: "回答待处理问题 / 编辑排队消息", groupId: "codex", kind: "sequence", value: "Shift+Left" },
+  { id: "codex-key-edit-queued-alt", title: "Alt+↑", detail: "回答待处理问题 / 编辑排队消息", groupId: "codex", kind: "sequence", value: "Alt+Up" },
   { id: "codex-key-prompt-back", title: "Shift+→", detail: "返回输入区域", groupId: "codex", kind: "sequence", value: "Shift+Right" },
   { id: "codex-key-prompt-back-alt", title: "Alt+↓", detail: "返回输入区域", groupId: "codex", kind: "sequence", value: "Alt+Down" },
   { id: "codex-key-skip-question", title: "Ctrl+]", detail: "跳过当前问题", groupId: "codex", kind: "sequence", value: "Ctrl+]" },
@@ -202,6 +203,16 @@ const DEFAULT_CODEX_SHORTCUTS: readonly ShortcutSeed[] = [
   { id: "codex-key-kill-line-end", title: "Ctrl+K", detail: "删除到行尾", groupId: "codex", kind: "sequence", value: "Ctrl+K" },
   { id: "codex-key-yank", title: "Ctrl+Y", detail: "粘贴已删除文本", groupId: "codex", kind: "sequence", value: "Ctrl+Y" },
 ];
+
+const CODEX_TUI_PRIMARY_IDS = [
+  "codex-key-edit-queued", "codex-key-prompt-back", "codex-key-warnings",
+  "codex-tui-escape", "codex-tui-up", "codex-tui-down", "codex-tui-enter", "codex-tui-tab",
+] as const;
+
+function tuiShortcutOrder(id: string, fallback: number): number {
+  const index = CODEX_TUI_PRIMARY_IDS.findIndex((primaryId) => primaryId === id);
+  return index < 0 ? CODEX_TUI_PRIMARY_IDS.length + fallback : index;
+}
 
 export const DEFAULT_SHORTCUTS: readonly ShortcutSeed[] = [
   { id: "favorite-git-status", title: "git status", detail: "工作区状态", groupId: "favorites", kind: "send", value: "git status" },
@@ -229,7 +240,9 @@ export const DEFAULT_SHORTCUTS: readonly ShortcutSeed[] = [
   { id: "codex-resume", title: "/resume", detail: "continue", groupId: "codex", kind: "send", value: "/resume" },
   { id: "codex-diff", title: "/diff", detail: "changes", groupId: "codex", kind: "send", value: "/diff" },
   { id: "codex-status", title: "/status", detail: "usage", groupId: "codex", kind: "send", value: "/status" },
-  ...DEFAULT_CODEX_SHORTCUTS,
+  ...DEFAULT_CODEX_SHORTCUTS.map((shortcut, index) => shortcut.kind === "sequence"
+    ? { ...shortcut, groupId: "codex-tui", sortOrder: tuiShortcutOrder(shortcut.id, index) }
+    : shortcut),
   { id: "key-escape", title: "Esc", detail: "cancel", groupId: "ctrl", kind: "terminal", value: "codex-escape" },
   { id: "key-enter", title: "↵", detail: "enter", groupId: "ctrl", kind: "terminal", value: "codex-enter" },
   { id: "key-tab", title: "Tab", detail: "complete", groupId: "ctrl", kind: "terminal", value: "codex-tab" },
@@ -278,6 +291,7 @@ export const DEFAULT_SHORTCUTS: readonly ShortcutSeed[] = [
   { id: "keyboard-percent", title: "%", detail: "symbol", groupId: "keyboard", kind: "sequence", value: "%" },
   { id: "keyboard-caret", title: "^", detail: "symbol", groupId: "keyboard", kind: "sequence", value: "^" },
   { id: "composer-attachment", title: "附件", detail: "选择文件", groupId: "composer", kind: "insert", value: "", actionKey: "attachment", displayMode: "closed", sortOrder: 0 },
+  { id: "composer-skill-picker", title: "$", detail: "选择 Codex 技能", groupId: "composer", kind: "insert", value: "", actionKey: "skill-picker", displayMode: "expanded", sortOrder: 12 },
   { id: "composer-close-panel", title: "关闭", detail: "关闭快捷栏", groupId: "composer", kind: "insert", value: "", actionKey: "close-panel", displayMode: "expanded", sortOrder: 0 },
   { id: "composer-scroll-top", title: "顶部", detail: "滚动到顶部", groupId: "composer", kind: "insert", value: "", actionKey: "scroll-top", displayMode: "both", sortOrder: 1 },
   { id: "composer-scroll-bottom", title: "底部", detail: "滚动到底部", groupId: "composer", kind: "insert", value: "", actionKey: "scroll-bottom", displayMode: "both", sortOrder: 2 },
@@ -290,4 +304,20 @@ export const DEFAULT_SHORTCUTS: readonly ShortcutSeed[] = [
   { id: "composer-enter", title: "↵", detail: "回车", groupId: "composer", kind: "terminal", value: "codex-enter", actionKey: "terminal-enter", displayMode: "both", sortOrder: 9 },
   { id: "composer-keyboard-panel", title: "键盘", detail: "打开键盘面板", groupId: "composer", kind: "insert", value: "", actionKey: "keyboard-panel", displayMode: "closed", sortOrder: 10 },
   { id: "composer-ctrl-panel", title: "Ctrl", detail: "打开 Ctrl 面板", groupId: "composer", kind: "insert", value: "", actionKey: "ctrl-panel", displayMode: "expanded", sortOrder: 11 },
+  { id: "composer-tui-panel", title: "TUI", detail: "打开 Codex TUI 按键", groupId: "composer", kind: "insert", value: "", actionKey: "codex-panel", displayMode: "both", sortOrder: 1 },
+  { id: "composer-tui-answer", title: "答题", detail: "Shift+←：回答待处理问题 / 编辑排队消息", groupId: "composer", kind: "terminal", value: "codex-answer", actionKey: "terminal-answer", displayMode: "expanded", sortOrder: 6 },
+  { id: "composer-tui-back", title: "返回", detail: "Shift+→：返回输入区域", groupId: "composer", kind: "terminal", value: "codex-prompt-back", actionKey: "terminal-prompt-back", displayMode: "expanded", sortOrder: 6 },
+  { id: "composer-tui-warnings", title: "F2", detail: "F2：查看警告", groupId: "composer", kind: "terminal", value: "codex-warnings", actionKey: "terminal-warnings", displayMode: "expanded", sortOrder: 6 },
+  ...([
+    ["escape", "Esc", "关闭弹窗 / 中断当前执行", "codex-escape"],
+    ["up", "↑", "上一项", "codex-up"],
+    ["down", "↓", "下一项", "codex-down"],
+    ["enter", "↵", "确认 / 提交", "codex-enter"],
+    ["tab", "Tab", "切换选项 / 排队跟进", "codex-tab"],
+    ["left", "←", "向左切换", "codex-left"],
+    ["right", "→", "向右切换", "codex-right"],
+  ] as const).map(([id, title, detail, value], index): ShortcutSeed => ({
+    id: `codex-tui-${id}`, title, detail, value, groupId: "codex-tui", kind: "terminal",
+    sortOrder: tuiShortcutOrder(`codex-tui-${id}`, index),
+  })),
 ];

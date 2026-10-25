@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import { StateDatabase } from "../src/db.js";
+import type { CodexHistoryUsageSnapshot } from "../src/codex-history.js";
 import type { RoutedTask } from "../src/types.js";
 
 const routedTask: RoutedTask = {
@@ -22,6 +23,38 @@ const routedTask: RoutedTask = {
 };
 
 describe("StateDatabase", () => {
+  it("updates Codex usage buckets and snapshots when the server backfills a date", () => {
+    const db = new StateDatabase(":memory:");
+    const makeSnapshot = (capturedAt: string, tokens: number): CodexHistoryUsageSnapshot => ({
+      snapshotDate: "2026-10-23",
+      capturedAt,
+      tokenUsage: {
+        summary: { lifetimeTokens: tokens, peakDailyTokens: tokens },
+        dailyUsageBuckets: [{ startDate: "2026-10-22", tokens }],
+      },
+    });
+
+    db.saveCodexUsageSnapshot(
+      "codex-default",
+      makeSnapshot("2026-10-23T00:07:31.497Z", 72_700_228),
+      [{ startDate: "2026-10-22", tokens: 72_700_228 }],
+    );
+    db.saveCodexUsageSnapshot(
+      "codex-default",
+      makeSnapshot("2026-10-23T03:18:27.000Z", 561_232_128),
+      [{ startDate: "2026-10-22", tokens: 561_232_128 }],
+    );
+
+    expect(db.listCodexUsageDailyBuckets("codex-default")).toEqual([
+      { startDate: "2026-10-22", tokens: 561_232_128 },
+    ]);
+    expect(db.getCodexUsageSnapshot("codex-default")).toMatchObject({
+      capturedAt: "2026-10-23T03:18:27.000Z",
+      tokenUsage: { summary: { peakDailyTokens: 561_232_128 } },
+    });
+    db.close();
+  });
+
   it("uses the AAMP task id as a durable primary key and preserves business state", () => {
     const db = new StateDatabase(":memory:");
     const first = db.initializeAampTask({

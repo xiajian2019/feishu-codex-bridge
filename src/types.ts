@@ -244,6 +244,31 @@ export interface WebTaskSubmission {
   projectKey: string;
   mode?: string;
   attachmentIds?: string[];
+  createWorktree?: boolean;
+}
+
+export const TASK_WORKSPACE_STATUSES = ["provisioning", "ready", "failed", "retained", "removed"] as const;
+export type TaskWorkspaceStatus = (typeof TASK_WORKSPACE_STATUSES)[number];
+
+export interface StoredTaskWorkspace {
+  workspace_id: string;
+  task_guid: string;
+  project_key: string;
+  project_root: string;
+  project_git_root: string;
+  git_common_directory: string;
+  working_directory: string;
+  worktree_path: string;
+  branch: string;
+  base_ref: string;
+  base_sha: string;
+  source_tmux_session_id: string | null;
+  status: TaskWorkspaceStatus;
+  followups_closed_at: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+  removed_at: string | null;
 }
 
 export type TmuxSessionActionType = "task_submit" | "terminal_command" | "shortcut" | "control_sequence";
@@ -259,8 +284,11 @@ export interface StoredTmuxSession {
   tmux_created_at: number;
   first_seen_at: string;
   last_seen_at: string;
+  open_count: number;
+  last_opened_at: string | null;
   ended_at: string | null;
   created_by_device_id: string | null;
+  workspace_id: string | null;
 }
 
 export interface StoredTmuxSessionAction {

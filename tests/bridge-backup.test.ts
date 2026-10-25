@@ -15,6 +15,7 @@ import {
 } from "../src/bridge-backup.js";
 import { runBackupCli } from "../src/backup-cli.js";
 import { DatabaseSync } from "../src/sqlite.js";
+import type { RoutedTask } from "../src/types.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -23,6 +24,72 @@ afterEach(() => {
 });
 
 describe("Bridge backup", () => {
+  it("preserves managed task workspace metadata when restoring the Bridge database", async () => {
+    const root = makeTemporaryDirectory();
+    const databasePath = join(root, "runtime", "bridge.db");
+    mkdirSync(join(root, "runtime"), { recursive: true });
+    const database = new StateDatabase(databasePath);
+    const routedTask: RoutedTask = {
+      taskGuid: "web-worktree-backup",
+      summary: "Backup worktree metadata",
+      description: "Verify persisted workspace links",
+      projectKey: "fixture",
+      mode: "implement",
+      repo: join(root, "project"),
+      sandboxMode: "workspace-write",
+      inputHash: "input-hash",
+      input: { projectKey: "fixture", mode: "implement", summary: "Backup worktree metadata", description: "Verify persisted workspace links" },
+      completed: false,
+      origin: "web",
+    };
+    const workspace = {
+      workspaceId: "workspace-backup",
+      taskGuid: routedTask.taskGuid,
+      projectKey: "fixture",
+      projectRoot: routedTask.repo,
+      projectGitRoot: routedTask.repo,
+      gitCommonDirectory: join(routedTask.repo, ".git"),
+      workingDirectory: join(root, "worktrees", "fixture", "task"),
+      worktreePath: join(root, "worktrees", "fixture", "task"),
+      branch: "bridge/tasks/backup-worktree-metadata",
+      baseRef: "main",
+      baseSha: "a".repeat(40),
+      sourceTmuxSessionId: "$8",
+    };
+    database.claimWebTaskSubmission({
+      idempotencyKey: "backup-worktree-submit",
+      normalizedRequestJson: "{}",
+      task: routedTask,
+      inputText: JSON.stringify(routedTask.input),
+      promptText: "backup fixture",
+      workspace,
+    });
+
+    const backupDirectory = join(root, "backup-worktree-metadata");
+    await createBridgeBackup({
+      databasePath,
+      outputDirectory: backupDirectory,
+      attachmentRoots: defaultBridgeAttachmentRoots(databasePath, root),
+      programVersion: "test-workspace-version",
+    });
+    const restored = await restoreBridgeBackup({ backupDirectory, outputDirectory: join(root, "restored-worktree-metadata") });
+    const restoredDatabase = new StateDatabase(restored.databasePath);
+    try {
+      expect(restoredDatabase.getTaskWorkspace(routedTask.taskGuid)).toMatchObject({
+        workspace_id: workspace.workspaceId,
+        task_guid: routedTask.taskGuid,
+        worktree_path: workspace.worktreePath,
+        branch: workspace.branch,
+        base_sha: workspace.baseSha,
+        source_tmux_session_id: "$8",
+        status: "provisioning",
+      });
+    } finally {
+      restoredDatabase.close();
+      database.close();
+    }
+  });
+
   it("rejects modified attachments before creating any restored output", async () => {
     const fixture = await makeSimpleBackup();
     const manifest = JSON.parse(readFileSync(join(fixture.backupDirectory, "manifest.json"), "utf8"));

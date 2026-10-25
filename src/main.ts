@@ -146,6 +146,7 @@ function createCodexHistoryService(
     listCacheStore: db,
     threadHomePreferenceStore: db,
     runStore: db,
+    usageSnapshotStore: db,
     logger,
   });
 }
@@ -159,8 +160,11 @@ async function runWebOnlyMode(
   initializeProjectRegistry(db, config.projects);
   const port = args.webPort ?? 17310;
   const auth = new WebPairingAuth({ db, allowLocalRequests: true });
-  const tmuxDashboardApi = new TmuxDashboardApi({ db });
   const dispatcher = createDashboardTaskDispatcher(config, args, db, logger);
+  const tmuxDashboardApi = new TmuxDashboardApi({
+    db,
+    createTaskFromSession: (input, source) => dispatcher.submitWebTask(input, source),
+  });
   const dashboard = new DashboardServer({
     db,
     databasePath: resolve(args.dbPath),
@@ -173,6 +177,7 @@ async function runWebOnlyMode(
     host: resolveDashboardListenHost(config.web.host),
     port,
     modes: Object.keys(config.modes),
+    linkToolProxy: config.codex.env,
     taskAttachmentsDirectory: join(dirname(resolve(args.dbPath)), "task-attachments"),
     actions: dashboardTaskActions(dispatcher),
     logger,
@@ -396,6 +401,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         codexHistory: createCodexHistoryService(config, projectRoot, logger, db),
         host: resolveDashboardListenHost(config.web.host),
         port: config.web.port,
+        linkToolProxy: config.codex.env,
         modes: Object.keys(config.modes),
         taskAttachmentsDirectory: join(dirname(resolve(args.dbPath)), "task-attachments"),
         actions: {
@@ -500,10 +506,15 @@ async function runDirectMode(
     attachmentsDir: join(resolveBridgeDataRoot(import.meta.url), "runtime", "direct", "attachments"),
   });
   const auth = config.web.enabled ? new WebPairingAuth({ db }) : null;
-  const tmuxDashboardApi = auth ? new TmuxDashboardApi({ db }) : null;
-  const dashboardDispatcher = tmuxDashboardApi
+  const dashboardDispatcher = auth
     ? createDashboardTaskDispatcher(config, args, db, logger)
     : null;
+  const tmuxDashboardApi = auth ? new TmuxDashboardApi({
+    db,
+    ...(dashboardDispatcher
+      ? { createTaskFromSession: (input, source) => dashboardDispatcher.submitWebTask(input, source) }
+      : {}),
+  }) : null;
   const dashboard = auth && tmuxDashboardApi && dashboardDispatcher
     ? new DashboardServer({
       db,
@@ -515,6 +526,7 @@ async function runDirectMode(
       tmuxDashboard: tmuxDashboardApi,
       codexHistory: createCodexHistoryService(config, projectRoot, logger, db),
       host: resolveDashboardListenHost(config.web.host),
+      linkToolProxy: config.codex.env,
       port: config.web.port,
       modes: Object.keys(config.modes),
       taskAttachmentsDirectory: join(dirname(dbPath), "task-attachments"),
@@ -655,10 +667,15 @@ async function runAampMode(
   const auth = config.web.enabled
     ? new WebPairingAuth({ db })
     : null;
-  const tmuxDashboardApi = config.web.enabled ? new TmuxDashboardApi({ db }) : null;
-  const dashboardDispatcher = tmuxDashboardApi
+  const dashboardDispatcher = auth
     ? createDashboardTaskDispatcher(config, args, db, logger)
     : null;
+  const tmuxDashboardApi = config.web.enabled ? new TmuxDashboardApi({
+    db,
+    ...(dashboardDispatcher
+      ? { createTaskFromSession: (input, source) => dashboardDispatcher.submitWebTask(input, source) }
+      : {}),
+  }) : null;
   const dashboard = config.web.enabled
     ? new DashboardServer({
         db,
@@ -669,6 +686,7 @@ async function runAampMode(
         auth: auth!,
         tmuxDashboard: tmuxDashboardApi!,
         codexHistory: createCodexHistoryService(config, projectRoot, logger, db),
+        linkToolProxy: config.codex.env,
         host: resolveDashboardListenHost(config.web.host),
         port: config.web.port,
         modes: Object.keys(config.modes),

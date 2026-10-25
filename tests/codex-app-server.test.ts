@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -121,6 +121,52 @@ rl.on("line", (line) => {
       await expect(client.readThread("thr_fake")).resolves.toMatchObject({
         thread: { id: "thr_fake", preview: "Read-only detail" },
       });
+      await client.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a server request before matching an outbound request with the same id", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "feishu-codex-app-server-collision-test-"));
+    const executable = join(directory, "fake-codex");
+    const protocolLog = join(directory, "protocol.jsonl");
+    await writeFile(executable, `#!/usr/bin/env node
+const fs = require("node:fs");
+const readline = require("node:readline");
+const output = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") {
+    output({ id: request.id, result: {} });
+  } else if (request.method === "thread/list") {
+    output({ id: request.id, method: "item/commandExecution/requestApproval", params: { threadId: "thread-1", turnId: "turn-1" } });
+    output({ id: request.id, result: { data: [{ id: "thread-1" }], nextCursor: null, backwardsCursor: null } });
+  } else if (request.method === undefined) {
+    fs.appendFileSync(process.env.FAKE_PROTOCOL_LOG, JSON.stringify(request) + "\\n");
+  }
+});
+`);
+    await chmod(executable, 0o700);
+
+    try {
+      const client = new CodexAppServerClient({
+        executable,
+        cwd: directory,
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", FAKE_PROTOCOL_LOG: protocolLog },
+        requestTimeoutMs: 2_000,
+      });
+      await expect(client.listThreads()).resolves.toMatchObject({ data: [{ id: "thread-1" }] });
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+      const responses = (await readFile(protocolLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      expect(responses).toEqual([{
+        id: 2,
+        error: {
+          code: -32601,
+          message: "This bridge client does not accept server-initiated requests.",
+        },
+      }]);
       await client.close();
     } finally {
       await rm(directory, { recursive: true, force: true });

@@ -13,6 +13,8 @@ import {
 export type PaletteCategory = ShortcutCategory;
 type SubmissionResult = { ok: boolean; message?: string };
 
+const COMPACT_VIEWPORT_QUERY = "(max-width: 760px)";
+
 type TmuxShortcutPaletteProps = {
   open: boolean;
   category: PaletteCategory;
@@ -67,14 +69,27 @@ export function TmuxShortcutPalette({
   onTerminalSequence,
 }: TmuxShortcutPaletteProps): ReactElement {
   const navigate = useNavigate();
+  const [isCompactViewport, setIsCompactViewport] = useState(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return true;
+    return window.matchMedia(COMPACT_VIEWPORT_QUERY).matches;
+  });
   const groups = useMemo(() => sortGroups(store), [store.groups]);
   const group = groups.find((item) => item.id === category);
   const cards = useMemo(() => panelShortcuts(store, category), [category, store.shortcuts]);
-  const pageSize = group?.layout === "keyboard" ? 20 : 8;
+  const pageSize = group?.layout === "keyboard" ? 20 : isCompactViewport ? 8 : 16;
   const pages = shortcutPages(cards, pageSize);
   const gridSize = pageSize;
   const pagesRef = useRef<HTMLDivElement>(null);
   const [pageIndex, setPageIndex] = useState(0);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const mediaQuery = window.matchMedia(COMPACT_VIEWPORT_QUERY);
+    const updateViewportMode = (): void => setIsCompactViewport(mediaQuery.matches);
+    updateViewportMode();
+    mediaQuery.addEventListener("change", updateViewportMode);
+    return () => mediaQuery.removeEventListener("change", updateViewportMode);
+  }, []);
 
   useEffect(() => {
     setPageIndex(0);
@@ -177,6 +192,7 @@ export function TmuxShortcutPalette({
               type="button"
               aria-pressed={category === item.id}
               title={item.title}
+              aria-label={item.title}
               onClick={() => onCategoryChange(item.id)}
             >{item.icon}</button>
           ))}
