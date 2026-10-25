@@ -1,4 +1,5 @@
 import { afterEach, expect, it } from "bun:test";
+import { realpathSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +20,7 @@ it("binds HTTP human responses to the original interactive History run and refus
   const responses: unknown[] = [];
   const forks: unknown[] = [];
   const history = new CodexHistoryService({ executable: "unused-fixture", homePaths: [root], runStore: db,
+    environment: { CODEX_HOME: root },
     createClient: () => ({ listThreads: async () => ({ data: [], nextCursor: null, backwardsCursor: null }),
       readThread: async (id) => ({ thread: { id, cwd: root, turns: [] } }), close: async () => {} }),
     createAgent: () => { throw new Error("interactive mode must not start the SDK"); },
@@ -34,7 +36,10 @@ it("binds HTTP human responses to the original interactive History run and refus
       listActions: () => [], steer: async () => "native-turn", interrupt: async () => {}, restoreApprovalPolicy: async () => {}, close: async () => {},
     }),
   });
-  const home = history.listHomes()[0]!;
+  const homes = history.listHomes();
+  expect(homes).toHaveLength(1);
+  const home = homes[0]!;
+  expect(home).toMatchObject({ path: realpathSync.native(root), available: true });
   const server = new DashboardServer({ db, codexHistory: history, host: "127.0.0.1", port: 0, modes: [], cleanupExpiredStagedAttachments: false });
   cleanups.push(() => server.stop());
   const url = await server.start();
