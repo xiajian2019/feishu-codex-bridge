@@ -290,7 +290,7 @@ export async function clearAllCodexHistoryDrafts(): Promise<void> {
         if (!cursor) return;
         const stored = cursor.value as StoredAttachment;
         if (stored.scopeKey.startsWith(`${scope}|`)
-          || !/^[A-Za-z0-9_-]{32,128}\|/.test(stored.scopeKey)) cursor.delete();
+          || !/(?:^|:)[A-Za-z0-9_-]{32,128}\|/.test(stored.scopeKey)) cursor.delete();
         cursor.continue();
       };
       transaction.oncomplete = () => resolve();

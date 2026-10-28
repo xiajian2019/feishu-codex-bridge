@@ -11,6 +11,9 @@ const tmuxWebSocketTarget = tmuxApiTarget.replace(/^http/, "ws");
 export default defineConfig({
   root: webRoot,
   plugins: [react()],
+  resolve: {
+    alias: [{ find: /^\.\/mobile-runtime\.js$/, replacement: fileURLToPath(new URL("./src/mobile-runtime.browser.ts", import.meta.url)) }],
+  },
   build: {
     outDir: fileURLToPath(new URL("../dist/web", import.meta.url)),
     emptyOutDir: true,
@@ -60,6 +63,13 @@ export default defineConfig({
         configure: (proxy) => {
           proxy.on("proxyReq", (proxyRequest, request) => {
             proxyRequest.setHeader("Origin", apiTarget);
+            proxyRequest.removeHeader("X-Bridge-Public-Origin");
+            const host = request.headers.host;
+            const protocol = (request.socket as typeof request.socket & { encrypted?: boolean }).encrypted ? "https" : "http";
+            if (host) {
+              try { proxyRequest.setHeader("X-Bridge-Public-Origin", new URL(`${protocol}://${host}`).origin); }
+              catch { /* Invalid hosts are not recorded as access metadata. */ }
+            }
             const address = request.socket.remoteAddress;
             if (address) proxyRequest.setHeader("X-Forwarded-For", address);
           });

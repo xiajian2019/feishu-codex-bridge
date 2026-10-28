@@ -7,6 +7,8 @@ import "@xterm/xterm/css/xterm.css";
 import { getActionToken, getJson } from "./api.js";
 import { openTerminalUrl, registerTerminalLinkProvider } from "./terminal-links.js";
 import { bindMobileTerminalTouch, type TerminalSelectionDisplay } from "./terminal-touch.js";
+import { copyMobileText, isMobileApp } from "./mobile-runtime.js";
+import { scopedStorageKey } from "./local-draft-scope.js";
 import "./jj-tools.css";
 
 interface JjRun {
@@ -37,10 +39,12 @@ function terminalLogLines(terminal: Terminal): string[] {
 }
 
 function savedRunId(): string {
-  try { return sessionStorage.getItem("bridge.jj.selected") ?? ""; } catch { return ""; }
+  const key = scopedStorageKey("jj-selected");
+  try { return key ? sessionStorage.getItem(key) ?? "" : ""; } catch { return ""; }
 }
 
 async function copyTextToClipboard(value: string): Promise<void> {
+  if (isMobileApp()) return copyMobileText(value);
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(value);
     return;
@@ -121,7 +125,8 @@ export function JjTools(): ReactElement {
     const host = terminalHost.current;
     if (!host || !selectedId) return;
     const controller = new AbortController();
-    try { sessionStorage.setItem("bridge.jj.selected", selectedId); } catch { /* Storage is optional. */ }
+    const key = scopedStorageKey("jj-selected");
+    try { if (key) sessionStorage.setItem(key, selectedId); } catch { /* Storage is optional. */ }
     setSelection(null);
     setLogLines([]);
     const terminal = new Terminal({

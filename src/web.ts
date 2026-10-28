@@ -33,11 +33,14 @@ import { writeProjectRegistrySnapshot } from "./project-registry.js";
 import type { TmuxDashboardApi } from "./tmux-dashboard-api.js";
 import { resolveBridgeProjectRoot } from "./portable-runtime.js";
 import { GitWorkspaceError, inspectTaskWorkspace, inspectUnmanagedWorktree, listGitWorktrees, removeTaskWorkspaceDirectory, resolveGitRoot, verifyTaskWorkspace } from "./git-workspaces.js";
-import { readSystemHealth } from "./system-health.js";
+import { readBridgeVersion, readSystemHealth } from "./system-health.js";
+import { bridgeBackupSchedule } from "./backup-scheduler.js";
 import { parseTaskInput } from "./fingerprint.js";
 import { LinkToolError, LinkToolsService, type LinkToolProxySettings } from "./link-tools.js";
 import { JjToolError, JjToolsService } from "./jj-tools.js";
+import { DownloadUploadError, DownloadUploadsService, DOWNLOAD_UPLOAD_CHUNK_BYTES } from "./download-uploads.js";
 import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
+import { isNativeAppOrigin, MobileStreamTickets, type MobileStreamAuthorization } from "./mobile-auth.js";
 import {
   WebTaskSubmissionConflictError,
   DIRECT_TASK_STATUSES,
@@ -148,6 +151,9 @@ export interface DashboardServerOptions {
   projectRegistrySnapshotPath?: string;
   taskAttachmentsDirectory?: string;
   linkToolProxy?: LinkToolProxySettings;
+  downloadsDirectory?: string;
+  /** Local debug APK exposed only to authenticated native App clients. */
+  mobileApkPath?: string;
   jjTools?: JjToolsService;
   webRoot?: string;
   auth?: WebPairingAuth;
@@ -156,6 +162,15 @@ export interface DashboardServerOptions {
   cleanupExpiredStagedAttachments?: boolean;
   actions?: DashboardActions;
   logger?: Logger;
+}
+
+interface MobileApkUpdateMetadata {
+  available: true;
+  revision: string;
+  size: number;
+  sha256: string;
+  modifiedAt: string;
+  downloadUrl: "/api/mobile/update/download";
 }
 
 export interface DashboardActions {
@@ -173,10 +188,13 @@ export class DashboardServer {
   private readonly auth: WebPairingAuth;
   private readonly webRoot: string;
   private readonly taskAttachmentsDirectory: string;
+  private readonly mobileApkPath: string;
   private readonly linkTools: LinkToolsService;
+  private readonly downloadUploads: DownloadUploadsService;
   private readonly jjTools: JjToolsService;
   private readonly workbench: WorkbenchService;
   private readonly eventClients = new Map<ServerResponse, () => boolean>();
+  private readonly mobileStreamTickets = new MobileStreamTickets();
   private server: Server | null = null;
   private unsubscribeFromDatabase: (() => void) | null = null;
   private unsubscribeFromAuth: (() => void) | null = null;
@@ -185,6 +203,7 @@ export class DashboardServer {
   private readonly localDemoProcesses = new Map<string, ChildProcess>();
   private readonly localDemoLogs = new Map<string, string[]>();
   private readonly localDemoErrors = new Map<string, string>();
+  private mobileApkMetadataCache: { size: number; modifiedAt: number; metadata: MobileApkUpdateMetadata } | null = null;
 
   constructor(options: DashboardServerOptions) {
     this.options = options;
@@ -194,7 +213,13 @@ export class DashboardServer {
     this.taskAttachmentsDirectory = resolve(
       options.taskAttachmentsDirectory ?? join(process.cwd(), "runtime", "task-attachments"),
     );
+    this.mobileApkPath = resolve(
+      options.mobileApkPath
+        ?? process.env.FEISHU_CODEX_BRIDGE_ANDROID_APK?.trim()
+        ?? join(process.cwd(), "android", "app", "build", "outputs", "apk", "debug", "app-debug.apk"),
+    );
     this.linkTools = new LinkToolsService({ proxy: options.linkToolProxy });
+    this.downloadUploads = new DownloadUploadsService({ directory: options.downloadsDirectory });
     this.jjTools = options.jjTools ?? new JjToolsService();
     this.workbench = new WorkbenchService({ db: options.db, history: options.codexHistory,
       tmuxAvailable: Boolean(options.tmuxDashboard), actions: options.actions, logger: options.logger });
@@ -221,7 +246,13 @@ export class DashboardServer {
       });
     });
     server.on("upgrade", (request, socket, head) => {
-      this.handleUpgrade(request, socket, head);
+      try { this.handleUpgrade(request, socket, head); }
+      catch (error) {
+        this.options.logger?.warn("websocket upgrade failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        socket.destroy();
+      }
     });
     this.server = server;
     this.unsubscribeFromDatabase = this.options.db.subscribe((change) => {
@@ -267,13 +298,15 @@ export class DashboardServer {
     await this.workbench.stop();
     for (const client of this.eventClients.keys()) client.end();
     this.eventClients.clear();
-    this.options.tmuxDashboard?.stop();
+    this.mobileStreamTickets.clear();
+    await this.options.tmuxDashboard?.stop();
     for (const [id, child] of this.localDemoProcesses) {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
       this.localDemoProcesses.delete(id);
     }
     await this.jjTools.dispose();
     await this.linkTools.dispose();
+    await this.downloadUploads.dispose();
     if (!server) return;
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error ? reject(error) : resolve());
@@ -283,16 +316,89 @@ export class DashboardServer {
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", "http://localhost");
+    if (!this.allowMobileRequest(request, response, url)) return;
+    // EventSource cannot set Authorization. Exchange a credential for a short-lived,
+    // path-bound ticket instead of putting the device token in the URL.
+    if (request.method === "GET" && url.pathname === "/api/events" && url.searchParams.has("bridgeTicket")) {
+      const authorization = this.mobileStreamTickets.consume(request.url ?? "/");
+      if (!authorization) {
+        sendJson(response, 401, { error: "invalid stream ticket" });
+        return;
+      }
+      this.openEventStream(request, response, authorization.isAuthorized);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/auth/mobile/pair") {
+      await this.claimPairing(request, response, true);
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/mobile/update") {
+      if (!this.auth.isBearerAuthorized(request)) {
+        sendJson(response, 401, { error: "bearer token required" });
+        return;
+      }
+      const metadata = await this.mobileApkMetadata();
+      sendJson(response, 200, metadata ?? { available: false });
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/mobile/update/download") {
+      if (!this.auth.isBearerAuthorized(request)) {
+        sendJson(response, 401, { error: "bearer token required" });
+        return;
+      }
+      await this.downloadMobileApk(response);
+      return;
+    }
     const mutating = request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS";
     if (mutating && url.pathname.startsWith("/api/auth/") && url.pathname !== "/api/auth/pairing/claim") {
       if (!this.requireAuthorization(request, response) || !this.requireActionAuthorization(request, response)) return;
     }
+    if (request.method === "POST" && url.pathname === "/api/auth/mobile/stream-ticket") {
+      if (!this.auth.isBearerAuthorized(request)) {
+        sendJson(response, 401, { error: "bearer token required" });
+        return;
+      }
+      let body: Record<string, unknown>;
+      try { body = await readJsonBody(request); }
+      catch {
+        sendJson(response, 400, { error: "invalid request" });
+        return;
+      }
+      const deviceId = this.auth.currentDeviceId(request);
+      if (typeof body.path !== "string" || !deviceId) {
+        sendJson(response, 400, { error: "stream path is required" });
+        return;
+      }
+      try {
+        sendJson(response, 200, this.mobileStreamTickets.issue(body.path, {
+          deviceId, isAuthorized: this.auth.connectionAuthorization(request),
+        }));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "invalid stream path";
+        sendJson(response, message === "too many pending stream tickets" ? 429 : 400, { error: message });
+      }
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/api/auth/status") {
-      sendJson(response, 200, this.auth.status(request));
+      const status = this.auth.status(request);
+      // An admin can extend another device. Refresh that device's own Cookie when
+      // it next checks in, using the database expiry rather than the original 30 days.
+      if (status.authenticated) this.auth.refreshSessionCookie(request, response);
+      response.setHeader("Cache-Control", "no-store");
+      sendJson(response, 200, {
+        ...status,
+        ...(status.authenticated ? { client: {
+          schemaVersion: 1, protocolVersion: 1, minimumClientProtocol: 1,
+          version: await readBridgeVersion(),
+          features: ["download-uploads", "mobile-apk-update", "backups",
+            ...(this.options.tmuxDashboard ? ["tmux"] : []),
+            ...(this.options.codexHistory ? ["codex-history"] : [])],
+        } } : {}),
+      });
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/auth/devices") {
-      const devices = this.auth.listDevices(request);
+      const devices = this.auth.listDevices(request, url.searchParams.get("includeInactive") === "1");
       if (!devices) {
         sendJson(response, 401, { error: "pairing required" });
         return;
@@ -383,11 +489,16 @@ export class DashboardServer {
       // is a form POST without custom headers and does not mutate server state.
       const diagnosticExport = request.method === "POST" && url.pathname === "/tmux-dashboard/api/scroll-diagnostics/export";
       if (mutating && !diagnosticExport && !this.requireActionAuthorization(request, response)) return;
-      if (diagnosticExport && request.headers.origin && !this.isSameOriginAction(request.headers.origin, request)) {
+      if (diagnosticExport && request.headers.origin && !this.isAllowedActionOrigin(request)) {
         sendJson(response, 403, { error: "cross-origin action rejected" });
         return;
       }
-      await this.options.tmuxDashboard.handleRequest(request, response, this.auth.currentDeviceId(request));
+      await this.options.tmuxDashboard.handleRequest(
+        request,
+        response,
+        this.auth.currentDeviceId(request),
+        () => this.auth.isAuthorized(request),
+      );
       return;
     }
     if (request.method === "GET" && isSpaRoute(url.pathname)) {
@@ -426,6 +537,11 @@ export class DashboardServer {
           : /not found|不存在/i.test(message) ? 404 : 400;
         sendJson(response, status, { error: message });
       }
+      return;
+    }
+    if (url.pathname === "/api/download-uploads" || url.pathname.startsWith("/api/download-uploads/")) {
+      if (mutating && !this.requireActionAuthorization(request, response)) return;
+      await this.handleDownloadUploads(request, response, url);
       return;
     }
     if (url.pathname === "/api/jj" || url.pathname.startsWith("/api/jj/")) {
@@ -1048,10 +1164,10 @@ export class DashboardServer {
     sendJson(response, 404, { error: "not found" });
   }
 
-  private async claimPairing(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  private async claimPairing(request: IncomingMessage, response: ServerResponse, mobile = false): Promise<void> {
     // The initial claim cannot have an Action Token yet; the one-time code is
     // its credential, but a browser must still claim it from the same origin.
-    if (request.headers.origin && !this.isSameOriginAction(request.headers.origin, request)) {
+    if (request.headers.origin && !(mobile && isNativeAppOrigin(request.headers.origin)) && !this.isSameOriginAction(request.headers.origin, request)) {
       sendJson(response, 403, { error: "cross-origin action rejected" });
       return;
     }
@@ -1067,6 +1183,10 @@ export class DashboardServer {
       return;
     }
     try {
+      if (mobile) {
+        sendJson(response, 200, this.auth.claimMobilePairing(request, body.code));
+        return;
+      }
       const token = this.auth.claimPairing(request, body.code);
       this.auth.setSessionCookie(request, response, token);
       sendJson(response, 200, { ok: true });
@@ -1080,12 +1200,59 @@ export class DashboardServer {
     }
   }
 
+  private async mobileApkMetadata(): Promise<MobileApkUpdateMetadata | null> {
+    const file = await stat(this.mobileApkPath).catch(() => null);
+    if (!file?.isFile()) return null;
+    const modifiedAt = Math.trunc(file.mtimeMs);
+    const cached = this.mobileApkMetadataCache;
+    if (cached && cached.size === file.size && cached.modifiedAt === modifiedAt) return cached.metadata;
+
+    const sha256 = await new Promise<string>((resolvePromise, rejectPromise) => {
+      const digest = createHash("sha256");
+      const stream = createReadStream(this.mobileApkPath);
+      stream.on("data", (chunk) => digest.update(chunk));
+      stream.once("error", rejectPromise);
+      stream.once("end", () => resolvePromise(digest.digest("hex")));
+    });
+    const metadata: MobileApkUpdateMetadata = {
+      available: true,
+      revision: `${modifiedAt}-${file.size}-${sha256.slice(0, 16)}`,
+      size: file.size,
+      sha256,
+      modifiedAt: new Date(file.mtimeMs).toISOString(),
+      downloadUrl: "/api/mobile/update/download",
+    };
+    this.mobileApkMetadataCache = { size: file.size, modifiedAt, metadata };
+    return metadata;
+  }
+
+  private async downloadMobileApk(response: ServerResponse): Promise<void> {
+    const file = await stat(this.mobileApkPath).catch(() => null);
+    if (!file?.isFile()) {
+      sendJson(response, 404, { error: "Android APK is not available." });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Content-Type", "application/vnd.android.package-archive");
+    response.setHeader("Content-Length", String(file.size));
+    response.setHeader("Content-Disposition", 'attachment; filename="bridge-update.apk"');
+    response.statusCode = 200;
+    const stream = createReadStream(this.mobileApkPath);
+    stream.once("error", (error) => response.destroy(error));
+    stream.pipe(response);
+  }
+
   private requireAuthorization(
     request: IncomingMessage,
     response: ServerResponse,
     allowUnauthenticated = false,
   ): boolean {
-    if (allowUnauthenticated || this.auth.isAuthorized(request)) return true;
+    if (allowUnauthenticated) return true;
+    if (this.auth.isAuthorized(request)) {
+      this.auth.refreshSessionCookie(request, response);
+      return true;
+    }
     sendJson(response, 401, { error: "pairing required" });
     return false;
   }
@@ -2042,7 +2209,7 @@ export class DashboardServer {
   }
 
   private backupRootPath(): string {
-    if (!this.options.backupRoot || !this.options.databasePath || !this.options.backupAttachmentRoots) {
+    if (!this.options.backupRoot || !this.options.databasePath) {
       throw new Error("系统备份未配置");
     }
     return resolve(this.options.backupRoot);
@@ -2066,7 +2233,7 @@ export class DashboardServer {
     try {
       const root = this.backupRootPath();
       if (!await this.ensureBackupDirectory(root, false)) {
-        sendJson(response, 200, { backups: [], restoreDirectory: "restores/" });
+        sendJson(response, 200, { backups: [], restoreDirectory: "restores/", schedule: bridgeBackupSchedule() });
         return;
       }
       const entries = await listBridgeBackups(root);
@@ -2075,6 +2242,7 @@ export class DashboardServer {
           ? { backupId: basename(entry.backupDirectory), status: entry.status, metadata: publicBackupMetadata(entry.metadata) }
           : { backupId: basename(entry.backupDirectory), status: entry.status, error: "无法读取此备份的清单" }),
         restoreDirectory: "restores/",
+        schedule: bridgeBackupSchedule(),
       });
     } catch (error) {
       this.logBackupFailure("list", error);
@@ -2091,7 +2259,6 @@ export class DashboardServer {
       await createBridgeBackup({
         databasePath: this.options.databasePath!,
         outputDirectory: join(root, backupId),
-        attachmentRoots: this.options.backupAttachmentRoots!,
       });
       const metadata = await inspectBridgeBackupMetadata(join(root, backupId));
       sendJson(response, 201, {
@@ -2155,6 +2322,7 @@ export class DashboardServer {
         restore: {
           restoreId,
           location: `restores/${restoreId}/`,
+          scope: restored.scope,
           attachmentCount: restored.attachmentCount,
           attachmentBytes: restored.attachmentBytes,
           schemaFingerprint: restored.schemaFingerprint,
@@ -2559,6 +2727,41 @@ export class DashboardServer {
     }
   }
 
+  private async handleDownloadUploads(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    const owner = this.auth.currentDeviceId(request) ?? "local";
+    const partMatch = /^\/api\/download-uploads\/([a-f0-9-]+)\/parts\/(\d+)$/.exec(url.pathname);
+    const match = /^\/api\/download-uploads\/([a-f0-9-]+)(\/complete)?$/.exec(url.pathname);
+    try {
+      if (request.method === "POST" && url.pathname === "/api/download-uploads") {
+        const body = await readJsonBody(request);
+        const protocol = body.protocol === "parts" ? "parts" : "offset";
+        sendJson(response, 201, await this.downloadUploads.create(owner, body.fileName, body.sizeBytes, protocol));
+      } else if (partMatch && request.method === "PUT") {
+        sendJson(response, 200, await this.downloadUploads.appendPart(partMatch[1], owner, Number(partMatch[2]), request, this.auth.connectionAuthorization(request)));
+      } else if (match && request.method === "GET" && !match[2]) {
+        sendJson(response, 200, this.downloadUploads.status(match[1], owner));
+      } else if (match && request.method === "PUT" && !match[2]) {
+        const offset = url.searchParams.get("offset");
+        if (offset === null || !/^\d+$/.test(offset)) throw new DownloadUploadError(400, "上传进度无效。");
+        if (Number(request.headers["content-length"]) > DOWNLOAD_UPLOAD_CHUNK_BYTES) throw new DownloadUploadError(413, "单次传输数据过大，请使用分块上传。");
+        sendJson(response, 200, await this.downloadUploads.append(match[1], owner, Number(offset), request, this.auth.connectionAuthorization(request)));
+      } else if (match && request.method === "POST" && match[2]) {
+        await readJsonBody(request);
+        sendJson(response, 200, await this.downloadUploads.complete(match[1], owner));
+      } else if (match && request.method === "DELETE" && !match[2]) {
+        await this.downloadUploads.cancel(match[1], owner);
+        sendJson(response, 200, { ok: true });
+      } else sendJson(response, 404, { error: "上传接口不存在。" });
+    } catch (error) {
+      if (response.destroyed) return;
+      const code = (error as NodeJS.ErrnoException).code;
+      const status = error instanceof DownloadUploadError ? error.statusCode : code === "ENOSPC" ? 507 : 500;
+      const message = error instanceof DownloadUploadError ? error.message : code === "ENOSPC" ? "Mac 磁盘空间不足。"
+        : "无法保存文件，请检查 Mac 的 Downloads 目录和磁盘空间。";
+      sendJson(response, status, { error: message });
+    }
+  }
+
   private requireActionAuthorization(request: IncomingMessage, response: ServerResponse): boolean {
     const token = request.headers["x-bridge-action-token"];
     if (!constantTimeTokenMatches(typeof token === "string" ? token : "", this.actionToken)) {
@@ -2566,7 +2769,7 @@ export class DashboardServer {
       return false;
     }
     const origin = request.headers.origin;
-    if (origin && !this.isSameOriginAction(origin, request)) {
+    if (origin && !this.isAllowedActionOrigin(request)) {
       sendJson(response, 403, { error: "cross-origin action rejected" });
       return false;
     }
@@ -2697,7 +2900,7 @@ export class DashboardServer {
       return;
     }
     const origin = request.headers.origin;
-    if (origin && !this.isSameOriginAction(origin, request)) {
+    if (origin && !this.isAllowedActionOrigin(request)) {
       sendJson(response, 403, { error: "cross-origin action rejected" });
       return;
     }
@@ -2925,7 +3128,7 @@ export class DashboardServer {
     const origin = request.headers.origin;
     // Validate browser writes at the Bridge boundary before removing Origin
     // for the loopback upstream. Demo APIs do not use the Bridge Action Token.
-    if (mutating && origin && !this.isSameOriginAction(origin, request)) {
+    if (mutating && origin && !this.isAllowedActionOrigin(request)) {
       sendJson(response, 403, { error: "cross-origin action rejected" });
       return;
     }
@@ -3014,19 +3217,28 @@ export class DashboardServer {
   }
 
   private handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
-    const isAuthorized = this.auth.connectionAuthorization(request);
+    let url: URL;
+    try { url = new URL(request.url ?? "/", "http://localhost"); }
+    catch { socket.destroy(); return; }
+    let ticket: MobileStreamAuthorization | null = null;
+    if (url.searchParams.has("bridgeTicket")) {
+      ticket = this.mobileStreamTickets.consume(request.url ?? "/");
+      if (!ticket) { socket.destroy(); return; }
+    }
+    const isAuthorized = ticket?.isAuthorized ?? this.auth.connectionAuthorization(request);
     if (!isAuthorized()) {
       socket.destroy();
       return;
     }
-    const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+    const pathname = url.pathname;
     if (pathname === "/tmux-dashboard/terminal" && this.options.tmuxDashboard) {
       void this.options.tmuxDashboard.handleUpgrade(
         request,
         socket,
         head,
-        this.auth.currentDeviceId(request),
+        ticket?.deviceId ?? this.auth.currentDeviceId(request),
         isAuthorized,
+        ticket !== null,
       ).catch((error: unknown) => {
         this.options.logger?.warn("tmux dashboard websocket failed", {
           error: error instanceof Error ? error.message : String(error),
@@ -3038,8 +3250,7 @@ export class DashboardServer {
     socket.destroy();
   }
 
-  private openEventStream(request: IncomingMessage, response: ServerResponse): void {
-    const isAuthorized = this.auth.connectionAuthorization(request);
+  private openEventStream(request: IncomingMessage, response: ServerResponse, isAuthorized = this.auth.connectionAuthorization(request)): void {
     if (!isAuthorized()) {
       sendJson(response, 401, { error: "pairing required" });
       return;
@@ -3141,6 +3352,55 @@ export class DashboardServer {
     if (this.isSameOrigin(origin, request)) return true;
     return firstHeaderValue(request.headers["sec-fetch-site"])?.toLowerCase() === "same-origin";
   }
+
+  private isAllowedActionOrigin(request: IncomingMessage): boolean {
+    const origin = request.headers.origin;
+    if (!origin) return true;
+    if (this.isSameOriginAction(origin, request)) return true;
+    return isNativeAppOrigin(origin)
+      ? this.auth.isBearerAuthorized(request)
+      : false;
+  }
+
+  private allowMobileRequest(request: IncomingMessage, response: ServerResponse, url: URL): boolean {
+    const origin = request.headers.origin;
+    const api = url.pathname.startsWith("/api/") || url.pathname.startsWith("/tmux-dashboard/api/") || url.pathname === "/healthz";
+    if (!api || !origin || this.isSameOriginAction(origin, request)) return true;
+    if (!isNativeAppOrigin(origin)) {
+      if (request.method === "OPTIONS" || url.pathname.startsWith("/api/auth/mobile/") || url.searchParams.has("bridgeTicket")) {
+        sendJson(response, 403, { error: "cross-origin request rejected" });
+        return false;
+      }
+      return true;
+    }
+    response.setHeader("Access-Control-Allow-Origin", origin);
+    response.setHeader("Vary", "Origin");
+    response.setHeader("Access-Control-Expose-Headers", "Content-Disposition, Retry-After");
+    if (request.method === "OPTIONS") {
+      const methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
+      const headers = ["authorization", "content-type", "x-bridge-action-token", "x-file-name"];
+      const requestedMethod = firstHeaderValue(request.headers["access-control-request-method"]);
+      const requestedHeaders = firstHeaderValue(request.headers["access-control-request-headers"])
+        ?.toLowerCase().split(",").map((value) => value.trim()).filter(Boolean) ?? [];
+      if (!requestedMethod || !methods.includes(requestedMethod) || requestedHeaders.some((header) => !headers.includes(header))) {
+        sendJson(response, 403, { error: "cross-origin request rejected" });
+        return false;
+      }
+      response.setHeader("Access-Control-Allow-Methods", methods.join(", "));
+      response.setHeader("Access-Control-Allow-Headers", headers.join(", "));
+      response.setHeader("Access-Control-Max-Age", "600");
+      response.statusCode = 204;
+      response.end();
+      return false;
+    }
+    const publicRoute = url.pathname === "/api/auth/mobile/pair" || url.pathname === "/api/auth/status" || url.pathname === "/healthz";
+    const streamTicket = request.method === "GET" && url.pathname === "/api/events" && url.searchParams.has("bridgeTicket");
+    if (!publicRoute && !streamTicket && !this.auth.isBearerAuthorized(request)) {
+      sendJson(response, 401, { error: "bearer token required" });
+      return false;
+    }
+    return true;
+  }
 }
 
 function linkToolErrorDetails(error: unknown): { status: number; message: string } {
@@ -3170,6 +3430,7 @@ function isSpaRoute(pathname: string): boolean {
     || pathname === "/demos"
     || pathname === "/link-tools"
     || pathname === "/system-management/jj"
+    || pathname === "/system-management/uploads"
     || pathname === "/tmux-dashboard"
     || (pathname.startsWith("/tmux-dashboard/")
       && !pathname.startsWith("/tmux-dashboard/api/")
@@ -3570,6 +3831,8 @@ function publicWebTaskAttachment(attachment: StoredWebTaskAttachment) {
 
 function publicBackupMetadata(metadata: BridgeBackupMetadata | BridgeBackupVerification) {
   return {
+    scope: metadata.scope,
+    source: metadata.source,
     formatVersion: metadata.formatVersion,
     programVersion: metadata.programVersion,
     createdAt: metadata.createdAt,
@@ -3594,7 +3857,7 @@ function setSecurityHeaders(response: ServerResponse): void {
   response.setHeader("X-Frame-Options", "DENY");
   response.setHeader(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'",
+    "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data: blob:; worker-src 'self' blob:; media-src 'self' blob:; frame-ancestors 'none'",
   );
 }
 

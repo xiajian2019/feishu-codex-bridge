@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState, type ReactElement } from "react";
 import { getActionToken, getJson } from "./api.js";
+import { bridgeUrl, copyMobileText, isMobileApp, openBridgeExternal } from "./mobile-runtime.js";
 
 type DemoState = "checking" | "starting" | "ready" | "unavailable";
 
@@ -127,7 +128,8 @@ export function DemoCatalog(): ReactElement {
     try {
       const result = await loadLog(demo);
       const text = result.displayLines.join("\n") || "尚未启动，或暂时没有日志。";
-      try {
+      if (isMobileApp()) await copyMobileText(text);
+      else try {
         await navigator.clipboard.writeText(text);
       } catch {
         const textarea = document.createElement("textarea");
@@ -162,6 +164,12 @@ export function DemoCatalog(): ReactElement {
   }, [checkDemo]);
 
   const openDemoTab = useCallback((demo: LocalDemo, target?: Window | null): boolean => {
+    if (isMobileApp()) {
+      void openBridgeExternal(bridgeUrl(demo.openPath)).catch((failure: unknown) => {
+        setErrors((current) => ({ ...current, [demo.id]: failure instanceof Error ? failure.message : "无法打开系统浏览器。" }));
+      });
+      return true;
+    }
     if (target && !target.closed) {
       target.location.replace(demo.openPath);
       return true;
@@ -176,7 +184,7 @@ export function DemoCatalog(): ReactElement {
   }, []);
 
   const startDemo = useCallback(async (demo: LocalDemo): Promise<void> => {
-    const demoTab = window.open("about:blank", "_blank");
+    const demoTab = isMobileApp() ? null : window.open("about:blank", "_blank");
     if (demoTab) demoTab.opener = null;
     setStates((current) => ({ ...current, [demo.id]: "starting" }));
     try {
@@ -229,6 +237,7 @@ export function DemoCatalog(): ReactElement {
         </div>
       </div>
       <p>本机视觉与模型实验，选择卡片即可开始体验。</p>
+      {isMobileApp() ? <p>Demo 在系统浏览器打开，需在浏览器配对。</p> : null}
     </header>
 
     <section className="demo-catalog-grid" aria-label="Demo 列表">

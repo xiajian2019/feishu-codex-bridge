@@ -9,7 +9,6 @@ import {
   updateCodexSkillPreferences,
   updateShortcut,
   updateShortcutGroup,
-  watchRemoteShortcutConfig,
   type CodexSkillRecord,
 } from "./api.js";
 import { COMPOSER_ACTION_OPTIONS, parseTerminalSequence, type ShortcutDefinition, type ShortcutDisplayMode, type ShortcutGroup, type ShortcutKind, type ShortcutStore, type ShortcutSurface } from "./tmux-shortcuts.js";
@@ -56,13 +55,13 @@ export function ShortcutManagement(): ReactElement {
   const [error, setError] = useState<string | null>(null);
   const loadGeneration = useRef(0);
 
-  const load = async (): Promise<void> => {
+  const load = async (force = false): Promise<void> => {
     const generation = ++loadGeneration.current;
     setLoading(true);
     setSkillsLoading(true);
     setError(null);
     try {
-      const [shortcutResult, skillResult] = await Promise.allSettled([fetchShortcutConfig(), fetchCodexSkills()]);
+      const [shortcutResult, skillResult] = await Promise.allSettled([fetchShortcutConfig({ force }), fetchCodexSkills({ force })]);
       if (generation !== loadGeneration.current) return;
       if (shortcutResult.status === "fulfilled") {
         const next = shortcutResult.value;
@@ -95,8 +94,7 @@ export function ShortcutManagement(): ReactElement {
       setStore(readShortcutConfigCache() ?? { groups: [], shortcuts: [] });
       void load();
     }, false);
-    const unsubscribeRemote = watchRemoteShortcutConfig(() => void load());
-    return () => { unsubscribeLocal(); unsubscribeRemote(); };
+    return unsubscribeLocal;
   }, []);
 
   const groups = useMemo(
@@ -261,7 +259,7 @@ export function ShortcutManagement(): ReactElement {
     <main className="shortcut-management-page">
       <header className="shortcut-management-header">
         <h1>快捷键与技能管理</h1>
-        <button className="primary shortcut-management-refresh" type="button" onClick={() => void load()} disabled={loading || busy}>刷新配置</button>
+        <button className="primary shortcut-management-refresh" type="button" onClick={() => void load(true)} disabled={loading || busy}>刷新配置</button>
       </header>
       {error ? <div className="shortcut-management-error" role="alert">{error}</div> : null}
       <div className={`shortcut-management-layout${managementView === "skills" ? " is-skill-view" : ""}`}>

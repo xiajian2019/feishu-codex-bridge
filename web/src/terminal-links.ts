@@ -1,4 +1,5 @@
 import type { IDisposable, Terminal } from "@xterm/xterm";
+import { isMobileApp, openBridgeExternal } from "./mobile-runtime.js";
 
 export type TerminalLinkMatch = {
   text: string;
@@ -56,6 +57,12 @@ export function openTerminalUrl(value: string): void {
     return;
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return;
+  if (isMobileApp()) {
+    void openBridgeExternal(url.href).catch((error: unknown) => {
+      console.warn("Could not open terminal link.", error);
+    });
+    return;
+  }
   window.open(url.href, "_blank", "noopener,noreferrer");
 }
 

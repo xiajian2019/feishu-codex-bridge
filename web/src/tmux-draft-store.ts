@@ -1,3 +1,5 @@
+import { getLocalDraftScope, scopedStorageKey } from "./local-draft-scope.js";
+
 export type DraftAttachment = {
   id: string;
   name: string;
@@ -13,12 +15,14 @@ export type TmuxDraft = {
   updatedAt: number;
 };
 
-const DRAFT_PREFIX = "feishu-codex-bridge:tmux-draft:";
 const DATABASE_NAME = "feishu-codex-bridge-tmux-drafts";
 const STORE_NAME = "attachments";
+const DRAFT_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 
 type StoredAttachment = {
   key: string;
+  scope: string;
+  storedAt: number;
   sessionId: string;
   file: Blob;
   name: string;
@@ -26,20 +30,33 @@ type StoredAttachment = {
   lastModified: number;
 };
 
-function metadataKey(sessionId: string): string {
-  return DRAFT_PREFIX + encodeURIComponent(sessionId);
+function metadataKey(sessionId: string): string | null {
+  return scopedStorageKey("tmux-draft", sessionId);
 }
 
-function attachmentKey(sessionId: string, id: string): string {
-  return encodeURIComponent(sessionId) + ":" + encodeURIComponent(id);
+function attachmentPrefix(sessionId?: string): string | null {
+  return scopedStorageKey("tmux-attachment", sessionId === undefined ? "" : JSON.stringify(sessionId))?.concat(sessionId === undefined ? "" : ":") ?? null;
+}
+
+function attachmentKey(sessionId: string, id: string): string | null {
+  const prefix = attachmentPrefix(sessionId);
+  return prefix ? prefix + encodeURIComponent(id) : null;
 }
 
 export function loadDraftMetadata(sessionId: string): TmuxDraft | null {
+  const key = metadataKey(sessionId);
+  if (!key) return null;
   try {
-    const raw = localStorage.getItem(metadataKey(sessionId));
+    const raw = window.localStorage.getItem(key);
     if (!raw) return null;
     const draft = JSON.parse(raw) as Partial<TmuxDraft>;
-    if (draft.version !== 1 || typeof draft.text !== "string" || !Array.isArray(draft.attachments)) return null;
+    const age = Date.now() - Number(draft.updatedAt);
+    if (draft.version !== 1 || typeof draft.text !== "string" || !Array.isArray(draft.attachments)
+      || !Number.isFinite(draft.updatedAt) || age < 0 || age > DRAFT_TTL_MS) {
+      window.localStorage.removeItem(key);
+      void clearDraftAttachments(sessionId);
+      return null;
+    }
     return {
       version: 1,
       text: draft.text,
@@ -59,9 +76,12 @@ export function loadDraftMetadata(sessionId: string): TmuxDraft | null {
   }
 }
 
-export function saveDraftMetadata(sessionId: string, draft: Omit<TmuxDraft, "version" | "updatedAt">): void {
+export function saveDraftMetadata(sessionId: string, draft: Omit<TmuxDraft, "version" | "updatedAt">, expectedScope = getLocalDraftScope()): void {
+  if (expectedScope !== getLocalDraftScope()) return;
+  const key = metadataKey(sessionId);
+  if (!key) return;
   try {
-    localStorage.setItem(metadataKey(sessionId), JSON.stringify({
+    window.localStorage.setItem(key, JSON.stringify({
       version: 1,
       text: draft.text,
       attachments: draft.attachments,
@@ -72,9 +92,12 @@ export function saveDraftMetadata(sessionId: string, draft: Omit<TmuxDraft, "ver
   }
 }
 
-export function clearDraftMetadata(sessionId: string): void {
+export function clearDraftMetadata(sessionId: string, expectedScope = getLocalDraftScope()): void {
+  if (expectedScope !== getLocalDraftScope()) return;
+  const key = metadataKey(sessionId);
+  if (!key) return;
   try {
-    localStorage.removeItem(metadataKey(sessionId));
+    window.localStorage.removeItem(key);
   } catch {
     // Ignore unavailable local storage.
   }
@@ -93,12 +116,16 @@ function openDatabase(): Promise<IDBDatabase | null> {
 }
 
 export async function saveDraftAttachment(sessionId: string, id: string, file: File): Promise<void> {
+  const key = attachmentKey(sessionId, id);
+  const scope = getLocalDraftScope();
+  if (!key || !scope) return;
   const database = await openDatabase();
   if (!database) return;
+  if (scope !== getLocalDraftScope()) { database.close(); return; }
   await new Promise<void>((resolve) => {
     const transaction = database.transaction(STORE_NAME, "readwrite");
     transaction.objectStore(STORE_NAME).put({
-      key: attachmentKey(sessionId, id),
+      key, scope, storedAt: Date.now(),
       sessionId,
       file,
       name: file.name,
@@ -113,15 +140,19 @@ export async function saveDraftAttachment(sessionId: string, id: string, file: F
 }
 
 export async function loadDraftAttachment(sessionId: string, id: string): Promise<File | null> {
+  const key = attachmentKey(sessionId, id);
+  const scope = getLocalDraftScope();
+  if (!key || !scope) return null;
   const database = await openDatabase();
   if (!database) return null;
   const stored = await new Promise<StoredAttachment | undefined>((resolve) => {
-    const request = database.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(attachmentKey(sessionId, id));
+    const request = database.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(key);
     request.onsuccess = () => resolve(request.result as StoredAttachment | undefined);
     request.onerror = () => resolve(undefined);
   });
   database.close();
-  if (!stored?.file) return null;
+  if (!stored?.file || stored.scope !== scope || getLocalDraftScope() !== scope
+    || !Number.isFinite(stored.storedAt) || Date.now() < stored.storedAt || Date.now() - stored.storedAt > DRAFT_TTL_MS) return null;
   try {
     return new File([stored.file], stored.name, { type: stored.type, lastModified: stored.lastModified });
   } catch {
@@ -130,6 +161,18 @@ export async function loadDraftAttachment(sessionId: string, id: string): Promis
 }
 
 export async function clearDraftAttachments(sessionId: string): Promise<void> {
+  const prefix = attachmentPrefix(sessionId);
+  if (!prefix) return;
+  await removeStoredAttachments((value) => value.key.startsWith(prefix));
+}
+
+/** Called before resetting auth scope; capture it before opening IndexedDB. */
+export async function clearAllTmuxDrafts(): Promise<void> {
+  const prefix = attachmentPrefix();
+  await removeStoredAttachments((value) => Boolean(prefix && value.key.startsWith(prefix)) || !value.scope);
+}
+
+async function removeStoredAttachments(matches: (value: StoredAttachment) => boolean): Promise<void> {
   const database = await openDatabase();
   if (!database) return;
   await new Promise<void>((resolve) => {
@@ -140,7 +183,7 @@ export async function clearDraftAttachments(sessionId: string): Promise<void> {
       const cursor = request.result as IDBCursorWithValue | null;
       if (!cursor) return;
       const value = cursor.value as StoredAttachment;
-      if (value.sessionId === sessionId) cursor.delete();
+      if (matches(value)) cursor.delete();
       cursor.continue();
     };
     transaction.oncomplete = () => resolve();

@@ -11,6 +11,7 @@ import { isExecutableCodexPath, resolveCodexCliPath } from "./codex-path.js";
 import { LocalCodexNotificationInbox } from "./codex-notification-inbox.js";
 import { StateDatabase } from "./db.js";
 import { defaultBridgeAttachmentRoots } from "./bridge-backup.js";
+import { BridgeBackupScheduler } from "./backup-scheduler.js";
 import { initializeProjectRegistry, writeProjectRegistrySnapshot } from "./project-registry.js";
 import { TmuxDashboardApi } from "./tmux-dashboard-api.js";
 import { Dispatcher } from "./dispatcher.js";
@@ -163,6 +164,7 @@ async function runWebOnlyMode(
   const dispatcher = createDashboardTaskDispatcher(config, args, db, logger);
   const tmuxDashboardApi = new TmuxDashboardApi({
     db,
+    logger,
     createTaskFromSession: (input, source) => dispatcher.submitWebTask(input, source),
   });
   const dashboard = new DashboardServer({
@@ -324,6 +326,24 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
   const logger = createLogger();
   const config = loadConfig(args.configPath, { executionMode: args.executionMode });
+  const backups = args.once ? null : new BridgeBackupScheduler({
+    databasePath: resolve(args.dbPath),
+    backupRoot: dashboardBackupOptions(resolve(args.dbPath), join(dirname(resolve(args.dbPath)), "task-attachments")).backupRoot,
+    logger,
+  });
+  backups?.start();
+  try {
+    await runConfiguredMode(config, args, logger);
+  } finally {
+    await backups?.stop();
+  }
+}
+
+async function runConfiguredMode(
+  config: ReturnType<typeof loadConfig>,
+  args: MainArguments,
+  logger: Logger,
+): Promise<void> {
   if (args.webOnly) {
     await runWebOnlyMode(config, args, logger);
     return;
@@ -388,7 +408,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const auth = config.web.enabled
     ? new WebPairingAuth({ db })
     : null;
-  const tmuxDashboardApi = config.web.enabled ? new TmuxDashboardApi({ db }) : null;
+  const tmuxDashboardApi = config.web.enabled ? new TmuxDashboardApi({ db, logger }) : null;
   const dashboard = config.web.enabled
       ? new DashboardServer({
         db,
@@ -511,6 +531,7 @@ async function runDirectMode(
     : null;
   const tmuxDashboardApi = auth ? new TmuxDashboardApi({
     db,
+    logger,
     ...(dashboardDispatcher
       ? { createTaskFromSession: (input, source) => dashboardDispatcher.submitWebTask(input, source) }
       : {}),
@@ -672,6 +693,7 @@ async function runAampMode(
     : null;
   const tmuxDashboardApi = config.web.enabled ? new TmuxDashboardApi({
     db,
+    logger,
     ...(dashboardDispatcher
       ? { createTaskFromSession: (input, source) => dashboardDispatcher.submitWebTask(input, source) }
       : {}),

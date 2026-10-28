@@ -5,7 +5,8 @@ const VCONSOLE_VISIBILITY_STORAGE_KEY = "feishu-codex-bridge.vconsole-visible";
 export function readVConsoleVisible(): boolean {
   if (typeof window === "undefined") return true;
   try {
-    return window.localStorage.getItem(VCONSOLE_VISIBILITY_STORAGE_KEY) !== "false";
+    const saved = window.localStorage.getItem(VCONSOLE_VISIBILITY_STORAGE_KEY);
+    return saved === null ? import.meta.env.VITE_BRIDGE_MOBILE !== "true" : saved !== "false";
   } catch {
     return true;
   }

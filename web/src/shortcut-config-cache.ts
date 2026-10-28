@@ -1,17 +1,22 @@
 import type { ShortcutStore } from "./tmux-shortcuts.js";
+import { getBridgeOrigin } from "./mobile-runtime.js";
 
 const CACHE_KEY = "feishu-codex-bridge.shortcut-config.v1";
 const REVISION_KEY = "feishu-codex-bridge.shortcut-config.revision";
 const CHANGE_EVENT = "feishu-codex-bridge:shortcut-config-invalidated";
-const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 let inMemoryRevision = 0;
-let lastServerRevision: string | null = null;
+let memory: { revision: string; store: ShortcutStore } | null = null;
+let pending: { revision: string; promise: Promise<ShortcutStore> } | null = null;
 
-type CacheEntry = {
-  version: 1;
-  cachedAt: number;
-  store: ShortcutStore;
-};
+type CacheEntry = { version: 1; cachedAt: number; store: ShortcutStore };
+
+function scope(): string {
+  return typeof window === "undefined" ? "" : getBridgeOrigin();
+}
+
+function storageKey(key: string): string {
+  return `${key}:${encodeURIComponent(scope())}`;
+}
 
 function isShortcutStore(value: unknown): value is ShortcutStore {
   if (typeof value !== "object" || value === null) return false;
@@ -33,61 +38,69 @@ function isShortcutStore(value: unknown): value is ShortcutStore {
     ));
 }
 
+export function readShortcutConfigRevision(): string {
+  let storedRevision = "";
+  try { storedRevision = window.localStorage.getItem(storageKey(REVISION_KEY)) ?? ""; } catch { /* Use the in-memory revision. */ }
+  return `${scope()}:${inMemoryRevision}:${storedRevision}`;
+}
+
+/** Shared by every Session; retained until a local edit or an explicit management refresh. */
 export function readShortcutConfigCache(): ShortcutStore | null {
+  const revision = readShortcutConfigRevision();
+  if (memory?.revision === revision) return memory.store;
   if (typeof window === "undefined") return null;
   try {
-    const raw = window.localStorage.getItem(CACHE_KEY);
+    const raw = window.localStorage.getItem(storageKey(CACHE_KEY));
     if (!raw) return null;
     const entry = JSON.parse(raw) as Partial<CacheEntry>;
-    const age = Date.now() - Number(entry.cachedAt);
-    if (entry.version !== 1 || !Number.isFinite(entry.cachedAt) || age < 0 || age > CACHE_TTL_MS || !isShortcutStore(entry.store)) {
-      window.localStorage.removeItem(CACHE_KEY);
+    if (entry.version !== 1 || !isShortcutStore(entry.store)) {
+      window.localStorage.removeItem(storageKey(CACHE_KEY));
       return null;
     }
+    memory = { revision, store: entry.store };
     return entry.store;
   } catch {
-    try { window.localStorage.removeItem(CACHE_KEY); } catch { /* Browser storage may be unavailable. */ }
     return null;
   }
 }
 
 export function writeShortcutConfigCache(store: ShortcutStore): void {
+  memory = { revision: readShortcutConfigRevision(), store };
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(CACHE_KEY, JSON.stringify({ version: 1, cachedAt: Date.now(), store } satisfies CacheEntry));
+    window.localStorage.setItem(storageKey(CACHE_KEY), JSON.stringify({ version: 1, cachedAt: Date.now(), store } satisfies CacheEntry));
   } catch {
-    // Cached configuration is an optimization; API reads remain authoritative.
+    // Keep the shared memory cache when storage is unavailable or full.
   }
+  window.dispatchEvent(new Event(CHANGE_EVENT));
 }
 
-export function readShortcutConfigRevision(): string {
-  let storedRevision = "";
-  try { storedRevision = window.localStorage.getItem(REVISION_KEY) ?? ""; } catch { /* Use the in-memory revision. */ }
-  return `${inMemoryRevision}:${storedRevision}`;
-}
-
-export function recordShortcutConfigServerRevision(revision: string): void {
-  if (/^[0-9a-f]{64}$/i.test(revision)) lastServerRevision = revision;
-}
-
-export function observeShortcutConfigServerRevision(revision: string): boolean {
-  if (!/^[0-9a-f]{64}$/i.test(revision)) return false;
-  if (lastServerRevision === null) {
-    lastServerRevision = revision;
-    return false;
-  }
-  if (lastServerRevision === revision) return false;
-  lastServerRevision = revision;
-  invalidateShortcutConfigCache();
-  return true;
+export function loadShortcutConfig(load: () => Promise<ShortcutStore>, force = false): Promise<ShortcutStore> {
+  const cached = force ? null : readShortcutConfigCache();
+  if (cached) return Promise.resolve(cached);
+  const revision = readShortcutConfigRevision();
+  if (pending?.revision === revision) return pending.promise;
+  const originalScope = scope();
+  const promise = load().then((store) => {
+    if (originalScope !== scope()) throw new DOMException("Bridge connection changed", "AbortError");
+    // A response started before an edit must never replace the newer configuration.
+    if (revision !== readShortcutConfigRevision()) return loadShortcutConfig(load);
+    writeShortcutConfigCache(store);
+    return store;
+  }).finally(() => {
+    if (pending?.promise === promise) pending = null;
+  });
+  pending = { revision, promise };
+  return promise;
 }
 
 export function invalidateShortcutConfigCache(): void {
-  if (typeof window === "undefined") return;
   inMemoryRevision += 1;
+  memory = null;
+  if (typeof window === "undefined") return;
   try {
-    window.localStorage.removeItem(CACHE_KEY);
-    window.localStorage.setItem(REVISION_KEY, `${Date.now()}:${Math.random().toString(36).slice(2)}`);
+    window.localStorage.removeItem(storageKey(CACHE_KEY));
+    window.localStorage.setItem(storageKey(REVISION_KEY), `${Date.now()}:${Math.random().toString(36).slice(2)}`);
   } catch {
     // The in-tab notification still refreshes consumers when storage is blocked.
   }
@@ -97,7 +110,10 @@ export function invalidateShortcutConfigCache(): void {
 export function subscribeShortcutConfigInvalidation(onInvalidated: () => void, includeSameTab = true): () => void {
   if (typeof window === "undefined") return () => undefined;
   const onStorage = (event: StorageEvent): void => {
-    if (event.key === REVISION_KEY) onInvalidated();
+    if (event.key === storageKey(REVISION_KEY) || event.key === storageKey(CACHE_KEY) || event.key === null) {
+      memory = null;
+      onInvalidated();
+    }
   };
   const onChange = (): void => onInvalidated();
   window.addEventListener("storage", onStorage);

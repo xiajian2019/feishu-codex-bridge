@@ -4,6 +4,8 @@ import remarkGfm from "remark-gfm";
 
 import { getJson } from "./api.js";
 import { CodeTextViewer } from "./CodeTextViewer.js";
+import { BridgeImage } from "./BridgeMedia.js";
+import { downloadBridgeFile, getBridgeOrigin, isMobileApp, openBridgeExternal } from "./mobile-runtime.js";
 
 const TEXT_EXTENSIONS = new Set([
   "c", "cc", "conf", "cpp", "css", "csv", "go", "h", "hpp", "html", "ini", "java", "js", "json", "jsx",
@@ -41,7 +43,7 @@ const TASK_FILE_MARKDOWN_COMPONENTS: Components = {
 
 function taskFileUrl(taskGuid: string, action: "list" | "content" | "download", path: string): string {
   const suffix = action === "list" ? "" : `/${action}`;
-  const url = new URL(`/api/tasks/${encodeURIComponent(taskGuid)}/files${suffix}`, window.location.origin);
+  const url = new URL(`/api/tasks/${encodeURIComponent(taskGuid)}/files${suffix}`, getBridgeOrigin());
   url.searchParams.set("path", path);
   return url.pathname + url.search;
 }
@@ -93,8 +95,8 @@ function resolveMarkdownFileTarget(
   if (!value || value.startsWith("#") || value.startsWith("//")) return null;
   if (/^[a-z][a-z\d+.-]*:/i.test(value)) {
     try {
-      const url = new URL(value, window.location.origin);
-      if ((url.protocol !== "http:" && url.protocol !== "https:") || url.origin !== window.location.origin) return null;
+      const url = new URL(value, getBridgeOrigin());
+      if ((url.protocol !== "http:" && url.protocol !== "https:") || url.origin !== getBridgeOrigin()) return null;
       value = url.pathname + url.search + url.hash;
     } catch {
       return null;
@@ -181,6 +183,11 @@ export function TaskFileBrowser({ taskGuid, initialFilePath }: { taskGuid: strin
   useEffect(() => () => previewAbortRef.current?.abort(), []);
 
   useEffect(() => {
+    if (preview?.type !== "image" || !preview.url.startsWith("blob:")) return;
+    return () => URL.revokeObjectURL(preview.url);
+  }, [preview]);
+
+  useEffect(() => {
     if (!preview) return;
     const closeOnEscape = (event: KeyboardEvent): void => {
       if (event.key === "Escape") closePreview();
@@ -231,7 +238,15 @@ export function TaskFileBrowser({ taskGuid, initialFilePath }: { taskGuid: strin
     try {
       const path = joinTaskFilePath(basePath, entry.name);
       if (isImage) {
-        setPreview({ name: entry.name, path, type: "image", url: taskFileUrl(taskGuid, "content", path) });
+        let url = taskFileUrl(taskGuid, "content", path);
+        if (isMobileApp()) {
+          const response = await fetch(url, { signal: controller.signal });
+          if (!response.ok) throw new Error(await responseError(response));
+          const blob = await response.blob();
+          if (controller.signal.aborted || previewRequestRef.current !== requestId) return;
+          url = URL.createObjectURL(blob);
+        }
+        setPreview({ name: entry.name, path, type: "image", url });
         return;
       }
       const response = await fetch(taskFileUrl(taskGuid, "content", path), { signal: controller.signal });
@@ -286,6 +301,15 @@ export function TaskFileBrowser({ taskGuid, initialFilePath }: { taskGuid: strin
     previewRequestRef.current += 1;
     previewAbortRef.current?.abort();
     setPreview(null);
+  };
+
+  const shareFile = async (path: string, name: string): Promise<void> => {
+    setError("");
+    try {
+      await downloadBridgeFile(taskFileUrl(taskGuid, "download", path), name);
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "文件下载失败。");
+    }
   };
 
   const openEntry = (entry: TaskFileEntry): void => {
@@ -346,7 +370,11 @@ export function TaskFileBrowser({ taskGuid, initialFilePath }: { taskGuid: strin
               <span className="task-files-date">{formatModifiedAt(entry.modifiedAt)}</span>
               <div className="task-files-row-actions">
                 {entry.type === "file" && previewable ? <button type="button" onClick={() => void openPreview(entry)}>预览</button> : null}
-                {entry.type === "file" ? <a href={taskFileUrl(taskGuid, "download", path)} download={entry.name}>下载</a> : null}
+                {entry.type === "file" ? <a href={taskFileUrl(taskGuid, "download", path)} download={entry.name} onClick={(event) => {
+                  if (!isMobileApp()) return;
+                  event.preventDefault();
+                  void shareFile(path, entry.name);
+                }}>下载</a> : null}
               </div>
             </div>
           );
@@ -358,7 +386,11 @@ export function TaskFileBrowser({ taskGuid, initialFilePath }: { taskGuid: strin
           <section className="task-files-preview" role="dialog" aria-modal="true" aria-label={`预览 ${preview.name}`}>
             <header>
               <strong title={preview.name}>{preview.name}</strong>
-              <div><a href={taskFileUrl(taskGuid, "download", preview.path)} download={preview.name}>下载</a><button type="button" onClick={closePreview}>关闭预览</button></div>
+              <div><a href={taskFileUrl(taskGuid, "download", preview.path)} download={preview.name} onClick={(event) => {
+                if (!isMobileApp()) return;
+                event.preventDefault();
+                void shareFile(preview.path, preview.name);
+              }}>下载</a><button type="button" onClick={closePreview}>关闭预览</button></div>
             </header>
             {preview.type === "image" ? <img src={preview.url} alt={preview.name} onError={() => setError("无法读取图片文件，请刷新目录后重试。")} /> : preview.type === "markdown" ? (
               <div className="task-files-markdown codex-assistant-markdown">
@@ -366,6 +398,13 @@ export function TaskFileBrowser({ taskGuid, initialFilePath }: { taskGuid: strin
                   remarkPlugins={[remarkGfm]}
                   components={{
                     ...TASK_FILE_MARKDOWN_COMPONENTS,
+                    ...(isMobileApp() ? { img: ({ node, src, ...props }) => {
+                      void node;
+                      const target = typeof src === "string" && listing
+                        ? resolveMarkdownFileTarget(src, listing.root, preview.path) : null;
+                      if (target && "outside" in target) return <span>图片不在当前任务目录内。</span>;
+                      return <BridgeImage {...props} src={target && "path" in target ? taskFileUrl(taskGuid, "content", target.path) : src} />;
+                    } } satisfies Components : {}),
                     a: ({ node, href, children, ...props }) => {
                       void node;
                       const target = typeof href === "string" && listing
@@ -376,7 +415,15 @@ export function TaskFileBrowser({ taskGuid, initialFilePath }: { taskGuid: strin
                           {...props}
                           href={href}
                           onClick={(event) => {
-                            if (!target) return;
+                            if (!target) {
+                              if (isMobileApp() && href && /^(https?:\/\/|\/\/)/i.test(href)) {
+                                event.preventDefault();
+                                void openBridgeExternal(href).catch((failure: unknown) => {
+                                  setError(failure instanceof Error ? failure.message : "链接打开失败。");
+                                });
+                              }
+                              return;
+                            }
                             event.preventDefault();
                             void openMarkdownTarget(target);
                           }}

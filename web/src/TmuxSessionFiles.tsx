@@ -1,11 +1,15 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type AnchorHTMLAttributes, type ReactElement } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type AnchorHTMLAttributes, type ImgHTMLAttributes, type ReactElement } from "react";
 import { useNavigate, useParams } from "react-router";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { getActionToken, getJson } from "./api.js";
 import { CodeTextViewer } from "./CodeTextViewer.js";
+import { BridgeImage } from "./BridgeMedia.js";
+import { isBridgeApiPath } from "./mobile-connection.js";
 import { useSystemNavigation } from "./WebNavigation.js";
+import { copyMobileText, downloadBridgeFile, getBridgeOrigin, isMobileApp, openBridgeExternal } from "./mobile-runtime.js";
+import { normalizeSessionPathInput, sessionPathName, sessionPathParent } from "./tmux-session-path.js";
 
 const API_ROOT = "/tmux-dashboard/api";
 const PREVIEW_TEXT_LIMIT = 2 * 1024 * 1024;
@@ -39,6 +43,7 @@ type FilePreview =
 type SessionFileAction = "view" | "download" | "copy" | "forward";
 
 interface SessionFileMarkdownLinkContextValue {
+  sessionId: string;
   currentFilePath: string;
   onOpenFile: (relativePath: string) => void;
   onInvalidLink: () => void;
@@ -68,7 +73,19 @@ const SESSION_FILE_MARKDOWN_COMPONENTS: Components = {
     void node;
     return <SessionFileMarkdownAnchor {...props} />;
   },
+  img: ({ node, ...props }) => {
+    void node;
+    return <SessionFileMarkdownImage {...props} />;
+  },
 };
+
+function SessionFileMarkdownImage({ src, ...props }: ImgHTMLAttributes<HTMLImageElement>): ReactElement {
+  const context = useContext(SESSION_FILE_MARKDOWN_LINK_CONTEXT);
+  if (!isMobileApp()) return <img {...props} src={src} />;
+  const path = context && src && !isBridgeApiPath(src.split(/[?#]/, 1)[0] ?? "") && !/^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(src)
+    ? resolveSessionMarkdownFilePath(context.currentFilePath, src) : null;
+  return <BridgeImage {...props} src={context && path ? sessionFilesUrl(context.sessionId, "download", path) : src} />;
+}
 
 function SessionFileMarkdownAnchor({ href, children, onClick, ...props }: AnchorHTMLAttributes<HTMLAnchorElement>): ReactElement {
   const context = useContext(SESSION_FILE_MARKDOWN_LINK_CONTEXT);
@@ -80,7 +97,12 @@ function SessionFileMarkdownAnchor({ href, children, onClick, ...props }: Anchor
     return <a {...props} href={href} onClick={onClick}>{children}</a>;
   }
   if (isExternalWebLink) {
-    return <a {...props} href={href} onClick={onClick} target={/^https?:\/\/|^\/\//i.test(trimmedHref) ? "_blank" : undefined} rel="noreferrer">{children}</a>;
+    return <a {...props} href={href} onClick={(event) => {
+      onClick?.(event);
+      if (event.defaultPrevented || !isMobileApp() || !/^https?:\/\/|^\/\//i.test(trimmedHref)) return;
+      event.preventDefault();
+      void openBridgeExternal(trimmedHref).catch(() => context.onInvalidLink());
+    }} target={/^https?:\/\/|^\/\//i.test(trimmedHref) ? "_blank" : undefined} rel="noreferrer">{children}</a>;
   }
   if (hasUnsupportedProtocol) return <span>{children}</span>;
 
@@ -104,7 +126,7 @@ function SessionFileMarkdownAnchor({ href, children, onClick, ...props }: Anchor
 
 function sessionFilesUrl(sessionId: string, action: "list" | "upload" | "download", path: string): string {
   const suffix = action === "list" ? "" : `/${action}`;
-  const url = new URL(`${API_ROOT}/sessions/${encodeURIComponent(sessionId)}/files${suffix}`, window.location.origin);
+  const url = new URL(`${API_ROOT}/sessions/${encodeURIComponent(sessionId)}/files${suffix}`, getBridgeOrigin());
   url.searchParams.set("path", path);
   return url.pathname + url.search;
 }
@@ -182,6 +204,7 @@ async function responseError(response: Response): Promise<string> {
 }
 
 async function copyTextToClipboard(value: string): Promise<void> {
+  if (isMobileApp()) return copyMobileText(value);
   const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const field = document.createElement("textarea");
   field.value = value;
@@ -239,6 +262,7 @@ export function TmuxSessionFiles(): ReactElement {
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [previewHistory, setPreviewHistory] = useState<string[]>([]);
   const [previewNavigationBusy, setPreviewNavigationBusy] = useState(false);
+  const [pathNavigationBusy, setPathNavigationBusy] = useState(false);
   const [filenameQuery, setFilenameQuery] = useState("");
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -316,6 +340,17 @@ export function TmuxSessionFiles(): ReactElement {
       setNotice(`已复制文件名：${relativePath}`);
     } catch (copyError) {
       setError(copyError instanceof Error ? copyError.message : "复制文件失败。");
+    }
+  };
+
+  const shareFile = async (relativePath: string, name: string): Promise<void> => {
+    setError("");
+    setNotice("");
+    try {
+      await downloadBridgeFile(sessionFilesUrl(sessionId, "download", relativePath), name);
+      if (!isMobileApp()) setNotice(`已开始下载：${name}`);
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "文件下载失败。");
     }
   };
 
@@ -477,15 +512,54 @@ export function TmuxSessionFiles(): ReactElement {
   }, []);
 
   const markdownLinkContext = useMemo<SessionFileMarkdownLinkContextValue>(() => ({
+    sessionId,
     currentFilePath: preview?.type === "markdown" ? preview.relativePath : "",
     onOpenFile: openMarkdownFile,
     onInvalidLink: reportInvalidMarkdownLink,
-  }), [openMarkdownFile, preview, reportInvalidMarkdownLink]);
+  }), [openMarkdownFile, preview, reportInvalidMarkdownLink, sessionId]);
 
   const navigateToPath = (path: string): void => {
     setFilenameQuery("");
     setPreviewHistory([]);
     setCurrentPath(path);
+  };
+
+  const navigateFromPathInput = async (): Promise<void> => {
+    const normalized = normalizeSessionPathInput(filenameQuery);
+    if (!normalized) {
+      setError("请输入当前 Session 根目录下的相对路径，不要使用绝对路径或 ..。");
+      return;
+    }
+    setPathNavigationBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const direct = await getJson<SessionFileListing>(sessionFilesUrl(sessionId, "list", normalized.path)).catch(() => null);
+      if (direct) {
+        navigateToPath(normalized.path);
+        return;
+      }
+      if (normalized.hasTrailingSlash) {
+        throw new Error("目标文件夹不存在，或当前 Session 无权访问。");
+      }
+      const parentPath = sessionPathParent(normalized.path);
+      const parent = await getJson<SessionFileListing>(sessionFilesUrl(sessionId, "list", parentPath)).catch(() => null);
+      const name = sessionPathName(normalized.path);
+      const entry = parent?.entries.find((candidate) => candidate.name === name);
+      if (entry?.type === "file") {
+        navigateToPath(parentPath);
+        return;
+      }
+      if (entry?.type === "directory") {
+        navigateToPath(normalized.path);
+        return;
+      }
+      throw new Error("找不到这个相对路径，请确认文件或文件夹名称正确。");
+    } catch (pathError) {
+      setError(pathError instanceof Error ? pathError.message : "无法打开这个相对路径。");
+    } finally {
+      setPathNavigationBusy(false);
+    }
   };
 
   const openEntry = (entry: SessionFileEntry): void => {
@@ -540,8 +614,15 @@ export function TmuxSessionFiles(): ReactElement {
               type="search"
               value={filenameQuery}
               onChange={(event) => setFilenameQuery(event.currentTarget.value)}
-              placeholder="按文件名模糊检索当前目录"
-              aria-label="按文件名模糊检索当前目录"
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void navigateFromPathInput();
+                }
+              }}
+              placeholder="按文件名检索，输入相对路径后回车"
+              aria-label="按文件名检索或输入相对路径跳转"
+              disabled={pathNavigationBusy}
             />
             {filenameQuery ? <span className="tmux-files-search-count">{visibleEntries.length} 项</span> : null}
           </label>
@@ -587,6 +668,11 @@ export function TmuxSessionFiles(): ReactElement {
                     download={entry.name}
                     aria-label={`下载 ${entry.name}`}
                     title="下载"
+                    onClick={(event) => {
+                      if (!isMobileApp()) return;
+                      event.preventDefault();
+                      void shareFile(fileRelativePath(currentPath, entry.name), entry.name);
+                    }}
                   >
                     <SessionFileActionIcon action="download" />
                   </a>
@@ -615,7 +701,7 @@ export function TmuxSessionFiles(): ReactElement {
             </div>
           ))}
         </div>
-        <p className="tmux-files-footnote">上传会写入当前目录；下载位置由浏览器的下载设置决定。列表复制文件名，预览复制内容；转发会把相对文件名追加到对应 Session 的聊天框。文件访问限制在 session 工作目录内。</p>
+        <p className="tmux-files-footnote">上传会写入当前目录；{isMobileApp() ? "Android 下载会保存到系统 Downloads，iOS 下载会打开保存/分享面板。" : "下载位置由浏览器的下载设置决定。"}列表复制文件名，预览复制内容；转发会把相对文件名追加到对应 Session 的聊天框。文件访问限制在 session 工作目录内。</p>
       </section>
 
       {preview ? (
@@ -640,6 +726,11 @@ export function TmuxSessionFiles(): ReactElement {
                   download={preview.name}
                   aria-label={`下载 ${preview.name}`}
                   title="下载"
+                  onClick={(event) => {
+                    if (!isMobileApp()) return;
+                    event.preventDefault();
+                    void shareFile(preview.relativePath, preview.name);
+                  }}
                 >
                   <SessionFileActionIcon action="download" />
                 </a>

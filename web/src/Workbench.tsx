@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, useSyncExternalStore, type ReactElement } from "react";
-import { useNavigate } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 
 import {
   createWorkbenchTemplate,
@@ -146,7 +146,10 @@ function rememberSeenNotification(id: string): void {
 
 export function WorkbenchNotifications(): null {
   const navigate = useNavigate();
+  const { pathname } = useLocation();
+  const isTmuxPage = pathname === "/tmux-dashboard" || pathname.startsWith("/tmux-dashboard/");
   useEffect(() => {
+    if (isTmuxPage) return;
     const goToNotification = (route: string): void => { void navigate(route); };
     navigateToNotification = goToNotification;
     void refreshWorkbenchInbox();
@@ -173,7 +176,7 @@ export function WorkbenchNotifications(): null {
       document.removeEventListener("visibilitychange", handleVisibility);
       if (navigateToNotification === goToNotification) navigateToNotification = null;
     };
-  }, [navigate]);
+  }, [isTmuxPage, navigate]);
   return null;
 }
 

@@ -706,6 +706,8 @@ pre {
 .web-navigation-submenu-popover a { display: inline-flex; width: 100%; height: 36px; min-height: 36px; box-sizing: border-box; align-items: center; justify-content: flex-start; padding: 0 10px; border-radius: 8px; color: var(--muted); font-size: 12px; font-weight: 700; text-decoration: none; white-space: nowrap; }
 .web-navigation-submenu-popover a:hover { color: var(--ink); background: var(--paper); }
 .web-navigation-submenu-popover a[aria-current="page"] { color: var(--accent); background: var(--accent-soft); }
+.web-navigation-submenu-popover > button.web-navigation-submenu-action { display: inline-flex; width: 100%; height: 36px; min-height: 36px; box-sizing: border-box; align-items: center; justify-content: flex-start; margin-top: 4px; padding: 0 10px; border: 0; border-top: 1px solid var(--line); border-radius: 0 0 8px 8px; color: var(--muted); background: transparent; font-size: 12px; font-weight: 700; text-align: left; white-space: nowrap; }
+.web-navigation-submenu-popover > button.web-navigation-submenu-action:hover { color: var(--ink); background: var(--paper); }
 .page-header, .tmux-header { flex-wrap: wrap; }
 
 @media (min-width: 761px) {
@@ -1019,6 +1021,9 @@ pre {
 .dashboard-composer-image-preview img { width: 100%; height: 100%; object-fit: cover; }
 .dashboard-composer-image-remove { position: absolute; top: 2px; right: 2px; z-index: 1; display: grid; width: 17px; min-width: 17px; min-height: 17px; height: 17px; place-items: center; padding: 0; border: 0; border-radius: 50%; color: #fff; background: #111820dd; font-size: 14px; line-height: 1; }
 .dashboard-composer-image-remove:disabled { opacity: .5; }
+.dashboard-composer-upload-progress { position: absolute; right: 0; bottom: 0; left: 0; z-index: 2; display: grid; gap: 1px; padding: 2px 4px; color: #fff; background: #111820dd; font-size: 9px; line-height: 1.1; }
+.dashboard-composer-upload-progress progress { display: block; width: 100%; height: 3px; accent-color: #89d2a8; }
+.dashboard-composer-image.is-file .dashboard-composer-upload-progress { right: 20px; left: 7px; }
 .dashboard-image-lightbox { position: fixed; z-index: 500; inset: 0; display: grid; place-items: center; padding: 0; background: #000b; }
 .dashboard-image-lightbox-content { display: grid; width: 96vw; height: 94dvh; place-items: center; }
 .dashboard-image-lightbox-content img { display: block; max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 8px; box-shadow: 0 18px 60px #000b; }
@@ -3245,3 +3250,31 @@ button.secondary,
   .task-panel-toolbar .live time { display: none; }
   .task-panel-quick-filters > button { padding-right: 7px; padding-left: 7px; }
 }
+
+.pairing-claim-card { min-width: 0; padding: 24px; }
+.pairing-claim-card h1 { margin: 0; font-size: 24px; }
+.pairing-claim-card .pairing-description { margin: 10px 0 16px; font-size: 14px; line-height: 1.6; }
+.pairing-claim-card button { min-height: 36px; padding: 8px 12px; font-size: 14px; }
+.pairing-note { margin: 10px 0; color: var(--muted); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.pairing-manual { margin-top: 16px; }
+.pairing-manual summary, .pairing-diagnostics summary { padding: 5px 0; color: var(--ink); cursor: pointer; font-size: 14px; }
+.pairing-manual .pairing-form { margin-top: 10px; gap: 10px; }
+.pairing-manual .pairing-form label { font-size: 13px; }
+.pairing-manual .pairing-form input { font-size: 16px; letter-spacing: normal; text-transform: none; }
+.pairing-camera { display: grid; gap: 8px; margin-top: 12px; }
+.pairing-camera video { width: 100%; max-height: 260px; border-radius: 10px; background: #000; object-fit: cover; }
+.pairing-diagnosis { margin-top: 16px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); font-size: 14px; }
+.pairing-diagnosis p { margin: 6px 0 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
+.pairing-diagnostics { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+.pairing-diagnostics dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px 12px; margin: 12px 0; font-size: 12px; }
+.pairing-diagnostics dt { color: var(--muted); }
+.pairing-diagnostics dd { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+.pairing-report { width: 100%; margin-top: 10px; font-size: 16px; }
+@media (max-width: 540px) {
+  .pairing-page { padding: 16px; align-items: start; align-content: center; }
+  .pairing-claim-card { padding: 20px; }
+}
+
+.pairing-camera-video { position: relative; overflow: hidden; border-radius: 10px; background: #000; }
+.pairing-camera-video video { display: block; width: 100%; max-height: 320px; object-fit: contain; }
+.pairing-camera .pairing-note, .pairing-camera .pairing-error { margin: 0; }

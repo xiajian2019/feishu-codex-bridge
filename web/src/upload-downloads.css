@@ -1,0 +1,13 @@
+.upload-downloads-page { width: min(1080px, 100%); margin: 0 auto; padding: 20px 28px 40px; }
+.upload-downloads-header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.upload-downloads-header h1 { margin: 0; font-size: 22px; }
+.upload-downloads-header > span { color: var(--muted); font-size: 12px; }
+.upload-downloads-tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+.upload-downloads-tabs [role="tab"] { min-height: 34px; padding: 5px 13px; color: var(--muted); background: var(--card); border-color: var(--line); font-size: 13px; }
+.upload-downloads-tabs [aria-selected="true"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+:root[data-theme="dark"] .upload-downloads-tabs button[aria-selected="true"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+.upload-downloads-tabs [role="tab"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.upload-downloads-page .downloads-upload-panel, .upload-downloads-page .link-tools-panel { min-width: 0; }
+@media (max-width: 760px) {
+  .upload-downloads-page { padding: 16px 14px 28px; }
+}

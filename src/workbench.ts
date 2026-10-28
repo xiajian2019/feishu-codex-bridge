@@ -92,10 +92,10 @@ export class WorkbenchService {
   private notify(target: WorkbenchTarget, category: WorkbenchNotificationCategory, identity: string): void {
     if (!this.store.getNotificationSettings()[category]) return;
     const eventKey = `${workbenchTargetKey(target)}:${category}:${identity}`;
-    const existing = this.store.hasNotification(eventKey);
+    if (this.store.hasNotification(eventKey)) return;
     this.store.recordNotification({ eventKey, target, category,
       title: category === "completion" ? "执行已完成" : category === "failure" ? "执行失败或已中断" : "等待你处理" });
-    if (!existing) this.store.updatePreferences(target, { unread: true });
+    this.store.updatePreferences(target, { unread: true });
   }
 
   async request(method: string, url: URL, body: Record<string, unknown> = {}): Promise<WorkbenchResult> {

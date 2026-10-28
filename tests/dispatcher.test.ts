@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 
 import { parseConfig } from "../src/config.js";
 import { StateDatabase } from "../src/db.js";
@@ -120,6 +120,14 @@ class FakeRunner implements WorkerRunner {
   }
 }
 
+const harnesses: Array<{ db: StateDatabase; dispatcher: Dispatcher }> = [];
+afterEach(async () => {
+  for (const { db, dispatcher } of harnesses.splice(0).reverse()) {
+    try { await dispatcher.shutdown(); }
+    finally { db.close(); }
+  }
+});
+
 function createHarness(options: Pick<DispatcherOptions, "captureWorkspaceSnapshot"> = {}) {
   const db = new StateDatabase(":memory:");
   db.createProject({ name: "food", path: process.cwd() });
@@ -134,6 +142,7 @@ function createHarness(options: Pick<DispatcherOptions, "captureWorkspaceSnapsho
     logger: { info() {}, warn() {}, error() {} },
     ...(options.captureWorkspaceSnapshot ? { captureWorkspaceSnapshot: options.captureWorkspaceSnapshot } : {}),
   });
+  harnesses.push({ db, dispatcher });
   return { db, lark, runner, dispatcher };
 }
 
@@ -156,7 +165,6 @@ describe("Dispatcher", () => {
 
     await dispatcher.observe(task());
     expect(runner.starts).toHaveLength(1);
-    db.close();
   });
 
   it("creates a web task on the existing Codex SDK path without Feishu outbox comments", async () => {
@@ -181,7 +189,6 @@ describe("Dispatcher", () => {
     await dispatcher.waitForIdle();
     expect(db.getTask(taskRecord.task_guid)?.state).toBe("WAITING_REVIEW");
     expect(lark.comments).toHaveLength(0);
-    db.close();
   });
 
   it("records before and after Git workspace snapshots for a Web run", async () => {
@@ -232,7 +239,6 @@ describe("Dispatcher", () => {
     ]);
     expect(db.listRunWorkspaceSnapshots(taskRecord.task_guid).every((item) => item.snapshot.taskAttribution === "unattributed-shared-workspace")).toBe(true);
     expect(db.getTask(taskRecord.task_guid)?.state).toBe("WAITING_REVIEW");
-    db.close();
   });
 
   it("continues Web task execution when workspace snapshot capture fails", async () => {
@@ -254,7 +260,6 @@ describe("Dispatcher", () => {
 
     expect(db.getTask(taskRecord.task_guid)?.state).toBe("WAITING_REVIEW");
     expect(db.listRunWorkspaceSnapshots(taskRecord.task_guid)).toHaveLength(0);
-    db.close();
   });
 
   it("resumes the same thread when the description is appended", async () => {
@@ -271,7 +276,6 @@ describe("Dispatcher", () => {
     const resumed = db.getRun(runner.starts[1]);
     expect(resumed?.thread_id).toBe("thread-1");
     expect(resumed?.prompt_text).toContain("重试：1");
-    db.close();
   });
 
   it("blocks invalid configuration without starting a worker", async () => {
@@ -281,7 +285,6 @@ describe("Dispatcher", () => {
     expect(db.getTask("task-1")?.state).toBe("BLOCKED_CONFIG");
     await dispatcher.flushOutbox();
     expect(lark.comments[0]).toContain("配置错误");
-    db.close();
   });
 
   it("cancels a running run when the Feishu task is completed", async () => {
@@ -291,7 +294,6 @@ describe("Dispatcher", () => {
     await dispatcher.observe(task({ status: "done", completed_at: "123" }));
     expect(db.getTask("task-1")?.state).toBe("CANCELED");
     expect(db.getRun(runId)?.state).toBe("CANCELED");
-    db.close();
   });
 
   it("interrupts a running run and leaves a cancellation comment", async () => {
@@ -304,7 +306,6 @@ describe("Dispatcher", () => {
     expect(db.getRun(runId)?.state).toBe("CANCELED");
     await dispatcher.flushOutbox();
     expect(lark.comments.some((comment) => comment.includes("执行已取消"))).toBe(true);
-    db.close();
   });
 
   it("appends feedback to Feishu and queues another turn for a processed task", async () => {
@@ -322,6 +323,5 @@ describe("Dispatcher", () => {
     expect(updated.state).toBe("RUNNING");
     expect(runner.starts).toHaveLength(2);
     expect(db.getRun(runner.starts[1])?.thread_id).toBe("thread-1");
-    db.close();
   });
 });

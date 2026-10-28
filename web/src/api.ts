@@ -20,8 +20,24 @@ import type {
   TaskListResponse,
 } from "./types.js";
 import { DEFAULT_COMPOSER_SHORTCUTS, type ShortcutDefinition, type ShortcutDisplayMode, type ShortcutGroup, type ShortcutKind, type ShortcutStore, type ShortcutSurface } from "./tmux-shortcuts.js";
-import { invalidateShortcutConfigCache, observeShortcutConfigServerRevision, readShortcutConfigRevision, recordShortcutConfigServerRevision, writeShortcutConfigCache } from "./shortcut-config-cache.js";
+import { invalidateShortcutConfigCache, loadShortcutConfig, readShortcutConfigCache, readShortcutConfigRevision, writeShortcutConfigCache } from "./shortcut-config-cache.js";
 import { clearCodexSkillCache, readCodexSkillCache, writeCodexSkillCache } from "./skill-cache.js";
+import { isMobileApp, mobileStreamUrl, MOBILE_RESUME_EVENT } from "./mobile-runtime.js";
+import { subscribeToTicketedEvents } from "./mobile-stream.js";
+import { getLocalDraftScope } from "./local-draft-scope.js";
+import { BridgeResponseError, readBridgeJson } from "./bridge-json.js";
+import { assertBridgeApiSupported } from "./client-capabilities.js";
+import {
+  cacheBridgeJson,
+  clearBridgeJsonCache,
+  isTransientBridgeFailure,
+  markBridgeCacheFallback,
+  markBridgeRequestFailure,
+  markBridgeRequestSettled,
+  markBridgeRequestStart,
+  markBridgeRequestSuccess,
+  readCachedBridgeJson,
+} from "./connection-state.js";
 
 export interface TaskQuery {
   q?: string;
@@ -61,29 +77,58 @@ export interface CodexSkillPreference {
 }
 
 export async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    ...init,
-    headers: {
-      Accept: "application/json",
-      ...(init?.headers ?? {}),
-    },
-  });
-  const body = await response.text();
-  let payload: unknown = null;
-  if (body) {
-    try {
-      payload = JSON.parse(body);
-    } catch {
-      payload = { error: body };
+  assertBridgeApiSupported(new URL(url, "http://bridge.invalid").pathname);
+  const scope = getLocalDraftScope();
+  const method = (init?.method ?? "GET").toUpperCase();
+  const cached = method === "GET" ? readCachedBridgeJson<T>(url) : undefined;
+  markBridgeRequestStart();
+  let requestEnded = false;
+  try {
+    const response = await fetch(url, {
+      ...init,
+      headers: {
+        Accept: "application/json",
+        ...(init?.headers ?? {}),
+      },
+    });
+    const payload = response.status === 204 ? null : await readBridgeJson<unknown>(response);
+    if (scope !== getLocalDraftScope()) throw new DOMException("Bridge identity changed", "AbortError");
+    if (!response.ok) {
+      const message = response.status === 404 ? "当前后端不支持该接口，请升级后端或切换环境。" : typeof payload === "object" && payload !== null && "error" in payload
+        ? String(payload.error)
+        : `请求失败：${response.status}`;
+      markBridgeRequestFailure(new Error(message), response.status);
+      requestEnded = true;
+      if (response.status === 401) clearBridgeJsonCache();
+      if (cached !== undefined && response.status >= 500) {
+        markBridgeCacheFallback();
+        return cached;
+      }
+      throw new Error(message);
     }
+    markBridgeRequestSuccess();
+    requestEnded = true;
+    if (method === "GET" && payload !== null) cacheBridgeJson(url, payload);
+    return payload as T;
+  } catch (error) {
+    if (scope !== getLocalDraftScope()) {
+      if (!requestEnded) markBridgeRequestSettled();
+      throw new DOMException("Bridge identity changed", "AbortError");
+    }
+    if (requestEnded) throw error;
+    if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+      markBridgeRequestSettled();
+      throw error;
+    }
+    const transient = isTransientBridgeFailure(error, error instanceof BridgeResponseError ? error.status : undefined);
+    if (transient) markBridgeRequestFailure(error, error instanceof BridgeResponseError ? error.status : undefined);
+    else markBridgeRequestSettled();
+    if (cached !== undefined && transient) {
+      markBridgeCacheFallback();
+      return cached;
+    }
+    throw error;
   }
-  if (!response.ok) {
-    const message = typeof payload === "object" && payload !== null && "error" in payload
-      ? String(payload.error)
-      : `请求失败：${response.status}`;
-    throw new Error(message);
-  }
-  return payload as T;
 }
 
 export function fetchTasks(query: TaskQuery, signal?: AbortSignal): Promise<TaskListResponse> {
@@ -287,12 +332,14 @@ export async function fetchProjects(): Promise<ProjectRecord[]> {
   return result.projects;
 }
 
-export async function fetchCodexSkills(): Promise<CodexSkillRecord[]> {
-  const cached = readCodexSkillCache(CODEX_SKILLS_CACHE_KEY, isCodexSkillRecordList);
+export async function fetchCodexSkills(options: { force?: boolean } = {}): Promise<CodexSkillRecord[]> {
+  const scope = getLocalDraftScope();
+  const cached = options.force ? null : readCodexSkillCache(CODEX_SKILLS_CACHE_KEY, isCodexSkillRecordList);
   if (cached) return cached;
   const result = await getJson<{ skills: CodexSkillRecord[] }>("/api/skills");
+  if (scope !== getLocalDraftScope()) throw new DOMException("Bridge identity changed", "AbortError");
   const skills = Array.isArray(result.skills) ? result.skills : [];
-  if (skills.length > 0) writeCodexSkillCache(CODEX_SKILLS_CACHE_KEY, skills);
+  if (skills.length > 0) writeCodexSkillCache(CODEX_SKILLS_CACHE_KEY, skills, scope);
   return skills;
 }
 
@@ -335,10 +382,12 @@ export async function updateProject(
   return result.project;
 }
 
-export async function fetchShortcutConfig(): Promise<ShortcutStore> {
-  const revisionAtStart = readShortcutConfigRevision();
+export function fetchShortcutConfig(options: { force?: boolean } = {}): Promise<ShortcutStore> {
+  return loadShortcutConfig(readShortcutConfig, options.force);
+}
+
+async function readShortcutConfig(): Promise<ShortcutStore> {
   const result = await getJson<{ groups: ShortcutGroup[]; shortcuts: ShortcutDefinition[]; revision?: string }>("/api/shortcut-config");
-  if (result.revision) recordShortcutConfigServerRevision(result.revision);
   const composerDefaults = new Map(DEFAULT_COMPOSER_SHORTCUTS.map((shortcut) => [shortcut.id, shortcut]));
   const shortcuts = Array.isArray(result.shortcuts)
     ? result.shortcuts.map((shortcut) => {
@@ -356,30 +405,7 @@ export async function fetchShortcutConfig(): Promise<ShortcutStore> {
       : [],
     shortcuts,
   };
-  if (revisionAtStart === readShortcutConfigRevision()) writeShortcutConfigCache(store);
   return store;
-}
-
-/** Polls the small server revision while the page is visible so other devices' edits appear. */
-export function watchRemoteShortcutConfig(onChanged?: () => void): () => void {
-  let active = true;
-  const check = async (): Promise<void> => {
-    if (!active || document.visibilityState === "hidden") return;
-    try {
-      const response = await getJson<{ revision: string }>("/api/shortcut-config/revision");
-      if (active && observeShortcutConfigServerRevision(response.revision)) onChanged?.();
-    } catch {
-      // Keep the last valid configuration while the device is offline.
-    }
-  };
-  const onVisibility = (): void => { if (document.visibilityState === "visible") void check(); };
-  document.addEventListener("visibilitychange", onVisibility);
-  const timer = window.setInterval(() => void check(), 30_000);
-  return () => {
-    active = false;
-    window.clearInterval(timer);
-    document.removeEventListener("visibilitychange", onVisibility);
-  };
 }
 
 export async function createShortcutGroup(input: {
@@ -481,11 +507,18 @@ export async function deleteShortcut(id: string): Promise<void> {
 }
 
 export async function recordShortcutUse(id: string): Promise<ShortcutDefinition> {
+  const revision = readShortcutConfigRevision();
   const token = await getActionToken();
   const result = await getJson<{ shortcut: ShortcutDefinition }>(`/api/shortcuts/${encodeURIComponent(id)}/use`, {
     method: "POST",
     headers: { "X-Bridge-Action-Token": token },
   });
+  const cached = readShortcutConfigCache();
+  if (cached && revision === readShortcutConfigRevision()) {
+    writeShortcutConfigCache({ ...cached, shortcuts: cached.shortcuts.map((shortcut) => shortcut.id === id
+      ? { ...shortcut, operationCount: Math.max(shortcut.operationCount, result.shortcut.operationCount) }
+      : shortcut) });
+  }
   return result.shortcut;
 }
 
@@ -556,11 +589,11 @@ export async function postTaskFollowup(source: "desk" | "direct", taskId: string
   });
 }
 
-export async function getActionToken(): Promise<string> {
+export async function getActionToken(signal?: AbortSignal): Promise<string> {
   const meta = document.querySelector<HTMLMetaElement>("meta[name=bridge-action-token]");
   const embedded = meta?.content;
   if (embedded && embedded !== "__BRIDGE_ACTION_TOKEN__") return embedded;
-  const session = await getJson<{ actionToken: string }>("/api/session");
+  const session = await getJson<{ actionToken: string }>("/api/session", { signal });
   return session.actionToken;
 }
 
@@ -574,8 +607,6 @@ export function subscribeToChanges(
     onStatus("disconnected");
     return () => undefined;
   }
-  onStatus("connecting");
-  const source = new EventSource("/api/events");
   const handleChange = (event: MessageEvent<string>): void => {
     try {
       onChange(JSON.parse(event.data) as DashboardChange);
@@ -583,6 +614,16 @@ export function subscribeToChanges(
       // Ignore malformed events; the next snapshot refresh will reconcile state.
     }
   };
+  if (isMobileApp()) {
+    return subscribeToTicketedEvents({
+      url: () => mobileStreamUrl("/api/events"),
+      onChange: handleChange,
+      onStatus,
+      resumeEvent: MOBILE_RESUME_EVENT,
+    });
+  }
+  onStatus("connecting");
+  const source = new EventSource("/api/events");
   source.addEventListener("task.updated", handleChange);
   source.onopen = () => onStatus("connected");
   source.onerror = () => onStatus("disconnected");

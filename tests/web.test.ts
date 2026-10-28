@@ -342,6 +342,16 @@ describe("DashboardServer", () => {
     expect(createSessionResponse.status).toBe(201);
     expect(createdSessionDirectories).toEqual([directory]);
 
+    const customDirectory = join(directory, "custom-worktree");
+    await mkdir(customDirectory);
+    const customSessionResponse = await fetch(bridgeUrl + "/tmux-dashboard/api/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": actionToken, Origin: bridgeUrl },
+      body: JSON.stringify({ name: "custom-session", workingDirectory: customDirectory }),
+    });
+    expect(customSessionResponse.status).toBe(201);
+    expect(createdSessionDirectories).toEqual([directory, customDirectory]);
+
     const concurrentSessionResponses = await Promise.all([
       fetch(bridgeUrl + "/tmux-dashboard/api/sessions?includeHomes=0"),
       fetch(bridgeUrl + "/tmux-dashboard/api/sessions?includeHomes=0"),

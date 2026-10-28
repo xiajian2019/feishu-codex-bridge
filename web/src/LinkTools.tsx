@@ -1,6 +1,8 @@
 import { useState, type FormEvent, type ReactElement } from "react";
 
 import { getActionToken, getJson } from "./api.js";
+import { BridgeImage, useBridgeMediaUrl } from "./BridgeMedia.js";
+import { copyMobileText, downloadBridgeFile, isMobileApp } from "./mobile-runtime.js";
 
 type PreviewKind = "image" | "pdf" | "text" | "unknown";
 
@@ -26,7 +28,7 @@ interface LinkDownloadResponse {
   sizeBytes: number;
 }
 
-export function LinkTools(): ReactElement {
+export function LinkTools({ embedded = false }: { embedded?: boolean }): ReactElement {
   const [url, setUrl] = useState("");
   const [preview, setPreview] = useState<LinkPreviewResponse | null>(null);
   const [download, setDownload] = useState<LinkDownloadResponse | null>(null);
@@ -94,15 +96,16 @@ export function LinkTools(): ReactElement {
     void previewUrl();
   };
 
+  const Container = embedded ? "section" : "main";
   return (
-    <main className="link-tools-page">
-      <header className="link-tools-header">
+    <Container className={embedded ? "link-tools-panel" : "link-tools-page"}>
+      {!embedded && <header className="link-tools-header">
         <div>
           <p className="eyebrow">Mac link relay</p>
           <h1>链接工具</h1>
           <p className="subtitle">在手机上提交链接，由 Mac 通过自己的 VPN/代理访问并处理文件。</p>
         </div>
-      </header>
+      </header>}
 
       <section className="link-tools-card link-tools-form-card">
         <form onSubmit={submitPreview}>
@@ -145,7 +148,13 @@ export function LinkTools(): ReactElement {
               <p className="eyebrow">Preview</p>
               <h2>{preview.fileName}</h2>
             </div>
-            <a href={preview.previewUrl} target="_blank" rel="noreferrer">新窗口打开</a>
+            <a href={preview.previewUrl} target="_blank" rel="noreferrer" onClick={(event) => {
+              if (!isMobileApp()) return;
+              event.preventDefault();
+              void downloadBridgeFile(preview.previewUrl, preview.fileName).catch((failure: unknown) => {
+                setError(failure instanceof Error ? failure.message : "文件下载失败。");
+              });
+            }}>{isMobileApp() ? "保存或分享" : "新窗口打开"}</a>
           </header>
           <dl className="link-tools-meta">
             <div><dt>类型</dt><dd>{preview.contentType}</dd></div>
@@ -170,20 +179,23 @@ export function LinkTools(): ReactElement {
           </div>
         </section>
       ) : null}
-    </main>
+    </Container>
   );
 }
 
 function PreviewBody({ preview }: { preview: LinkPreviewResponse }): ReactElement {
+  const pdf = useBridgeMediaUrl(isMobileApp() && preview.kind === "pdf" ? preview.previewUrl : undefined);
   if (preview.kind === "image") {
     return (
       <div className="link-tools-image-preview">
-        <img src={preview.previewUrl} alt={preview.fileName} />
+        <BridgeImage src={preview.previewUrl} alt={preview.fileName} />
       </div>
     );
   }
   if (preview.kind === "pdf") {
-    return <iframe className="link-tools-pdf-preview" src={preview.previewUrl} title={preview.fileName} />;
+    if (pdf.error) return <p className="link-tools-error" role="alert">{pdf.error}</p>;
+    if (pdf.loading) return <p role="status">正在读取 PDF…</p>;
+    return <iframe className="link-tools-pdf-preview" src={isMobileApp() ? pdf.url : preview.previewUrl} title={preview.fileName} />;
   }
   if (preview.kind === "text") {
     return (
@@ -204,6 +216,7 @@ function formatBytes(bytes: number): string {
 }
 
 async function copyTextToClipboard(value: string): Promise<void> {
+  if (isMobileApp()) return copyMobileText(value);
   const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const field = document.createElement("textarea");
   field.value = value;

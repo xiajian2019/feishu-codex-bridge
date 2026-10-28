@@ -628,6 +628,8 @@ export class WorkbenchStore {
 
   public markStaleQueueMessagesUnconfirmed(before: number): number {
     const threshold = requireTimestamp(before, "before");
+    if (!this.db.prepare(`SELECT 1 FROM workbench_queue_messages
+      WHERE status='sending' AND claimed_at IS NOT NULL AND claimed_at<? LIMIT 1`).get(threshold)) return 0;
     return Number(this.db.prepare(`UPDATE workbench_queue_messages SET status='unconfirmed',
       error='Delivery status is unknown after the sending claim became stale.', finished_at=?, updated_at=?
       WHERE status='sending' AND claimed_at IS NOT NULL AND claimed_at<?`)
@@ -920,6 +922,15 @@ export class WorkbenchStore {
     const claimLimit = requireInteger(limit, "limit", 1, MAX_AUTOMATION_CLAIM_LIMIT);
     const leaseDuration = requireInteger(leaseMs, "leaseMs", 1_000, MAX_AUTOMATION_LEASE_MS);
     const timestamp = this.timestamp();
+    // Idle ticks must remain reads: even an UPDATE affecting zero rows needs the SQLite writer lock.
+    const expiredClaim = this.db.prepare("SELECT 1 FROM workbench_automation_claims WHERE lease_until<=? LIMIT 1").get(timestamp);
+    const dueAutomation = this.db.prepare(`SELECT 1 FROM workbench_automations
+      WHERE enabled=1 AND next_run_at IS NOT NULL AND next_run_at<=?
+        AND NOT EXISTS (SELECT 1 FROM workbench_automation_claims c WHERE c.automation_id=workbench_automations.automation_id)
+        AND NOT EXISTS (SELECT 1 FROM workbench_automation_runs r
+          WHERE r.automation_id=workbench_automations.automation_id AND r.scheduled_for=workbench_automations.next_run_at)
+      LIMIT 1`).get(timestamp);
+    if (!expiredClaim && !dueAutomation) return [];
     return withSavepoint(this.db, () => {
       this.db.prepare(`UPDATE workbench_automation_claims SET lease_until=lease_until WHERE lease_until<=?`).run(timestamp);
       this.recoverExpiredAutomationClaims(timestamp);
@@ -1322,14 +1333,14 @@ export class WorkbenchStore {
       ? previous ? asNumber(previous.expires_at) : timestamp + DEFAULT_ACTION_TTL_MS
       : requireTimestamp(value.expiresAt, "expiresAt");
     const id = randomUUID();
-    this.db.prepare(`INSERT INTO workbench_pending_actions
+    if (!previous) this.db.prepare(`INSERT INTO workbench_pending_actions
       (action_id, run_id, request_id, target_key, target_json, type, payload_json, status,
        response_json, created_at, expires_at, resolved_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
       ON CONFLICT(run_id, request_id) DO NOTHING`)
       .run(id, runId, requestId, workbenchTargetKey(target), JSON.stringify(target), type, payloadJson,
         expiresAt <= timestamp ? "expired" : "pending", timestamp, expiresAt, expiresAt <= timestamp ? timestamp : null);
-    const row = this.db.prepare("SELECT * FROM workbench_pending_actions WHERE run_id=? AND request_id=?")
+    const row = previous ?? this.db.prepare("SELECT * FROM workbench_pending_actions WHERE run_id=? AND request_id=?")
       .get(runId, requestId) as SqlRow | undefined;
     if (!row) throw new Error("Pending action could not be stored.");
     const stored = mapPendingAction(row);
@@ -1396,6 +1407,8 @@ export class WorkbenchStore {
 
   public expirePendingActions(at?: number): number {
     const timestamp = at === undefined ? this.timestamp() : requireTimestamp(at, "at");
+    if (!this.db.prepare(`SELECT 1 FROM workbench_pending_actions
+      WHERE status='pending' AND expires_at<=? LIMIT 1`).get(timestamp)) return 0;
     return Number(this.db.prepare(`UPDATE workbench_pending_actions SET status='expired', resolved_at=?
       WHERE status='pending' AND expires_at<=?`).run(timestamp, timestamp).changes);
   }

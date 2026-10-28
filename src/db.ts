@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 
 import { DatabaseSync as DatabaseSyncConstructor, type SqliteDatabase } from "./sqlite.js";
 import { WorkbenchStore } from "./workbench-store.js";
+import { writeCodexUsageSnapshotRows } from "./codex-usage-snapshot.js";
+import { CodexUsageSnapshotWriter, type CodexUsageSnapshotWriterOptions } from "./codex-usage-snapshot-writer.js";
 import type { CodexSkillScope, CodexSkillSource, DiscoveredCodexSkill } from "./codex-skills.js";
 import { DEFAULT_SHORTCUT_GROUPS, DEFAULT_SHORTCUTS } from "./tmux-shortcut-defaults.js";
 import {
@@ -485,7 +487,10 @@ CREATE TABLE IF NOT EXISTS web_auth_sessions (
     created_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
-    revoked_at TEXT
+    revoked_at TEXT,
+    client_type TEXT NOT NULL DEFAULT 'unknown',
+    last_access_origin TEXT,
+    last_access_origin_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_web_auth_sessions_active
@@ -747,8 +752,13 @@ export class StateDatabase {
   private readonly changeListeners = new Set<(change: DatabaseChange) => void>();
   private pendingChanges: DatabaseChange[] | null = null;
   private transactionDepth = 0;
+  private readonly usageSnapshotWriter: CodexUsageSnapshotWriter | null;
 
-  constructor(filePath: string, now: () => Date = () => new Date()) {
+  constructor(
+    filePath: string,
+    now: () => Date = () => new Date(),
+    usageSnapshotWriterOptions: CodexUsageSnapshotWriterOptions = {},
+  ) {
     if (filePath !== ":memory:") {
       mkdirSync(dirname(resolve(filePath)), { recursive: true });
     }
@@ -761,6 +771,8 @@ export class StateDatabase {
     this.runMigrations();
     this.seedShortcutDefaults();
     this.workbench = new WorkbenchStore(this.db, () => this.now().getTime());
+    this.usageSnapshotWriter = filePath === ":memory:" ? null
+      : new CodexUsageSnapshotWriter(realpathSync(filePath), usageSnapshotWriterOptions);
   }
 
   public getOrCreateDraftInstallationId(): string {
@@ -774,41 +786,43 @@ export class StateDatabase {
   }
 
   public transaction<T>(callback: () => T): T {
-    const isOuterTransaction = this.transactionDepth === 0;
-    const savepoint = `bridge_tx_${this.transactionDepth}`;
+    const previousDepth = this.transactionDepth;
+    const isOuterTransaction = previousDepth === 0;
+    const savepoint = `bridge_tx_${previousDepth}`;
+    const pendingChangeCount = this.pendingChanges?.length ?? 0;
     if (isOuterTransaction) this.pendingChanges = [];
     try {
       if (isOuterTransaction) this.db.exec("BEGIN");
       else this.db.exec(`SAVEPOINT ${savepoint}`);
-      this.transactionDepth += 1;
+      this.transactionDepth = previousDepth + 1;
     } catch (error) {
       if (isOuterTransaction) this.pendingChanges = null;
       throw error;
     }
+    let result: T;
     try {
-      const result = callback();
-      this.transactionDepth -= 1;
-      if (isOuterTransaction) {
-        this.db.exec("COMMIT");
-        this.flushChanges();
-      } else {
-        this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
-      }
-      return result;
+      result = callback();
+      if (isOuterTransaction) this.db.exec("COMMIT");
+      else this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
     } catch (error) {
-      this.transactionDepth -= 1;
-      if (isOuterTransaction) {
-        try {
+      try {
+        if (isOuterTransaction) {
           this.db.exec("ROLLBACK");
-        } finally {
-          this.pendingChanges = null;
+        } else {
+          this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+          this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
         }
-      } else {
-        this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
-        this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      } finally {
+        if (isOuterTransaction) this.pendingChanges = null;
+        else this.pendingChanges?.splice(pendingChangeCount);
       }
       throw error;
+    } finally {
+      // COMMIT/RELEASE can throw too. Restore the depth exactly once on every path.
+      this.transactionDepth = previousDepth;
     }
+    if (isOuterTransaction) this.flushChanges();
+    return result;
   }
 
   public subscribe(listener: (change: DatabaseChange) => void): () => void {
@@ -1257,30 +1271,19 @@ export class StateDatabase {
     snapshot: CodexHistoryUsageSnapshot,
     finalizedDailyBuckets: CodexHistoryUsageDailyBucket[],
   ): void {
-    this.transaction(() => {
-      for (const bucket of finalizedDailyBuckets) {
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(bucket.startDate)
-          || bucket.startDate >= snapshot.snapshotDate
-          || !Number.isSafeInteger(bucket.tokens)
-          || bucket.tokens < 0) continue;
-        this.db.prepare(
-          `INSERT INTO codex_account_usage_daily_buckets
-             (home_id, usage_date, tokens, captured_at) VALUES (?, ?, ?, ?)
-           ON CONFLICT(home_id, usage_date) DO UPDATE SET
-             tokens = excluded.tokens,
-             captured_at = excluded.captured_at
-           WHERE excluded.captured_at >= codex_account_usage_daily_buckets.captured_at`,
-        ).run(homeId, bucket.startDate, bucket.tokens, snapshot.capturedAt);
-      }
-      this.db.prepare(
-        `INSERT INTO codex_account_usage_snapshots (home_id, snapshot_date, captured_at, payload_json)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(home_id, snapshot_date) DO UPDATE SET
-           captured_at = excluded.captured_at,
-           payload_json = excluded.payload_json
-         WHERE excluded.captured_at >= codex_account_usage_snapshots.captured_at`,
-      ).run(homeId, snapshot.snapshotDate, snapshot.capturedAt, JSON.stringify(snapshot));
+    this.withoutBusyWait(() => {
+      writeCodexUsageSnapshotRows(this.db, homeId, snapshot, finalizedDailyBuckets);
     });
+  }
+
+  public enqueueCodexUsageSnapshot(
+    homeId: string,
+    snapshot: CodexHistoryUsageSnapshot,
+    finalizedDailyBuckets: CodexHistoryUsageDailyBucket[],
+    onError?: (error: Error) => void,
+  ): void {
+    // In-memory databases need no disk cache; the service retains the latest read.
+    this.usageSnapshotWriter?.enqueue(homeId, snapshot, finalizedDailyBuckets, onError);
   }
 
   public listCodexUsageDailyBuckets(homeId: string): CodexHistoryUsageDailyBucket[] {
@@ -3877,8 +3880,8 @@ export class StateDatabase {
       .prepare(
         `INSERT INTO web_auth_sessions
           (session_id, token_hash, device_name, user_agent, remote_address,
-           created_at, last_seen_at, expires_at, revoked_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           created_at, last_seen_at, expires_at, revoked_at, client_type, last_access_origin, last_access_origin_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.sessionId,
@@ -3890,6 +3893,9 @@ export class StateDatabase {
         record.lastSeenAt,
         record.expiresAt,
         record.revokedAt,
+        record.clientType ?? "unknown",
+        record.lastAccessOrigin ?? null,
+        record.lastAccessOriginAt ?? null,
       );
   }
 
@@ -3905,12 +3911,22 @@ export class StateDatabase {
     lastSeenAt: string,
     userAgent: string | null,
     remoteAddress: string | null,
+    lastAccessOrigin: string | null = null,
+    clientType: "browser" | "app" | "unknown" = "unknown",
   ): void {
-    this.db
-      .prepare(
-        "UPDATE web_auth_sessions SET last_seen_at = ?, user_agent = ?, remote_address = ? WHERE session_id = ? AND revoked_at IS NULL",
-      )
-      .run(lastSeenAt, userAgent, remoteAddress, sessionId);
+    // Last-seen metadata is best effort; it must never wait behind another process's writer.
+    try {
+      this.withoutBusyWait(() => this.db.prepare(
+        `UPDATE web_auth_sessions SET last_seen_at = ?, user_agent = ?, remote_address = ?,
+         client_type = CASE WHEN client_type = 'unknown' THEN ? ELSE client_type END,
+         last_access_origin = COALESCE(?, last_access_origin),
+         last_access_origin_at = CASE WHEN ? IS NOT NULL THEN ? ELSE last_access_origin_at END
+         WHERE session_id = ? AND revoked_at IS NULL`,
+      ).run(lastSeenAt, userAgent, remoteAddress, clientType, lastAccessOrigin, lastAccessOrigin, lastSeenAt, sessionId));
+    } catch (error) {
+      if (!isSqliteBusyError(error)) throw error;
+      // The next request retries; credential validation and revocation are unaffected.
+    }
   }
 
   public listWebAuthSessions(): WebAuthSessionRecord[] {
@@ -4020,6 +4036,22 @@ export class StateDatabase {
     return this.getTmuxSession(recordId)!;
   }
 
+  public observeTmuxSession(
+    session: { id: string; name: string; cwd: string; createdAt: number },
+  ): StoredTmuxSession {
+    try {
+      return this.withoutBusyWait(() => this.recordTmuxSession(session));
+    } catch (error) {
+      if (isSqliteBusyError(error)) {
+        const saved = this.getLatestTmuxSession(session.id);
+        // Reconnect may use existing metadata until the next poll. Never reuse
+        // history belonging to a recreated tmux session with the same id.
+        if (saved && saved.ended_at === null && saved.tmux_created_at === session.createdAt) return saved;
+      }
+      throw error;
+    }
+  }
+
   public setTmuxSessionCodexHome(tmuxSessionId: string, codexHomeId: string | null): StoredTmuxSession | null {
     const session = this.db.prepare(`SELECT record_id FROM tmux_sessions
       WHERE tmux_session_id = ? AND ended_at IS NULL
@@ -4033,18 +4065,23 @@ export class StateDatabase {
   public syncTmuxSessions(sessions: Array<{ id: string; name: string; cwd: string; createdAt: number }>): void {
     const currentKeys = new Set(sessions.map((session) => `${session.id}\u0000${session.createdAt}`));
     const endedAt = this.timestamp();
-    this.transaction(() => {
-      const active = this.db.prepare(
-        "SELECT record_id, tmux_session_id, tmux_created_at FROM tmux_sessions WHERE ended_at IS NULL",
-      ).all() as Array<{ record_id: string; tmux_session_id: string; tmux_created_at: number }>;
-      for (const record of active) {
-        if (!currentKeys.has(`${record.tmux_session_id}\u0000${record.tmux_created_at}`)) {
-          this.db.prepare("UPDATE tmux_sessions SET ended_at = ? WHERE record_id = ? AND ended_at IS NULL")
-            .run(endedAt, record.record_id);
+    try {
+      this.withoutBusyWait(() => this.transaction(() => {
+        const active = this.db.prepare(
+          "SELECT record_id, tmux_session_id, tmux_created_at FROM tmux_sessions WHERE ended_at IS NULL",
+        ).all() as Array<{ record_id: string; tmux_session_id: string; tmux_created_at: number }>;
+        for (const record of active) {
+          if (!currentKeys.has(`${record.tmux_session_id}\u0000${record.tmux_created_at}`)) {
+            this.db.prepare("UPDATE tmux_sessions SET ended_at = ? WHERE record_id = ? AND ended_at IS NULL")
+              .run(endedAt, record.record_id);
+          }
         }
-      }
-      for (const session of sessions) this.recordTmuxSession(session);
-    });
+        for (const session of sessions) this.recordTmuxSession(session);
+      }));
+    } catch (error) {
+      if (!isSqliteBusyError(error)) throw error;
+      // Passive refreshes use the last committed records; the next poll retries.
+    }
   }
 
   public getTmuxSession(recordId: string): StoredTmuxSession | null {
@@ -4298,6 +4335,7 @@ export class StateDatabase {
   }
 
   public close(): void {
+    this.usageSnapshotWriter?.stop();
     try {
       this.db.close();
     } catch (error) {
@@ -4415,6 +4453,16 @@ export class StateDatabase {
     return this.now().toISOString();
   }
 
+  private withoutBusyWait<T>(callback: () => T): T {
+    const { timeout } = this.db.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+    this.db.exec("PRAGMA busy_timeout = 0");
+    try {
+      return callback();
+    } finally {
+      this.db.exec(`PRAGMA busy_timeout = ${timeout}`);
+    }
+  }
+
   private noteChange(change: DatabaseChange): void {
     if (this.pendingChanges) {
       this.pendingChanges.push(change);
@@ -4440,6 +4488,28 @@ export class StateDatabase {
   }
 
   private runMigrations(): void {
+    // Early installations kept only one snapshot per Home. CREATE TABLE IF
+    // NOT EXISTS does not upgrade that key, so date-scoped UPSERTs would fail.
+    this.transaction(() => {
+      const columns = this.db.prepare("PRAGMA table_info(codex_account_usage_snapshots)").all() as Array<{ name: string; pk: number }>;
+      if (columns.some((column) => column.name === "snapshot_date" && column.pk > 0)) return;
+      this.db.exec(`
+        CREATE TABLE codex_account_usage_snapshots_by_date (
+          home_id TEXT NOT NULL,
+          snapshot_date TEXT NOT NULL,
+          captured_at TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          PRIMARY KEY(home_id, snapshot_date)
+        );
+        INSERT INTO codex_account_usage_snapshots_by_date (home_id, snapshot_date, captured_at, payload_json)
+          SELECT home_id, snapshot_date, captured_at, payload_json FROM codex_account_usage_snapshots;
+        DROP TABLE codex_account_usage_snapshots;
+        ALTER TABLE codex_account_usage_snapshots_by_date RENAME TO codex_account_usage_snapshots;
+      `);
+    });
+    addColumnIfMissing(this.db, "web_auth_sessions", "client_type", "TEXT NOT NULL DEFAULT 'unknown'");
+    addColumnIfMissing(this.db, "web_auth_sessions", "last_access_origin", "TEXT");
+    addColumnIfMissing(this.db, "web_auth_sessions", "last_access_origin_at", "TEXT");
     // These columns were added after the minimal schema in the design document.
     // Keeping the migration additive lets an operator upgrade an existing database.
     // Remove the abandoned model-usage cache from existing Bridge databases.
@@ -4725,9 +4795,15 @@ function migrateBridgeTaskStatusConstraint(db: SqliteDatabase): void {
   `);
 }
 
+function isSqliteBusyError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && /^SQLITE_(?:BUSY|LOCKED)(?:_|$)/.test(code);
+}
+
 function addColumnIfMissing(
   db: SqliteDatabase,
-  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts" | "shortcut_groups" | "tmux_sessions" | "tmux_session_actions",
+  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts" | "shortcut_groups" | "tmux_sessions" | "tmux_session_actions" | "web_auth_sessions",
   column: string,
   definition: string,
 ): void {
@@ -5032,6 +5108,9 @@ function mapWebAuthSession(row: Record<string, unknown>): WebAuthSessionRecord {
     sessionId: String(row.session_id),
     tokenHash: String(row.token_hash),
     deviceName: String(row.device_name),
+    clientType: row.client_type === "app" || row.client_type === "browser" ? row.client_type : "unknown",
+    lastAccessOrigin: nullableString(row.last_access_origin),
+    lastAccessOriginAt: nullableString(row.last_access_origin_at),
     userAgent: nullableString(row.user_agent),
     remoteAddress: nullableString(row.remote_address),
     createdAt: String(row.created_at),

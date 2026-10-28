@@ -21,7 +21,9 @@ import {
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 
 import { CodeTextViewer } from "./CodeTextViewer.js";
-import { getLocalDraftScope } from "./local-draft-scope.js";
+import { BridgeImage } from "./BridgeMedia.js";
+import { downloadBridgeFile, getBridgeOrigin, isMobileApp, openBridgeExternal } from "./mobile-runtime.js";
+import { getLocalDraftScope, scopedStorageKey } from "./local-draft-scope.js";
 import {
   extractHistoryMessages,
   fetchHistoryPreferences,
@@ -86,6 +88,8 @@ interface CodexFilePreviewTarget {
 type CodexFileLinkTarget = CodexFilePreviewTarget | { outside: true };
 
 interface CodexMarkdownLinkContextValue {
+  homeId: string;
+  threadId: string;
   rootPath: string;
   onOpenFile: (target: CodexFileLinkTarget) => void;
 }
@@ -102,8 +106,6 @@ const EMPTY_FILTERS: HistoryFilters = {
   status: "",
 };
 
-const CODEX_HISTORY_HOME_STORAGE_KEY = "feishu-codex-bridge.codex-history-home";
-const CODEX_HISTORY_DETAIL_CACHE_PREFIX = "feishu-codex-bridge.codex-history-detail.v1:";
 const CODEX_HISTORY_DETAIL_CACHE_TTL_MS = 60 * 60 * 1_000;
 const CODEX_HISTORY_LIST_VERSION_MAX_AGE_MS = 30 * 1_000;
 const CODEX_HISTORY_DETAIL_CACHE_MAX_CHARS = 600_000;
@@ -116,28 +118,33 @@ interface CodexHistoryDetailCacheEntry {
 }
 
 function readStoredCodexHistoryHome(): string {
+  const key = scopedStorageKey("history-home");
+  if (!key) return "";
   try {
-    return window.localStorage.getItem(CODEX_HISTORY_HOME_STORAGE_KEY) ?? "";
+    return window.localStorage.getItem(key) ?? "";
   } catch {
     return "";
   }
 }
 
 function persistCodexHistoryHome(homeId: string): void {
+  const key = scopedStorageKey("history-home");
+  if (!key) return;
   try {
-    if (homeId) window.localStorage.setItem(CODEX_HISTORY_HOME_STORAGE_KEY, homeId);
-    else window.localStorage.removeItem(CODEX_HISTORY_HOME_STORAGE_KEY);
+    if (homeId) window.localStorage.setItem(key, homeId);
+    else window.localStorage.removeItem(key);
   } catch {
     // The selector still works for this page if browser storage is unavailable.
   }
 }
 
-function codexHistoryDetailCacheKey(homeId: string, threadId: string): string {
-  return `${CODEX_HISTORY_DETAIL_CACHE_PREFIX}${encodeURIComponent(homeId)}:${encodeURIComponent(threadId)}`;
+function codexHistoryDetailCacheKey(homeId: string, threadId: string): string | null {
+  return scopedStorageKey("history-detail", JSON.stringify([homeId, threadId]));
 }
 
 function readCodexHistoryDetailCache(homeId: string, threadId: string): CodexHistoryDetailResponse | null {
   const key = codexHistoryDetailCacheKey(homeId, threadId);
+  if (!key) return null;
   try {
     const raw = window.localStorage.getItem(key);
     if (!raw) return null;
@@ -155,8 +162,10 @@ function readCodexHistoryDetailCache(homeId: string, threadId: string): CodexHis
   }
 }
 
-function writeCodexHistoryDetailCache(detail: CodexHistoryDetailResponse): void {
+function writeCodexHistoryDetailCache(detail: CodexHistoryDetailResponse, expectedScope: string | null): void {
+  if (getLocalDraftScope() !== expectedScope) return;
   const key = codexHistoryDetailCacheKey(detail.home.id, detail.thread.id);
+  if (!key) return;
   const cachedDetail: CodexHistoryDetailResponse = {
     ...detail,
     home: { ...detail.home, path: "" },
@@ -175,21 +184,26 @@ function writeCodexHistoryDetailCache(detail: CodexHistoryDetailResponse): void 
   }
 }
 
-function removeCodexHistoryDetailCache(homeId: string, threadId: string): void {
+function removeCodexHistoryDetailCache(homeId: string, threadId: string, expectedScope: string | null): void {
+  if (getLocalDraftScope() !== expectedScope) return;
+  const key = codexHistoryDetailCacheKey(homeId, threadId);
+  if (!key) return;
   try {
-    window.localStorage.removeItem(codexHistoryDetailCacheKey(homeId, threadId));
+    window.localStorage.removeItem(key);
   } catch {
     // Browser storage is only an optimization.
   }
 }
 
 function pruneCodexHistoryDetailCache(): void {
+  const prefix = scopedStorageKey("history-detail");
+  if (!prefix) return;
   try {
     const now = Date.now();
     const entries: Array<{ key: string; cachedAt: number }> = [];
     for (let index = 0; index < window.localStorage.length; index += 1) {
       const key = window.localStorage.key(index);
-      if (!key?.startsWith(CODEX_HISTORY_DETAIL_CACHE_PREFIX)) continue;
+      if (!key?.startsWith(prefix)) continue;
       try {
         const value = JSON.parse(window.localStorage.getItem(key) ?? "null") as Partial<CodexHistoryDetailCacheEntry> | null;
         if (!value || value.version !== 1 || typeof value.cachedAt !== "number" || !Number.isFinite(value.cachedAt)
@@ -246,6 +260,14 @@ export function CodexHistory(): ReactElement {
   const [organizationTag, setOrganizationTag] = useState("");
   const autoMarkReadAttempt = useRef<string | null>(null);
 
+  useEffect(() => {
+    const refreshAfterReconnect = (): void => {
+      if (navigator.onLine !== false) setHistoryRefreshVersion((current) => current + 1);
+    };
+    window.addEventListener("online", refreshAfterReconnect);
+    return () => window.removeEventListener("online", refreshAfterReconnect);
+  }, []);
+
   const rememberHome = useCallback((nextHomeId: string): void => {
     persistCodexHistoryHome(nextHomeId);
     setSelectedHome((current) => current === nextHomeId ? current : nextHomeId);
@@ -269,7 +291,7 @@ export function CodexHistory(): ReactElement {
       })
       .finally(() => { if (!controller.signal.aborted) setPreferencesLoaded(true); });
     return () => controller.abort();
-  }, []);
+  }, [historyRefreshVersion]);
 
   const patchPreference = useCallback(async (
     target: HistoryWorkbenchTarget,
@@ -759,7 +781,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
             && (Array.isArray(cachedTurns) ? cachedTurns.length : 0) === (Array.isArray(nextTurns) ? nextTurns.length : 0);
           setDetail(sameVersion && cachedDetail ? { ...next, thread: cachedDetail.thread } : next);
           setImagePreviews(buildTurnImagePreviews(homeId, threadId, next.imageAttachments ?? []));
-          writeCodexHistoryDetailCache(next);
+          writeCodexHistoryDetailCache(next, draftScope);
         }
       })
       .catch((nextError: unknown) => {
@@ -864,7 +886,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
           if (cancelled || controller.signal.aborted) return;
           setDetail(refreshed);
           setImagePreviews(buildTurnImagePreviews(homeId, threadId, refreshed.imageAttachments ?? []));
-          writeCodexHistoryDetailCache(refreshed);
+          writeCodexHistoryDetailCache(refreshed, draftScope);
           setLiveRun(null);
         }
       } catch (nextError: unknown) {
@@ -916,9 +938,11 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
     setFilePreviewTarget(target);
   }, []);
   const markdownLinkContext = useMemo<CodexMarkdownLinkContextValue>(() => ({
+    homeId,
+    threadId,
     rootPath: thread.cwd ?? "",
     onOpenFile: openFilePreview,
-  }), [openFilePreview, thread.cwd]);
+  }), [homeId, threadId, openFilePreview, thread.cwd]);
 
   const submitMessage = useCallback(async (
     text: string,
@@ -938,7 +962,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
         ...(settings.interactive ? { interactive: true } : {}),
       };
       const result = await sendCodexThreadMessage(homeId, threadId, messageInput);
-      removeCodexHistoryDetailCache(homeId, threadId);
+      removeCodexHistoryDetailCache(homeId, threadId, draftScope);
       setRunNotice(null);
       const previews = result.attachments
         .filter((attachment) => attachment.mimeType.startsWith("image/"))
@@ -953,7 +977,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
         const refreshed = await fetchCodexThreadDetail(homeId, threadId);
         setDetail(refreshed);
         setImagePreviews(buildTurnImagePreviews(homeId, threadId, refreshed.imageAttachments ?? []));
-        writeCodexHistoryDetailCache(refreshed);
+        writeCodexHistoryDetailCache(refreshed, draftScope);
         setLiveRun(null);
         setRunNotice(result.state === "interrupted"
           ? "Bridge 已重启，无法继续跟踪上一轮；请核对 Codex 历史后再提交。"
@@ -1336,13 +1360,22 @@ function CodexAssistantUserMessage({ messageId, showActions, selected, bookmarke
 }
 
 function CodexImagesPart({ data }: { data: { images: CodexImagePreview[] } }): ReactElement {
+  const [error, setError] = useState("");
   return (
     <div className="codex-assistant-user-images">
       {data.images.map((image, index) => (
-        <a key={`${image.fileName}:${index}`} href={image.src} target="_blank" rel="noreferrer" title={image.fileName}>
-          <img src={image.src} alt={image.fileName} />
+        <a key={`${image.fileName}:${index}`} href={image.src} target="_blank" rel="noreferrer" title={image.fileName} onClick={(event) => {
+          if (!isMobileApp()) return;
+          event.preventDefault();
+          setError("");
+          void downloadBridgeFile(image.src, image.fileName).catch((failure: unknown) => {
+            setError(failure instanceof Error ? failure.message : "附件下载失败。");
+          });
+        }}>
+          <BridgeImage src={image.src} alt={image.fileName} />
         </a>
       ))}
+      {error ? <span role="alert">{error}</span> : null}
     </div>
   );
 }
@@ -1396,8 +1429,8 @@ function resolveCodexFileLink(href: string, rootPath: string): CodexFileLinkTarg
   if (!value || value.startsWith("#") || value.startsWith("//")) return null;
   if (/^https?:\/\//i.test(value)) {
     try {
-      const url = new URL(value, window.location.origin);
-      if (url.origin !== window.location.origin) return null;
+      const url = new URL(value, getBridgeOrigin());
+      if (url.origin !== getBridgeOrigin()) return null;
       value = url.pathname + url.search + url.hash;
     } catch {
       return null;
@@ -1455,10 +1488,19 @@ function resolveCodexFileLink(href: string, rootPath: string): CodexFileLinkTarg
   return { relativePath: pathParts.join("/"), ...(lineNumber ? { lineNumber } : {}) };
 }
 
-function CodexMarkdown({ text }: { text: string }): ReactElement {
+function CodexMarkdown({ text, filePath }: { text: string; filePath?: string }): ReactElement {
   const linkContext = useContext(CODEX_MARKDOWN_LINK_CONTEXT);
   const components = useMemo<Components>(() => ({
     ...CODEX_MARKDOWN_COMPONENTS,
+    ...(isMobileApp() ? { img: ({ node, src, ...props }) => {
+      void node;
+      const relativeSrc = src && filePath && !/^(?:[a-z][a-z\d+.-]*:|\/)/i.test(src)
+        ? [...filePath.split("/").slice(0, -1), src].join("/") : src;
+      const target = relativeSrc && linkContext ? resolveCodexFileLink(relativeSrc, linkContext.rootPath) : null;
+      if (target && "outside" in target) return <span>图片不在当前会话目录内。</span>;
+      return <BridgeImage {...props} src={target && linkContext
+        ? codexFilePreviewUrl(linkContext.homeId, linkContext.threadId, target.relativePath) : src} />;
+    } } satisfies Components : {}),
     a: ({ node, href, children, ...props }) => {
       void node;
       const target = typeof href === "string" && linkContext
@@ -1469,14 +1511,20 @@ function CodexMarkdown({ text }: { text: string }): ReactElement {
           {...props}
           href={href}
           onClick={(event) => {
-            if (!target || !linkContext) return;
+            if (!target || !linkContext) {
+              if (isMobileApp() && href && /^(https?:\/\/|\/\/)/i.test(href)) {
+                event.preventDefault();
+                void openBridgeExternal(href).catch(() => {});
+              }
+              return;
+            }
             event.preventDefault();
             linkContext.onOpenFile(target);
           }}
         >{children}</a>
       );
     },
-  }), [linkContext]);
+  }), [filePath, linkContext]);
   return (
     <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
       {text}
@@ -1489,7 +1537,7 @@ const CODEX_FILE_IMAGE_EXTENSIONS = new Set(["apng", "avif", "bmp", "gif", "jpeg
 function codexFilePreviewUrl(homeId: string, threadId: string, relativePath: string): string {
   const url = new URL(
     `/api/codex/threads/${encodeURIComponent(homeId)}/${encodeURIComponent(threadId)}/files/preview`,
-    window.location.origin,
+    getBridgeOrigin(),
   );
   url.searchParams.set("path", relativePath);
   return url.pathname + url.search;
@@ -1563,9 +1611,9 @@ function CodexFilePreviewDialog({
         <div className="codex-file-preview-body">
           {loading ? <div className="empty">正在读取文件…</div> : null}
           {error ? <div className="codex-file-preview-error" role="alert">{error}</div> : null}
-          {!loading && !error && isImage ? <img src={previewUrl} alt={fileName} onError={() => setError("无法读取图片文件。")} /> : null}
+          {!loading && !error && isImage ? <BridgeImage src={previewUrl} alt={fileName} onError={() => setError("无法读取图片文件。")} /> : null}
           {!loading && !error && !isImage && (extension === "md" || extension === "markdown") ? (
-            <div className="codex-file-preview-markdown codex-assistant-markdown"><CodexMarkdown text={text} /></div>
+            <div className="codex-file-preview-markdown codex-assistant-markdown"><CodexMarkdown text={text} filePath={target.relativePath} /></div>
           ) : null}
           {!loading && !error && !isImage && extension !== "md" && extension !== "markdown" ? (
             <CodeTextViewer fileName={fileName} text={text} lineNumber={target.lineNumber} />

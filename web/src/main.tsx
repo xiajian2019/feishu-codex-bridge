@@ -8,6 +8,10 @@ import { WorkbenchNotifications } from "./Workbench.js";
 import { AuthGate, PairingAdmin } from "./auth.js";
 import { readVConsoleVisible, VCONSOLE_VISIBILITY_CHANGE_EVENT } from "./app-settings.js";
 import { ThemeProvider } from "./theme.js";
+import { MobileConnectionBoundary } from "./mobile-entry.js";
+import { BridgeConnectionStatus } from "./BridgeConnectionStatus.js";
+import { BackendFeatureGate } from "./BackendFeatureGate.js";
+import { UploadManagerProvider } from "./upload-manager.js";
 import "./styles.css";
 
 const TmuxDashboard = lazy(() => import("./TmuxDashboard.js").then((module) => ({ default: module.TmuxDashboard })));
@@ -27,7 +31,7 @@ const Automations = lazy(() => import("./Automations.js").then((module) => ({ de
 const ExecutionMachines = lazy(() => import("./ExecutionMachines.js").then((module) => ({ default: module.ExecutionMachines })));
 const DemoCatalog = lazy(() => import("./DemoCatalog.js").then((module) => ({ default: module.DemoCatalog })));
 const JjTools = lazy(() => import("./JjTools.js").then((module) => ({ default: module.JjTools })));
-const LinkTools = lazy(() => import("./LinkTools.js").then((module) => ({ default: module.LinkTools })));
+const UploadDownloads = lazy(() => import("./UploadDownloads.js").then((module) => ({ default: module.UploadDownloads })));
 
 function LegacyDirectTasksRedirect() {
   const location = useLocation();
@@ -194,41 +198,45 @@ async function mountApp(): Promise<void> {
     <StrictMode>
         <ThemeProvider>
         <BrowserRouter>
-          <AuthGate>
-            <SystemNavigationProvider>
-              <WebNavigation />
-              <WorkbenchNotifications />
-              <Suspense fallback={<div className="route-loading">页面加载中…</div>}>
-                <Routes>
+          <MobileConnectionBoundary><AuthGate>
+            <UploadManagerProvider>
+              <SystemNavigationProvider>
+                <BridgeConnectionStatus />
+                <WebNavigation />
+                <WorkbenchNotifications />
+                <Suspense fallback={<div className="route-loading">页面加载中…</div>}>
+                  <Routes>
                   <Route path="/" element={<App />} />
                   <Route path="/tasks/:source/:taskId" element={<TaskDetailPage />} />
                   <Route path="/direct-tasks" element={<LegacyDirectTasksRedirect />} />
-                  <Route path="/codex-history" element={<CodexHistory />} />
-                  <Route path="/codex-history/:homeId/:threadId" element={<CodexHistory />} />
+                  <Route path="/codex-history" element={<BackendFeatureGate feature="codex-history"><CodexHistory /></BackendFeatureGate>} />
+                  <Route path="/codex-history/:homeId/:threadId" element={<BackendFeatureGate feature="codex-history"><CodexHistory /></BackendFeatureGate>} />
                   <Route path="/demos" element={<DemoCatalog />} />
-                  <Route path="/link-tools" element={<LinkTools />} />
+                  <Route path="/link-tools" element={<Navigate to="/system-management/uploads?tab=download" replace />} />
                   <Route path="/system-management/jj" element={<JjTools />} />
-                  <Route path="/tmux-dashboard/history" element={<TmuxSessionHistory />} />
-                  <Route path="/tmux-dashboard/git-changes/:sessionId" element={<TmuxGitChanges />} />
-                  <Route path="/tmux-dashboard/files/:sessionId" element={<TmuxSessionFiles />} />
-                  <Route path="/tmux-dashboard/*" element={<TmuxDashboard />} />
+                  <Route path="/system-management/uploads" element={<UploadDownloads />} />
+                  <Route path="/tmux-dashboard/history" element={<BackendFeatureGate feature="tmux"><TmuxSessionHistory /></BackendFeatureGate>} />
+                  <Route path="/tmux-dashboard/git-changes/:sessionId" element={<BackendFeatureGate feature="tmux"><TmuxGitChanges /></BackendFeatureGate>} />
+                  <Route path="/tmux-dashboard/files/:sessionId" element={<BackendFeatureGate feature="tmux"><TmuxSessionFiles /></BackendFeatureGate>} />
+                  <Route path="/tmux-dashboard/*" element={<BackendFeatureGate feature="tmux"><TmuxDashboard /></BackendFeatureGate>} />
                   <Route path="/system-management" element={<Navigate to="/system-management/devices" replace />} />
                   <Route path="/system-management/devices" element={<PairingAdmin />} />
                   <Route path="/system-management/projects" element={<ProjectManagement />} />
                   <Route path="/system-management/shortcuts" element={<ShortcutManagement />} />
                   <Route path="/system-management/usage" element={<CodexUsage />} />
                   <Route path="/system-management/health" element={<SystemHealth />} />
-                  <Route path="/system-management/backups" element={<SystemBackups />} />
+                  <Route path="/system-management/backups" element={<BackendFeatureGate feature="backups"><SystemBackups /></BackendFeatureGate>} />
                   <Route path="/system-management/workspaces" element={<TaskWorkspaces />} />
                   <Route path="/system-management/settings" element={<SystemSettings />} />
                   <Route path="/system-management/automations" element={<Automations />} />
                   <Route path="/system-management/machines" element={<ExecutionMachines />} />
                   <Route path="/pair-admin" element={<Navigate to="/system-management/devices" replace />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
-                </Routes>
-              </Suspense>
-            </SystemNavigationProvider>
-          </AuthGate>
+                  </Routes>
+                </Suspense>
+              </SystemNavigationProvider>
+            </UploadManagerProvider>
+          </AuthGate></MobileConnectionBoundary>
         </BrowserRouter>
       </ThemeProvider>
     </StrictMode>,

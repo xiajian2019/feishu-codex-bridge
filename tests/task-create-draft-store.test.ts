@@ -65,7 +65,7 @@ describe("Task Desk create-form draft storage", () => {
     expect(loadTaskCreateDraft("project-a")).toBeNull();
   });
 
-  test("device-revocation cleanup removes only task and Codex History drafts", async () => {
+  test("device-revocation cleanup also removes unattributable legacy tmux drafts", async () => {
     saveTaskCreateDraft("project-a", "Task draft", false);
     await saveCodexHistoryDraft(`${scopeA}|home-a/thread-a`, "History draft", []);
     values.set("feishu-codex-bridge:tmux-draft:session-a", "keep tmux draft");
@@ -76,7 +76,7 @@ describe("Task Desk create-form draft storage", () => {
 
     expect(loadTaskCreateDraft("project-a")).toBeNull();
     expect(values.has("feishu-codex-bridge:codex-history-draft:v2:" + encodeURIComponent(`${scopeA}|home-a/thread-a`))).toBe(false);
-    expect(values.get("feishu-codex-bridge:tmux-draft:session-a")).toBe("keep tmux draft");
+    expect(values.has("feishu-codex-bridge:tmux-draft:session-a")).toBe(false);
     expect(values.get("feishu-codex-bridge.codex-history-home")).toBe("home-a");
     expect(values.get("feishu-codex-bridge.shortcut-config.v1")).toBe("keep shortcut config");
 

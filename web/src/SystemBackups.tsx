@@ -3,13 +3,11 @@ import { useCallback, useEffect, useState, type ReactElement } from "react";
 import { getActionToken, getJson } from "./api.js";
 
 interface BackupMetadata {
+  source?: "manual" | "scheduled";
   formatVersion?: number;
   programVersion: string;
   createdAt: string;
   databaseBytes: number;
-  attachmentCount: number;
-  attachmentBytes: number;
-  attachmentCountsByKind?: Record<"web" | "direct" | "aamp" | "tmux", number>;
   schemaFingerprint: string;
   contentHashesVerified: boolean;
 }
@@ -24,6 +22,12 @@ interface BackupEntry {
 interface BackupListResponse {
   backups: BackupEntry[];
   restoreDirectory: string;
+  schedule?: {
+    timeZone: string;
+    nextRunAt: string;
+    retentionDays: number;
+    minimumBackups: number;
+  };
 }
 
 interface BackupVerification {
@@ -31,9 +35,6 @@ interface BackupVerification {
   programVersion: string;
   createdAt: string;
   databaseBytes: number;
-  attachmentCount: number;
-  attachmentBytes: number;
-  attachmentCountsByKind?: Record<"web" | "direct" | "aamp" | "tmux", number>;
   schemaFingerprint: string;
   contentHashesVerified: boolean;
 }
@@ -49,8 +50,6 @@ interface UpgradeCompatibility {
 interface RestoreResult {
   restoreId: string;
   location: string;
-  attachmentCount: number;
-  attachmentBytes: number;
   schemaFingerprint: string;
 }
 
@@ -124,12 +123,8 @@ export function SystemBackups(): ReactElement {
 
   const runAction = async (backupId: string, action: "verify" | "check-upgrade" | "restore"): Promise<void> => {
     if (action === "restore") {
-      const formatVersion = snapshot?.backups.find((backup) => backup.backupId === backupId)?.metadata?.formatVersion ?? 1;
-      const legacyNote = formatVersion < 2
-        ? "此旧版清单未包含 tmux 附件；若备份数据库引用了 tmux 截图，恢复会被拒绝。"
-        : "";
       if (!window.confirm(
-        `将 ${backupId} 恢复到 backups/restores 下的全新目录。不会覆盖当前数据库，也不会切换或重启服务。${legacyNote}继续？`,
+        `将 ${backupId} 的 SQLite 数据库恢复到 backups/restores 下的全新目录，不恢复附件。不会覆盖当前数据库，也不会切换或重启服务。继续？`,
       )) return;
     }
     const key = `${backupId}:${action}`;
@@ -144,7 +139,7 @@ export function SystemBackups(): ReactElement {
       if (result.restore) {
         setNotice(`恢复完成，结果位于 ${result.restore.location}；运行服务仍使用原数据库。`);
       } else if (result.verification) {
-        setNotice(`${backupId} 的数据库和附件哈希校验通过。`);
+        setNotice(`${backupId} 的 SQLite 数据库校验通过。`);
       } else if (result.compatibility) {
         setNotice(result.compatibility.compatible
           ? `${backupId} 可由当前程序版本迁移。`
@@ -167,8 +162,9 @@ export function SystemBackups(): ReactElement {
         </button>
       </div>
     </header>
-    <p className="muted">备份保存在 Bridge 数据目录的 backups/。包含数据库记录引用的 Web、Direct、AAMP 和 tmux 附件；tmux 只收集任务提交记录中引用且仍存在的附件。不包含配置文件、项目仓库、Codex 账户数据库或未关联的文件。</p>
-    <p className="muted">清单为数据库文件和每个已关联附件保存 SHA-256 内容摘要；“校验备份”会重新读取文件并比对这些摘要。列表只读清单元数据，显示“尚未校验”表示本次尚未执行文件校验；清单 JSON 自身没有单独的哈希。数据库结构指纹是另一项信息。“检查升级”会在临时副本上运行数据库迁移。“恢复到新目录”会先校验备份并写入独立目录，不会覆盖或切换当前服务。</p>
+    <p className="muted">仅备份 Bridge 的 SQLite 数据库，保存在数据目录的 backups/。</p>
+    <p className="muted">每天凌晨 01:00（{snapshot?.schedule?.timeZone ?? "主机时区"}）自动备份，完成后按日期清理 3 天前的系统定时备份，始终保留最近 3 个。手动备份保留。</p>
+    <p className="muted">校验备份会检查数据库完整性；检查升级使用临时副本。新旧备份均只恢复数据库，库内原有附件路径保持不变，不恢复附件，也不覆盖当前数据库或切换服务。</p>
     {error ? <p className="error" role="alert">{error}</p> : null}
     {notice ? <p className="system-backups-notice" role="status">{notice}</p> : null}
     {loading && !snapshot ? <p className="muted">正在读取备份清单…</p> : null}
@@ -179,29 +175,23 @@ export function SystemBackups(): ReactElement {
         const rowBusy = busy && busy.startsWith(`${backup.backupId}:`) ? busy.slice(backup.backupId.length + 1) : null;
         const hashVerified = Boolean(item?.verification) || Boolean(backup.metadata?.contentHashesVerified);
         const formatVersion = backup.metadata?.formatVersion ?? 1;
-        const attachmentCounts = backup.metadata?.attachmentCountsByKind ?? { web: 0, direct: 0, aamp: 0, tmux: 0 };
         return <article className="system-backup-card" key={backup.backupId}>
           <header>
             <div>
               <h2>{backup.backupId}</h2>
-              {backup.metadata ? <p className="muted">{formatTime(backup.metadata.createdAt)} · 程序 {backup.metadata.programVersion}</p> : null}
+              {backup.metadata ? <p className="muted">{formatTime(backup.metadata.createdAt)} · {backup.metadata.source === "scheduled" ? "系统定时" : "手动"} · 程序 {backup.metadata.programVersion}</p> : null}
             </div>
             {backup.status === "invalid" ? <span className="system-backup-invalid">清单无效</span> : null}
           </header>
           {backup.metadata ? <dl>
             <div><dt>数据库</dt><dd>{formatBytes(backup.metadata.databaseBytes)}</dd></div>
-            <div><dt>已关联附件</dt><dd>{backup.metadata.attachmentCount} 个 · {formatBytes(backup.metadata.attachmentBytes)}</dd></div>
-            {backup.metadata.attachmentCount > 0 ? <div><dt>来源</dt><dd>{([
-              ["web", "Task Desk"], ["direct", "Direct"], ["aamp", "AAMP"], ["tmux", "tmux"],
-            ] as const).filter(([kind]) => attachmentCounts[kind] > 0)
-              .map(([kind, label]) => `${label} ${attachmentCounts[kind]}`).join(" · ")}</dd></div> : null}
-            <div><dt>清单版本</dt><dd>v{formatVersion}{formatVersion < 2 ? " · 未收录 tmux 附件" : " · 包含受引用的 tmux 附件"}</dd></div>
-            <div><dt>文件 SHA-256 校验</dt><dd>{hashVerified ? "本页已校验" : "本页尚未校验"}</dd></div>
+            <div><dt>备份范围</dt><dd>SQLite 数据库</dd></div>
+            <div><dt>清单版本</dt><dd>v{formatVersion}</dd></div>
+            <div><dt>数据库校验</dt><dd>{hashVerified ? "本页已校验" : "本页尚未校验"}</dd></div>
           </dl> : <p className="muted">{backup.error || "无法读取此备份的元数据。"}</p>}
-          {item?.verification ? <p className="system-backup-result">校验通过 · 数据库和附件哈希匹配。</p> : null}
+          {item?.verification ? <p className="system-backup-result">校验通过 · SQLite 数据库完整性与 SHA-256 匹配。</p> : null}
           {item?.compatibility ? <p className="system-backup-result">升级检查：{item.compatibility.compatible ? "兼容" : "不兼容"}（{item.compatibility.sourceProgramVersion} → {item.compatibility.targetProgramVersion}）</p> : null}
-          {item?.restore ? <p className="system-backup-result">恢复目录：<code>{item.restore.location}</code> · {item.restore.attachmentCount} 个附件</p> : null}
-          {backup.metadata && formatVersion < 2 ? <p className="system-backup-warning">旧版备份没有包含 tmux 截图；如果数据库仍引用这些截图，系统会阻止不完整恢复。请创建新版备份。</p> : null}
+          {item?.restore ? <p className="system-backup-result">恢复目录：<code>{item.restore.location}</code> · 仅数据库</p> : null}
           {backup.status === "metadata" ? <div className="system-backup-actions">
             <button type="button" disabled={busy !== null} onClick={() => void runAction(backup.backupId, "verify")}>
               {rowBusy === "verify" ? "正在校验…" : "校验备份"}

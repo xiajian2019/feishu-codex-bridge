@@ -1,33 +1,28 @@
-import { useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
+import { Fragment, useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import * as QRCode from "qrcode";
 import { getActionToken } from "./api.js";
 import { clearLocalDraftsAfterDeviceRevocation } from "./local-draft-cleanup.js";
-import { setLocalDraftScope } from "./local-draft-scope.js";
+import { getLocalDraftScope, setLocalDraftScope } from "./local-draft-scope.js";
+import { readBridgeJson } from "./bridge-json.js";
+import { parseBridgeCapabilities, setBridgeCapabilities } from "./client-capabilities.js";
+import { copyMobileText, getBridgeOrigin, isMobileApp, openBridgeExternal } from "./mobile-runtime.js";
+import { clearBridgeJsonCache, isTransientBridgeFailure, markBridgeRequestFailure, markBridgeRequestStart, markBridgeRequestSuccess } from "./connection-state.js";
+
+import { PairingClaim } from "./PairingClaim.js";
+import { recordAuthStatus, type AuthStatus } from "./pairing-diagnostics.js";
+import { DeviceAuthorizations } from "./DeviceAuthorizations.js";
+import "./device-authorizations.css";
+import { describeDevice, deviceAuthorizationState, type DeviceAuthorization as WebAuthDevice } from "./device-authorizations.js";
 
 const PAIRING_COMMAND = "feishu-codex-bridge web:pair";
-
-interface AuthStatus {
-  authenticated: boolean;
-  local: boolean;
-  activeSessionCount: number | null;
-  pairingAvailable: boolean;
-  pairingExpiresAt: number | null;
-  draftScope?: string | null;
-}
+const LAST_KNOWN_AUTH_KEY = "bridge:last-known-authenticated";
 
 interface ApiError {
   error?: string;
 }
 
-interface WebAuthDevice {
-  sessionId: string;
-  current: boolean;
-  deviceName: string;
-  userAgent: string | null;
-  remoteAddress: string | null;
-  createdAt: string;
-  lastSeenAt: string;
-  expiresAt: string;
+class PairingClaimFailure extends Error {
+  constructor(message: string, public readonly status: AuthStatus) { super(message); }
 }
 
 interface PairingInfo {
@@ -38,6 +33,7 @@ interface PairingInfo {
 export function AuthGate({ children }: { children: ReactNode }): ReactElement {
   const [status, setStatus] = useState<AuthStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [offlineFallback, setOfflineFallback] = useState(false);
   const pairingClaimRef = useRef<Promise<AuthStatus> | null>(null);
 
   useEffect(() => {
@@ -47,65 +43,178 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
         if (!cancelled) setStatus(nextStatus);
       })
       .catch((requestError: unknown) => {
-        if (!cancelled) setError(requestError instanceof Error ? requestError.message : String(requestError));
+        if (cancelled) return;
+        if (navigator.onLine === false && hasLastKnownAuth()) {
+          setOfflineFallback(true);
+          return;
+        }
+        if (requestError instanceof PairingClaimFailure) setStatus(requestError.status);
+        setError(requestError instanceof Error ? requestError.message : String(requestError));
       });
     return () => {
       cancelled = true;
     };
   }, []);
 
-  if (error) return <AuthShell><div className="pairing-error">{error}</div></AuthShell>;
-  if (!status) return <AuthShell><div className="route-loading">正在检查访问权限…</div></AuthShell>;
-  if (status.authenticated) return <>{children}</>;
-  return <PairingClaim status={status} />;
+  useEffect(() => {
+    if (!status && !offlineFallback) return;
+    let cancelled = false;
+    let pending = false;
+    const revalidate = (): void => {
+      if (pending || navigator.onLine === false || document.visibilityState === "hidden") return;
+      pending = true;
+      void loadAuthStatus()
+        .then((nextStatus) => {
+          if (cancelled) return;
+          setStatus(nextStatus);
+          setOfflineFallback(false);
+          setError(null);
+        })
+        .catch((requestError: unknown) => {
+          if (cancelled || isTransientBridgeFailure(requestError)) return;
+          forgetLastKnownAuth();
+          setStatus(null);
+          setOfflineFallback(false);
+          setError(requestError instanceof Error ? requestError.message : String(requestError));
+        })
+        .finally(() => { pending = false; });
+    };
+    // Also refresh a long-open terminal tab after an admin extends this device.
+    const timer = window.setInterval(revalidate, status?.authenticated ? 60_000 : 15_000);
+    window.addEventListener("online", revalidate);
+    window.addEventListener("focus", revalidate);
+    document.addEventListener("visibilitychange", revalidate);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener("online", revalidate);
+      window.removeEventListener("focus", revalidate);
+      document.removeEventListener("visibilitychange", revalidate);
+    };
+  }, [offlineFallback, status?.authenticated]);
+
+  if (status?.authenticated || offlineFallback) return <Fragment key={getLocalDraftScope() ?? "legacy"}>{children}</Fragment>;
+  if (!status && !error) return <AuthShell><div className="route-loading">正在检查访问权限…</div></AuthShell>;
+  return <AuthShell><PairingClaim status={status} error={error} onRefresh={async () => {
+    const nextStatus = await loadAuthStatus();
+    setStatus(nextStatus);
+    setError(null);
+  }} onClaim={async (code) => {
+    try {
+      const nextStatus = await claimBrowserPairing(code);
+      setStatus(nextStatus);
+      setError(null);
+    } catch (failure) {
+      if (failure instanceof PairingClaimFailure) setStatus(failure.status);
+      throw failure;
+    }
+  }} /></AuthShell>;
 }
 
 async function loadAuthStatus(
   pairingClaimRef?: { current: Promise<AuthStatus> | null },
 ): Promise<AuthStatus> {
-  const statusResponse = await fetch("/api/auth/status", {
-    headers: { Accept: "application/json" },
-    credentials: "same-origin",
-  });
-  const statusBody = await statusResponse.json() as AuthStatus & ApiError;
-  if (!statusResponse.ok) {
-    setLocalDraftScope(null);
-    throw new Error("鉴权状态读取失败（" + statusResponse.status + "）");
-  }
-  setLocalDraftScope(statusBody.authenticated ? statusBody.draftScope : null);
-  if (statusBody.authenticated) return statusBody;
-
-  const code = readPairingCodeFromHash();
-  if (!code) return statusBody;
-  if (pairingClaimRef?.current) return pairingClaimRef.current;
-
-  const claimPromise = (async (): Promise<AuthStatus> => {
-    const claimResponse = await fetch("/api/auth/pairing/claim", {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-      },
+  markBridgeRequestStart();
+  let requestEnded = false;
+  const requestOrigin = getBridgeOrigin();
+  try {
+    const statusResponse = await fetch("/api/auth/status", {
+      headers: { Accept: "application/json" },
       credentials: "same-origin",
-      body: JSON.stringify({ code }),
+      cache: "no-store",
     });
-    const claimBody = await claimResponse.json() as ApiError;
-    if (!claimResponse.ok) {
-      throw new Error(claimBody.error || "二维码配对失败（" + claimResponse.status + "）");
+    const statusBody = await readBridgeJson<AuthStatus & ApiError>(statusResponse);
+    if (requestOrigin !== getBridgeOrigin()) throw new DOMException("Bridge connection changed", "AbortError");
+    if (!statusResponse.ok) {
+      markBridgeRequestFailure(new Error("鉴权状态读取失败（" + statusResponse.status + "）"), statusResponse.status);
+      requestEnded = true;
+      if (statusResponse.status === 401) clearBridgeJsonCache();
+      throw new Error("鉴权状态读取失败（" + statusResponse.status + "）");
     }
-    window.history.replaceState(null, "", window.location.pathname + window.location.search);
-    return loadAuthStatus();
-  })();
+    if (typeof statusBody.authenticated !== "boolean") throw new Error("当前后端的鉴权响应不兼容，请检查服务版本。");
+    markBridgeRequestSuccess();
+    requestEnded = true;
+    if (!statusBody.authenticated) await clearLocalDraftsAfterDeviceRevocation();
+    const capabilities = statusBody.authenticated ? parseBridgeCapabilities(statusBody.client) : null;
+    setLocalDraftScope(statusBody.authenticated ? statusBody.draftScope : null, isMobileApp() ? requestOrigin : undefined);
+    setBridgeCapabilities(capabilities);
+    if (!isMobileApp()) recordAuthStatus(statusBody);
+    if (statusBody.authenticated) {
+      rememberLastKnownAuth(statusBody.draftScope);
+      return statusBody;
+    }
+    forgetLastKnownAuth();
+    clearBridgeJsonCache();
+    // Native pairing is handled by MobileConnectionGate, which stores a device token.
+    if (isMobileApp()) return statusBody;
 
-  if (pairingClaimRef) {
-    pairingClaimRef.current = claimPromise;
-    try {
-      return await claimPromise;
-    } finally {
-      if (pairingClaimRef.current === claimPromise) pairingClaimRef.current = null;
+    // StrictMode can start two status reads before the first claim completes.
+    // Join the in-flight claim even after its one-time URL fragment was removed.
+    if (pairingClaimRef?.current) return pairingClaimRef.current;
+    const code = readPairingCodeFromHash();
+    if (!code) return statusBody;
+
+    const claimPromise = claimBrowserPairing(code).catch((error: unknown) => {
+      if (error instanceof PairingClaimFailure) throw error;
+      throw new PairingClaimFailure(error instanceof Error ? error.message : "配对失败，请重试。", statusBody);
+    });
+    if (pairingClaimRef) {
+      pairingClaimRef.current = claimPromise;
+      try {
+        return await claimPromise;
+      } finally {
+        if (pairingClaimRef.current === claimPromise) pairingClaimRef.current = null;
+      }
     }
+    return claimPromise;
+  } catch (error) {
+    if (!requestEnded) {
+      markBridgeRequestFailure(error);
+    }
+    throw error;
   }
-  return claimPromise;
+}
+
+async function claimBrowserPairing(code: string): Promise<AuthStatus> {
+  // A one-time code belongs only in the claim request, not browser history or logs.
+  window.history.replaceState(null, "", window.location.pathname + window.location.search);
+  const response = await fetch("/api/auth/pairing/claim", {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    credentials: "same-origin",
+    cache: "no-store",
+    body: JSON.stringify({ code }),
+  });
+  const body = await response.json() as ApiError;
+  if (!response.ok) {
+    const message = response.status === 429 ? "配对尝试过多，请稍后重试。"
+      : body.error === "pairing code expired or unavailable" ? "二维码已过期、已使用或尚未生成，请在 Mac 上重新生成。"
+      : body.error === "invalid pairing code" ? "配对码不正确，请扫描最新的二维码。"
+      : "配对失败（" + response.status + "），请重新生成二维码后重试。";
+    throw new Error(message);
+  }
+  const status = await loadAuthStatus();
+  if (!status.authenticated) {
+    throw new PairingClaimFailure("配对已受理，但浏览器没有保存或发送登录 Cookie。请检查 Cookie 设置及当前访问地址，再生成二维码重试。", status);
+  }
+  return status;
+}
+
+function hasLastKnownAuth(): boolean {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(LAST_KNOWN_AUTH_KEY) ?? "null");
+    if (value?.origin !== getBridgeOrigin() || typeof value.scope !== "string" || !/^[A-Za-z0-9_-]{32,128}$/.test(value.scope)) return false;
+    setLocalDraftScope(value.scope, isMobileApp() ? value.origin : undefined);
+    return true;
+  } catch { return false; }
+}
+
+function rememberLastKnownAuth(scope: string | null | undefined): void {
+  try { sessionStorage.setItem(LAST_KNOWN_AUTH_KEY, JSON.stringify({ origin: getBridgeOrigin(), scope })); } catch { /* unavailable in private browsing */ }
+}
+
+function forgetLastKnownAuth(): void {
+  try { sessionStorage.removeItem(LAST_KNOWN_AUTH_KEY); } catch { /* unavailable in private browsing */ }
 }
 
 function readPairingCodeFromHash(): string | null {
@@ -119,6 +228,7 @@ function readPairingCodeFromHash(): string | null {
 }
 
 async function copyTextToClipboard(value: string): Promise<void> {
+  if (isMobileApp()) return copyMobileText(value);
   if (navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(value);
@@ -140,7 +250,7 @@ async function copyTextToClipboard(value: string): Promise<void> {
 }
 
 export function PairingAdmin(): ReactElement {
-  const [status, setStatus] = useState<AuthStatus | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [devices, setDevices] = useState<WebAuthDevice[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -161,18 +271,18 @@ export function PairingAdmin(): ReactElement {
     setLoading(true);
     setError(null);
     try {
-      const [nextStatus, devicesResponse] = await Promise.all([
+      const [, devicesResponse] = await Promise.all([
         loadAuthStatus(),
-        fetch("/api/auth/devices", {
+        fetch("/api/auth/devices?includeInactive=1", {
           headers: { Accept: "application/json" },
           credentials: "same-origin",
+          cache: "no-store",
         }),
       ]);
       const body = await devicesResponse.json() as { devices?: WebAuthDevice[] } & ApiError;
       if (!devicesResponse.ok) {
         throw new Error(body.error || "设备列表读取失败（" + devicesResponse.status + "）");
       }
-      setStatus(nextStatus);
       setDevices(body.devices ?? []);
     } catch (requestError: unknown) {
       setError(requestError instanceof Error ? requestError.message : String(requestError));
@@ -183,6 +293,35 @@ export function PairingAdmin(): ReactElement {
 
   useEffect(() => {
     void loadManagement();
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let pending = false;
+    const refreshDevices = async (): Promise<void> => {
+      if (pending || controller.signal.aborted || document.visibilityState === "hidden" || navigator.onLine === false) return;
+      pending = true;
+      try {
+        const response = await fetch("/api/auth/devices?includeInactive=1", {
+          headers: { Accept: "application/json" }, credentials: "same-origin",
+          cache: "no-store", signal: controller.signal,
+        });
+        if (!response.ok) return;
+        const body = await response.json() as { devices?: WebAuthDevice[] };
+        if (!controller.signal.aborted && body.devices) setDevices(body.devices);
+      } catch { /* Keep the last device list until the next refresh. */ }
+      finally { pending = false; }
+    };
+    const refresh = (): void => { void refreshDevices(); };
+    const timer = window.setInterval(refresh, 30_000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
   }, []);
 
   useEffect(() => {
@@ -269,7 +408,7 @@ export function PairingAdmin(): ReactElement {
         throw new Error("二维码响应不完整。");
       }
       const serverPairingUrl = new URL(body.pairingUrl);
-      const currentPairingUrl = new URL("/", window.location.origin);
+      const currentPairingUrl = new URL("/", getBridgeOrigin());
       currentPairingUrl.hash = serverPairingUrl.hash;
       setPairing({ pairingUrl: currentPairingUrl.toString(), expiresAt: body.expiresAt });
     } catch (requestError: unknown) {
@@ -313,6 +452,7 @@ export function PairingAdmin(): ReactElement {
       setEditingDeviceId(null);
       setEditingDeviceName("");
       await loadManagement();
+      setNotice("名称 / 备注已更新。");
     } catch (requestError: unknown) {
       setError(requestError instanceof Error ? requestError.message : String(requestError));
     } finally {
@@ -321,7 +461,9 @@ export function PairingAdmin(): ReactElement {
   };
 
   const extendDevice = async (device: WebAuthDevice): Promise<void> => {
-    if (!window.confirm(`确认将“${device.deviceName}”的授权延期一年？`)) return;
+    const profile = describeDevice(device);
+    if (!window.confirm(`将“${profile.name} · ${profile.browser}”（#${profile.shortId}）的授权延期一年？`)) return;
+    setNotice(null);
     setBusy(true);
     setError(null);
     try {
@@ -339,6 +481,7 @@ export function PairingAdmin(): ReactElement {
         throw new Error(body.error || "设备授权延期失败（" + response.status + "）");
       }
       await loadManagement();
+      setNotice(body.expiresAt ? `授权已延期至 ${formatDate(body.expiresAt)}。` : "授权已延期一年。");
     } catch (requestError: unknown) {
       setError(requestError instanceof Error ? requestError.message : String(requestError));
     } finally {
@@ -347,6 +490,9 @@ export function PairingAdmin(): ReactElement {
   };
 
   const revokeAll = async (): Promise<void> => {
+    const count = devices.filter((device) => deviceAuthorizationState(device) === "active").length;
+    if (!window.confirm(`撤销全部 ${count} 份有效授权？当前设备也会退出，所有设备都需要重新配对。`)) return;
+    setNotice(null);
     setBusy(true);
     setError(null);
     try {
@@ -366,38 +512,43 @@ export function PairingAdmin(): ReactElement {
     }
   };
 
-  const revokeDevice = async (sessionId: string, current: boolean): Promise<void> => {
-    if (!window.confirm("确认撤销这台设备的访问权限？")) return;
+  const revokeDevices = async (targets: WebAuthDevice[]): Promise<void> => {
+    if (targets.length === 0) return;
     setBusy(true);
     setError(null);
+    setNotice(null);
+    let succeeded = 0;
+    const failures: string[] = [];
     try {
-      const response = await fetch("/api/auth/devices/" + encodeURIComponent(sessionId) + "/revoke", {
-        method: "POST",
-        headers: { Accept: "application/json", "X-Bridge-Action-Token": await getActionToken() },
-        credentials: "same-origin",
-      });
-      const body = await response.json() as ApiError;
-      if (!response.ok) {
-        if (response.status === 401) {
-          window.location.assign("/");
-          return;
-        }
-        throw new Error(body.error || "设备撤销失败（" + response.status + "）");
-      }
-      if (current) {
-        await clearLocalDraftsAfterDeviceRevocation();
-        window.location.assign("/");
-        return;
+      const actionToken = await getActionToken();
+      // A single-device self-revocation is explicit; bulk selection excludes it.
+      for (const device of [...targets].sort((a, b) => Number(a.current) - Number(b.current))) {
+        try {
+          const response = await fetch("/api/auth/devices/" + encodeURIComponent(device.sessionId) + "/revoke", {
+            method: "POST",
+            headers: { Accept: "application/json", "X-Bridge-Action-Token": actionToken },
+            credentials: "same-origin",
+          });
+          if (response.status === 401) { window.location.assign("/"); return; }
+          if (!response.ok) throw new Error("revoke failed");
+          succeeded++;
+          if (device.current) {
+            await clearLocalDraftsAfterDeviceRevocation();
+            window.location.assign("/");
+            return;
+          }
+        } catch { const profile = describeDevice(device); failures.push(`${profile.name} #${profile.shortId}`); }
       }
       await loadManagement();
+      if (succeeded) setNotice(`已撤销 ${succeeded} 份授权，可在历史记录中查看。`);
+      if (failures.length) setError(`${failures.length} 份授权未能撤销，请刷新后重试：${failures.slice(0, 4).join("、")}${failures.length > 4 ? "…" : ""}`);
     } catch (requestError: unknown) {
-      setError(requestError instanceof Error ? requestError.message : String(requestError));
-    } finally {
-      setBusy(false);
-    }
+      setError(requestError instanceof Error ? requestError.message : "撤销失败，请重试。");
+    } finally { setBusy(false); }
   };
 
   const beginRename = (device: WebAuthDevice): void => {
+    setNotice(null);
     setEditingDeviceId(device.sessionId);
     setEditingDeviceName(device.deviceName);
     setError(null);
@@ -413,70 +564,12 @@ export function PairingAdmin(): ReactElement {
     : null;
 
   return (
-    <main className="device-management-page">
+    <main className="device-management-page device-management-compact">
       {error ? <div className="pairing-error device-page-alert" role="alert">{error}</div> : null}
+      {notice ? <div className="pairing-success device-page-alert" role="status">{notice}</div> : null}
 
       <div className="device-management-grid">
-        <section className="device-list-panel">
-          <div className="device-panel-heading">
-            <div>
-              <h2>已配对设备</h2>
-            </div>
-            <div className="device-panel-heading-actions">
-              <span>{status?.activeSessionCount ?? devices.length}</span>
-              <button className="secondary" type="button" disabled={loading} onClick={() => void loadManagement()}>
-                刷新
-              </button>
-            </div>
-          </div>
-          {loading ? <div className="device-empty-state">正在读取设备状态…</div> : null}
-          {!loading && devices.length === 0 ? (
-            <div className="device-empty-state">
-              <strong>还没有配对设备</strong>
-              <span>在下方生成二维码，再用新设备扫描完成配对。</span>
-            </div>
-          ) : null}
-          <div className="device-list">
-            {devices.map((device) => (
-              <article className="device-row" key={device.sessionId}>
-                <div className="device-row-main">
-                  <div className="device-row-title">
-                    <strong>{device.deviceName}</strong>
-                    <span className="device-live-dot">已授权</span>
-                    {device.current ? <span className="device-current-badge">当前设备</span> : null}
-                  </div>
-                  <p>{device.userAgent || "浏览器设备"} · {device.remoteAddress || "未知地址"}</p>
-                  <small>
-                    首次配对 {formatDate(device.createdAt)} · 最近访问 {formatDate(device.lastSeenAt)} · 到期 {formatDate(device.expiresAt)}
-                  </small>
-                </div>
-                <div className="device-row-actions">
-                  {editingDeviceId !== device.sessionId ? (
-                    <button className="secondary device-row-action-button device-rename-button" type="button" disabled={busy} onClick={() => beginRename(device)}>
-                      设置名称
-                    </button>
-                  ) : null}
-                  <button
-                    className="secondary device-row-action-button device-extend-button"
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void extendDevice(device)}
-                  >
-                    延期一年
-                  </button>
-                  <button
-                    className="device-row-action-button device-revoke-button"
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void revokeDevice(device.sessionId, device.current)}
-                  >
-                    撤销
-                  </button>
-                </div>
-              </article>
-            ))}
-          </div>
-        </section>
+        <DeviceAuthorizations devices={devices} loading={loading} busy={busy || renamingDeviceId !== null} onRefresh={loadManagement} onRename={beginRename} onExtend={extendDevice} onRevoke={revokeDevices} />
 
         <section className="device-side-panel">
           <div className="device-info-section">
@@ -498,7 +591,13 @@ export function PairingAdmin(): ReactElement {
                   <div className="device-pairing-link">
                     <p>没有扫码功能？在新设备的浏览器中打开此链接：</p>
                     <div className="device-pairing-link-row">
-                      <a href={pairing.pairingUrl} target="_blank" rel="noreferrer">
+                      <a href={pairing.pairingUrl} target="_blank" rel="noreferrer" onClick={(event) => {
+                        if (!isMobileApp()) return;
+                        event.preventDefault();
+                        void openBridgeExternal(pairing.pairingUrl).catch((failure: unknown) => {
+                          setPairingError(failure instanceof Error ? failure.message : "链接打开失败。");
+                        });
+                      }}>
                         {pairing.pairingUrl}
                       </a>
                       <button
@@ -543,8 +642,8 @@ export function PairingAdmin(): ReactElement {
             <summary>危险操作 · 撤销所有访问</summary>
             <div className="device-danger-content">
               <p>撤销所有已配对设备的会话。当前页面也会立即失去访问权限。</p>
-              <button className="danger" type="button" disabled={busy || devices.length === 0} onClick={() => void revokeAll()}>
-                撤销所有手机
+              <button className="danger" type="button" disabled={busy || !devices.some((device) => deviceAuthorizationState(device) === "active")} onClick={() => void revokeAll()}>
+                撤销所有授权
               </button>
             </div>
           </details>
@@ -562,14 +661,13 @@ export function PairingAdmin(): ReactElement {
           <section className="device-name-modal" role="dialog" aria-modal="true" aria-labelledby="device-name-modal-title">
             <div className="device-modal-heading">
               <div>
-                <p className="device-panel-kicker">DEVICE NAME</p>
-                <h2 id="device-name-modal-title">设置设备名称</h2>
+                <h2 id="device-name-modal-title">名称 / 备注</h2>
               </div>
               <button className="secondary device-modal-close" type="button" aria-label="关闭" onClick={cancelRename}>
                 ×
               </button>
             </div>
-            <p className="device-modal-description">为“{editingDevice.deviceName}”设置一个方便识别的名称或备注。</p>
+            <p className="device-modal-description">{describeDevice(editingDevice).name} · {describeDevice(editingDevice).browser} · #{describeDevice(editingDevice).shortId}</p>
             <form onSubmit={(event) => {
               event.preventDefault();
               void saveDeviceName(editingDevice.sessionId);
@@ -580,6 +678,7 @@ export function PairingAdmin(): ReactElement {
                   id="device-name-modal-input"
                   value={editingDeviceName}
                   maxLength={80}
+                  placeholder="例如：主力华为 · App"
                   autoFocus
                   onChange={(event) => setEditingDeviceName(event.target.value)}
                 />
@@ -589,7 +688,7 @@ export function PairingAdmin(): ReactElement {
                   取消
                 </button>
                 <button className="primary" type="submit" disabled={renamingDeviceId !== null}>
-                  {renamingDeviceId ? "保存中…" : "保存名称"}
+                  {renamingDeviceId ? "保存中…" : "保存"}
                 </button>
               </div>
             </form>
@@ -609,33 +708,6 @@ function formatDate(value: string | number): string {
 
 function redactPairingSecrets(value: string): string {
   return value.replace(/#pair=[^\s&"'}]+/gi, "#pair=<已隐藏>");
-}
-
-function PairingClaim({
-  status,
-}: {
-  status: AuthStatus;
-}): ReactElement {
-  return (
-    <AuthShell>
-      <section className="pairing-card">
-        <p className="pairing-eyebrow">DEVICE PAIRING</p>
-        <h1>需要配对</h1>
-        <p className="pairing-description">
-          这是一个受保护的本地终端页面。请在运行 Bridge 的 Mac 命令行执行 web:pair，然后用手机扫描终端中的二维码。
-        </p>
-        <div className="pairing-code-panel">
-          <span>当前状态</span>
-          <strong>{status.pairingAvailable ? "等待扫码" : "等待 CLI 配对"}</strong>
-          <div className="pairing-code-meta">
-            <span>二维码 5 分钟有效</span>
-            <span>只能使用一次</span>
-          </div>
-        </div>
-        <p className="pairing-hint">二维码扫描成功后，页面会自动进入 Bridge。</p>
-      </section>
-    </AuthShell>
-  );
 }
 
 function AuthShell({ children }: { children: ReactNode }): ReactElement {

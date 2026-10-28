@@ -5,6 +5,8 @@ import remarkGfm from "remark-gfm";
 import { fetchTaskDetail, getActionToken, getJson, postTaskAction, postTaskFollowup, taskAttachmentUrl } from "./api.js";
 import { directTaskTitle } from "./task-title.js";
 import { TaskFileBrowser } from "./TaskFileBrowser.js";
+import { downloadBridgeFile, isMobileApp } from "./mobile-runtime.js";
+import { scopedStorageKey } from "./local-draft-scope.js";
 import type { AampTaskDetailResponse, DirectTaskDetailResponse, RunWorkspaceSnapshot, StoredRun, TaskDetailResponse, WebRunReview, WorkspaceFileFingerprint } from "./types.js";
 import { PromptTemplatePicker } from "./Workbench.js";
 import {
@@ -66,7 +68,7 @@ export function TaskDetailPage(): ReactElement {
   const workbenchTarget = useMemo<WorkbenchTarget>(() => ({ kind: "task", source, id: taskId }), [source, taskId]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const scrollAfterSubmitRef = useRef(false);
-  const draftKey = `bridge-task-draft:${source}:${taskId}`;
+  const draftKey = scopedStorageKey("task-followup", JSON.stringify([source, taskId]));
 
   useEffect(() => {
     setDesk(null);
@@ -79,7 +81,7 @@ export function TaskDetailPage(): ReactElement {
     pendingSubmission.current = null;
     pendingRetry.current = null;
     setFollowupStatus(null);
-    try { setDraft(sessionStorage.getItem(draftKey) ?? ""); } catch { setDraft(""); }
+    try { setDraft(draftKey ? sessionStorage.getItem(draftKey) ?? "" : ""); } catch { setDraft(""); }
   }, [draftKey]);
 
   const load = useCallback(async (quiet = false): Promise<void> => {
@@ -124,6 +126,7 @@ export function TaskDetailPage(): ReactElement {
 
   const updateDraft = (value: string): void => {
     setDraft(value);
+    if (!draftKey) return;
     try { if (value) sessionStorage.setItem(draftKey, value); else sessionStorage.removeItem(draftKey); } catch { /* Storage is optional. */ }
   };
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
@@ -375,7 +378,12 @@ export function TaskDetailPage(): ReactElement {
           </section> : null}
           {deskTask.progress_text && active ? <div className="task-detail-progress">{deskTask.progress_text}</div> : null}
           {deskTask.last_error ? <div className="task-detail-page-error">{deskTask.last_error}</div> : null}
-          {desk.attachments.length ? <details className="task-detail-extra"><summary>附件（{desk.attachments.length}）</summary>{desk.attachments.map((item) => <p key={item.attachment_id}><a href={taskAttachmentUrl(taskId, item.attachment_id)} target="_blank" rel="noreferrer">{item.file_name}</a></p>)}</details> : null}
+          {desk.attachments.length ? <details className="task-detail-extra"><summary>附件（{desk.attachments.length}）</summary>{desk.attachments.map((item) => <p key={item.attachment_id}><a href={taskAttachmentUrl(taskId, item.attachment_id)} target="_blank" rel="noreferrer" onClick={(event) => {
+            if (!isMobileApp()) return;
+            event.preventDefault();
+            void downloadBridgeFile(taskAttachmentUrl(taskId, item.attachment_id), item.file_name)
+              .catch((failure: unknown) => setError(failure instanceof Error ? failure.message : "附件下载失败。"));
+          }}>{item.file_name}</a></p>)}</details> : null}
           <details ref={filesRef} className="task-detail-extra" open={filesOpen} onToggle={(event) => setFilesOpen(event.currentTarget.open)}><summary>{desk.workspace ? "当前任务工作区文件（实时）" : "当前项目文件（实时）"}</summary><p className="muted">此处读取当前工作目录，不是执行时的不可变产物快照；共享目录中的改动不能自动归因到本任务。</p>{filesOpen ? <TaskFileBrowser key={currentFileTarget?.sequence ?? 0} taskGuid={taskId} initialFilePath={currentFileTarget?.path} /> : null}</details>
           {active ? <button className="danger" type="button" disabled={interrupting} onClick={() => void interrupt()}>{interrupting ? "正在中断…" : "中断当前执行"}</button> : null}
           {desk.can_retry ? <button type="button" disabled={retrying} onClick={() => void retryTask()}>{retrying ? "正在重试…" : "重新执行任务"}</button> : null}

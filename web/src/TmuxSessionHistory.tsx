@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent, type ReactElement } from "react";
 import { Link, useSearchParams } from "react-router";
 import { getJson } from "./api.js";
+import { BridgeImage } from "./BridgeMedia.js";
 
 interface TmuxSessionInfo {
   session_name: string;
@@ -177,7 +178,7 @@ export function TmuxSessionHistory({ embedded = false, sessionIdOverride }: Tmux
                   <div className="tmux-history-images" aria-label="提交的图片">
                     {item.imageAttachments.map((image) => (
                       <button key={image.url} type="button" onClick={() => setPreviewImage(image)} aria-label={`放大查看 ${image.name}`} title={`查看 ${image.name}`}>
-                        <img src={image.url} alt={image.name} loading="lazy" />
+                        <BridgeImage src={image.url} alt={image.name} loading="lazy" />
                       </button>
                     ))}
                   </div>
@@ -203,7 +204,7 @@ export function TmuxSessionHistory({ embedded = false, sessionIdOverride }: Tmux
           if (event.target === event.currentTarget) setPreviewImage(null);
         }}>
           <button className="tmux-history-lightbox-close" type="button" aria-label="关闭图片预览" onClick={() => setPreviewImage(null)}>×</button>
-          <img src={previewImage.url} alt={previewImage.name} />
+          <BridgeImage src={previewImage.url} alt={previewImage.name} />
         </div>
       ) : null}
     </main>

@@ -1,6 +1,7 @@
 import type { Terminal } from "@xterm/xterm";
 
 import { openTerminalUrl, terminalLinkAtBufferCell, type TerminalLinkMatch } from "./terminal-links.js";
+import { isMobileApp, shareMobileBlob } from "./mobile-runtime.js";
 
 function cellPosition(terminal: Terminal, element: HTMLElement, clientX: number, clientY: number): { col: number; row: number } {
   const screen = element.querySelector<HTMLElement>(".xterm-screen");
@@ -80,7 +81,7 @@ function logScrollDiagnostic(event: string, details: Record<string, unknown>): v
   console.log(`[tmux-scroll:${event}] ${JSON.stringify(entry)}`);
 }
 
-export function downloadTerminalScrollDiagnostics(): number {
+export function downloadTerminalScrollDiagnostics(): number | Promise<number> {
   const entries = [...scrollDiagnosticEntries];
   if (entries.length === 0) return 0;
   const payload = {
@@ -89,6 +90,18 @@ export function downloadTerminalScrollDiagnostics(): number {
     entryCount: entries.length,
     entries,
   };
+  if (isMobileApp()) {
+    return fetch("/tmux-dashboard/api/scroll-diagnostics/export", {
+      method: "POST",
+      body: new URLSearchParams({ payload: JSON.stringify(payload) }),
+      signal: AbortSignal.timeout(20_000),
+    }).then(async (response) => {
+      if (!response.ok) throw new Error("滚动诊断导出失败（" + response.status + "）。");
+      const fileName = "tmux-scroll-diagnostics-" + payload.exportedAt.replace(/[:.]/g, "-") + ".json";
+      await shareMobileBlob(await response.blob(), fileName);
+      return entries.length;
+    });
+  }
   const form = document.createElement("form");
   form.method = "POST";
   form.action = "/tmux-dashboard/api/scroll-diagnostics/export";

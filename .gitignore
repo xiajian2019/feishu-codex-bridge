@@ -16,3 +16,33 @@ config.json
 !package-lock.json
 *.log
 runtime/node
+
+# Native projects are source. Ignore machine-specific configuration, credentials,
+# copied web assets and build products; retain Gradle wrapper and SPM manifests.
+android/.gradle/
+android/.idea/
+android/**/build/
+android/local.properties
+android/key.properties
+android/signing.properties
+android/*.jks
+android/*.keystore
+android/app/*.jks
+android/app/*.keystore
+android/app/src/main/assets/public/
+android/app/src/main/assets/capacitor.config.json
+android/app/src/main/assets/capacitor.plugins.json
+android/capacitor-cordova-android-plugins/
+ios/App/App/public/
+ios/App/App/capacitor.config.json
+ios/App/Pods/
+ios/App/build/
+ios/**/DerivedData/
+ios/**/xcuserdata/
+ios/**/*.xcuserstate
+ios/**/.build/
+ios/**/Package.resolved
+*.mobileprovision
+*.p12
+*.p8
+ios/signing.xcconfig
