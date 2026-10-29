@@ -508,6 +508,7 @@ CREATE TABLE IF NOT EXISTS tmux_sessions (
     last_seen_at TEXT NOT NULL,
     open_count INTEGER NOT NULL DEFAULT 0 CHECK (open_count >= 0),
     last_opened_at TEXT,
+    suspended_at TEXT,
     ended_at TEXT,
     created_by_device_id TEXT,
     workspace_id TEXT,
@@ -4068,7 +4069,7 @@ export class StateDatabase {
     try {
       this.withoutBusyWait(() => this.transaction(() => {
         const active = this.db.prepare(
-          "SELECT record_id, tmux_session_id, tmux_created_at FROM tmux_sessions WHERE ended_at IS NULL",
+          "SELECT record_id, tmux_session_id, tmux_created_at FROM tmux_sessions WHERE ended_at IS NULL AND suspended_at IS NULL",
         ).all() as Array<{ record_id: string; tmux_session_id: string; tmux_created_at: number }>;
         for (const record of active) {
           if (!currentKeys.has(`${record.tmux_session_id}\u0000${record.tmux_created_at}`)) {
@@ -4094,14 +4095,14 @@ export class StateDatabase {
     const now = this.timestamp();
     const result = this.db.prepare(`UPDATE tmux_sessions
       SET open_count = open_count + 1, last_opened_at = ?
-      WHERE tmux_session_id = ? AND ended_at IS NULL`).run(now, tmuxSessionId);
+      WHERE tmux_session_id = ? AND ended_at IS NULL AND suspended_at IS NULL`).run(now, tmuxSessionId);
     if (result.changes === 0) return null;
     return this.getLatestTmuxSession(tmuxSessionId);
   }
 
   public listTmuxSessionsForDashboard(): StoredTmuxSession[] {
     const rows = this.db.prepare(`SELECT * FROM tmux_sessions
-      ORDER BY (ended_at IS NULL) DESC, open_count DESC,
+      ORDER BY (ended_at IS NULL AND suspended_at IS NULL) DESC, (suspended_at IS NOT NULL) DESC, open_count DESC,
         (last_opened_at IS NULL) ASC, last_opened_at DESC, last_seen_at DESC, first_seen_at DESC`).all() as Record<string, unknown>[];
     return rows.map(mapTmuxSession);
   }
@@ -4109,14 +4110,14 @@ export class StateDatabase {
   public getLatestTmuxSession(tmuxSessionId: string): StoredTmuxSession | null {
     const row = this.db.prepare(`SELECT * FROM tmux_sessions
       WHERE tmux_session_id = ?
-      ORDER BY (ended_at IS NULL) DESC, first_seen_at DESC
+      ORDER BY (ended_at IS NULL AND suspended_at IS NULL) DESC, (suspended_at IS NOT NULL) DESC, first_seen_at DESC
       LIMIT 1`).get(tmuxSessionId) as Record<string, unknown> | undefined;
     return row ? mapTmuxSession(row) : null;
   }
 
   public listTmuxSessionsForWorkspace(workspaceId: string): StoredTmuxSession[] {
     const rows = this.db.prepare(`SELECT * FROM tmux_sessions
-      WHERE workspace_id = ? ORDER BY (ended_at IS NULL) DESC, first_seen_at DESC`).all(workspaceId) as Record<string, unknown>[];
+      WHERE workspace_id = ? ORDER BY (ended_at IS NULL AND suspended_at IS NULL) DESC, (suspended_at IS NOT NULL) DESC, first_seen_at DESC`).all(workspaceId) as Record<string, unknown>[];
     return rows.map(mapTmuxSession);
   }
 
@@ -4236,8 +4237,31 @@ export class StateDatabase {
   }
 
   public markTmuxSessionEnded(tmuxSessionId: string): void {
-    this.db.prepare("UPDATE tmux_sessions SET ended_at = ? WHERE tmux_session_id = ? AND ended_at IS NULL")
+    this.db.prepare("UPDATE tmux_sessions SET ended_at = ?, suspended_at = NULL WHERE tmux_session_id = ? AND ended_at IS NULL")
       .run(this.timestamp(), tmuxSessionId);
+  }
+
+  public markTmuxSessionSuspended(tmuxSessionId: string): StoredTmuxSession | null {
+    const result = this.db.prepare(`UPDATE tmux_sessions
+      SET suspended_at = ?, ended_at = NULL
+      WHERE tmux_session_id = ? AND ended_at IS NULL AND suspended_at IS NULL`).run(this.timestamp(), tmuxSessionId);
+    if (result.changes === 0) return null;
+    return this.getLatestTmuxSession(tmuxSessionId);
+  }
+
+  public resumeTmuxSession(recordId: string, session: { id: string; name: string; cwd: string; createdAt: number }): StoredTmuxSession | null {
+    const result = this.db.prepare(`UPDATE tmux_sessions SET
+      tmux_session_id = ?, session_name = ?, working_directory = ?, tmux_created_at = ?,
+      last_seen_at = ?, suspended_at = NULL, ended_at = NULL
+      WHERE record_id = ? AND ended_at IS NULL AND suspended_at IS NOT NULL`).run(
+        session.id,
+        session.name,
+        session.cwd,
+        session.createdAt,
+        this.timestamp(),
+        recordId,
+      );
+    return result.changes > 0 ? this.getTmuxSession(recordId) : null;
   }
 
   public beginTmuxSessionAction(input: {
@@ -4542,6 +4566,7 @@ export class StateDatabase {
     addColumnIfMissing(this.db, "tmux_sessions", "workspace_id", "TEXT");
     addColumnIfMissing(this.db, "tmux_sessions", "open_count", "INTEGER NOT NULL DEFAULT 0");
     addColumnIfMissing(this.db, "tmux_sessions", "last_opened_at", "TEXT");
+    addColumnIfMissing(this.db, "tmux_sessions", "suspended_at", "TEXT");
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tmux_sessions_workspace
       ON tmux_sessions(workspace_id, ended_at, last_seen_at DESC)`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_tmux_sessions_dashboard
@@ -5133,6 +5158,7 @@ function mapTmuxSession(row: Record<string, unknown>): StoredTmuxSession {
     last_seen_at: String(row.last_seen_at),
     open_count: Number(row.open_count ?? 0),
     last_opened_at: nullableString(row.last_opened_at),
+    suspended_at: nullableString(row.suspended_at),
     ended_at: nullableString(row.ended_at),
     created_by_device_id: nullableString(row.created_by_device_id),
     workspace_id: nullableString(row.workspace_id),

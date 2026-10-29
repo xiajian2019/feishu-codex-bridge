@@ -1,4 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
+import { readFileSync, rmSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import { StateDatabase } from "../src/db.js";
@@ -105,4 +106,57 @@ describe("bounded tmux Session enumeration", () => {
       } finally { await api.stop(); db.close(); }
     });
   }
+
+  it("submits an optional initial task to codex-worktree after creating the Session", async () => {
+    const db = new StateDatabase(":memory:");
+    const session = { id: "$9", name: "initial-task", cwd: "/tmp", createdAt: 9, windows: 1, attachedClients: 0 };
+    db.createProject({ name: "fixture", path: "/tmp" });
+    let pastedCommand = "";
+    let enteredPane = "";
+    const api = new TmuxDashboardApi({
+      db,
+      codexWorktreeExecutable: "/fixture/bin/codex-worktree",
+      operations: {
+        listSessions: async () => [session],
+        findSession: async () => session,
+        createSession: async () => session,
+        killSession: async () => {},
+        inspectReviewPane: async () => ({
+          paneId: "%9",
+          panePid: 99,
+          paneTty: "/dev/ttysfixture",
+          currentCommand: "zsh",
+          cwd: "/tmp",
+          foregroundCodex: null,
+        }),
+        pasteTextToPane: async (_paneId, text) => { pastedCommand = text; },
+        sendEnterToPane: async (paneId) => { enteredPane = paneId; },
+      },
+    });
+    const request = Readable.from([JSON.stringify({
+      name: session.name,
+      projectKey: "fixture",
+      taskDescription: "修复 session 创建后的初始任务\n并保留 shell quote: 'quoted'",
+    })]) as IncomingMessage;
+    request.method = "POST";
+    request.url = "/tmux-dashboard/api/sessions";
+    request.headers = { "content-type": "application/json" };
+    const response = responseFixture();
+    try {
+      await api.handleRequest(request, response as unknown as ServerResponse);
+      expect(response.statusCode).toBe(201);
+      expect(JSON.parse(response.body).initialTask).toEqual({ status: "submitted" });
+      expect(enteredPane).toBe("%9");
+      expect(pastedCommand).toContain("'/fixture/bin/codex-worktree' --task-file '");
+      const taskFile = pastedCommand.match(/--task-file '([^']+)'/)?.[1];
+      expect(taskFile).toBeTruthy();
+      expect(readFileSync(taskFile!, "utf8")).toBe("修复 session 创建后的初始任务\n并保留 shell quote: 'quoted'");
+      expect(pastedCommand).toContain("rm -f '");
+    } finally {
+      const taskFile = pastedCommand.match(/--task-file '([^']+)'/)?.[1];
+      if (taskFile) rmSync(taskFile, { force: true });
+      await api.stop();
+      db.close();
+    }
+  });
 });

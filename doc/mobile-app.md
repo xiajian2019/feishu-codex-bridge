@@ -16,7 +16,11 @@ bun run mobile:build
 
 `mobile:build` 生成 `dist/mobile` 并执行 Capacitor sync；原有 `bun run build:web` 仍输出 `dist/web`，不会替换已部署网页。只同步已有构建可用 `bun run mobile:sync`。`mobile:doctor` 只读检查工具，不安装 SDK，不启动或重启 Bridge；缺少工具时以非零状态退出。
 
-Android App 会在已配对且回到前台时检查固定 APK 路径 `android/app/build/outputs/apk/debug/app-debug.apk` 的文件指纹；发现重新编译的 APK 后显示更新提示。也可以通过 `FEISHU_CODEX_BRIDGE_ANDROID_APK` 指定其他本机 APK 路径。更新接口需要当前手机的 Bearer 配对凭据；更新提示可以直接交给 Android 安装器，也可以选择下载 APK。已配对后的连接管理页将“App 更新”折叠在连接确认与现有连接操作之后；展开后可用“手动下载 APK”通过系统 DownloadManager 保存到 Downloads，完成后手动安装。未配对时不显示更新入口。
+Android App 在配对后及回前台时比较更新包与实际安装的 versionCode；首次连接旧版本也会提示，点击“稍后”暂缓 30 分钟。已下载、打开安装器和已安装分别记录，取消安装或拒绝安装权限后仍可重试。更新状态按服务器隔离。
+
+服务端读取 `android/app/build/outputs/apk/debug/app-debug.apk` 及同目录 Gradle 生成的 `output-metadata.json`；可用 `FEISHU_CODEX_BRIDGE_ANDROID_APK` 指定其他构建输出。首次检查时流式复制为同目录 `.bridge-updates/<SHA-256>.apk` 快照，返回带摘要的下载路径，后续构建不会覆盖已公布的更新包。自定义路径必须同时提供对应构建元数据。更新接口始终要求 App Bearer。安装和“手动下载 APK”均先下载至缓存，原生侧校验大小、SHA-256、包名及预期版本，拒绝降级后才打开安装器或流式写入系统 Downloads。安装器仍负责系统签名与安装确认。APK 下载需要保持 App 在前台，普通文件仍使用系统 DownloadManager。
+
+Android 构建通过 `scripts/mobile-version.mjs` 分配构建号，使用被忽略的 `android/.bridge-version.json` 与既有 APK 输出记录防止同秒重编译/时钟回退复用编号。版本名称与 UA 从 `package.json` 读取；跨开发机编号、正式渠道及签名策略另行制定。
 
 普通 Web 构建会替换为不含原生依赖的浏览器 runtime；App 使用独立构建入口和 runtime。分别构建两者后，运行 `bun run mobile:verify` 检查浏览器产物没有混入原生插件、App 凭据逻辑或 App 专用 viewport 配置。
 
@@ -49,6 +53,7 @@ App 内置页面，不使用 Capacitor `server.url` 加载远端网页，也不�
 - Android 文件下载通过系统 DownloadManager 保存到 Downloads，并显示系统下载通知；App 在前台读取系统真实进度，回到前台后立即刷新，只有系统确认完成才提示保存完成并显示实际保存文件名，支持打开系统下载列表。iOS 文件下载到 App 缓存后通过系统分享面板保存或转交其他应用，提示区分下载、保存／分享和取消，不承诺系统面板已经保存成功。Android FileProvider 只公开更新安装所需的缓存 `bridge-downloads/` 子目录。附件选择沿用系统 WebView 的文件选择器。
 - Android App 在 1.8 秒内连续两次明显反向晃动会打开环境管理弹窗，两次至少间隔 160 ms，无需停稳；按固定 80 ms 时间窗口判断力度，降低传感器采样频率差异的影响。触发后冷却 1.5 秒，切到后台或传感器中断会清除未完成的计数。同一 Mac 主机的 `5173` 标为开发环境，`7310` 标为稳定环境；已配对环境直接切换，未配对环境进入连接管理重新配对。
 - 外部网页通过系统 Browser 插件打开；复制通过原生 Clipboard 插件适配。
+- App 打开 Demo 时换取短时一次性授权链接，系统浏览器获得仅限所选 Demo 的 HttpOnly Cookie，正常跳转后链接不再含票据。授权最长 8 小时，且随原 App 的设备授权撤销而失效；不会获得 Bridge 管理权限。服务端重启或过期后从 App 再次打开。
 - `BridgeCredentials` 自定义插件按服务地址读写凭据：`get({server}) -> {token: string | null}`、`set({server, token})`、`remove({server})`。
 - iOS 凭据使用 `WhenUnlockedThisDeviceOnly` Keychain，不进行 iCloud 同步；Android 使用 Keystore 的 AES-GCM 密钥加密，私有 SharedPreferences 中只保存密文，并排除备份和设备迁移。凭据不写入 localStorage。
 - Capacitor 原生日志关闭，避免插件参数或结果中的设备凭据进入调试日志。iOS 提供局域网用途说明和有限 ATS 私网异常；Android 开启 LAN 所需的 cleartext，连接页限制 HTTP 目的地址。

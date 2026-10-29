@@ -10,7 +10,7 @@
 
 | 功能 | 用途 |
 | --- | --- |
-| Tmux Dashboard | 从手机或浏览器查看 Bridge 主机上已有的 tmux session，向选中的 Codex session 发送消息，并浏览该 session 工作目录中的文件。 |
+| Tmux Dashboard | 从手机或浏览器查看 Bridge 主机上已有的 tmux session，向选中的 Codex session 发送消息，并浏览该 session 工作目录中的文件；可用 `tmux-resurrect` + `tmux-continuum` 按 Session 保存、挂起和恢复 Mac 重启前的状态。 |
 | 飞书 Direct | 从飞书提交文字、图片或文件任务，查看执行状态、续问或取消任务。 |
 | Web Task Desk | 从浏览器为已登记项目创建 Codex 任务，查看运行记录、附加文件、续问和处理支持的重试/审核操作。 |
 | Codex History | 搜索不同 Codex home 的会话，并通过 Codex SDK 继续已有会话。 |
@@ -19,6 +19,8 @@
 | 设备与运维 | 配对和撤销浏览器设备，查看运行状态；每天凌晨 1 点自动备份 SQLite，也可手动创建、校验和恢复。 |
 
 Tmux Dashboard 默认通过 Composer 给选中的 Codex session 发送消息；需要执行 Shell 命令或操作全屏终端程序时，可以显式开启“终端输入”模式，让 xterm 按键直接进入当前 tmux session。两种输入入口彼此独立。它连接的是 Bridge 主机上的 tmux，不会进入 pane 里可能通过 SSH 登录的另一台机器。
+
+tmux 快照安装与进程恢复白名单见 [tmux Session 快照说明](doc/tmux-resurrect.md)。
 
 ## 工作方式
 

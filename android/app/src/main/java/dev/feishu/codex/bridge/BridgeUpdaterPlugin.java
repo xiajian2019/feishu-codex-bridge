@@ -7,6 +7,8 @@ import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.net.Uri;
 import android.media.MediaScannerConnection;
@@ -31,10 +33,12 @@ import com.getcapacitor.annotation.PermissionCallback;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.HashMap;
 import java.util.Map;
+import java.security.MessageDigest;
 
 /** Downloads authenticated files and opens downloaded APKs in Android's package installer. */
 @CapacitorPlugin(
@@ -234,7 +238,8 @@ public class BridgeUpdaterPlugin extends Plugin {
             call.reject("没有获得保存到系统 Downloads 的权限。", "PUBLIC_STORAGE_PERMISSION_DENIED");
             return;
         }
-        if ("save".equals(call.getMethodName())) saveBlob(call);
+        if ("saveApk".equals(call.getMethodName())) saveApk(call);
+        else if ("save".equals(call.getMethodName())) saveBlob(call);
         else enqueueDownload(call);
     }
 
@@ -363,9 +368,100 @@ public class BridgeUpdaterPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void verifyApk(PluginCall call) {
+        getBridge().execute(() -> {
+            try { verifiedApk(call); call.resolve(); }
+            catch (Exception error) { call.reject(error.getMessage(), "APK_VERIFICATION_FAILED"); }
+        });
+    }
+
+    private File verifiedApk(PluginCall call) throws Exception {
+        String suppliedUri = call.getString("uri");
+        Uri supplied = suppliedUri == null ? null : Uri.parse(suppliedUri);
+        if (supplied == null || !"file".equals(supplied.getScheme()) || supplied.getPath() == null) throw new IOException("更新文件地址无效，请重新下载。");
+        File file = new File(supplied.getPath()).getCanonicalFile();
+        String root = new File(getContext().getCacheDir(), "bridge-downloads").getCanonicalPath() + File.separator;
+        if (!file.isFile() || !file.getPath().startsWith(root) || !file.getName().endsWith(".apk")) throw new IOException("更新文件已失效，请重新下载。");
+        String hash = call.getString("sha256", "");
+        Long size = call.getLong("size");
+        Long version = call.getLong("versionCode");
+        if (!hash.matches("[a-f0-9]{64}") || size == null || size < 1 || version == null || version < 1
+            || !getContext().getPackageName().equals(call.getString("packageName"))) throw new IOException("更新校验信息无效。");
+        if (file.length() != size) throw new IOException("更新包大小不符，请重新下载。");
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (FileInputStream input = new FileInputStream(file)) {
+            byte[] buffer = new byte[65536];
+            int count;
+            while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count);
+        }
+        StringBuilder actual = new StringBuilder();
+        for (byte value : digest.digest()) actual.append(String.format(java.util.Locale.ROOT, "%02x", value & 0xff));
+        if (!hash.equals(actual.toString())) throw new IOException("更新包摘要不符，请重新下载。");
+        PackageManager manager = getContext().getPackageManager();
+        PackageInfo archive = manager.getPackageArchiveInfo(file.getPath(), 0);
+        PackageInfo installed = manager.getPackageInfo(getContext().getPackageName(), 0);
+        long archiveCode = archive == null ? -1 : Build.VERSION.SDK_INT >= 28 ? archive.getLongVersionCode() : archive.versionCode;
+        long installedCode = Build.VERSION.SDK_INT >= 28 ? installed.getLongVersionCode() : installed.versionCode;
+        if (archive == null || !getContext().getPackageName().equals(archive.packageName) || archiveCode != version
+            || !java.util.Objects.equals(archive.versionName, call.getString("versionName"))) throw new IOException("更新包的包名或版本不符，请重新检查更新。");
+        if (archiveCode < installedCode) throw new IOException("该更新包版本低于已安装版本，已停止安装。");
+        return file;
+    }
+
+    @PluginMethod
+    public void saveApk(PluginCall call) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && !isPublicStorageGranted()) {
+            requestPermissionForAlias(PUBLIC_STORAGE, call, "permissionCallback"); return;
+        }
+        getBridge().execute(() -> {
+            try {
+                File source = verifiedApk(call);
+                String name = "Bridge-" + call.getLong("versionCode") + "-" + System.currentTimeMillis() + ".apk";
+                String mimeType = "application/vnd.android.package-archive";
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    ContentResolver resolver = getContext().getContentResolver();
+                    ContentValues values = new ContentValues();
+                    values.put(MediaStore.Downloads.DISPLAY_NAME, name);
+                    values.put(MediaStore.Downloads.MIME_TYPE, mimeType);
+                    values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                    values.put(MediaStore.Downloads.IS_PENDING, 1);
+                    Uri destination = resolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values);
+                    if (destination == null) throw new IOException("无法创建下载文件。");
+                    try (FileInputStream input = new FileInputStream(source); OutputStream output = resolver.openOutputStream(destination)) {
+                        if (output == null) throw new IOException("无法保存下载文件。");
+                        byte[] buffer = new byte[65536]; int count;
+                        while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+                        values.clear(); values.put(MediaStore.Downloads.IS_PENDING, 0);
+                        resolver.update(destination, values, null, null);
+                    } catch (Exception error) { resolver.delete(destination, null, null); throw error; }
+                } else {
+                    File directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                    if (!directory.exists() && !directory.mkdirs()) throw new IOException("无法访问下载目录。");
+                    File destination = new File(directory, name);
+                    try (FileInputStream input = new FileInputStream(source); FileOutputStream output = new FileOutputStream(destination)) {
+                        byte[] buffer = new byte[65536]; int count;
+                        while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+                    } catch (Exception error) { destination.delete(); throw error; }
+                    MediaScannerConnection.scanFile(getContext(), new String[]{destination.getPath()}, new String[]{mimeType}, null);
+                }
+                JSObject result = new JSObject(); result.put("fileName", name); call.resolve(result);
+            } catch (Exception error) { call.reject(error.getMessage(), "APK_SAVE_FAILED"); }
+        });
+    }
+
+    @PluginMethod
     public void install(PluginCall call) {
+        getBridge().execute(() -> {
+            try {
+                File file = verifiedApk(call);
+                getActivity().runOnUiThread(() -> openInstaller(call, Uri.fromFile(file).toString()));
+            } catch (Exception error) { call.reject(error.getMessage(), "APK_VERIFICATION_FAILED"); }
+        });
+    }
+
+    private void openInstaller(PluginCall call, String verifiedUri) {
         String expectedAuthority = getContext().getPackageName() + ".fileprovider";
-        Uri uri = resolveUpdateUri(call.getString("uri"), expectedAuthority);
+        Uri uri = resolveUpdateUri(verifiedUri, expectedAuthority);
         if (uri == null) {
             call.reject("无法识别更新包，请重新下载后重试。", "INVALID_UPDATE_URI");
             return;
@@ -376,7 +472,8 @@ public class BridgeUpdaterPlugin extends Plugin {
                 Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                 Uri.parse("package:" + getContext().getPackageName())
             );
-            getActivity().startActivity(settings);
+            try { getActivity().startActivity(settings); }
+            catch (Exception error) { call.reject("无法打开安装权限设置，请在系统设置中允许安装后重试。", "INSTALL_PERMISSION_REQUIRED"); return; }
             call.reject("请允许 Bridge 安装未知来源应用后重试。", "INSTALL_PERMISSION_REQUIRED");
             return;
         }

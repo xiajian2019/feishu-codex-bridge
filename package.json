@@ -35,6 +35,8 @@
     "dev:web:start": "bun scripts/dev-server.mjs web",
     "dev:tmux-api": "FEISHU_CODEX_BRIDGE_LAN_BIND=1 bun --watch src/main.ts --web-only --web-port 17310 --config ./config.example.json --db ./runtime/bridge.db",
     "dev:web": "BRIDGE_WEB_API_TARGET=http://127.0.0.1:17310 bun run --bun vite --config web/vite.config.ts",
+    "tmux:setup": "bun scripts/setup-tmux-resurrect.mjs",
+    "tmux:setup:check": "bun scripts/setup-tmux-resurrect.mjs --check",
     "web:pair": "bun src/web-pair-cli.ts",
     "start": "bun dist/main.js",
     "start:all": "bun dist/main.js",

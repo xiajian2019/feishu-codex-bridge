@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type ReactElement } from "react";
 import { getActionToken, getJson } from "./api.js";
-import { bridgeUrl, copyMobileText, isMobileApp, openBridgeExternal } from "./mobile-runtime.js";
+import { copyMobileText, isMobileApp, openMobileDemo } from "./mobile-runtime.js";
 
 type DemoState = "checking" | "starting" | "ready" | "unavailable";
 
@@ -165,7 +165,7 @@ export function DemoCatalog(): ReactElement {
 
   const openDemoTab = useCallback((demo: LocalDemo, target?: Window | null): boolean => {
     if (isMobileApp()) {
-      void openBridgeExternal(bridgeUrl(demo.openPath)).catch((failure: unknown) => {
+      void openMobileDemo(demo.id, demo.openPath).catch((failure: unknown) => {
         setErrors((current) => ({ ...current, [demo.id]: failure instanceof Error ? failure.message : "无法打开系统浏览器。" }));
       });
       return true;
@@ -237,7 +237,7 @@ export function DemoCatalog(): ReactElement {
         </div>
       </div>
       <p>本机视觉与模型实验，选择卡片即可开始体验。</p>
-      {isMobileApp() ? <p>Demo 在系统浏览器打开，需在浏览器配对。</p> : null}
+      {isMobileApp() ? <p>Demo 在系统浏览器打开，本次授权仅用于所选 Demo。</p> : null}
     </header>
 
     <section className="demo-catalog-grid" aria-label="Demo 列表">

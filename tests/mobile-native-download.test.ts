@@ -3,6 +3,10 @@ import { fileURLToPath } from "node:url";
 
 const fixture = fileURLToPath(new URL("./fixtures/mobile-native-download.ts", import.meta.url));
 const scenarios = [
+  ["android-apk-success", "verifies an APK before handing it to the installer and does not claim installation succeeded"],
+  ["android-apk-invalid", "rejects a damaged APK before installation or saving and removes the failed download"],
+  ["android-apk-cancel", "retains a verified APK after installer permission refusal so the user can retry"],
+  ["android-apk-save", "validates a manually downloaded APK before saving it to Downloads"],
   ["android", "waits for Android system completion and refreshes real progress on resume"],
   ["android-invalid-id", "rejects an invalid Android enqueue result without claiming completion"],
   ["ios-completion", "shows iOS transfer byte progress and waits for the system share handoff"],

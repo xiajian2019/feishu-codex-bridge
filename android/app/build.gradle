@@ -1,11 +1,12 @@
 apply plugin: 'com.android.application'
 
-// Debug APKs are rebuilt frequently during local development. Use the build
-// minute as a monotonically increasing versionCode so Android accepts a newly
-// compiled APK as an update instead of treating it as the same package.
-def generatedMobileVersionCode = (System.currentTimeMillis() / 60000L).toLong().intValue()
-def mobileVersionCode = (project.findProperty('androidVersionCode') ?: generatedMobileVersionCode).toString().toInteger()
-def mobileVersionName = (project.findProperty('androidVersionName') ?: '0.5.0-dev').toString()
+// Allocate under an exclusive lock; repeated builds and clock rollback cannot reuse a version code.
+def versionArgs = [System.getenv('BRIDGE_BUN_PATH') ?: 'bun', '../scripts/mobile-version.mjs']
+if (project.hasProperty('androidVersionCode')) versionArgs.add(project.property('androidVersionCode').toString())
+def generatedVersion = providers.exec { workingDir rootProject.projectDir; commandLine versionArgs }.standardOutput.asText.get()
+def mobileVersion = new groovy.json.JsonSlurper().parseText(generatedVersion)
+def mobileVersionCode = mobileVersion.versionCode.toInteger()
+def mobileVersionName = mobileVersion.versionName.toString()
 
 android {
     namespace = "dev.feishu.codex.bridge"

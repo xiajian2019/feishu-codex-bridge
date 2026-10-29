@@ -23,6 +23,8 @@ android/.gradle/
 android/.idea/
 android/**/build/
 android/local.properties
+android/.bridge-version.json
+android/.bridge-version.json.lock
 android/key.properties
 android/signing.properties
 android/*.jks

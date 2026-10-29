@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { lstat, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
-import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Duplex } from "node:stream";
 
 import { StateDatabase } from "./db.js";
@@ -41,6 +41,8 @@ import { JjToolError, JjToolsService } from "./jj-tools.js";
 import { DownloadUploadError, DownloadUploadsService, DOWNLOAD_UPLOAD_CHUNK_BYTES } from "./download-uploads.js";
 import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import { isNativeAppOrigin, MobileStreamTickets, type MobileStreamAuthorization } from "./mobile-auth.js";
+import { MobileApkStore } from "./mobile-apk.js";
+import { DemoBrowserAccess } from "./demo-browser-access.js";
 import {
   WebTaskSubmissionConflictError,
   DIRECT_TASK_STATUSES,
@@ -164,15 +166,6 @@ export interface DashboardServerOptions {
   logger?: Logger;
 }
 
-interface MobileApkUpdateMetadata {
-  available: true;
-  revision: string;
-  size: number;
-  sha256: string;
-  modifiedAt: string;
-  downloadUrl: "/api/mobile/update/download";
-}
-
 export interface DashboardActions {
   createTask?(input: WebTaskSubmission): Promise<StoredTask>;
   retryWebTask?(taskGuid: string, idempotencyKey: string): Promise<StoredTask>;
@@ -188,13 +181,14 @@ export class DashboardServer {
   private readonly auth: WebPairingAuth;
   private readonly webRoot: string;
   private readonly taskAttachmentsDirectory: string;
-  private readonly mobileApkPath: string;
+  private readonly mobileApks: MobileApkStore;
   private readonly linkTools: LinkToolsService;
   private readonly downloadUploads: DownloadUploadsService;
   private readonly jjTools: JjToolsService;
   private readonly workbench: WorkbenchService;
   private readonly eventClients = new Map<ServerResponse, () => boolean>();
   private readonly mobileStreamTickets = new MobileStreamTickets();
+  private readonly demoBrowserAccess = new DemoBrowserAccess();
   private server: Server | null = null;
   private unsubscribeFromDatabase: (() => void) | null = null;
   private unsubscribeFromAuth: (() => void) | null = null;
@@ -203,7 +197,6 @@ export class DashboardServer {
   private readonly localDemoProcesses = new Map<string, ChildProcess>();
   private readonly localDemoLogs = new Map<string, string[]>();
   private readonly localDemoErrors = new Map<string, string>();
-  private mobileApkMetadataCache: { size: number; modifiedAt: number; metadata: MobileApkUpdateMetadata } | null = null;
 
   constructor(options: DashboardServerOptions) {
     this.options = options;
@@ -213,11 +206,12 @@ export class DashboardServer {
     this.taskAttachmentsDirectory = resolve(
       options.taskAttachmentsDirectory ?? join(process.cwd(), "runtime", "task-attachments"),
     );
-    this.mobileApkPath = resolve(
+    const mobileApkPath = resolve(
       options.mobileApkPath
         ?? process.env.FEISHU_CODEX_BRIDGE_ANDROID_APK?.trim()
         ?? join(process.cwd(), "android", "app", "build", "outputs", "apk", "debug", "app-debug.apk"),
     );
+    this.mobileApks = new MobileApkStore(mobileApkPath, join(dirname(mobileApkPath), ".bridge-updates"));
     this.linkTools = new LinkToolsService({ proxy: options.linkToolProxy });
     this.downloadUploads = new DownloadUploadsService({ directory: options.downloadsDirectory });
     this.jjTools = options.jjTools ?? new JjToolsService();
@@ -337,17 +331,31 @@ export class DashboardServer {
         sendJson(response, 401, { error: "bearer token required" });
         return;
       }
-      const metadata = await this.mobileApkMetadata();
-      sendJson(response, 200, metadata ?? { available: false });
+      try { sendJson(response, 200, await this.mobileApks.latest() ?? { available: false }); }
+      catch { sendJson(response, 409, { error: "更新包正在生成或缺少构建元数据，请完成 APK 构建后重试。" }); }
       return;
     }
-    if (request.method === "GET" && url.pathname === "/api/mobile/update/download") {
+    if (request.method === "GET" && url.pathname.startsWith("/api/mobile/update/download")) {
       if (!this.auth.isBearerAuthorized(request)) {
         sendJson(response, 401, { error: "bearer token required" });
         return;
       }
-      await this.downloadMobileApk(response);
+      const revision = url.pathname === "/api/mobile/update/download"
+        ? url.searchParams.get("revision") ?? "" : url.pathname.slice("/api/mobile/update/download/".length);
+      await this.downloadMobileApk(revision, response);
       return;
+    }
+    const demoOpen = /^\/api\/local-demos\/([^/]+)\/browser-open$/.exec(url.pathname);
+    if (request.method === "GET" && demoOpen) {
+      const target = LOCAL_DEMO_PROXY_TARGETS.find((demo) => demo.id === demoOpen[1]);
+      const grant = target && this.demoBrowserAccess.consume(target.id, url.searchParams.get("ticket") ?? "");
+      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Referrer-Policy", "no-referrer");
+      if (!target || !grant) { sendJson(response, 401, { error: "Demo 打开链接已过期，请返回 App 重新打开。" }); return; }
+      const secure = firstHeaderValue(request.headers["x-forwarded-proto"]) === "https"
+        || Boolean((request.socket as typeof request.socket & { encrypted?: boolean }).encrypted);
+      response.setHeader("Set-Cookie", `bridge_demo_${target.id}=${grant.token}; Path=${target.prefix}/; HttpOnly; SameSite=Lax; Max-Age=28800${secure ? "; Secure" : ""}`);
+      response.writeHead(303, { Location: grant.target }); response.end(); return;
     }
     const mutating = request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS";
     if (mutating && url.pathname.startsWith("/api/auth/") && url.pathname !== "/api/auth/pairing/claim") {
@@ -518,11 +526,14 @@ export class DashboardServer {
       await this.serveIndex(request, response);
       return;
     }
+    const demoTarget = LOCAL_DEMO_PROXY_TARGETS.find((demo) => url.pathname.startsWith(demo.prefix + "/"));
+    const scopedDemoAccess = demoTarget && !["start", "logs", "browser-ticket", "browser-open"].includes(url.pathname.slice(demoTarget.prefix.length + 1))
+      && this.demoBrowserAccess.allows(demoTarget.id, request.headers.cookie);
     const publicWebRequest = request.method === "GET" && !url.pathname.startsWith("/api/");
     if (!this.requireAuthorization(
       request,
       response,
-      publicWebRequest || url.pathname === "/healthz",
+      publicWebRequest || url.pathname === "/healthz" || Boolean(scopedDemoAccess),
     )) return;
     if (url.pathname === "/api/workbench" || url.pathname.startsWith("/api/workbench/")) {
       if (mutating && !this.requireActionAuthorization(request, response)) return;
@@ -548,6 +559,22 @@ export class DashboardServer {
       if (mutating && !this.requireActionAuthorization(request, response)) return;
       await this.handleJj(request, response, url);
       return;
+    }
+    const demoTicket = /^\/api\/local-demos\/([^/]+)\/browser-ticket$/.exec(url.pathname);
+    if (request.method === "POST" && demoTicket) {
+      if (!this.auth.isBearerAuthorized(request) || !this.requireActionAuthorization(request, response)) {
+        if (!response.writableEnded) sendJson(response, 401, { error: "bearer token required" });
+        return;
+      }
+      const target = LOCAL_DEMO_PROXY_TARGETS.find((demo) => demo.id === demoTicket[1]);
+      const body = await readJsonBody(request);
+      const path = typeof body.path === "string" ? body.path : "";
+      if (!target || !path.startsWith(target.prefix + "/") || path.includes("\\") || path.includes("#")
+        || new URL(path, "http://bridge.invalid").pathname !== target.prefix + "/") {
+        sendJson(response, 400, { error: "Demo 打开地址无效。" }); return;
+      }
+      const ticket = this.demoBrowserAccess.issue(target.id, path, this.auth.connectionAuthorization(request));
+      sendJson(response, 200, { url: `${target.prefix}/browser-open?ticket=${ticket}` }); return;
     }
     const localDemoStartMatch = /^\/api\/local-demos\/([^/]+)\/start$/.exec(url.pathname);
     if (request.method === "POST" && localDemoStartMatch) {
@@ -1200,45 +1227,19 @@ export class DashboardServer {
     }
   }
 
-  private async mobileApkMetadata(): Promise<MobileApkUpdateMetadata | null> {
-    const file = await stat(this.mobileApkPath).catch(() => null);
-    if (!file?.isFile()) return null;
-    const modifiedAt = Math.trunc(file.mtimeMs);
-    const cached = this.mobileApkMetadataCache;
-    if (cached && cached.size === file.size && cached.modifiedAt === modifiedAt) return cached.metadata;
-
-    const sha256 = await new Promise<string>((resolvePromise, rejectPromise) => {
-      const digest = createHash("sha256");
-      const stream = createReadStream(this.mobileApkPath);
-      stream.on("data", (chunk) => digest.update(chunk));
-      stream.once("error", rejectPromise);
-      stream.once("end", () => resolvePromise(digest.digest("hex")));
-    });
-    const metadata: MobileApkUpdateMetadata = {
-      available: true,
-      revision: `${modifiedAt}-${file.size}-${sha256.slice(0, 16)}`,
-      size: file.size,
-      sha256,
-      modifiedAt: new Date(file.mtimeMs).toISOString(),
-      downloadUrl: "/api/mobile/update/download",
-    };
-    this.mobileApkMetadataCache = { size: file.size, modifiedAt, metadata };
-    return metadata;
-  }
-
-  private async downloadMobileApk(response: ServerResponse): Promise<void> {
-    const file = await stat(this.mobileApkPath).catch(() => null);
-    if (!file?.isFile()) {
+  private async downloadMobileApk(revision: string, response: ServerResponse): Promise<void> {
+    const artifact = await this.mobileApks.revision(revision);
+    if (!artifact) {
       sendJson(response, 404, { error: "Android APK is not available." });
       return;
     }
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");
     response.setHeader("Content-Type", "application/vnd.android.package-archive");
-    response.setHeader("Content-Length", String(file.size));
+    response.setHeader("Content-Length", String(artifact.metadata.size));
     response.setHeader("Content-Disposition", 'attachment; filename="bridge-update.apk"');
     response.statusCode = 200;
-    const stream = createReadStream(this.mobileApkPath);
+    const stream = createReadStream(artifact.path);
     stream.once("error", (error) => response.destroy(error));
     stream.pipe(response);
   }

@@ -1,20 +1,20 @@
-import { useEffect, useState, type FormEvent, type ReactElement, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactElement, type ReactNode } from "react";
 import { parseMobilePairingInput } from "./mobile-connection.js";
 import {
   checkMobileApkUpdate, checkMobileConnection, disconnectMobileConnection, downloadMobileApkUpdate, getMobileConnection,
   initializeMobileRuntime, installMobileApkUpdate, MOBILE_CONNECTION_EVENT, MOBILE_RESUME_EVENT, MOBILE_SETTINGS_EVENT,
   MOBILE_SHAKE_EVENT, openMobileConnectionSettings, pairMobileConnection, switchMobileConnection,
-  getMobileAppVersion,
+  getMobileAppVersion, getMobileAppBuild,
   type MobileApkUpdate,
 } from "./mobile-runtime.js";
 import MobileDownloadStatus from "./MobileDownloadStatus.js";
 import MobilePairingScanner from "./MobilePairingScanner.js";
 import { getBridgeCapabilities } from "./client-capabilities.js";
 import { getLocalDraftScope } from "./local-draft-scope.js";
+import { apkUpdateStorageKey, readApkUpdateState, shouldOfferApkUpdate, type ApkUpdateState, type ApkUpdatePhase } from "./mobile-apk-update.js";
 import "./mobile-app.css";
 
 type ConnectionState = "loading" | "setup" | "ready" | "unavailable";
-const MOBILE_APK_REVISION_KEY = "bridge.mobile.apk-revision";
 
 export default function MobileConnectionGate({ children }: { children: ReactNode }): ReactElement {
   return <><MobileConnectionContent>{children}</MobileConnectionContent><MobileDownloadStatus /></>;
@@ -28,6 +28,9 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
   const [busy, setBusy] = useState(false);
   const [scannerOpen, setScannerOpen] = useState(false);
   const [apkUpdate, setApkUpdate] = useState<MobileApkUpdate | null>(null);
+  const [apkState, setApkState] = useState<ApkUpdateState | null>(null);
+  const apkStateRef = useRef<ApkUpdateState | null>(null);
+  const apkBusyRef = useRef(false);
   const [apkUpdateBusy, setApkUpdateBusy] = useState(false);
   const [apkDownloadBusy, setApkDownloadBusy] = useState(false);
   const [apkUpdateError, setApkUpdateError] = useState<string | null>(null);
@@ -38,6 +41,12 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
   const [environmentBusy, setEnvironmentBusy] = useState<string | null>(null);
   const [environmentMessage, setEnvironmentMessage] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState("读取中…");
+
+  const saveApkState = (update: MobileApkUpdate, state: ApkUpdateState): void => {
+    apkStateRef.current = state;
+    setApkState(state);
+    try { window.localStorage.setItem(apkUpdateStorageKey(update.server), JSON.stringify(state)); } catch { /* Recheck installed version on resume even without storage. */ }
+  };
 
   useEffect(() => { void getMobileAppVersion().then(setAppVersion).catch(() => setAppVersion("暂不可读")); }, []);
 
@@ -97,18 +106,21 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
     if (state !== "ready" || editing) return;
     let active = true;
     const checkForApkUpdate = async (): Promise<void> => {
+      if (apkBusyRef.current || document.visibilityState === "hidden") return;
       try {
         const update = await checkMobileApkUpdate();
-        if (!active || !update) return;
-        const seenRevision = window.localStorage.getItem(MOBILE_APK_REVISION_KEY);
-        if (!seenRevision) {
-          window.localStorage.setItem(MOBILE_APK_REVISION_KEY, update.revision);
-          return;
+        const installed = await getMobileAppBuild();
+        if (!active || apkBusyRef.current) return;
+        if (!Number.isSafeInteger(installed) || installed < 1) throw new Error("无法读取已安装 App 版本，请稍后重试。");
+        if (!update) { setApkUpdate(null); return; }
+        let saved: ApkUpdateState;
+        try { saved = readApkUpdateState(window.localStorage, update); }
+        catch { saved = { revision: update.revision, phase: "available", snoozeUntil: 0 }; }
+        if (installed >= update.versionCode) {
+          saveApkState(update, { ...saved, phase: "installed" }); setApkUpdate(null); return;
         }
-        if (seenRevision !== update.revision) {
-          setApkUpdate(update);
-          setApkUpdateError(null);
-        }
+        saveApkState(update, saved);
+        setApkUpdate(shouldOfferApkUpdate(update, installed, saved) ? update : null);
       } catch (cause) {
         if (active) setApkUpdateError(cause instanceof Error ? cause.message : "更新检查失败。");
       }
@@ -144,33 +156,27 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
     finally { setBusy(false); }
   };
 
-  const installApkUpdate = async (): Promise<void> => {
-    if (!apkUpdate) return;
-    setApkUpdateBusy(true);
-    setApkUpdateError(null);
-    try {
-      await installMobileApkUpdate(apkUpdate);
-      window.localStorage.setItem(MOBILE_APK_REVISION_KEY, apkUpdate.revision);
-      setApkUpdate(null);
-    } catch (cause) {
-      setApkUpdateError(cause instanceof Error ? cause.message : "更新安装失败。");
-    } finally {
-      setApkUpdateBusy(false);
-    }
-  };
-
-  const downloadApkUpdate = async (): Promise<void> => {
-    if (!apkUpdate) return;
-    setApkDownloadBusy(true);
+  const transferApk = async (update: MobileApkUpdate, install: boolean): Promise<void> => {
+    if (apkBusyRef.current) return;
+    apkBusyRef.current = true;
+    setApkUpdateBusy(install); setApkDownloadBusy(!install);
     setApkUpdateError(null);
     setApkDownloadMessage(null);
+    const existing = apkStateRef.current?.revision === update.revision ? apkStateRef.current : null;
+    const onPhase = (phase: ApkUpdatePhase, uri?: string): void => {
+      saveApkState(update, { revision: update.revision, phase, snoozeUntil: 0, ...(uri ? { uri } : {}) });
+    };
     try {
-      await downloadMobileApkUpdate(apkUpdate);
-      window.localStorage.setItem(MOBILE_APK_REVISION_KEY, apkUpdate.revision);
+      if (install) await installMobileApkUpdate(update, existing?.uri, onPhase);
+      else {
+        await downloadMobileApkUpdate(update, existing?.uri, onPhase);
+        setApkDownloadMessage("APK 已校验并保存到系统 Downloads，可手动安装。");
+      }
     } catch (cause) {
-      setApkUpdateError(cause instanceof Error ? cause.message : "APK 下载失败。");
+      setApkUpdateError(cause instanceof Error ? cause.message : "更新失败，请重试。");
     } finally {
-      setApkDownloadBusy(false);
+      apkBusyRef.current = false;
+      setApkUpdateBusy(false); setApkDownloadBusy(false);
     }
   };
 
@@ -185,8 +191,8 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
         return;
       }
       setApkUpdate(update);
-      await downloadMobileApkUpdate(update);
-      window.localStorage.setItem(MOBILE_APK_REVISION_KEY, update.revision);
+      setApkDownloadBusy(false);
+      await transferApk(update, false);
     } catch (cause) {
       setApkUpdateError(cause instanceof Error ? cause.message : "APK 下载失败。");
     } finally {
@@ -196,7 +202,7 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
 
   const dismissApkUpdate = (): void => {
     if (!apkUpdate) return;
-    window.localStorage.setItem(MOBILE_APK_REVISION_KEY, apkUpdate.revision);
+    saveApkState(apkUpdate, { ...(apkStateRef.current ?? { revision: apkUpdate.revision, phase: "available" }), snoozeUntil: Date.now() + 30 * 60_000 });
     setApkUpdate(null);
     setApkUpdateError(null);
   };
@@ -244,11 +250,12 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
       <aside className="mobile-update-banner" role="status">
         <div>
           <strong>发现新的 Bridge App</strong>
-          <span>{formatApkSize(apkUpdate.size)} · {new Date(apkUpdate.modifiedAt).toLocaleString()}</span>
+          <span>{apkUpdate.versionName} ({apkUpdate.versionCode}) · {formatApkSize(apkUpdate.size)}</span>
+          {apkState?.phase === "installer-opened" ? <span>已打开安装器；若已取消，可再次安装。</span> : apkState?.phase === "downloaded" ? <span>更新包已校验，可继续安装。</span> : null}
         </div>
         <div className="mobile-update-actions">
-          <button type="button" onClick={() => void installApkUpdate()} disabled={apkUpdateBusy || apkDownloadBusy}>{apkUpdateBusy ? "下载中…" : "更新"}</button>
-          <button type="button" className="mobile-update-download" onClick={() => void downloadApkUpdate()} disabled={apkUpdateBusy || apkDownloadBusy}>{apkDownloadBusy ? "准备中…" : "下载 APK"}</button>
+          <button type="button" onClick={() => void transferApk(apkUpdate, true)} disabled={apkUpdateBusy || apkDownloadBusy}>{apkUpdateBusy ? "处理中…" : apkState?.uri ? "继续安装" : "更新"}</button>
+          <button type="button" className="mobile-update-download" onClick={() => void transferApk(apkUpdate, false)} disabled={apkUpdateBusy || apkDownloadBusy}>{apkDownloadBusy ? "处理中…" : "下载 APK"}</button>
           <button type="button" className="mobile-update-dismiss" onClick={dismissApkUpdate} disabled={apkUpdateBusy || apkDownloadBusy}>稍后</button>
         </div>
         {apkUpdateError ? <p role="alert">{apkUpdateError}</p> : null}

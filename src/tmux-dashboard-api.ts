@@ -1,4 +1,4 @@
-import { constants, createReadStream, createWriteStream } from "node:fs";
+import { constants, createReadStream, createWriteStream, existsSync } from "node:fs";
 import { chmod, copyFile, link, lstat, mkdir, realpath, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
@@ -8,6 +8,11 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { DownloadUploadError, DownloadUploadsService } from "./download-uploads.js";
+import {
+  tmuxResurrectController,
+  TmuxResurrectUnavailableError,
+  type TmuxResurrectController,
+} from "./tmux-resurrect.js";
 
 import { getBunRuntime, type BunSubprocess, type BunTerminal } from "./bun-runtime.js";
 import { isNativeAppOrigin } from "./mobile-auth.js";
@@ -29,6 +34,7 @@ import * as tmux from "./tmux-dashboard.js";
 const API_PREFIX = "/tmux-dashboard/api";
 const MAX_SESSION_FILE_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_SUBMISSION_BYTES = 32 * 1024;
+const MAX_CODEX_WORKTREE_TASK_DESCRIPTION_LENGTH = 20_000;
 const MAX_GIT_REVIEW_ANCHORS = 20;
 const MAX_SCROLL_DIAGNOSTIC_EXPORT_BYTES = 5 * 1024 * 1024;
 const MAX_SCROLL_DIAGNOSTIC_ENTRIES = 2_000;
@@ -42,6 +48,7 @@ const MAX_TERMINAL_INPUT_BYTES = 32 * 1024;
 // Keep the synthetic submit outside that window so it is handled as submit.
 const TERMINAL_PASTE_SETTLE_MS = 180;
 const TERMINAL_HEARTBEAT_INTERVAL_MS = 30_000;
+const CODEX_WORKTREE_TASK_DIRECTORY = join(tmpdir(), "feishu-codex-bridge", "codex-worktree-tasks");
 const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.freeze({
   "codex-escape": "\u001b",
   "codex-interrupt": "\u0003",
@@ -151,6 +158,18 @@ const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.fre
   "tmux-resize-pane-5-left": "\u0002\u001b[1;3D",
   "tmux-resize-pane-5-right": "\u0002\u001b[1;3C",
 });
+
+function resolveCodexWorktreeExecutable(configured?: string): string {
+  const requested = configured?.trim() || process.env.CODEX_WORKTREE_CLI?.trim();
+  if (requested) return requested;
+  const personalExecutable = join(homedir(), ".codex", "bin", "codex-worktree");
+  return existsSync(personalExecutable) ? personalExecutable : "codex-worktree";
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 const ATTACHMENT_DIRECTORY = join(homedir(), ".feishu-codex-bridge", "tmux-dashboard-attachments");
 const LEGACY_ATTACHMENT_DIRECTORY = join(tmpdir(), "feishu-codex-bridge", "tmux-dashboard-attachments");
 const IMAGE_ATTACHMENT_FILENAME = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}\.(?:avif|bmp|gif|heic|heif|jpe?g|png|webp)$/i;
@@ -194,6 +213,12 @@ export interface TmuxDashboardApiOptions {
   heartbeatIntervalMs?: number;
   /** Injectable for tests; production discovers the local Codex homes. */
   discoverCodexHomes?: () => CodexHistoryHome[];
+  /** Absolute path or executable name used for the optional initial Session task. */
+  codexWorktreeExecutable?: string;
+  /** Injectable for tests; production delegates complete Session snapshots to tmux-resurrect. */
+  resurrect?: TmuxResurrectController;
+  /** Isolated fixture servers must not restore the user's real tmux snapshots. */
+  autoRestoreSessions?: boolean;
 }
 
 export interface TerminalHeartbeatPeer {
@@ -266,6 +291,10 @@ export class TmuxDashboardApi {
   private sessionListController?: AbortController;
   private readonly sessionListTimeoutMs: number;
   private readonly logger?: Logger;
+  private readonly codexWorktreeExecutable: string;
+  private readonly resurrect: TmuxResurrectController;
+  private readonly autoRestoreSessions: boolean;
+  private readonly manageSessionSnapshots: boolean;
   private stopped = false;
   private attachmentStorageReady: Promise<void> | null = null;
   private readonly attachmentDirectory: string;
@@ -286,7 +315,43 @@ export class TmuxDashboardApi {
       : TERMINAL_HEARTBEAT_INTERVAL_MS;
     this.createTaskFromSession = options.createTaskFromSession;
     this.discoverCodexHomes = options.discoverCodexHomes ?? (() => discoverCodexHistoryHomes());
+    this.codexWorktreeExecutable = resolveCodexWorktreeExecutable(options.codexWorktreeExecutable);
+    this.resurrect = options.resurrect ?? tmuxResurrectController;
+    this.autoRestoreSessions = options.autoRestoreSessions ?? !options.operations;
+    this.manageSessionSnapshots = options.autoRestoreSessions ?? (!options.operations || Boolean(options.resurrect));
     this.operations = { ...tmux, ...options.operations };
+  }
+
+  private async submitInitialCodexWorktreeTask(session: tmux.TmuxSession, description: string): Promise<void> {
+    const inspectReviewPane = this.operations.inspectReviewPane ?? tmux.inspectReviewPane;
+    const pasteTextToPane = this.operations.pasteTextToPane ?? tmux.pasteTextToPane;
+    const sendEnterToPane = this.operations.sendEnterToPane ?? tmux.sendEnterToPane;
+    const pane = await inspectReviewPane(session.id, session);
+    await mkdir(CODEX_WORKTREE_TASK_DIRECTORY, { recursive: true, mode: 0o700 });
+    const taskFile = join(CODEX_WORKTREE_TASK_DIRECTORY, `task-${randomUUID()}.md`);
+    await writeFile(taskFile, description, { encoding: "utf8", flag: "wx", mode: 0o600 });
+
+    // Passing the textarea through a temporary Markdown file keeps multiline and
+    // non-ASCII prompts out of the shell command line. The wrapper removes the
+    // file after codex-worktree has read it, while preserving its exit status.
+    const quotedTaskFile = shellQuote(taskFile);
+    const command = [
+      `${shellQuote(this.codexWorktreeExecutable)} --task-file ${quotedTaskFile}`,
+      "status=$?",
+      `rm -f ${quotedTaskFile}`,
+      'exit "$status"',
+    ].join("; ");
+    let commandBuffered = false;
+    try {
+      await pasteTextToPane(pane.paneId, command);
+      commandBuffered = true;
+      await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, TERMINAL_PASTE_SETTLE_MS));
+      await sendEnterToPane(pane.paneId);
+    } finally {
+      // Once paste-buffer succeeds, leave the file for the shell wrapper. If
+      // paste itself failed, no shell command can consume it.
+      if (!commandBuffered) await unlink(taskFile).catch(() => undefined);
+    }
   }
 
   public async getWorkspaceSessionSnapshot(): Promise<Array<{ sessionId: string; currentPath: string }>> {
@@ -614,6 +679,80 @@ export class TmuxDashboardApi {
       });
       return;
     }
+    if (request.method === "GET" && apiPath === "/resurrect/status") {
+      sendJson(response, 200, this.resurrect.status());
+      return;
+    }
+    const sessionResurrectMatch = /^\/sessions\/([^/]+)\/resurrect\/save$/.exec(apiPath);
+    if (request.method === "POST" && sessionResurrectMatch) {
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(sessionResurrectMatch[1]!); }
+      catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
+      try {
+        const live = await this.operations.findSession(sessionId);
+        const saved = this.db.getLatestTmuxSession(sessionId);
+        const sessionName = live?.name ?? saved?.session_name;
+        if (!sessionName) throw new tmux.SessionNotFoundError("Session record no longer exists.");
+        if (!live) throw new tmux.SessionNotFoundError("Only a running Session can be saved.");
+        const result = await this.resurrect.saveSession(sessionName);
+        sendJson(response, 200, {
+          ok: true,
+          action: result.action,
+          sessionName: result.sessionName,
+          snapshot: result.snapshot,
+          output: result.output || null,
+        });
+      } catch (error) {
+        sendDashboardError(response, error);
+      }
+      return;
+    }
+    const sessionLifecycleMatch = /^\/sessions\/([^/]+)\/(suspend|resume)$/.exec(apiPath);
+    if (request.method === "POST" && sessionLifecycleMatch) {
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(sessionLifecycleMatch[1]!); }
+      catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
+      const action = sessionLifecycleMatch[2] as "suspend" | "resume";
+      try {
+        const saved = this.db.getLatestTmuxSession(sessionId);
+        if (action === "suspend") {
+          const live = await this.operations.findSession(sessionId);
+          if (!live) throw new tmux.SessionNotFoundError("Only a running Session can be suspended.");
+          const snapshot = await this.resurrect.saveSession(live.name);
+          await this.operations.killSession(sessionId);
+          const suspended = this.db.markTmuxSessionSuspended(sessionId);
+          if (!suspended) throw new tmux.SessionNotFoundError("Session record no longer exists.");
+          this.invalidateSessionList();
+          sendJson(response, 200, {
+            ok: true,
+            action,
+            session: { id: sessionId, name: live.name, suspendedAt: suspended.suspended_at, snapshot: snapshot.snapshot },
+          });
+          return;
+        }
+        if (!saved || saved.ended_at !== null || saved.suspended_at === null) {
+          throw new DashboardBodyError("只有已挂起的 Session 可以恢复。", 409);
+        }
+        const liveSessions = await this.operations.listSessions();
+        if (liveSessions.some((session) => session.name === saved.session_name)) {
+          throw new DashboardBodyError("同名 Session 已在运行，请先刷新列表。", 409);
+        }
+        const snapshot = await this.resurrect.restoreSession(saved.session_name);
+        const restored = (await this.operations.listSessions()).find((session) => session.name === saved.session_name);
+        if (!restored) throw new tmux.SessionNotFoundError("快照已恢复，但没有找到新的 tmux Session。");
+        const resumed = this.db.resumeTmuxSession(saved.record_id, restored);
+        if (!resumed) throw new tmux.SessionNotFoundError("挂起的 Session 记录已变化，请刷新后重试。");
+        this.invalidateSessionList();
+        sendJson(response, 200, {
+          ok: true,
+          action,
+          session: { id: restored.id, name: restored.name, suspendedAt: null, snapshot: snapshot.snapshot },
+        });
+      } catch (error) {
+        sendDashboardError(response, error);
+      }
+      return;
+    }
     if (request.method === "GET" && apiPath === "/history") {
       const limit = Number(url.searchParams.get("limit") ?? 50);
       const offset = Number(url.searchParams.get("offset") ?? 0);
@@ -677,6 +816,7 @@ export class TmuxDashboardApi {
             cwd: live?.cwd ?? saved.working_directory,
             createdAt: live?.createdAt ?? saved.tmux_created_at,
             endedAt: saved.ended_at,
+            suspendedAt: saved.suspended_at,
             openCount: saved.open_count,
             lastOpenedAt: saved.last_opened_at,
             codexHomeId: saved.codex_home_id,
@@ -684,6 +824,7 @@ export class TmuxDashboardApi {
             taskGuid: workspace?.task_guid ?? null,
             workspaceBranch: workspace?.branch ?? null,
             workspaceStatus: workspace?.status ?? null,
+            snapshot: this.resurrect.snapshotForSession(saved.session_name),
           };
         });
         sendJson(response, 200, includeHomes
@@ -941,6 +1082,16 @@ export class TmuxDashboardApi {
         sendJson(response, 400, { error: "A session name is required." });
         return;
       }
+      if (body.taskDescription !== undefined
+        && (typeof body.taskDescription !== "string" || body.taskDescription.length > MAX_CODEX_WORKTREE_TASK_DESCRIPTION_LENGTH)) {
+        sendJson(response, 400, { error: "taskDescription must contain up to 20000 characters." });
+        return;
+      }
+      const taskDescription = typeof body.taskDescription === "string" ? body.taskDescription.trim() : "";
+      if (taskDescription.includes("\0")) {
+        sendJson(response, 400, { error: "taskDescription cannot contain NUL bytes." });
+        return;
+      }
       try {
         const projectKey = typeof body.projectKey === "string" ? body.projectKey.trim() : "";
         const project = this.db.getAvailableProject(projectKey);
@@ -962,7 +1113,24 @@ export class TmuxDashboardApi {
         const session = await this.operations.createSession(body.name.trim(), workingDirectory);
         this.invalidateSessionList();
         this.db.recordTmuxSession(session, { projectKey: recordProjectKey, createdByDeviceId: deviceId });
-        sendJson(response, 201, { session: { ...session, codexHomeId: null } });
+        let initialTask: { status: "submitted" | "failed"; error?: string } | undefined;
+        if (taskDescription) {
+          try {
+            await this.submitInitialCodexWorktreeTask(session, taskDescription);
+            initialTask = { status: "submitted" };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            this.logger?.warn("could not submit initial Codex worktree task", {
+              sessionId: session.id,
+              error: message,
+            });
+            initialTask = { status: "failed", error: message };
+          }
+        }
+        sendJson(response, 201, {
+          session: { ...session, codexHomeId: null },
+          ...(initialTask ? { initialTask } : {}),
+        });
       } catch (error) {
         sendDashboardError(response, error);
       }
@@ -1111,9 +1279,16 @@ export class TmuxDashboardApi {
         return;
       }
       try {
-        await this.operations.killSession(sessionId);
+        const live = await this.operations.findSession(sessionId);
+        const saved = this.db.getLatestTmuxSession(sessionId);
+        const sessionName = live?.name ?? saved?.session_name;
+        if (live) await this.operations.killSession(sessionId);
+        else if (!saved || saved.ended_at !== null || saved.suspended_at === null) {
+          throw new tmux.SessionNotFoundError("Session no longer exists.");
+        }
         this.invalidateSessionList();
         this.db.markTmuxSessionEnded(sessionId);
+        if (sessionName && this.manageSessionSnapshots) this.resurrect.disableSession(sessionName);
         sendEmpty(response, 204);
       } catch (error) {
         sendDashboardError(response, error);
@@ -1363,10 +1538,26 @@ export class TmuxDashboardApi {
       controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true });
     });
     const refresh = (async () => {
-      const sessions = await Promise.race([this.operations.listSessions({ signal: controller.signal }), timeout]);
+      let sessions = await Promise.race([this.operations.listSessions({ signal: controller.signal }), timeout]);
       if (controller.signal.aborted) throw controller.signal.reason;
       if (generation !== this.sessionListGeneration) throw new DashboardBodyError("Session 列表已变化，请重新读取。", 503);
       const enumerationMs = Math.round(performance.now() - started);
+      if (this.autoRestoreSessions) {
+        const activeSessionNames = this.db.listTmuxSessionsForDashboard()
+          .filter((saved) => saved.ended_at === null && saved.suspended_at === null)
+          .map((saved) => saved.session_name);
+        const restoreResult = await this.resurrect.restorePendingSessions(
+          activeSessionNames,
+          sessions.map((session) => session.name),
+        );
+        for (const failure of restoreResult.failures) {
+          this.logger?.warn("could not restore tmux Session snapshot", failure);
+        }
+        if (restoreResult.restored.length > 0) {
+          phase = "tmux-enumeration-after-restore";
+          sessions = await this.operations.listSessions({ signal: controller.signal });
+        }
+      }
       phase = "database-sync";
       this.db.syncTmuxSessions(sessions);
       const elapsedMs = Math.round(performance.now() - started);
@@ -2138,7 +2329,7 @@ function attachmentStorageName(fileName: string, contentType: string): string {
 }
 
 function sendDashboardError(response: ServerResponse, error: unknown): void {
-  const status = error instanceof tmux.TmuxQueryTimeoutError ? 503 : error instanceof DownloadUploadError ? error.statusCode : error instanceof DashboardBodyError
+  const status = error instanceof tmux.TmuxQueryTimeoutError || error instanceof TmuxResurrectUnavailableError ? 503 : error instanceof DownloadUploadError ? error.statusCode : error instanceof DashboardBodyError
     ? error.statusCode
     : error instanceof GitWorkspaceError
       ? error.statusCode

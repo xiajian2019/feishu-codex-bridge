@@ -31,6 +31,9 @@ const shares: Array<{ options: { files: string[] }; pending: ReturnType<typeof d
 const enqueues: Array<{ options: Record<string, unknown>; pending: ReturnType<typeof deferred<{ id: number; fileName: string }>> }> = [];
 const queries: Array<{ ids: number[]; pending: ReturnType<typeof deferred<{ downloads: NativeDownloadStatus[] }>> }> = [];
 const removedDirectories: string[] = [];
+const verifications: Array<Record<string, unknown>> = [];
+const installations: Array<Record<string, unknown>> = [];
+const apkSaves: Array<Record<string, unknown>> = [];
 const timers = new Map<number, () => void>();
 let timerSequence = 0;
 const windowEvents = new EventTarget();
@@ -49,6 +52,15 @@ Object.defineProperty(globalThis, "clearTimeout", { value: (id: number) => { tim
 mock.module("@capacitor/core", () => ({
   Capacitor: { isNativePlatform: () => true, getPlatform: () => android ? "android" : "ios" },
   registerPlugin: (name: string) => name === "BridgeUpdater" ? {
+    verifyApk: async (options: Record<string, unknown>) => {
+      verifications.push(options);
+      if (scenario === "android-apk-invalid") throw new Error("更新包摘要不符");
+    },
+    install: async (options: Record<string, unknown>) => {
+      installations.push(options);
+      if (scenario === "android-apk-cancel") throw new Error("请允许 Bridge 安装未知来源应用后重试。");
+    },
+    saveApk: async (options: Record<string, unknown>) => { apkSaves.push(options); return { fileName: "verified.apk" }; },
     download: (options: Record<string, unknown>) => {
       const pending = deferred<{ id: number; fileName: string }>();
       enqueues.push({ options, pending });
@@ -103,6 +115,44 @@ const emit = (patch: Partial<Progress> = {}) => {
   const event = { type: "download", url, bytes: 11, lengthComputable: false, contentLength: 999, ...patch };
   for (const listener of listeners) listener(event);
 };
+
+if (scenario?.startsWith("android-apk-")) {
+  const update = { available: true as const, revision: "a".repeat(64), sha256: "a".repeat(64), size: 100,
+    modifiedAt: new Date().toISOString(), packageName: "dev.feishu.codex.bridge", versionCode: 200, versionName: "0.5.0",
+    downloadUrl: url, server: "https://bridge.fixture" };
+  const phases: Array<{ phase: string; uri?: string }> = [];
+  const install = scenario !== "android-apk-save";
+  const pending = native.prepareApkUpdate(update, token, install, undefined, (phase, uri) => phases.push({ phase, uri }));
+  const result = pending.then((uri) => ({ uri, error: null }), (error: Error) => ({ uri: null, error }));
+  await until(() => transfers.length === 1);
+  assert.equal(installations.length, 0);
+  assert.equal(verifications.length, 0);
+  assert.equal(transfers[0]!.options.disableRedirects, true);
+  transfers[0]!.pending.resolve();
+  const completed = await result;
+  assert.equal(verifications[0]?.sha256, update.sha256);
+  assert.equal(verifications[0]?.size, 100);
+  if (scenario === "android-apk-invalid") {
+    assert.ok(completed.error);
+    assert.equal(installations.length, 0);
+    assert.equal(apkSaves.length, 0);
+    assert.ok(removedDirectories.length > 0);
+    assert.equal(phases.at(-1)?.phase, "error");
+    assert.equal(phases.at(-1)?.uri, undefined);
+  } else if (scenario === "android-apk-cancel") {
+    assert.ok(completed.error);
+    assert.equal(phases.at(-1)?.phase, "error");
+    assert.ok(phases.at(-1)?.uri);
+    assert.equal(removedDirectories.length, 0);
+  } else {
+    assert.equal(completed.error, null);
+    assert.equal(installations.length, install ? 1 : 0);
+    assert.equal(apkSaves.length, install ? 0 : 1);
+    assert.deepEqual(phases.map((item) => item.phase), install ? ["downloading", "downloaded", "installer-opened"] : ["downloading", "downloaded"]);
+    assert.equal(getMobileDownloads()[0]?.state, "done");
+  }
+  process.exit(0);
+}
 
 if (scenario === "android") {
   const downloading = native.downloadBridgeFile(url, "report.pdf", token);

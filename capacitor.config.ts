@@ -1,4 +1,7 @@
 import type { CapacitorConfig } from "@capacitor/cli";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+const version = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8")).version as string;
 
 const config: CapacitorConfig = {
   appId: "dev.feishu.codex.bridge",
@@ -17,11 +20,11 @@ const config: CapacitorConfig = {
   ios: {
     contentInset: "never",
     allowsLinkPreview: false,
-    appendUserAgent: "BridgeApp/0.5.0 (iOS)",
+    appendUserAgent: `BridgeApp/${version} (iOS)`,
   },
   android: {
     allowMixedContent: false,
-    appendUserAgent: "BridgeApp/0.5.0 (Android)",
+    appendUserAgent: `BridgeApp/${version} (Android)`,
   },
 };
 

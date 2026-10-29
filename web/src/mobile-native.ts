@@ -9,6 +9,7 @@ import { Clipboard } from "@capacitor/clipboard";
 import { CapacitorBarcodeScanner } from "@capacitor/barcode-scanner";
 import { MOBILE_BACK_EVENT, MOBILE_RESUME_EVENT, MOBILE_SHAKE_EVENT } from "./mobile-runtime.js";
 import { createShakeDetector } from "./mobile-shake.js";
+import type { MobileApkUpdate, ApkUpdatePhase } from "./mobile-apk-update.js";
 import {
   failMobileDownload, hasAndroidMobileDownloads, refreshAndroidMobileDownloads, startMobileDownload,
   trackAndroidMobileDownload, updateMobileDownload, type NativeDownloadStatus,
@@ -26,8 +27,11 @@ interface CredentialPlugin {
   set(options: { server: string; token: string }): Promise<void>;
   remove(options: { server: string }): Promise<void>;
 }
+type ApkVerification = Pick<MobileApkUpdate, "sha256" | "size" | "packageName" | "versionCode" | "versionName"> & { uri: string };
 interface UpdaterPlugin {
-  install(options: { uri: string }): Promise<void>;
+  verifyApk(options: ApkVerification): Promise<void>;
+  saveApk(options: ApkVerification): Promise<{ fileName: string }>;
+  install(options: ApkVerification): Promise<void>;
   getDownloads(options: { ids: number[] }): Promise<{ downloads: NativeDownloadStatus[] }>;
   openDownloads(): Promise<void>;
   download(options: { url: string; token: string; fileName: string; mimeType?: string; userAgent: string }): Promise<{ id: number; fileName: string }>;
@@ -61,6 +65,7 @@ export async function nativeAppVersion(): Promise<string> {
   const info = await App.getInfo();
   return `${info.version} (${info.build})`;
 }
+export async function nativeAppInfo(): Promise<{ id: string; build: string; version: string }> { return App.getInfo(); }
 
 export async function installNativeLifecycle(): Promise<void> {
   if (!Capacitor.isNativePlatform()) return;
@@ -147,26 +152,43 @@ export async function scanPairingQr(): Promise<string | null> {
   }
 }
 
-export async function installApkUpdate(url: string, token: string): Promise<void> {
+export async function prepareApkUpdate(update: MobileApkUpdate, token: string, install: boolean, existingUri?: string,
+  onPhase?: (phase: ApkUpdatePhase, uri?: string) => void): Promise<string> {
   if (!isAndroidPlatform()) throw new Error("APK 更新仅支持 Android App。");
-  const task = startMobileDownload("bridge-update.apk", "installer");
+  const task = startMobileDownload("bridge-update.apk", install ? "installer" : "downloads");
   const parent = "bridge-downloads/" + Date.now() + "-" + crypto.randomUUID();
   const path = parent + "/bridge-update.apk";
-  let handedOff = false;
+  let verified = false;
+  let uri = existingUri;
   try {
-    await cleanDownloadCache().catch(() => {});
-    await Filesystem.mkdir({ path: parent, directory: Directory.Cache, recursive: true });
-    const { uri } = await Filesystem.getUri({ path, directory: Directory.Cache });
-    await transferWithProgress(url, uri, token, task);
-    updateMobileDownload(task, { state: "saving", message: "正在打开 Android 安装器" });
-    await Updater.install({ uri });
-    handedOff = true;
-    updateMobileDownload(task, { state: "done", message: "更新包已下载，已打开 Android 安装器；请按系统提示完成安装。" });
+    if (!uri) {
+      onPhase?.("downloading");
+      await cleanDownloadCache().catch(() => {});
+      await Filesystem.mkdir({ path: parent, directory: Directory.Cache, recursive: true });
+      uri = (await Filesystem.getUri({ path, directory: Directory.Cache })).uri;
+      await transferWithProgress(update.downloadUrl, uri, token, task);
+    }
+    updateMobileDownload(task, { state: "saving", message: "正在校验更新包" });
+    const options: ApkVerification = { uri, sha256: update.sha256, size: update.size, packageName: update.packageName,
+      versionCode: update.versionCode, versionName: update.versionName };
+    await Updater.verifyApk(options);
+    verified = true;
+    onPhase?.("downloaded", uri);
+    if (install) {
+      await Updater.install(options);
+      onPhase?.("installer-opened", uri);
+      updateMobileDownload(task, { state: "done", message: "已校验并打开 Android 安装器；请按系统提示完成安装。" });
+    } else {
+      const saved = await Updater.saveApk(options);
+      updateMobileDownload(task, { state: "done", savedName: saved.fileName, message: "更新包已校验并保存到 Downloads，可手动安装。" });
+    }
+    return uri;
   } catch (cause) {
+    onPhase?.("error", verified ? uri : undefined);
     failMobileDownload(task, cause);
     throw cause;
   } finally {
-    if (!handedOff) await Filesystem.rmdir({ path: parent, directory: Directory.Cache, recursive: true }).catch(() => {});
+    if (!verified && !existingUri) await Filesystem.rmdir({ path: parent, directory: Directory.Cache, recursive: true }).catch(() => {});
   }
 }
 

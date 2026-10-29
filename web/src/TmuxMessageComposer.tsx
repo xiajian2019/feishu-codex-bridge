@@ -9,7 +9,8 @@ import {
   type ChatModelAdapter,
   type ThreadUserMessage,
 } from "@assistant-ui/react";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
+import { createPortal } from "react-dom";
 
 import {
   beginDebugLogCapture,
@@ -138,6 +139,7 @@ type TmuxMessageComposerProps = {
   onSessionFileForwardConsumed: (requestId: string) => void;
   diagnosticSessionActive: boolean;
   disabled: boolean;
+  sendDisabled: boolean;
   sending: boolean;
   placeholder: string;
   onSubmit: (text: string) => Promise<ComposerSubmissionResult>;
@@ -251,7 +253,31 @@ function ImagePreview({ file, onOpen }: { file: File; onOpen: (file: File) => vo
 
 function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): ReactElement {
   const previewUrl = useFileObjectUrl(file);
-  return (
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    const previousFocus = document.activeElement;
+    closeButtonRef.current?.focus({ preventScroll: true });
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onCloseRef.current();
+      } else if (event.key === "Tab") {
+        event.preventDefault();
+        closeButtonRef.current?.focus({ preventScroll: true });
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus({ preventScroll: true });
+    };
+  }, []);
+
+  return createPortal(
     <div
       className="dashboard-image-lightbox"
       role="dialog"
@@ -261,8 +287,10 @@ function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): 
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      <button className="dashboard-image-lightbox-close" type="button" aria-label="关闭图片预览" onClick={onClose}>×</button>
-      <div className="dashboard-image-lightbox-content">
+      <button ref={closeButtonRef} className="dashboard-image-lightbox-close" type="button" aria-label="关闭图片预览" onClick={onClose}>×</button>
+      <div className="dashboard-image-lightbox-content" onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}>
         {previewUrl ? (
           <img
             src={previewUrl}
@@ -272,7 +300,8 @@ function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): 
           />
         ) : <span>图片加载中…</span>}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -295,7 +324,7 @@ type ComposerFieldsProps = TmuxMessageComposerProps & {
   onSendStart: () => void;
 };
 
-function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending, placeholder, preparing, attachmentProgress, onSendStart, onSubmit, onSubmitCommand, onAttachmentError, onOpenFiles, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
+function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sendDisabled, sending, placeholder, preparing, attachmentProgress, onSendStart, onSubmit, onSubmitCommand, onAttachmentError, onOpenFiles, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
   const aui = useAui();
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [shortcutCategory, setShortcutCategory] = useState<ShortcutCategory>("favorites");
@@ -313,7 +342,8 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
   const skillsSearchTimerRef = useRef<number | null>(null);
   const [debugLogActive, setDebugLogActive] = useState(() => isDebugLogCaptureActive());
   const [debugLogBusy, setDebugLogBusy] = useState(false);
-  const controlsDisabled = disabled || sending || preparing || debugLogBusy;
+  const inputDisabled = disabled || sending || preparing || debugLogBusy;
+  const controlsDisabled = disabled || sendDisabled || sending || preparing || debugLogBusy;
   const debugLogControlsDisabled = sending || preparing || debugLogBusy || (disabled && !debugLogActive);
   const composerFormRef = useRef<HTMLFormElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -787,7 +817,11 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
   const renderComposerAction = (shortcut: ShortcutDefinition): ReactElement | null => {
     const track = (): void => { void handleShortcutUse(shortcut.id); };
     const terminalAction = (value: string): ReactElement => (
-      <button key={shortcut.id} className="dashboard-keybar-button is-icon" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.detail || shortcut.title} disabled={controlsDisabled} onClick={() => { track(); void onTerminalShortcut(value as TerminalShortcut); }}>{shortcut.title}</button>
+      <button key={shortcut.id} className={`dashboard-keybar-button is-icon${shortcut.actionKey === "terminal-enter" ? " is-enter" : ""}`} type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.detail || shortcut.title} disabled={controlsDisabled} onClick={() => { track(); void onTerminalShortcut(value as TerminalShortcut); }}>
+        {shortcut.actionKey === "terminal-enter"
+          ? <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 4v7a4 4 0 0 1-4 4H4m5-5-5 5 5 5" /></svg>
+          : shortcut.title}
+      </button>
     );
     switch (shortcut.actionKey) {
       case "attachment":
@@ -854,7 +888,11 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
       <ComposerPrimitive.Root
         className="dashboard-composer"
         ref={composerFormRef}
-        onSubmit={() => {
+        onSubmit={(event: FormEvent<HTMLFormElement>) => {
+          if (controlsDisabled) {
+            event.preventDefault();
+            return;
+          }
           setSkillsPickerOpen(false);
           skillTriggerRangeRef.current = null;
           if (aui.composer.getState().isEmpty) return;
@@ -899,8 +937,8 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
             maxLength={8_000}
             minRows={2}
             maxRows={6}
-            disabled={controlsDisabled}
-            submitMode="enter"
+            disabled={inputDisabled}
+            submitMode={sendDisabled ? "none" : "enter"}
             unstable_insertNewlineOnTouchEnter
             unstable_focusOnRunStart={false}
             unstable_focusOnScrollToBottom={false}
@@ -1033,7 +1071,8 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
             className="dashboard-compose-send"
             type="button"
             disabled={controlsDisabled}
-            aria-label={sending || preparing ? "正在发送" : "发送消息"}
+            aria-label={sendDisabled ? "等待连接恢复后发送" : sending || preparing ? "正在发送" : "发送消息"}
+            title={sendDisabled ? "连接不可用，恢复后可发送" : undefined}
           ><span className="dashboard-send-label">{sending || preparing ? "发送中…" : "发送"}</span><span aria-hidden="true">↑</span></ComposerPrimitive.Send>
         </div>
       </ComposerPrimitive.Root>

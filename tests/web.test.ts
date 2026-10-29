@@ -370,8 +370,10 @@ describe("DashboardServer", () => {
         workspaceBranch: null,
         workspaceStatus: null,
         endedAt: null,
+        suspendedAt: null,
         openCount: 0,
         lastOpenedAt: null,
+        snapshot: null,
       })),
     });
     expect(codexHomeDiscoveries).toBe(0);
@@ -396,8 +398,10 @@ describe("DashboardServer", () => {
         workspaceBranch: null,
         workspaceStatus: null,
         endedAt: null,
+        suspendedAt: null,
         openCount: 0,
         lastOpenedAt: null,
+        snapshot: null,
       })),
       codexHomes: expect.any(Array),
     });

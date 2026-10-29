@@ -5,20 +5,14 @@ import { assertBridgeApiSupported, bridgeFeatureUnavailable, parseBridgeCapabili
 import { setLocalDraftScope } from "./local-draft-scope.js";
 import { clearLocalDraftsAfterDeviceRevocation } from "./local-draft-cleanup.js";
 import type { AuthStatus } from "./pairing-diagnostics.js";
+import { parseApkUpdate, type MobileApkUpdate, type ApkUpdatePhase } from "./mobile-apk-update.js";
+export type { MobileApkUpdate } from "./mobile-apk-update.js";
 
 export const MOBILE_RESUME_EVENT = "bridge:mobile-resume";
 export const MOBILE_CONNECTION_EVENT = "bridge:mobile-connection";
 export const MOBILE_SETTINGS_EVENT = "bridge:mobile-settings";
 export const MOBILE_SHAKE_EVENT = "bridge:mobile-shake";
 export const MOBILE_BACK_EVENT = "bridge:mobile-back";
-export interface MobileApkUpdate {
-  available: true;
-  revision: string;
-  size: number;
-  sha256: string;
-  modifiedAt: string;
-  downloadUrl: string;
-}
 const SERVER_KEY = "bridge.mobile.server";
 let connection: MobileConnection | null = null;
 let originalFetch: typeof fetch | null = null;
@@ -29,6 +23,7 @@ const connectionSwitch = createMobileConnectionSwitch();
 export function isMobileApp(): boolean { return import.meta.env.VITE_BRIDGE_MOBILE === "true"; }
 export function getMobileConnection(): MobileConnection | null { return connection; }
 export async function getMobileAppVersion(): Promise<string> { return (await import("./mobile-native.js")).nativeAppVersion(); }
+export async function getMobileAppBuild(): Promise<number> { return Number((await (await import("./mobile-native.js")).nativeAppInfo()).build); }
 export function getBridgeOrigin(): string { return isMobileApp() && connection ? connection.server : window.location.origin; }
 
 export function bridgeUrl(path: string): string {
@@ -226,6 +221,24 @@ export async function openBridgeExternal(value: string): Promise<void> {
   await native.openExternal(url.toString());
 }
 
+export async function openMobileDemo(id: string, path: string): Promise<void> {
+  const selected = connection;
+  if (!selected?.token) throw new Error("请先配对 Bridge。");
+  const session = await fetch("/api/session", { signal: AbortSignal.timeout(10_000), cache: "no-store" });
+  const { actionToken } = await readBridgeJson<{ actionToken: string }>(session);
+  const response = await fetch(`/api/local-demos/${encodeURIComponent(id)}/browser-ticket`, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": actionToken },
+    body: JSON.stringify({ path }), signal: AbortSignal.timeout(10_000),
+  });
+  const result = await readBridgeJson<{ url?: string; error?: string }>(response);
+  if (!response.ok || !result.url) throw new Error(result.error || "Demo 浏览器授权失败，请升级后端后重试。");
+  const url = new URL(result.url, selected.server);
+  if (url.origin !== selected.server || url.pathname !== `/api/local-demos/${id}/browser-open` || url.username || url.password || url.hash
+    || !/^[A-Za-z0-9_-]{43}$/.test(url.searchParams.get("ticket") ?? "")) throw new Error("Demo 打开地址无效。");
+  if (selected !== connection) throw new Error("当前环境已变化，请重新打开 Demo。");
+  await openBridgeExternal(url.href);
+}
+
 export async function copyMobileText(value: string): Promise<void> {
   const native = await import("./mobile-native.js");
   await native.copyText(value);
@@ -245,30 +258,32 @@ export async function supportsMobileApkUpdates(): Promise<boolean> {
 export async function checkMobileApkUpdate(): Promise<MobileApkUpdate | null> {
   if (!(await supportsMobileApkUpdates())) return null;
   if (bridgeFeatureUnavailable("mobile-apk-update")) return null;
+  const selected = connection;
   const response = await fetch("/api/mobile/update", { cache: "no-store", signal: AbortSignal.timeout(15_000) });
   if (response.status === 404 || response.status === 501) return null;
-  const result = await readBridgeJson<Partial<MobileApkUpdate> & { available?: boolean; error?: string }>(response);
+  const result = await readBridgeJson<{ available?: boolean; error?: string }>(response);
   if (!response.ok) throw new Error(result.error || `更新检查失败（${response.status}）。`);
-  if (result.available !== true || typeof result.revision !== "string" || typeof result.downloadUrl !== "string") return null;
-  return result as MobileApkUpdate;
+  if (result.available !== true) return null;
+  if (selected !== connection || !selected) throw new Error("环境已变化，请重新检查更新。");
+  return parseApkUpdate(result, selected.server);
 }
 
-export async function installMobileApkUpdate(update: MobileApkUpdate): Promise<void> {
+async function transferMobileApk(update: MobileApkUpdate, install: boolean, uri?: string, onPhase?: (phase: ApkUpdatePhase, uri?: string) => void): Promise<string> {
   const current = getMobileConnection();
   if (!current?.token) throw new Error("请先配对 Bridge。");
+  if (update.server !== current.server) throw new Error("更新包属于其他环境，请重新检查更新。");
+  const validated = parseApkUpdate(update, current.server);
   const native = await import("./mobile-native.js");
-  await native.installApkUpdate(new URL(update.downloadUrl, current.server).toString(), current.token);
+  if (current !== connection) throw new Error("环境已变化，请重新检查更新。");
+  const release = connectionSwitch.beforeRequest("POST");
+  try { return await native.prepareApkUpdate(validated, current.token, install, uri, onPhase); }
+  finally { release(); }
 }
-
-export async function downloadMobileApkUpdate(update: MobileApkUpdate): Promise<void> {
-  const current = getMobileConnection();
-  if (!current?.token) throw new Error("请先配对 Bridge。");
-  const url = new URL(update.downloadUrl, current.server);
-  if (url.origin !== current.server || url.pathname !== "/api/mobile/update/download") {
-    throw new Error("更新文件地址无效。");
-  }
-  const native = await import("./mobile-native.js");
-  await native.downloadBridgeFile(url.toString(), "bridge-update.apk", current.token);
+export function installMobileApkUpdate(update: MobileApkUpdate, uri?: string, onPhase?: (phase: ApkUpdatePhase, uri?: string) => void): Promise<string> {
+  return transferMobileApk(update, true, uri, onPhase);
+}
+export function downloadMobileApkUpdate(update: MobileApkUpdate, uri?: string, onPhase?: (phase: ApkUpdatePhase, uri?: string) => void): Promise<string> {
+  return transferMobileApk(update, false, uri, onPhase);
 }
 
 export async function shareMobileBlob(blob: Blob, fileName: string): Promise<void> {
