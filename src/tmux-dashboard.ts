@@ -1,13 +1,16 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
 import { getBunRuntime } from "./bun-runtime.js";
 import type { ForegroundCodexIdentity } from "./tmux-review.js";
 
-const SESSION_FORMAT = "#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_path}\t#{session_created}";
+// session_path is the directory recorded when a Session is created. The active
+// pane path follows a codex-worktree handoff (and ordinary `cd` commands), which
+// is the directory the Dashboard must use for files and Git changes.
+const SESSION_FORMAT = "#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}\t#{pane_current_path}\t#{session_created}";
 
 export interface TmuxSession {
   id: string;
@@ -239,17 +242,39 @@ export async function createSession(name: string, requestedCwd?: string): Promis
     throw new ValidationError("Session names must start with a letter or number and use only letters, numbers, dot, dash, or underscore.");
   }
 
-  const expandedCwd = requestedCwd?.trim().replace(/^~(?=\/|$)/, homedir());
-  const cwd = resolve(expandedCwd || homedir());
-  const cwdStat = await stat(cwd).catch(() => null);
-  if (!cwdStat?.isDirectory()) {
-    throw new ValidationError("The working directory does not exist or is not a directory.");
-  }
-
+  const cwd = await resolveWorkingDirectory(requestedCwd);
   await runTmux(["new-session", "-d", "-s", name, "-c", cwd]);
   const createdSession = (await listSessions()).find((session) => session.name === name);
   if (!createdSession) throw new Error("tmux created the session, but it was not returned by list-sessions.");
   return createdSession;
+}
+
+export async function resolveWorkingDirectory(requestedCwd?: string): Promise<string> {
+  const expandedCwd = requestedCwd?.trim().replace(/^~(?=\/|$)/, homedir());
+  const requestedDirectory = resolve(expandedCwd || homedir());
+  const cwd = await realpath(requestedDirectory).catch(() => null);
+  if (!cwd) {
+    throw new ValidationError("The working directory does not exist or is not a directory.");
+  }
+  const cwdStat = await stat(cwd).catch(() => null);
+  if (!cwdStat?.isDirectory()) {
+    throw new ValidationError("The working directory does not exist or is not a directory.");
+  }
+  return cwd;
+}
+
+export async function updateSession(id: string, name: string, requestedCwd: string): Promise<TmuxSession> {
+  if (!isSessionId(id)) throw new ValidationError("Invalid tmux session id.");
+  if (!isValidSessionName(name)) {
+    throw new ValidationError("Session names must start with a letter or number and use only letters, numbers, dot, dash, or underscore.");
+  }
+  await resolveWorkingDirectory(requestedCwd);
+  const session = await findSession(id);
+  if (!session) throw new SessionNotFoundError("Session no longer exists.");
+  if (session.name !== name) await runTmux(["rename-session", "-t", id, name]);
+  const updated = await findSession(id);
+  if (!updated) throw new SessionNotFoundError("Session no longer exists.");
+  return updated;
 }
 
 export async function killSession(id: string): Promise<void> {
@@ -268,7 +293,9 @@ export async function findSession(id: string): Promise<TmuxSession | undefined> 
 export async function getCurrentPanePath(id: string, knownSession?: TmuxSession): Promise<string> {
   if (!isSessionId(id)) throw new ValidationError("Invalid tmux session id.");
   if (!knownSession && !(await findSession(id))) throw new SessionNotFoundError("Session no longer exists.");
-  const cwd = resolve(await runTmux(["display-message", "-p", "-t", id, "#{pane_current_path}"]));
+  const requestedDirectory = resolve(await runTmux(["display-message", "-p", "-t", id, "#{pane_current_path}"]));
+  const cwd = await realpath(requestedDirectory).catch(() => null);
+  if (!cwd) throw new ValidationError("The tmux pane working directory is unavailable.");
   const cwdStat = await stat(cwd).catch(() => null);
   if (!cwdStat?.isDirectory()) throw new ValidationError("The tmux pane working directory is unavailable.");
   return cwd;
@@ -287,10 +314,12 @@ export async function inspectReviewPane(id: string, knownSession?: TmuxSession):
   ]);
   const [paneId, panePidValue, paneTty, currentCommand, ...cwdParts] = details.split("\t");
   const panePid = Number(panePidValue);
-  const cwd = resolve(cwdParts.join("\t"));
+  const requestedDirectory = resolve(cwdParts.join("\t"));
   if (!paneId || !/^%\d+$/.test(paneId) || !Number.isSafeInteger(panePid) || panePid < 1 || !paneTty || !cwdParts.length) {
     throw new ValidationError("The active tmux pane is unavailable.");
   }
+  const cwd = await realpath(requestedDirectory).catch(() => null);
+  if (!cwd) throw new ValidationError("The tmux pane working directory is unavailable.");
   const cwdStat = await stat(cwd).catch(() => null);
   if (!cwdStat?.isDirectory()) throw new ValidationError("The tmux pane working directory is unavailable.");
 

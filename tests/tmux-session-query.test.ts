@@ -1,6 +1,8 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import { readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Readable } from "node:stream";
 import { StateDatabase } from "../src/db.js";
 import { TmuxDashboardApi } from "../src/tmux-dashboard-api.js";
@@ -33,6 +35,8 @@ describe("bounded tmux Session enumeration", () => {
       await expect(listSessions({ timeoutMs: 15 })).rejects.toThrow("Session 列表查询超时");
       expect(commands).toHaveLength(1);
       expect(commands[0]!.slice(0, 2)).toEqual(["tmux", "list-sessions"]);
+      expect(commands[0]!.at(-1)).toContain("#{pane_current_path}");
+      expect(commands[0]!.at(-1)).not.toContain("#{session_path}");
       expect(signals).toEqual(["SIGKILL"]);
     } finally { spawn.mockRestore(); }
   });
@@ -147,11 +151,15 @@ describe("bounded tmux Session enumeration", () => {
       expect(response.statusCode).toBe(201);
       expect(JSON.parse(response.body).initialTask).toEqual({ status: "submitted" });
       expect(enteredPane).toBe("%9");
-      expect(pastedCommand).toContain("'/fixture/bin/codex-worktree' --task-file '");
+      expect(pastedCommand).toContain("__bridge_codex_worktree_task() {");
+      expect(pastedCommand).toContain("CODEX_WORKTREE_DELETE_TASK_FILE_AFTER_RUN=1");
+      expect(pastedCommand).toContain("'/fixture/bin/codex-worktree' --help");
+      expect(pastedCommand).toContain("${__bridge_codex_worktree_handoff:+--tmux-handoff} --task-file '");
       const taskFile = pastedCommand.match(/--task-file '([^']+)'/)?.[1];
       expect(taskFile).toBeTruthy();
       expect(readFileSync(taskFile!, "utf8")).toBe("修复 session 创建后的初始任务\n并保留 shell quote: 'quoted'");
       expect(pastedCommand).toContain("rm -f '");
+      expect(pastedCommand).not.toContain('exit "$status"');
     } finally {
       const taskFile = pastedCommand.match(/--task-file '([^']+)'/)?.[1];
       if (taskFile) rmSync(taskFile, { force: true });
@@ -159,4 +167,94 @@ describe("bounded tmux Session enumeration", () => {
       db.close();
     }
   });
+
+  it("updates a Session name and logical directory without changing the pane", async () => {
+    const root = mkdtempSync(join(tmpdir(), "bridge-session-edit-"));
+    const workingDirectory = join(root, "worktree");
+    mkdirSync(workingDirectory);
+    const db = new StateDatabase(":memory:");
+    db.createProject({ name: "fixture", path: "/tmp" });
+    let session = { id: "$12", name: "before", cwd: "/tmp", createdAt: 12, windows: 1, attachedClients: 0 };
+    db.recordTmuxSession(session, { projectKey: "fixture" });
+    const updates: Array<{ id: string; name: string; cwd: string }> = [];
+    const api = new TmuxDashboardApi({
+      db,
+      operations: {
+        listSessions: async () => [session],
+        findSession: async (id) => id === session.id ? session : undefined,
+        createSession: async () => session,
+        killSession: async () => {},
+        getCurrentPanePath: async () => session.cwd,
+        updateSession: async (id, name, cwd) => {
+          updates.push({ id, name, cwd });
+          session = { ...session, name };
+          return session;
+        },
+      },
+    });
+    const request = Readable.from([JSON.stringify({ name: "after", workingDirectory })]) as IncomingMessage;
+    request.method = "PATCH";
+    request.url = "/tmux-dashboard/api/sessions/%2412";
+    request.headers = { "content-type": "application/json" };
+    const response = responseFixture();
+    try {
+      await api.handleRequest(request, response as unknown as ServerResponse);
+      expect(response.statusCode).toBe(200);
+      const canonicalWorkingDirectory = realpathSync(workingDirectory);
+      expect(JSON.parse(response.body).session).toMatchObject({ id: "$12", name: "after", cwd: canonicalWorkingDirectory });
+      expect(updates).toEqual([{ id: "$12", name: "after", cwd: canonicalWorkingDirectory }]);
+      expect(db.getLatestTmuxSession("$12")).toMatchObject({
+        session_name: "after",
+        working_directory: canonicalWorkingDirectory,
+        working_directory_override: canonicalWorkingDirectory,
+        project_key: null,
+      });
+      expect(session.cwd).toBe("/tmp");
+      const listResponse = responseFixture();
+      await api.handleRequest({ method: "GET", url: "/tmux-dashboard/api/sessions?includeHomes=0" } as IncomingMessage,
+        listResponse as unknown as ServerResponse);
+      expect(JSON.parse(listResponse.body).sessions[0].cwd).toBe(canonicalWorkingDirectory);
+    } finally {
+      await api.stop();
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  for (const staleState of ["recreated", "ended", "suspended"] as const) {
+    it(`ignores a ${staleState} Session's directory override on direct file access`, async () => {
+      const root = mkdtempSync(join(tmpdir(), "bridge-stale-session-directory-"));
+      const oldDirectory = join(root, "old");
+      const currentDirectory = join(root, "current");
+      mkdirSync(oldDirectory);
+      mkdirSync(currentDirectory);
+      writeFileSync(join(oldDirectory, "old.txt"), "old session");
+      writeFileSync(join(currentDirectory, "current.txt"), "current session");
+      const db = new StateDatabase(":memory:");
+      const previous = { id: "$17", name: "previous", cwd: currentDirectory, createdAt: 1, windows: 1, attachedClients: 0 };
+      const record = db.recordTmuxSession(previous);
+      db.setTmuxSessionWorkingDirectory(record.record_id, currentDirectory, oldDirectory);
+      if (staleState === "ended") db.markTmuxSessionEnded(previous.id);
+      if (staleState === "suspended") db.markTmuxSessionSuspended(previous.id);
+      const live = { ...previous, createdAt: staleState === "recreated" ? 2 : 1 };
+      const api = new TmuxDashboardApi({ db, operations: {
+        listSessions: async () => [live], findSession: async () => live,
+        createSession: async () => live, killSession: async () => {},
+        getCurrentPanePath: async () => currentDirectory,
+      } });
+      try {
+        const response = responseFixture();
+        await api.handleRequest({ method: "GET", url: "/tmux-dashboard/api/sessions/%2417/files" } as IncomingMessage,
+          response as unknown as ServerResponse);
+        expect(response.statusCode).toBe(200);
+        const result = JSON.parse(response.body);
+        expect(result.root).toBe(realpathSync(currentDirectory));
+        expect(result.entries.map((entry: { name: string }) => entry.name)).toEqual(["current.txt"]);
+      } finally {
+        await api.stop();
+        db.close();
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
 });
