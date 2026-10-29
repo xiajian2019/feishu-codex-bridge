@@ -144,6 +144,8 @@ function rememberSeenNotification(id: string): void {
   }
 }
 
+import { startForegroundPolling } from "./foreground-polling.js";
+
 export function WorkbenchNotifications(): null {
   const navigate = useNavigate();
   const { pathname } = useLocation();
@@ -152,9 +154,7 @@ export function WorkbenchNotifications(): null {
     if (isTmuxPage) return;
     const goToNotification = (route: string): void => { void navigate(route); };
     navigateToNotification = goToNotification;
-    void refreshWorkbenchInbox();
-    const timer = window.setInterval(() => void refreshWorkbenchInbox({ quiet: true }), 30_000);
-    const handleOnline = (): void => { void refreshWorkbenchInbox(); };
+    const stopPolling = startForegroundPolling(async () => { await refreshWorkbenchInbox({ quiet: true }); }, 30_000);
     const handleOffline = (): void => {
       publishWorkbenchSnapshot({
         ...workbenchSnapshot,
@@ -163,17 +163,10 @@ export function WorkbenchNotifications(): null {
         inbox: { ...workbenchSnapshot.inbox, connection: { ...workbenchSnapshot.inbox.connection, state: "disconnected" } },
       });
     };
-    const handleVisibility = (): void => {
-      if (document.visibilityState === "visible") void refreshWorkbenchInbox({ quiet: true });
-    };
-    window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
-    document.addEventListener("visibilitychange", handleVisibility);
     return () => {
-      window.clearInterval(timer);
-      window.removeEventListener("online", handleOnline);
+      stopPolling();
       window.removeEventListener("offline", handleOffline);
-      document.removeEventListener("visibilitychange", handleVisibility);
       if (navigateToNotification === goToNotification) navigateToNotification = null;
     };
   }, [isTmuxPage, navigate]);

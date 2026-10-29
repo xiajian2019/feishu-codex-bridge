@@ -13,6 +13,7 @@ import { getBridgeCapabilities } from "./client-capabilities.js";
 import { getLocalDraftScope } from "./local-draft-scope.js";
 import { apkUpdateStorageKey, readApkUpdateState, shouldOfferApkUpdate, type ApkUpdateState, type ApkUpdatePhase } from "./mobile-apk-update.js";
 import "./mobile-app.css";
+import { useMobileBack } from "./use-mobile-back.js";
 
 type ConnectionState = "loading" | "setup" | "ready" | "unavailable";
 
@@ -41,6 +42,8 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
   const [environmentBusy, setEnvironmentBusy] = useState<string | null>(null);
   const [environmentMessage, setEnvironmentMessage] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState("读取中…");
+  useMobileBack(environmentDialogOpen, () => { if (!environmentBusy) setEnvironmentDialogOpen(false); }, 220);
+  useMobileBack(editing, () => { if (!busy) { setEditing(false); setError(null); } }, 50);
 
   const saveApkState = (update: MobileApkUpdate, state: ApkUpdateState): void => {
     apkStateRef.current = state;

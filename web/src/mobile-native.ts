@@ -6,13 +6,14 @@ import { Directory, Filesystem } from "@capacitor/filesystem";
 import { FileTransfer } from "@capacitor/file-transfer";
 import { Share } from "@capacitor/share";
 import { Clipboard } from "@capacitor/clipboard";
-import { CapacitorBarcodeScanner } from "@capacitor/barcode-scanner";
 import { MOBILE_BACK_EVENT, MOBILE_RESUME_EVENT, MOBILE_SHAKE_EVENT } from "./mobile-runtime.js";
 import { createShakeDetector } from "./mobile-shake.js";
 import type { MobileApkUpdate, ApkUpdatePhase } from "./mobile-apk-update.js";
+import { setAppForeground } from "./foreground-polling.js";
+import { MOBILE_SHAKE_PREFERENCE_EVENT, readMobileShakeEnabled, writeMobileShakeEnabled } from "./app-settings.js";
 import {
   failMobileDownload, hasAndroidMobileDownloads, refreshAndroidMobileDownloads, startMobileDownload,
-  trackAndroidMobileDownload, updateMobileDownload, type NativeDownloadStatus,
+  trackAndroidMobileDownload, updateMobileDownload, subscribeMobileDownloads, getMobileDownloads, cancelAndroidMobileDownload, type NativeDownloadStatus,
 } from "./mobile-download-manager.js";
 
 interface TransferProgress {
@@ -34,6 +35,8 @@ interface UpdaterPlugin {
   install(options: ApkVerification): Promise<void>;
   getDownloads(options: { ids: number[] }): Promise<{ downloads: NativeDownloadStatus[] }>;
   openDownloads(): Promise<void>;
+  cancelDownload(options: { id: number }): Promise<{ cancelled: boolean }>;
+  openDownloadedFile(options: { id: number }): Promise<void>;
   download(options: { url: string; token: string; fileName: string; mimeType?: string; userAgent: string }): Promise<{ id: number; fileName: string }>;
   save(options: { data: string; fileName: string; mimeType?: string }): Promise<{ fileName: string; size: number }>;
 }
@@ -74,6 +77,7 @@ export async function installNativeLifecycle(): Promise<void> {
     const handles: PluginListenerHandle[] = [];
     try {
       handles.push(await App.addListener("appStateChange", ({ isActive }) => {
+        setAppForeground(isActive);
         shakeActive = isActive;
         shakeDetector.reset();
         if (isActive) window.dispatchEvent(new Event(MOBILE_RESUME_EVENT));
@@ -89,6 +93,9 @@ export async function installNativeLifecycle(): Promise<void> {
       throw error;
     }
     installShakeDetector();
+    subscribeMobileDownloads(() => {
+      if (isAndroidPlatform() && hasAndroidMobileDownloads() && !downloadPolling && downloadTimer === null) watchAndroidDownloads();
+    });
     void cleanDownloadCache().catch(() => {});
   })();
   return lifecycle;
@@ -99,8 +106,9 @@ const shakeDetector = createShakeDetector();
 
 function installShakeDetector(): void {
   if (shakeCleanup || typeof window === "undefined" || !("DeviceMotionEvent" in window)) return;
+  let motionEnabled = readMobileShakeEnabled();
   const onMotion = (event: DeviceMotionEvent): void => {
-    if (!shakeActive || document.visibilityState === "hidden") {
+    if (!motionEnabled || !shakeActive || document.visibilityState === "hidden") {
       shakeDetector.reset();
       return;
     }
@@ -114,12 +122,14 @@ function installShakeDetector(): void {
       window.dispatchEvent(new Event(MOBILE_SHAKE_EVENT));
     }
   };
-  const resetMotion = (): void => shakeDetector.reset();
+  const resetMotion = (): void => { motionEnabled = readMobileShakeEnabled(); shakeDetector.reset(); };
   window.addEventListener("devicemotion", onMotion, { passive: true });
   document.addEventListener("visibilitychange", resetMotion);
+  window.addEventListener(MOBILE_SHAKE_PREFERENCE_EVENT, resetMotion);
   shakeCleanup = () => {
     window.removeEventListener("devicemotion", onMotion);
     document.removeEventListener("visibilitychange", resetMotion);
+    window.removeEventListener(MOBILE_SHAKE_PREFERENCE_EVENT, resetMotion);
   };
 }
 
@@ -128,28 +138,13 @@ export async function copyText(value: string): Promise<void> {
   else await navigator.clipboard.writeText(value);
 }
 
-export async function scanPairingQr(): Promise<string | null> {
-  if (!Capacitor.isNativePlatform()) throw new Error("扫码配对仅支持手机 App。");
-  try {
-    const result = await CapacitorBarcodeScanner.scanBarcode({
-      hint: 0,
-      scanInstructions: "扫描 Mac 上的 Bridge 配对二维码",
-      scanButton: false,
-      scanText: "扫码",
-      cameraDirection: 1,
-      scanOrientation: 3,
-      cancelButtonAccessibilityLabel: "取消扫码",
-      torchButtonOnAccessibilityLabel: "关闭闪光灯",
-      torchButtonOffAccessibilityLabel: "打开闪光灯",
-    });
-    const value = result.ScanResult?.trim();
-    return value || null;
-  } catch (cause) {
-    const error = cause as { code?: unknown; message?: unknown };
-    const marker = `${String(error.code ?? "")} ${String(error.message ?? cause)}`.toLowerCase();
-    if (marker.includes("cancel")) return null;
-    throw cause;
+export async function setShakeEnabled(enabled: boolean): Promise<void> {
+  if (enabled) {
+    const motion = (window as typeof window & { DeviceMotionEvent?: { requestPermission?: () => Promise<string> } }).DeviceMotionEvent;
+    if (!motion) throw new Error("此设备未提供摇一摇能力，可从系统管理手动切换环境。");
+    if (motion.requestPermission && await motion.requestPermission() !== "granted") throw new Error("未获得运动传感器权限，可从系统管理手动切换环境。");
   }
+  writeMobileShakeEnabled(enabled);
 }
 
 export async function prepareApkUpdate(update: MobileApkUpdate, token: string, install: boolean, existingUri?: string,
@@ -243,6 +238,19 @@ async function refreshSystemDownloads(): Promise<void> {
 export async function openMobileDownloads(): Promise<void> {
   if (!isAndroidPlatform()) throw new Error("系统下载目录仅支持 Android App。");
   await Updater.openDownloads();
+}
+
+export async function cancelMobileDownload(id: string): Promise<void> {
+  const task = getMobileDownloads().find((item) => item.id === id);
+  if (!task?.nativeId) throw new Error("此传输只能从原页面重试。");
+  const result = await Updater.cancelDownload({ id: task.nativeId });
+  if (result.cancelled) cancelAndroidMobileDownload(id);
+  else { await refreshSystemDownloads(); throw new Error("下载已完成，请打开文件或到系统下载查看。"); }
+}
+export async function openDownloadedFile(id: string): Promise<void> {
+  const task = getMobileDownloads().find((item) => item.id === id);
+  if (!task?.nativeId || task.state !== "done") throw new Error("请在系统下载中查看此文件。");
+  await Updater.openDownloadedFile({ id: task.nativeId });
 }
 
 export async function openExternal(url: string): Promise<void> {
@@ -354,6 +362,7 @@ export async function shareBlob(blob: Blob, suppliedName: string): Promise<void>
   const parent = "bridge-downloads/" + Date.now() + "-" + crypto.randomUUID();
   let written = false;
   try {
+    if (native && blob.size > 8 * 1024 * 1024) throw new Error("此导出超过 8 MiB，请使用文件页的流式下载，或减少诊断日志后重新导出。");
     updateMobileDownload(task, { state: "saving", totalBytes: blob.size, message: "正在保存文件" });
     if (!native) {
       const url = URL.createObjectURL(blob);

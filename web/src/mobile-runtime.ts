@@ -2,7 +2,9 @@ import { createMobileFetch, isBridgeApiPath, normalizeBridgeServer, parseMobileP
 import { createMobileConnectionSwitch } from "./mobile-connection-switch.js";
 import { readBridgeJson } from "./bridge-json.js";
 import { assertBridgeApiSupported, bridgeFeatureUnavailable, parseBridgeCapabilities, setBridgeCapabilities } from "./client-capabilities.js";
-import { setLocalDraftScope } from "./local-draft-scope.js";
+import { LOCAL_DRAFT_SCOPE_EVENT, scopedStorageKey, setLocalDraftScope } from "./local-draft-scope.js";
+import { clearMobileDownloadScope, restoreMobileDownloads } from "./mobile-download-manager.js";
+import { isAppForeground } from "./foreground-polling.js";
 import { clearLocalDraftsAfterDeviceRevocation } from "./local-draft-cleanup.js";
 import type { AuthStatus } from "./pairing-diagnostics.js";
 import { parseApkUpdate, type MobileApkUpdate, type ApkUpdatePhase } from "./mobile-apk-update.js";
@@ -17,6 +19,7 @@ const SERVER_KEY = "bridge.mobile.server";
 let connection: MobileConnection | null = null;
 let originalFetch: typeof fetch | null = null;
 let initialization: Promise<void> | null = null;
+let downloadTrackingInstalled = false;
 let credentialQueue = Promise.resolve();
 const connectionSwitch = createMobileConnectionSwitch();
 
@@ -56,6 +59,13 @@ export async function initializeMobileRuntime(): Promise<void> {
 }
 
 async function initialize(): Promise<void> {
+  if (!downloadTrackingInstalled) {
+    window.addEventListener(LOCAL_DRAFT_SCOPE_EVENT, () => {
+      try { restoreMobileDownloads(window.localStorage, scopedStorageKey("mobile-downloads")); }
+      catch { restoreMobileDownloads(null, null); }
+    });
+    downloadTrackingInstalled = true;
+  }
   originalFetch ??= window.fetch.bind(window);
   const native = await import("./mobile-native.js");
   let server: string | null = null;
@@ -77,6 +87,9 @@ async function initialize(): Promise<void> {
     fetch: originalFetch,
     beforeRequest: (method, path) => {
       assertBridgeApiSupported(path);
+      if (!["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase()) && !isAppForeground()) {
+        throw new DOMException("App 已进入后台，操作未继续提交；请回前台核对状态后手动重试。", "AbortError");
+      }
       return connectionSwitch.beforeRequest(method);
     },
     unauthorized: (failed) => {
@@ -98,6 +111,8 @@ export async function checkMobileConnection(): Promise<boolean> {
   if (status.authenticated) {
     setBridgeCapabilities(parseBridgeCapabilities(status.client));
     setLocalDraftScope(status.draftScope, selected.server);
+    try { restoreMobileDownloads(window.localStorage, scopedStorageKey("mobile-downloads")); }
+    catch { restoreMobileDownloads(null, null); }
   }
   if (!status.authenticated) await forgetMobileCredential();
   return status.authenticated;
@@ -163,6 +178,7 @@ function commitMobileConnection(next: MobileConnection): void {
 export async function forgetMobileCredential(): Promise<void> {
   const server = connection?.server;
   if (!server) return;
+  clearMobileDownloadScope();
   const cleanup = clearLocalDraftsAfterDeviceRevocation();
   setLocalDraftScope(null);
   setBridgeCapabilities(null);
@@ -244,9 +260,8 @@ export async function copyMobileText(value: string): Promise<void> {
   await native.copyText(value);
 }
 
-export async function scanMobilePairingQr(): Promise<string | null> {
-  const native = await import("./mobile-native.js");
-  return native.scanPairingQr();
+export async function setMobileShakeEnabled(enabled: boolean): Promise<void> {
+  await (await import("./mobile-native.js")).setShakeEnabled(enabled);
 }
 
 export async function supportsMobileApkUpdates(): Promise<boolean> {

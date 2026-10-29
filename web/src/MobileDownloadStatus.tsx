@@ -3,12 +3,13 @@ import {
   clearFinishedMobileDownloads, dismissMobileDownload, getMobileDownloads, isMobileDownloadActive,
   subscribeMobileDownloads, type MobileDownloadTask,
 } from "./mobile-download-manager.js";
-import { openMobileDownloads } from "./mobile-native.js";
+import { cancelMobileDownload, openDownloadedFile, openMobileDownloads } from "./mobile-native.js";
 import "./mobile-download-status.css";
+import { useMobileBack } from "./use-mobile-back.js";
 
 const stateLabels: Record<MobileDownloadTask["state"], string> = {
   preparing: "正在准备", queued: "等待下载", downloading: "正在下载", paused: "下载已暂停",
-  saving: "正在保存", sharing: "正在打开分享", done: "下载完成", error: "下载失败",
+  saving: "正在保存", sharing: "正在打开分享", done: "下载完成", error: "下载失败", cancelled: "已取消",
 };
 
 function stateLabel(task: MobileDownloadTask): string {
@@ -46,6 +47,8 @@ export default function MobileDownloadStatus(): ReactElement {
   const [announcement, setAnnouncement] = useState("");
   const [openError, setOpenError] = useState<string | null>(null);
   const [openingDownloads, setOpeningDownloads] = useState(false);
+  const [actionId, setActionId] = useState<string | null>(null);
+  useMobileBack(tasks.length > 0 && !collapsed, () => setCollapsed(true), 430);
   const previousTasks = useRef(new Map<string, MobileDownloadTask["state"]>());
 
   useEffect(() => {
@@ -70,6 +73,13 @@ export default function MobileDownloadStatus(): ReactElement {
     catch (cause) { setOpenError(cause instanceof Error ? cause.message : "无法打开系统下载，请从系统文件管理器查看。"); }
     finally { setOpeningDownloads(false); }
   }
+  async function fileAction(task: MobileDownloadTask, cancel = false): Promise<void> {
+    if (actionId) return;
+    setActionId(task.id); setOpenError(null);
+    try { if (cancel) await cancelMobileDownload(task.id); else await openDownloadedFile(task.id); }
+    catch (cause) { setOpenError(cause instanceof Error ? cause.message : "系统下载操作失败，请重试。"); }
+    finally { setActionId(null); }
+  }
 
   return <>
     <span className="mobile-download-announcement" role="status" aria-live="polite" aria-atomic="true">{announcement}</span>
@@ -91,12 +101,15 @@ export default function MobileDownloadStatus(): ReactElement {
             return <li key={task.id} className={`mobile-download-item is-${task.state}`}>
               <div className="mobile-download-item-heading">
                 <span className="mobile-download-name" title={task.fileName}>{task.fileName}</span>
+                {task.nativeId && active ? <button type="button" disabled={actionId !== null} onClick={() => void fileAction(task, true)}>取消</button> : null}
+                {task.nativeId && task.state === "done" ? <button type="button" disabled={actionId !== null} onClick={() => void fileAction(task)}>打开</button> : null}
                 {!active && <button type="button" className="mobile-download-dismiss" aria-label={`移除 ${task.fileName} 的下载记录`} onClick={() => dismissMobileDownload(task.id)}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg></button>}
               </div>
               <div className="mobile-download-metrics"><strong>{stateLabel(task)}</strong><span>{percent !== null ? `${percent}% · ` : ""}{bytes}</span></div>
               {active && <progress className="mobile-download-progress" max={100} value={percent ?? undefined} aria-label={`${task.fileName} 下载进度`} aria-valuetext={percent === null ? `${stateLabel(task)}，已下载 ${formatBytes(task.downloadedBytes)}，总大小未知` : `${percent}%，${bytes}`} />}
               {task.savedName && task.savedName !== task.fileName && <p className="mobile-download-saved-name">保存为：{task.savedName}</p>}
               {task.message && <p className="mobile-download-message">{task.message}</p>}
+              {task.state === "error" || task.state === "cancelled" ? <p className="mobile-download-message">需要重试时，请回到文件所在页面重新下载。</p> : null}
             </li>;
           })}
         </ul>

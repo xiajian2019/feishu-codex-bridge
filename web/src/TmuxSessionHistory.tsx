@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent, type ReactElement } from "react";
 import { Link, useSearchParams } from "react-router";
 import { getJson } from "./api.js";
 import { BridgeImage } from "./BridgeMedia.js";
+import { useMobileBack } from "./use-mobile-back.js";
 
 interface TmuxSessionInfo {
   session_name: string;
@@ -72,6 +73,7 @@ export function TmuxSessionHistory({ embedded = false, sessionIdOverride }: Tmux
   const [error, setError] = useState<string | null>(null);
   const [refresh, setRefresh] = useState(0);
   const [previewImage, setPreviewImage] = useState<TmuxSessionImageAttachment | null>(null);
+  useMobileBack(Boolean(previewImage), () => setPreviewImage(null), 950);
 
   useEffect(() => { setDraft(query); }, [query]);
   useEffect(() => {

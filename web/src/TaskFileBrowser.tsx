@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 
 import { getJson } from "./api.js";
 import { CodeTextViewer } from "./CodeTextViewer.js";
+import { useMobileBack } from "./use-mobile-back.js";
 import { BridgeImage } from "./BridgeMedia.js";
 import { downloadBridgeFile, getBridgeOrigin, isMobileApp, openBridgeExternal } from "./mobile-runtime.js";
 
@@ -160,6 +161,7 @@ export function TaskFileBrowser({ taskGuid, initialFilePath }: { taskGuid: strin
   const [refreshKey, setRefreshKey] = useState(0);
   const [filenameQuery, setFilenameQuery] = useState("");
   const [preview, setPreview] = useState<TaskFilePreview | null>(null);
+  useMobileBack(Boolean(preview), () => closePreview(), 100);
   const previewRequestRef = useRef(0);
   const previewAbortRef = useRef<AbortController | null>(null);
 

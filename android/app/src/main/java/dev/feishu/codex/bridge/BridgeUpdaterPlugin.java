@@ -221,6 +221,39 @@ public class BridgeUpdaterPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void cancelDownload(PluginCall call) {
+        Long id = call.getLong("id");
+        if (id == null || id <= 0) { call.reject("下载编号无效。"); return; }
+        DownloadManager manager = (DownloadManager) getContext().getSystemService(Context.DOWNLOAD_SERVICE);
+        if (manager == null) { call.reject("系统下载不可用。"); return; }
+        try (Cursor cursor = manager.query(new DownloadManager.Query().setFilterById(id))) {
+            if (cursor == null || !cursor.moveToFirst()) { call.reject("找不到此下载，请在系统下载中确认。"); return; }
+            boolean completed = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)) == DownloadManager.STATUS_SUCCESSFUL;
+            if (!completed) manager.remove(id);
+            JSObject result = new JSObject(); result.put("cancelled", !completed); call.resolve(result);
+        } catch (Exception error) { call.reject("无法取消此下载，请在系统下载中操作。"); }
+    }
+
+    @PluginMethod
+    public void openDownloadedFile(PluginCall call) {
+        Long id = call.getLong("id");
+        if (id == null || id <= 0) { call.reject("下载编号无效。"); return; }
+        DownloadManager manager = (DownloadManager) getContext().getSystemService(Context.DOWNLOAD_SERVICE);
+        if (manager == null) { call.reject("系统下载不可用。"); return; }
+        try {
+            Uri uri = manager.getUriForDownloadedFile(id);
+            if (uri == null) { call.reject("下载文件已移除或尚未完成，请重新下载。"); return; }
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            String mime = manager.getMimeTypeForDownloadedFile(id);
+            intent.setDataAndType(uri, mime == null ? "application/octet-stream" : mime);
+            intent.setClipData(ClipData.newRawUri("Bridge download", uri));
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            getActivity().startActivity(intent);
+            call.resolve();
+        } catch (Exception error) { call.reject("没有可打开此文件的应用，请在系统下载中查看或分享。"); }
+    }
+
+    @PluginMethod
     public void openDownloads(PluginCall call) {
         try {
             Intent intent = new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS);

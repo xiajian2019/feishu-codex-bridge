@@ -25,7 +25,7 @@ export const shareMobileBlob = appOnly;
 export const openBridgeExternal = appOnly;
 export const openMobileDemo = appOnly;
 export const copyMobileText = appOnly;
-export const scanMobilePairingQr = appOnly;
+export const setMobileShakeEnabled = appOnly;
 export const supportsMobileApkUpdates = async (): Promise<boolean> => false;
 export const checkMobileApkUpdate = async (): Promise<never> => appOnly();
 export const installMobileApkUpdate = async (): Promise<never> => appOnly();

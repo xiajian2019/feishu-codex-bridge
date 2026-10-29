@@ -9,6 +9,8 @@ import {
   useState,
 } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router";
+import { useMobileBack } from "./use-mobile-back.js";
+import { startForegroundPolling } from "./foreground-polling.js";
 
 import {
   createTask,
@@ -117,6 +119,7 @@ export function App(): ReactElement {
   }, [navigate, searchParams]);
   const [createOpen, setCreateOpen] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
+  useMobileBack(createOpen, () => closeCreateTask(), 100);
   const [createError, setCreateError] = useState<string | null>(null);
   const [newDescription, setNewDescription] = useState("");
   const [newAttachments, setNewAttachments] = useState<SelectedTaskAttachment[]>([]);
@@ -278,16 +281,12 @@ export function App(): ReactElement {
 
   useEffect(() => {
     if (streamStatus === "connected") return;
-    const timer = setInterval(() => {
-      void loadTasks(true);
-    }, 10_000);
-    return () => clearInterval(timer);
+    return startForegroundPolling(async () => { await loadTasks(true); }, 10_000);
   }, [loadTasks, streamStatus]);
 
   useEffect(() => {
     if (appliedFilters.source === "desk" || streamStatus !== "connected") return;
-    const timer = setInterval(() => void loadTasks(true), 10_000);
-    return () => clearInterval(timer);
+    return startForegroundPolling(async () => { await loadTasks(true); }, 10_000);
   }, [appliedFilters.source, loadTasks, streamStatus]);
 
   useEffect(() => {

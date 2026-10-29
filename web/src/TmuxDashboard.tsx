@@ -35,6 +35,7 @@ import {
   shouldRefreshSessionListOnVisibilityChange,
 } from "./tmux-session-refresh-policy.js";
 import { useTheme } from "./theme.js";
+import { useMobileBack } from "./use-mobile-back.js";
 
 const TmuxMessageComposer = lazy(() => import("./TmuxMessageComposer.js").then((module) => ({ default: module.TmuxMessageComposer })));
 const TmuxHistoryInspector = lazy(() => import("./TmuxSessionHistory.js").then((module) => ({ default: module.TmuxSessionHistory })));
@@ -391,6 +392,11 @@ export function TmuxDashboard(): ReactElement {
   const [sendingMessage, setSendingMessage] = useState(false);
   const [terminalSelection, setTerminalSelection] = useState<TerminalSelectionDisplay | null>(null);
   const [sessionInspector, setSessionInspector] = useState<SessionInspector | null>(null);
+  useMobileBack(createOpen, () => { if (!createBusy) setCreateOpen(false); }, 100);
+  useMobileBack(Boolean(sessionEditTargetId), () => { if (!sessionEditBusy) setSessionEditTargetId(null); }, 100);
+  useMobileBack(trackedTaskOpen, () => { if (!trackedTaskBusy) setTrackedTaskOpen(false); }, 100);
+  useMobileBack(Boolean(sessionInspector), () => setSessionInspector(null), 900);
+  useMobileBack(projectPickerOpen, () => setProjectPickerOpen(false), 110);
   const terminalHostRef = useRef<HTMLDivElement | null>(null);
   const projectPickerRef = useRef<HTMLDivElement | null>(null);
   const terminalInstanceRef = useRef<Terminal | null>(null);
@@ -864,6 +870,7 @@ export function TmuxDashboard(): ReactElement {
     setNavigationCollapsed(false);
     setMobileView("sessions");
   };
+  useMobileBack(isMobile && mobileView === "terminal", showSessionsOnMobile, 0, { escape: false, restoreFocus: false });
 
   const refreshSessionsList = useCallback(async (): Promise<void> => {
     if (sessionsRefreshing) return;

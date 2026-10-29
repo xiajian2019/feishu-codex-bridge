@@ -34,6 +34,8 @@ const removedDirectories: string[] = [];
 const verifications: Array<Record<string, unknown>> = [];
 const installations: Array<Record<string, unknown>> = [];
 const apkSaves: Array<Record<string, unknown>> = [];
+const openedDownloads: number[] = [];
+const cancelledDownloads: number[] = [];
 const timers = new Map<number, () => void>();
 let timerSequence = 0;
 const windowEvents = new EventTarget();
@@ -52,6 +54,8 @@ Object.defineProperty(globalThis, "clearTimeout", { value: (id: number) => { tim
 mock.module("@capacitor/core", () => ({
   Capacitor: { isNativePlatform: () => true, getPlatform: () => android ? "android" : "ios" },
   registerPlugin: (name: string) => name === "BridgeUpdater" ? {
+    cancelDownload: async ({ id }: { id: number }) => { cancelledDownloads.push(id); return { cancelled: true }; },
+    openDownloadedFile: async ({ id }: { id: number }) => { openedDownloads.push(id); },
     verifyApk: async (options: Record<string, unknown>) => {
       verifications.push(options);
       if (scenario === "android-apk-invalid") throw new Error("更新包摘要不符");
@@ -73,10 +77,9 @@ mock.module("@capacitor/core", () => ({
     },
   } : {},
 }));
-mock.module("@capacitor/app", () => ({ App: {} }));
+mock.module("@capacitor/app", () => ({ App: { addListener: async () => ({ remove: async () => {} }) } }));
 mock.module("@capacitor/browser", () => ({ Browser: {} }));
 mock.module("@capacitor/clipboard", () => ({ Clipboard: {} }));
-mock.module("@capacitor/barcode-scanner", () => ({ CapacitorBarcodeScanner: {} }));
 mock.module("@capacitor/filesystem", () => ({
   Directory: { Cache: "CACHE" },
   Filesystem: {
@@ -115,6 +118,53 @@ const emit = (patch: Partial<Progress> = {}) => {
   const event = { type: "download", url, bytes: 11, lengthComputable: false, contentLength: 999, ...patch };
   for (const listener of listeners) listener(event);
 };
+
+if (scenario === "android-restored") {
+  await native.installNativeLifecycle();
+  const { restoreMobileDownloads } = await import("../../web/src/mobile-download-manager.js");
+  const storage = { getItem: () => JSON.stringify({ version: 1, tasks: [{ id: "restored", fileName: "old.pdf", destination: "downloads",
+    state: "downloading", downloadedBytes: 50, totalBytes: 100, nativeId: 801, updatedAt: Date.now() }] }), setItem() {}, removeItem() {} };
+  restoreMobileDownloads(storage, "fixture-device");
+  assert.deepEqual(queries[0]?.ids, [801]);
+  queries[0]!.pending.resolve({ downloads: [{ id: 801, fileName: "old.pdf", state: "done", downloadedBytes: 100, totalBytes: 100 }] });
+  await until(() => getMobileDownloads()[0]?.state === "done");
+  await native.openDownloadedFile("restored");
+  assert.deepEqual(openedDownloads, [801]);
+  process.exit(0);
+}
+if (scenario === "android-cancel") {
+  const pending = native.downloadBridgeFile(url, "report.pdf", token);
+  enqueues[0]!.pending.resolve({ id: 701, fileName: "report.pdf" }); await pending;
+  const id = getMobileDownloads()[0]!.id;
+  await native.cancelMobileDownload(id);
+  assert.deepEqual(cancelledDownloads, [701]);
+  assert.equal(getMobileDownloads()[0]?.state, "cancelled");
+  queries[0]!.pending.resolve({ downloads: [{ id: 701, fileName: "report.pdf", state: "done", downloadedBytes: 100, totalBytes: 100 }] });
+  await until(() => !hasAndroidMobileDownloads());
+  assert.equal(getMobileDownloads()[0]?.state, "cancelled");
+  await assert.rejects(native.openDownloadedFile(id), /系统下载/);
+  assert.deepEqual(openedDownloads, []);
+  process.exit(0);
+}
+if (scenario === "android-export-limit") {
+  await assert.rejects(native.shareBlob({ size: 9 * 1024 * 1024 } as Blob, "large.log"), /8 MiB/);
+  assert.equal(getMobileDownloads()[0]?.state, "error");
+  process.exit(0);
+}
+if (scenario === "android-motion-permission") {
+  const rows = new Map<string, string>();
+  let permission = "denied";
+  Object.assign(windowEvents, { localStorage: { getItem: (key: string) => rows.get(key) ?? null, setItem: (key: string, value: string) => { rows.set(key, value); } },
+    DeviceMotionEvent: { requestPermission: async () => permission } });
+  await assert.rejects(native.setShakeEnabled(true), /传感器权限/);
+  assert.equal(rows.size, 0);
+  await native.setShakeEnabled(false);
+  assert.equal([...rows.values()][0], "false");
+  permission = "granted";
+  await native.setShakeEnabled(true);
+  assert.equal([...rows.values()][0], "true");
+  process.exit(0);
+}
 
 if (scenario?.startsWith("android-apk-")) {
   const update = { available: true as const, revision: "a".repeat(64), sha256: "a".repeat(64), size: 100,

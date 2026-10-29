@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
 import { PairingScanner } from "./PairingScanner.js";
 import { decodePairingImage } from "./pairing-qr.js";
-import { MOBILE_BACK_EVENT } from "./mobile-runtime.js";
+import { useMobileBack } from "./use-mobile-back.js";
 
 type ScanPhase = "idle" | "reading" | "pairing";
 
@@ -22,14 +22,7 @@ export default function MobilePairingScanner({ onPair, onClose }: {
     return () => { active.current = false; };
   }, []);
 
-  useEffect(() => {
-    const back = (event: Event): void => {
-      event.preventDefault();
-      if (phase !== "pairing") onClose();
-    };
-    window.addEventListener(MOBILE_BACK_EVENT, back);
-    return () => window.removeEventListener(MOBILE_BACK_EVENT, back);
-  }, [onClose, phase]);
+  useMobileBack(true, () => { if (phase !== "pairing") onClose(); }, 1000);
 
   useEffect(() => {
     const inputs = [imageRef.current, photoRef.current];

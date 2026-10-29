@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactElement } from "react";
 
-import { readVConsoleVisible, writeVConsoleVisible } from "./app-settings.js";
+import { readVConsoleVisible, writeVConsoleVisible, readMobileShakeEnabled } from "./app-settings.js";
+import { isMobileApp, setMobileShakeEnabled } from "./mobile-runtime.js";
 import { useTheme, type ThemeMode } from "./theme.js";
 import { fetchWorkbenchSettings, updateWorkbenchSettings, type WorkbenchNotificationSettings } from "./workbench-api.js";
 import "./workbench.css";
@@ -13,6 +14,9 @@ export function SystemSettings(): ReactElement {
   const [notificationLoading, setNotificationLoading] = useState(true);
   const [notificationSaving, setNotificationSaving] = useState<string | null>(null);
   const [notificationRevision, setNotificationRevision] = useState(0);
+  const [shakeEnabled, setShakeEnabled] = useState(readMobileShakeEnabled);
+  const [shakeBusy, setShakeBusy] = useState(false);
+  const [shakeError, setShakeError] = useState("");
 
   const loadNotifications = useCallback(async (): Promise<void> => {
     setNotificationLoading(true);
@@ -65,6 +69,16 @@ export function SystemSettings(): ReactElement {
     <main className="page-main system-settings-page">
       <h1>系统设置</h1>
       <section className="system-settings-panel" aria-label="界面设置">
+        {isMobileApp() ? <>
+          <label className="system-settings-row"><span>摇一摇切换环境</span><input type="checkbox" checked={shakeEnabled} disabled={shakeBusy} onChange={(event) => {
+            const enabled = event.target.checked;
+            setShakeBusy(true); setShakeError("");
+            void setMobileShakeEnabled(enabled).then(() => setShakeEnabled(enabled)).catch((cause: unknown) => {
+              setShakeError(cause instanceof Error ? cause.message : "无法更改摇一摇设置。");
+            }).finally(() => setShakeBusy(false));
+          }} /></label>
+          {shakeError ? <p className="workbench-page-error" role="alert">{shakeError}</p> : null}
+        </> : null}
         <label className="system-settings-row" htmlFor="system-settings-theme-mode">
           <span>主题颜色</span>
           <select

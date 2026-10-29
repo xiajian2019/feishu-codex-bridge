@@ -46,11 +46,14 @@ export function useSystemNavigation(): SystemNavigationState {
   return state;
 }
 
+import { useMobileBack } from "./use-mobile-back.js";
+
 export function WebNavigation(): ReactElement {
   const { collapsed, toggle } = useSystemNavigation();
   const location = useLocation();
   const systemActive = location.pathname.startsWith("/system-management") || location.pathname === "/pair-admin";
   const [systemOpen, setSystemOpen] = useState(systemActive);
+  useMobileBack(systemOpen, () => setSystemOpen(false), 1000);
   const [popoverPosition, setPopoverPosition] = useState<{ top: number; left: number } | null>(null);
   const systemTriggerRef = useRef<HTMLButtonElement | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);

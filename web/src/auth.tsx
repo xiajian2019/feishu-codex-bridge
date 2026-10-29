@@ -1,5 +1,7 @@
 import { Fragment, useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import * as QRCode from "qrcode";
+import { useMobileBack } from "./use-mobile-back.js";
+import { startForegroundPolling, isAppForeground } from "./foreground-polling.js";
 import { getActionToken } from "./api.js";
 import { clearLocalDraftsAfterDeviceRevocation } from "./local-draft-cleanup.js";
 import { getLocalDraftScope, setLocalDraftScope } from "./local-draft-scope.js";
@@ -61,7 +63,7 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
     let cancelled = false;
     let pending = false;
     const revalidate = (): void => {
-      if (pending || navigator.onLine === false || document.visibilityState === "hidden") return;
+      if (pending || navigator.onLine === false || !isAppForeground()) return;
       pending = true;
       void loadAuthStatus()
         .then((nextStatus) => {
@@ -80,13 +82,13 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
         .finally(() => { pending = false; });
     };
     // Also refresh a long-open terminal tab after an admin extends this device.
-    const timer = window.setInterval(revalidate, status?.authenticated ? 60_000 : 15_000);
+    const stopPolling = startForegroundPolling(async () => { revalidate(); }, status?.authenticated ? 60_000 : 15_000);
     window.addEventListener("online", revalidate);
     window.addEventListener("focus", revalidate);
     document.addEventListener("visibilitychange", revalidate);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      stopPolling();
       window.removeEventListener("online", revalidate);
       window.removeEventListener("focus", revalidate);
       document.removeEventListener("visibilitychange", revalidate);
@@ -265,6 +267,7 @@ export function PairingAdmin(): ReactElement {
   const [pairingCommandCopied, setPairingCommandCopied] = useState(false);
   const [editingDeviceId, setEditingDeviceId] = useState<string | null>(null);
   const [editingDeviceName, setEditingDeviceName] = useState("");
+  useMobileBack(Boolean(editingDeviceId), () => { if (!renamingDeviceId) setEditingDeviceId(null); }, 100);
   const [renamingDeviceId, setRenamingDeviceId] = useState<string | null>(null);
 
   const loadManagement = async (): Promise<void> => {
@@ -296,32 +299,17 @@ export function PairingAdmin(): ReactElement {
   }, []);
 
   useEffect(() => {
-    const controller = new AbortController();
-    let pending = false;
-    const refreshDevices = async (): Promise<void> => {
-      if (pending || controller.signal.aborted || document.visibilityState === "hidden" || navigator.onLine === false) return;
-      pending = true;
+    return startForegroundPolling(async (signal) => {
       try {
         const response = await fetch("/api/auth/devices?includeInactive=1", {
           headers: { Accept: "application/json" }, credentials: "same-origin",
-          cache: "no-store", signal: controller.signal,
+          cache: "no-store", signal,
         });
         if (!response.ok) return;
         const body = await response.json() as { devices?: WebAuthDevice[] };
-        if (!controller.signal.aborted && body.devices) setDevices(body.devices);
+        if (!signal.aborted && body.devices) setDevices(body.devices);
       } catch { /* Keep the last device list until the next refresh. */ }
-      finally { pending = false; }
-    };
-    const refresh = (): void => { void refreshDevices(); };
-    const timer = window.setInterval(refresh, 30_000);
-    window.addEventListener("focus", refresh);
-    document.addEventListener("visibilitychange", refresh);
-    return () => {
-      controller.abort();
-      window.clearInterval(timer);
-      window.removeEventListener("focus", refresh);
-      document.removeEventListener("visibilitychange", refresh);
-    };
+    }, 30_000);
   }, []);
 
   useEffect(() => {
