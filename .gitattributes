@@ -1,0 +1,2 @@
+# Keep the Windows Gradle launcher normalized in Git and checked out as CRLF.
+android/gradlew.bat text eol=crlf

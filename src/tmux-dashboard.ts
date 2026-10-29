@@ -29,6 +29,10 @@ export interface TmuxReviewPaneSnapshot {
 
 export class SessionNotFoundError extends Error {}
 
+export class TmuxQueryTimeoutError extends Error {
+  constructor() { super("tmux Session 列表查询超时，请重试。"); }
+}
+
 export class ValidationError extends Error {}
 
 export function isSessionId(value: string): boolean {
@@ -57,7 +61,8 @@ export function parseSessions(output: string): TmuxSession[] {
   });
 }
 
-async function runTmux(args: string[]): Promise<string> {
+async function runTmux(args: string[], options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<string> {
+  if (options.signal?.aborted) throw options.signal.reason;
   const child = getBunRuntime().spawn(["tmux", ...args], {
     env: {
       ...process.env,
@@ -67,15 +72,28 @@ async function runTmux(args: string[]): Promise<string> {
     stdout: "pipe",
     stderr: "pipe",
   });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    child.stdout!.text(),
-    child.stderr!.text(),
-    child.exited,
-  ]);
-  if (exitCode !== 0) {
-    throw new Error(stderr.trim() || `tmux ${args[0]} exited with code ${exitCode}`);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  const cancellation = new Promise<never>((_resolve, reject) => {
+    const cancel = (error: unknown): void => {
+      reject(error);
+      // This is the short-lived query client, never the tmux server or a Session.
+      try { child.kill("SIGKILL"); } catch { /* The client may already have exited. */ }
+    };
+    if (options.timeoutMs !== undefined) timer = setTimeout(() => cancel(new TmuxQueryTimeoutError()), options.timeoutMs);
+    onAbort = () => cancel(options.signal?.reason);
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    const [stdout, stderr, exitCode] = await Promise.race([
+      Promise.all([child.stdout!.text(), child.stderr!.text(), child.exited]), cancellation,
+    ]);
+    if (exitCode !== 0) throw new Error(stderr.trim() || `tmux ${args[0]} exited with code ${exitCode}`);
+    return stdout.trimEnd();
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (onAbort) options.signal?.removeEventListener("abort", onAbort);
   }
-  return stdout.trimEnd();
 }
 
 async function runTmuxWithStdin(args: string[], input: string): Promise<void> {
@@ -207,9 +225,9 @@ function isCodexProcessName(value: string): boolean {
   return /^codex(?:\.js)?$/i.test(name);
 }
 
-export async function listSessions(): Promise<TmuxSession[]> {
+export async function listSessions(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<TmuxSession[]> {
   try {
-    return parseSessions(await runTmux(["list-sessions", "-F", SESSION_FORMAT]));
+    return parseSessions(await runTmux(["list-sessions", "-F", SESSION_FORMAT], { timeoutMs: 4_000, ...options }));
   } catch (error) {
     if (/no server running|no sessions|failed to connect to server/i.test(String(error))) return [];
     throw error;

@@ -1,8 +1,10 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { nativeOriginRequiresBearer } from "./mobile-auth.js";
 
 const SESSION_COOKIE = "bridge_session";
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_TOUCH_INTERVAL_MS = 60_000;
 const PAIRING_TTL_MS = 5 * 60 * 1000;
 const FAILED_PAIRING_WINDOW_MS = 60 * 1000;
 const FAILED_PAIRING_LIMIT = 8;
@@ -23,6 +25,9 @@ export interface WebAuthSessionRecord {
   lastSeenAt: string;
   expiresAt: string;
   revokedAt: string | null;
+  clientType?: "browser" | "app" | "unknown";
+  lastAccessOrigin?: string | null;
+  lastAccessOriginAt?: string | null;
 }
 
 export interface WebAuthDatabase {
@@ -37,6 +42,8 @@ export interface WebAuthDatabase {
     lastSeenAt: string,
     userAgent: string | null,
     remoteAddress: string | null,
+    lastAccessOrigin?: string | null,
+    clientType?: "browser" | "app" | "unknown",
   ): void;
   listWebAuthSessions(): WebAuthSessionRecord[];
   updateWebAuthSessionDeviceName(sessionId: string, deviceName: string): void;
@@ -68,6 +75,23 @@ export interface WebAuthDevice {
   createdAt: string;
   lastSeenAt: string;
   expiresAt: string;
+  status: "active" | "expired" | "revoked";
+  revokedAt: string | null;
+  clientType: "browser" | "app" | "unknown";
+  lastAccessOrigin: string | null;
+  lastAccessOriginAt: string | null;
+}
+
+export interface WebAuthDiagnostics {
+  reason: "authenticated" | "local_access" | "credential_missing" | "credential_invalid"
+    | "session_unknown" | "session_expired" | "session_revoked";
+  credential: "cookie" | "bearer" | "none";
+  cookiePresent: boolean;
+  cookieCount: number;
+  serverTime: string;
+  installationId: string;
+  sessionExpiresAt: string | null;
+  sessionRevokedAt: string | null;
 }
 
 export interface PairingStatus {
@@ -77,6 +101,7 @@ export interface PairingStatus {
   pairingAvailable: boolean;
   pairingExpiresAt: number | null;
   draftScope: string | null;
+  diagnostics: WebAuthDiagnostics;
 }
 
 export class PairingRateLimitError extends Error {
@@ -116,8 +141,18 @@ export class WebPairingAuth {
   }
 
   public isAuthorized(request: IncomingMessage): boolean {
-    if (this.allowLocalRequests && this.isLocalRequest(request)) return true;
-    const token = readCookie(request.headers.cookie, SESSION_COOKIE);
+    if (request.headers.authorization === undefined && !nativeOriginRequiresBearer(request)
+      && this.allowLocalRequests && this.isLocalRequest(request)) {
+      // Loopback may bypass pairing, but a valid saved session still needs its
+      // latest client metadata, including after an App/browser upgrade.
+      const token = this.requestToken(request);
+      const session = token ? this.getSession(hashToken(token)) : null;
+      if (session && session.revokedAt === null && Date.parse(session.expiresAt) > this.now()) {
+        this.touchSession(session, request);
+      }
+      return true;
+    }
+    const token = this.requestToken(request);
     if (!token) return false;
     const session = this.getSession(hashToken(token));
     if (!session || session.revokedAt !== null) return false;
@@ -130,7 +165,7 @@ export class WebPairingAuth {
   }
 
   public currentDeviceId(request: IncomingMessage): string | null {
-    const token = readCookie(request.headers.cookie, SESSION_COOKIE);
+    const token = this.requestToken(request);
     if (!token) return null;
     const session = this.getSession(hashToken(token));
     if (!session || session.revokedAt !== null) return null;
@@ -141,9 +176,13 @@ export class WebPairingAuth {
     return session.sessionId;
   }
 
-  /** Bind a long-lived connection to its original cookie, without touching last_seen_at. */
+  public isBearerAuthorized(request: IncomingMessage): boolean {
+    return request.headers.authorization !== undefined && this.isAuthorized(request);
+  }
+
+  /** Bind a long-lived connection to its original credential, without touching last_seen_at. */
   public connectionAuthorization(request: IncomingMessage): () => boolean {
-    const token = readCookie(request.headers.cookie, SESSION_COOKIE);
+    const token = this.requestToken(request);
     if (token) {
       const tokenHash = hashToken(token);
       return () => {
@@ -155,7 +194,8 @@ export class WebPairingAuth {
         }
       };
     }
-    const trustedLocal = this.allowLocalRequests && this.isLocalRequest(request);
+    const trustedLocal = request.headers.authorization === undefined && !nativeOriginRequiresBearer(request)
+      && this.allowLocalRequests && this.isLocalRequest(request);
     return () => trustedLocal;
   }
 
@@ -176,21 +216,49 @@ export class WebPairingAuth {
       activeSessionCount: authenticated ? this.listActiveSessions().length : null,
       pairingAvailable: pairing !== null && pairing.expiresAt > this.now(),
       pairingExpiresAt: pairing && pairing.expiresAt > this.now() ? pairing.expiresAt : null,
+      diagnostics: this.diagnostics(request, authenticated),
       draftScope: deviceId
         ? createHash("sha256").update(JSON.stringify([this.draftInstallationId, deviceId])).digest("base64url")
         : null,
     };
   }
 
-  public listDevices(request: IncomingMessage): WebAuthDevice[] | null {
+  private diagnostics(request: IncomingMessage, authenticated: boolean): WebAuthDiagnostics {
+    const cookieCount = (request.headers.cookie ?? "").split(";")
+      .filter((part) => part.trim().split("=", 1)[0] === SESSION_COOKIE).length;
+    const cookiePresent = cookieCount > 0;
+    const credential = request.headers.authorization !== undefined ? "bearer" : cookiePresent ? "cookie" : "none";
+    const token = this.requestToken(request);
+    const session = token ? this.getSession(hashToken(token)) : null;
+    let reason: WebAuthDiagnostics["reason"];
+    if (authenticated) reason = session ? "authenticated" : "local_access";
+    else if (credential === "none") reason = "credential_missing";
+    else if (!token) reason = "credential_invalid";
+    else if (!session) reason = "session_unknown";
+    // isAuthorized may already have marked an expired session revoked.
+    else if (Date.parse(session.expiresAt) <= this.now()) reason = "session_expired";
+    else reason = "session_revoked";
+    return {
+      reason, credential, cookiePresent, cookieCount,
+      serverTime: new Date(this.now()).toISOString(),
+      installationId: createHash("sha256").update("web-auth-diagnostics:" + this.draftInstallationId).digest("hex").slice(0, 16),
+      sessionExpiresAt: session?.expiresAt ?? null,
+      sessionRevokedAt: session?.revokedAt ?? null,
+    };
+  }
+
+  public listDevices(request: IncomingMessage, includeInactive = false): WebAuthDevice[] | null {
     if (!this.isAuthorized(request)) return null;
-    const token = readCookie(request.headers.cookie, SESSION_COOKIE);
-    const currentSessionId = token
-      ? this.getSession(hashToken(token))?.sessionId ?? null
-      : null;
-    return this.listActiveSessions().map((session) => ({
+    const currentSessionId = this.currentDeviceId(request);
+    const sessions = this.db?.listWebAuthSessions() ?? [...this.memorySessions.values()];
+    return sessions.filter((session) => includeInactive || webAuthSessionState(session, this.now()) === "active").map((session) => ({
       sessionId: session.sessionId,
       current: session.sessionId === currentSessionId,
+      status: webAuthSessionState(session, this.now()),
+      revokedAt: session.revokedAt,
+      clientType: session.clientType ?? "unknown",
+      lastAccessOrigin: session.lastAccessOrigin ?? null,
+      lastAccessOriginAt: session.lastAccessOriginAt ?? null,
       deviceName: deviceDisplayName(session),
       userAgent: session.userAgent,
       remoteAddress: session.remoteAddress,
@@ -210,7 +278,7 @@ export class WebPairingAuth {
     return { code, expiresAt };
   }
 
-  public claimPairing(request: IncomingMessage, rawCode: string): string {
+  public claimPairing(request: IncomingMessage, rawCode: string, clientType: "browser" | "app" = "browser"): string {
     const pairing = this.getPairing();
     if (!pairing || pairing.expiresAt <= this.now()) {
       this.clearPairing();
@@ -229,6 +297,7 @@ export class WebPairingAuth {
     this.clearPairing();
     const token = randomBytes(32).toString("base64url");
     const now = this.now();
+    const accessOrigin = webAuthRequestOrigin(request);
     const session: WebAuthSessionRecord = {
       sessionId: randomUUID(),
       tokenHash: hashToken(token),
@@ -239,9 +308,17 @@ export class WebPairingAuth {
       lastSeenAt: new Date(now).toISOString(),
       expiresAt: new Date(now + SESSION_TTL_MS).toISOString(),
       revokedAt: null,
+      clientType,
+      lastAccessOrigin: accessOrigin,
+      lastAccessOriginAt: accessOrigin ? new Date(now).toISOString() : null,
     };
     this.createSession(session);
     return token;
+  }
+
+  public claimMobilePairing(request: IncomingMessage, code: string): { token: string; expiresAt: string } {
+    const token = this.claimPairing(request, code, "app");
+    return { token, expiresAt: this.getSession(hashToken(token))!.expiresAt };
   }
 
   public setSessionCookie(
@@ -266,6 +343,7 @@ export class WebPairingAuth {
   }
 
   public refreshSessionCookie(request: IncomingMessage, response: ServerResponse): void {
+    if (request.headers.authorization !== undefined) return;
     const token = readCookie(request.headers.cookie, SESSION_COOKIE);
     if (!token) return;
     const session = this.getSession(hashToken(token));
@@ -274,12 +352,12 @@ export class WebPairingAuth {
   }
 
   public clearSession(request: IncomingMessage, response: ServerResponse): void {
-    const token = readCookie(request.headers.cookie, SESSION_COOKIE);
+    const token = this.requestToken(request);
     if (token) {
       const session = this.getSession(hashToken(token));
       if (session) this.revokeSession(session.sessionId);
     }
-    response.setHeader(
+    if (request.headers.authorization === undefined) response.setHeader(
       "Set-Cookie",
       SESSION_COOKIE + "=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
     );
@@ -364,22 +442,48 @@ export class WebPairingAuth {
       ?? null;
   }
 
+  private requestToken(request: IncomingMessage): string | null {
+    const authorization = request.headers.authorization;
+    if (authorization !== undefined) {
+      const match = /^Bearer ([A-Za-z0-9_-]{43})$/i.exec(authorization);
+      return match?.[1] ?? null;
+    }
+    // A native cross-origin page must explicitly present its token, even on loopback.
+    if (nativeOriginRequiresBearer(request)) return null;
+    return readCookie(request.headers.cookie, SESSION_COOKIE);
+  }
+
   private createSession(session: WebAuthSessionRecord): void {
     if (this.db) this.db.createWebAuthSession(session);
     else this.memorySessions.set(session.tokenHash, session);
   }
 
   private touchSession(session: WebAuthSessionRecord, request: IncomingMessage): void {
-    const lastSeenAt = new Date(this.now()).toISOString();
-    // A browser can keep its session cookie through an OS upgrade, so refresh its display metadata on access.
+    const now = this.now();
+    const lastSeen = Date.parse(session.lastSeenAt);
+    // Authorization still reads revocation/expiry on every request; only display metadata is throttled.
     const userAgent = headerValue(request, "user-agent") ?? session.userAgent;
     const remoteAddress = this.clientAddress(request) ?? session.remoteAddress;
+    const observedOrigin = webAuthRequestOrigin(request);
+    const lastAccessOrigin = observedOrigin ?? session.lastAccessOrigin ?? null;
+    const clientType = session.clientType && session.clientType !== "unknown" ? session.clientType
+      : request.headers.authorization !== undefined ? "app" : "browser";
+    if (now >= lastSeen && now - lastSeen < SESSION_TOUCH_INTERVAL_MS
+      && userAgent === session.userAgent && remoteAddress === session.remoteAddress
+      && lastAccessOrigin === (session.lastAccessOrigin ?? null) && clientType === session.clientType
+      && (!observedOrigin || session.lastAccessOriginAt === session.lastSeenAt)) return;
+    const lastSeenAt = new Date(now).toISOString();
     if (this.db) {
-      this.db.touchWebAuthSession(session.sessionId, lastSeenAt, userAgent, remoteAddress);
+      this.db.touchWebAuthSession(session.sessionId, lastSeenAt, userAgent, remoteAddress, observedOrigin, clientType);
     } else {
       session.lastSeenAt = lastSeenAt;
       session.userAgent = userAgent;
       session.remoteAddress = remoteAddress;
+      session.clientType = clientType;
+      if (observedOrigin) {
+        session.lastAccessOrigin = observedOrigin;
+        session.lastAccessOriginAt = lastSeenAt;
+      }
     }
   }
 
@@ -454,6 +558,38 @@ export class WebPairingAuth {
   }
 }
 
+function webAuthSessionState(session: WebAuthSessionRecord, now: number): WebAuthDevice["status"] {
+  const expiry = Date.parse(session.expiresAt);
+  // Natural expiry can also mark a row revoked; distinguish that from an early revocation.
+  if (session.revokedAt && Date.parse(session.revokedAt) < expiry) return "revoked";
+  return session.revokedAt === null && Number.isFinite(expiry) && expiry > now ? "active" : "expired";
+}
+
+/** Public access origin for display only. Never use it as an authentication signal. */
+export function webAuthRequestOrigin(request: IncomingMessage): string | null {
+  const parse = (value: string | undefined): string | null => {
+    if (!value || value.length > 500) return null;
+    try {
+      const url = new URL(value);
+      return (url.protocol === "http:" || url.protocol === "https:") && !url.username && !url.password
+        && url.pathname === "/" && !url.search && !url.hash ? url.origin : null;
+    } catch { return null; }
+  };
+  const peer = normalizeAddress(request.socket.remoteAddress);
+  const localProxy = peer === "127.0.0.1" || peer === "::1";
+  if (localProxy) {
+    const explicit = parse(headerValue(request, "x-bridge-public-origin") ?? undefined);
+    if (explicit) return explicit;
+    const forwardedHost = headerValue(request, "x-forwarded-host")?.split(",", 1)[0]?.trim();
+    const forwardedProto = headerValue(request, "x-forwarded-proto")?.split(",", 1)[0]?.trim();
+    const forwarded = forwardedHost ? parse(`${forwardedProto === "https" ? "https" : "http"}://${forwardedHost}`) : null;
+    if (forwarded) return forwarded;
+  }
+  const protocol = (request.socket as typeof request.socket & { encrypted?: boolean }).encrypted ? "https" : "http";
+  const host = headerValue(request, "host");
+  return host ? parse(`${protocol}://${host}`) : null;
+}
+
 function addCalendarYear(value: string): string | null {
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp)) return null;
@@ -497,7 +633,9 @@ function readCookie(header: string | undefined, name: string): string | null {
 
 function headerValue(request: IncomingMessage, name: string): string | null {
   const value = request.headers[name];
-  return typeof value === "string" ? value.slice(0, 500) : null;
+  // App markers are appended to the system UA, which can already exceed 500
+  // characters on some devices. Keep the suffix within a bounded stored value.
+  return typeof value === "string" ? value.slice(0, name === "user-agent" ? 2_048 : 500) : null;
 }
 
 function deviceNameFromRequest(request: IncomingMessage): string {

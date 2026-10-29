@@ -4,33 +4,31 @@ import { pathToFileURL } from "node:url";
 import {
   checkBridgeBackupUpgradeCompatibility,
   createBridgeBackup,
-  defaultBridgeAttachmentRoots,
   inspectBridgeBackupMetadata,
   listBridgeBackups,
   restoreBridgeBackup,
   verifyBridgeBackup,
 } from "./bridge-backup.js";
-import { resolveBridgeDataRoot } from "./portable-runtime.js";
 
 export async function runBackupCli(args = process.argv.slice(2)): Promise<void> {
   const { values, positionals } = parseArgs({ args, allowPositionals: true, options: {
     db: { type: "string" }, out: { type: "string" }, backup: { type: "string" }, dir: { type: "string" },
+    // Accepted for compatibility with existing scripts; SQLite backups ignore attachment roots.
     "data-root": { type: "string" }, "web-root": { type: "string" },
     "direct-root": { type: "string" }, "aamp-root": { type: "string" },
     help: { type: "boolean", short: "h" },
   } });
   if (values.help || positionals.length === 0) {
-    console.log(`Bridge 数据备份（不启动任务或服务）
-  backup create --db <bridge.db> --out <新目录> [--data-root <安装根目录>]
-                [--web-root <附件目录>] [--direct-root <附件目录>] [--aamp-root <附件目录>]
+    console.log(`Bridge SQLite 数据备份（不启动任务或服务）
+  backup create --db <bridge.db> --out <新目录>
   backup list --dir <备份父目录>
   backup inspect --backup <备份目录>
   backup verify --backup <备份目录>
   backup restore --backup <备份目录> --out <新目录>
   backup check-upgrade --backup <备份目录>
-恢复只写入全新目录，不切换服务。备份包含 Bridge 数据库及其引用的 Web/Direct/AAMP/tmux 附件。
-list/inspect 只读取清单元数据，不校验附件哈希；恢复或使用前请先 verify。check-upgrade 在临时副本上运行当前版本迁移。
-自定义 Web/Direct/AAMP 附件目录需显式传入；tmux 使用 Bridge 管理的固定目录。不包含 config.json、项目仓库、Codex 账号数据或未关联的历史附件。`);
+只备份 Bridge SQLite 数据库，保留一致性快照、SHA-256 和结构指纹校验。
+恢复只写入全新目录，不切换服务；旧版备份也只恢复数据库，保留库内原有附件路径，不复制附件。
+list/inspect 只读取清单元数据；verify 校验数据库文件；check-upgrade 在临时副本上运行当前版本迁移。`);
     return;
   }
   if (positionals.length !== 1) throw new Error("只允许一个备份操作：create、list、inspect、verify、restore 或 check-upgrade。");
@@ -43,12 +41,7 @@ list/inspect 只读取清单元数据，不校验附件哈希；恢复或使用�
   switch (positionals[0]) {
     case "create": {
       const databasePath = required("db");
-      const roots = defaultBridgeAttachmentRoots(databasePath, values["data-root"] || resolveBridgeDataRoot(import.meta.url));
-      for (const kind of ["web", "direct", "aamp"] as const) {
-        const custom = values[`${kind}-root`];
-        if (custom) roots[kind].push(resolve(custom));
-      }
-      result = await createBridgeBackup({ databasePath, outputDirectory: required("out"), attachmentRoots: roots });
+      result = await createBridgeBackup({ databasePath, outputDirectory: required("out") });
       break;
     }
     case "list": result = await listBridgeBackups(required("dir")); break;

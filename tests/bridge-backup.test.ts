@@ -7,7 +7,6 @@ import { StateDatabase } from "../src/db.js";
 import {
   checkBridgeBackupUpgradeCompatibility,
   createBridgeBackup,
-  defaultBridgeAttachmentRoots,
   inspectBridgeBackupMetadata,
   listBridgeBackups,
   restoreBridgeBackup,
@@ -69,7 +68,6 @@ describe("Bridge backup", () => {
     await createBridgeBackup({
       databasePath,
       outputDirectory: backupDirectory,
-      attachmentRoots: defaultBridgeAttachmentRoots(databasePath, root),
       programVersion: "test-workspace-version",
     });
     const restored = await restoreBridgeBackup({ backupDirectory, outputDirectory: join(root, "restored-worktree-metadata") });
@@ -90,303 +88,236 @@ describe("Bridge backup", () => {
     }
   });
 
-  it("rejects modified attachments before creating any restored output", async () => {
+  it("rejects a modified SQLite file before creating any restored output", async () => {
     const fixture = await makeSimpleBackup();
-    const manifest = JSON.parse(readFileSync(join(fixture.backupDirectory, "manifest.json"), "utf8"));
-    writeFileSync(join(fixture.backupDirectory, manifest.attachments[0].file), "two");
-    await expect(verifyBridgeBackup(fixture.backupDirectory)).rejects.toThrow("does not match manifest");
-    await expect(checkBridgeBackupUpgradeCompatibility(fixture.backupDirectory)).rejects.toThrow("does not match manifest");
+    writeFileSync(join(fixture.backupDirectory, "bridge.db"), "modified database");
+    await expect(verifyBridgeBackup(fixture.backupDirectory)).rejects.toThrow("database hash or size");
+    await expect(checkBridgeBackupUpgradeCompatibility(fixture.backupDirectory)).rejects.toThrow("database hash or size");
     const outputDirectory = join(fixture.root, "restore-tampered");
-    await expect(restoreBridgeBackup({ backupDirectory: fixture.backupDirectory, outputDirectory })).rejects.toThrow("does not match manifest");
+    await expect(restoreBridgeBackup({ backupDirectory: fixture.backupDirectory, outputDirectory })).rejects.toThrow("database hash or size");
     expect(existsSync(outputDirectory)).toBe(false);
   });
 
-  it("snapshots an open WAL database and relocates Web, Direct, and AAMP attachments", async () => {
+  it("snapshots an open WAL database without copying files or rewriting attachment records", async () => {
     const root = makeTemporaryDirectory();
     const databaseDirectory = join(root, "data");
-    const dataRoot = join(root, "portable");
     mkdirSync(databaseDirectory, { recursive: true });
     const realDatabasePath = join(databaseDirectory, "bridge-data.db");
     const databasePath = join(databaseDirectory, "bridge.db");
     symlinkSync(realDatabasePath, databasePath);
-
-    const roots = defaultBridgeAttachmentRoots(databasePath, dataRoot);
-    const webPath = join(roots.web[0], "web.txt");
-    const directPath = join(roots.direct[0], "task-1", "direct.png");
-    const aampPath = join(roots.aamp[0], "aamp.png");
-    mkdirSync(roots.web[0], { recursive: true });
-    mkdirSync(join(roots.direct[0], "task-1"), { recursive: true });
-    mkdirSync(roots.aamp[0], { recursive: true });
+    const webPath = join(root, "web.txt");
+    const directPath = join(root, "missing-direct.png");
+    const aampPath = join(root, "symlink-aamp.png");
     writeFileSync(webPath, "web attachment\n");
-    writeFileSync(directPath, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]));
-    writeFileSync(aampPath, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 4, 5, 6]));
-
+    symlinkSync(webPath, aampPath);
+    writeFileSync(join(root, "config.json"), "unrelated configuration");
     const database = new StateDatabase(databasePath);
-    database.createStagedWebTaskAttachment({
-      attachmentId: "web-attachment-1",
-      fileName: "web.txt",
-      mimeType: "text/plain",
-      sizeBytes: Buffer.byteLength("web attachment\n"),
-      localPath: webPath,
-    });
-    const directTask = database.ingestDirectMessage({
-      sourceEventId: "evt-backup",
-      eventType: "im.message.receive_v1",
-      messageId: "msg-backup",
-      chatId: "chat-backup",
-      chatType: "p2p",
-      senderId: "sender-backup",
-      text: "请处理图片",
-      sessionKey: "chat:backup",
-      attachments: [{ type: "image", fileKey: "file-key", fileName: "direct.png" }],
-    }).task;
-    const directAttachment = database.getBridgeTaskAttachments(directTask.bridge_task_id)[0];
-    database.markAttachmentDownloaded(directAttachment.attachment_id, directPath);
-    database.initializeAampTask({
-      aampTaskId: "aamp-backup",
-      chatId: "chat-aamp",
-      imageLocalPaths: [aampPath],
-    });
-
     const walWriter = new DatabaseSync(databasePath);
-    walWriter.exec("CREATE TABLE web_idempotency_snapshot_probe (request_key TEXT PRIMARY KEY, result TEXT NOT NULL)");
-    walWriter.prepare("INSERT INTO web_idempotency_snapshot_probe VALUES (?, ?)").run("key-1", "saved-in-wal");
-    expect(existsSync(`${realDatabasePath}-wal`)).toBe(true);
-
-    const backupDirectory = join(root, "backup");
-    const backup = await createBridgeBackup({
-      databasePath,
-      outputDirectory: backupDirectory,
-      attachmentRoots: roots,
-      programVersion: "test-version",
-    });
-    expect(backup.attachmentCount).toBe(3);
-    expect(lstatSync(databasePath).isSymbolicLink()).toBe(true);
-    expect(database.getStagedWebTaskAttachment("web-attachment-1")?.local_path).toBe(webPath);
-    expect(walWriter.prepare("SELECT result FROM web_idempotency_snapshot_probe WHERE request_key = ?").get("key-1"))
-      .toEqual({ result: "saved-in-wal" });
-
-    const verification = await verifyBridgeBackup(backupDirectory);
-    expect(verification).toMatchObject({
-      programVersion: "test-version",
-      attachmentCount: 3,
-      schemaFingerprint: backup.schemaFingerprint,
-    });
-    expect(lstatSync(backupDirectory).mode & 0o777).toBe(0o700);
-
-    const restoreDirectory = join(root, "restored");
-    const restored = await restoreBridgeBackup({ backupDirectory, outputDirectory: restoreDirectory });
-    expect(restored.databasePath).toBe(join(restoreDirectory, "bridge.db"));
-    const restoredProbe = new DatabaseSync(restored.databasePath);
     try {
-      expect(restoredProbe.prepare("SELECT result FROM web_idempotency_snapshot_probe WHERE request_key = ?").get("key-1"))
+      database.createStagedWebTaskAttachment({
+        attachmentId: "web-attachment-1", fileName: "web.txt", mimeType: "text/plain",
+        sizeBytes: Buffer.byteLength("web attachment\n"), localPath: webPath,
+      });
+      const directTask = database.ingestDirectMessage({
+        sourceEventId: "evt-backup", eventType: "im.message.receive_v1", messageId: "msg-backup",
+        chatId: "chat-backup", chatType: "p2p", senderId: "sender-backup", text: "请处理图片", sessionKey: "chat:backup",
+        attachments: [{ type: "image", fileKey: "file-key", fileName: "direct.png" }],
+      }).task;
+      const directAttachment = database.getBridgeTaskAttachments(directTask.bridge_task_id)[0]!;
+      database.markAttachmentDownloaded(directAttachment.attachment_id, directPath);
+      database.initializeAampTask({ aampTaskId: "aamp-backup", chatId: "chat-aamp", imageLocalPaths: [aampPath] });
+      const action = addTmuxAttachmentReference(database, root);
+      walWriter.exec("CREATE TABLE wal_snapshot_probe (request_key TEXT PRIMARY KEY, result TEXT NOT NULL)");
+      walWriter.prepare("INSERT INTO wal_snapshot_probe VALUES (?, ?)").run("key-1", "saved-in-wal");
+      expect(existsSync(`${realDatabasePath}-wal`)).toBe(true);
+
+      const backupDirectory = join(root, "backup");
+      const backup = await createBridgeBackup({ databasePath, outputDirectory: backupDirectory, programVersion: "test-version" });
+      expect(backup).toMatchObject({ scope: "sqlite", attachmentCount: 0, attachmentBytes: 0 });
+      expect(readdirSync(backupDirectory).sort()).toEqual(["bridge.db", "manifest.json"]);
+      expect(JSON.parse(readFileSync(join(backupDirectory, "manifest.json"), "utf8")))
+        .toMatchObject({ formatVersion: 3, scope: "sqlite", attachments: [] });
+      expect(lstatSync(databasePath).isSymbolicLink()).toBe(true);
+      expect(lstatSync(backupDirectory).mode & 0o777).toBe(0o700);
+      expect(lstatSync(join(backupDirectory, "bridge.db")).mode & 0o777).toBe(0o600);
+      expect(lstatSync(join(backupDirectory, "manifest.json")).mode & 0o777).toBe(0o600);
+      expect(database.getStagedWebTaskAttachment("web-attachment-1")?.local_path).toBe(webPath);
+
+      const verification = await verifyBridgeBackup(backupDirectory);
+      expect(verification).toMatchObject({ scope: "sqlite", formatVersion: 3, programVersion: "test-version",
+        attachmentCount: 0, schemaFingerprint: backup.schemaFingerprint });
+      const restoreDirectory = join(root, "restored");
+      const restored = await restoreBridgeBackup({ backupDirectory, outputDirectory: restoreDirectory });
+      expect(restored).toMatchObject({ scope: "sqlite", attachmentCount: 0, attachmentBytes: 0 });
+      expect(readdirSync(restoreDirectory)).toEqual(["bridge.db"]);
+      expect(readFileSync(restored.databasePath)).toEqual(readFileSync(join(backupDirectory, "bridge.db")));
+      const restoredDatabase = new StateDatabase(restored.databasePath);
+      const restoredProbe = new DatabaseSync(restored.databasePath);
+      try {
+        expect(restoredProbe.prepare("SELECT result FROM wal_snapshot_probe WHERE request_key = ?").get("key-1"))
+          .toEqual({ result: "saved-in-wal" });
+        expect(restoredDatabase.getStagedWebTaskAttachment("web-attachment-1")?.local_path).toBe(webPath);
+        expect(restoredDatabase.getBridgeTaskAttachments(directTask.bridge_task_id)[0]?.local_path).toBe(directPath);
+        expect(restoredDatabase.listAampTasks({ search: "aamp-backup" }).items[0]?.image_local_paths).toEqual([aampPath]);
+        expect(restoredProbe.prepare("SELECT content FROM tmux_session_actions WHERE action_id = ?").get(action.actionId))
+          .toEqual({ content: action.content });
+        expect(restoredProbe.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+      } finally {
+        restoredProbe.close();
+        restoredDatabase.close();
+      }
+      const secondBackup = join(root, "rebackup");
+      await createBridgeBackup({ databasePath: restored.databasePath, outputDirectory: secondBackup });
+      expect((await verifyBridgeBackup(secondBackup)).attachmentCount).toBe(0);
+      expect(readdirSync(secondBackup).sort()).toEqual(["bridge.db", "manifest.json"]);
+      expect(walWriter.prepare("SELECT result FROM wal_snapshot_probe WHERE request_key = ?").get("key-1"))
         .toEqual({ result: "saved-in-wal" });
     } finally {
-      restoredProbe.close();
+      walWriter.close();
+      database.close();
     }
-    const restoredDatabase = new StateDatabase(restored.databasePath);
-    try {
-      const restoredWebPath = restoredDatabase.getStagedWebTaskAttachment("web-attachment-1")?.local_path;
-      const restoredDirectPath = restoredDatabase.getBridgeTaskAttachments(directTask.bridge_task_id)[0]?.local_path;
-      const restoredAampPath = restoredDatabase.listAampTasks({ search: "aamp-backup" }).items[0]?.image_local_paths[0];
-      for (const path of [restoredWebPath, restoredDirectPath, restoredAampPath]) {
-        expect(path).toStartWith(restoreDirectory);
-        expect(existsSync(path!)).toBe(true);
+  });
+
+  for (const formatVersion of [1, 2]) {
+    it.each(["missing", "modified", "symlink"])(`restores only SQLite from v${formatVersion} with %s legacy attachments`, async (state) => {
+      const fixture = await makeSimpleBackup();
+      const databasePath = join(fixture.root, "runtime", "bridge.db");
+      const database = new StateDatabase(databasePath);
+      const action = addTmuxAttachmentReference(database, fixture.root);
+      database.close();
+      const backupDirectory = join(fixture.root, `legacy-${formatVersion}`);
+      await createBridgeBackup({ databasePath, outputDirectory: backupDirectory });
+      const manifestPath = join(backupDirectory, "manifest.json");
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      manifest.formatVersion = formatVersion;
+      delete manifest.scope;
+      const attachmentFile = "attachments/web/9c7daf93-0aa0-4e8a-a214-5475796af882.txt";
+      manifest.attachments = [{
+        id: "9c7daf93-0aa0-4e8a-a214-5475796af882", kind: "web", file: attachmentFile,
+        sha256: "0".repeat(64), bytes: 3, references: [{ kind: "web", key: "one-file" }],
+      }];
+      writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      if (state === "modified") {
+        mkdirSync(join(backupDirectory, "attachments", "web"), { recursive: true });
+        writeFileSync(join(backupDirectory, attachmentFile), "modified legacy attachment");
+      } else if (state === "symlink") {
+        symlinkSync(join(fixture.root, "nonexistent-attachments"), join(backupDirectory, "attachments"));
       }
-      expect(restoredWebPath).not.toBe(webPath);
-      expect(restoredDirectPath).not.toBe(directPath);
-      expect(restoredAampPath).not.toBe(aampPath);
-      expect(restoredDatabase.listAampTasks({ search: "aamp-backup" }).items[0]?.image_local_paths).toHaveLength(1);
-    } finally {
-      restoredDatabase.close();
-    }
-
-    const secondBackup = join(root, "rebackup");
-    await createBridgeBackup({
-      databasePath: restored.databasePath,
-      outputDirectory: secondBackup,
-      attachmentRoots: defaultBridgeAttachmentRoots(restored.databasePath, dataRoot),
-      programVersion: "test-version",
+      const originalManifest = readFileSync(manifestPath);
+      const originalDatabase = readFileSync(join(backupDirectory, "bridge.db"));
+      expect(await verifyBridgeBackup(backupDirectory)).toMatchObject({ scope: "sqlite", formatVersion, attachmentCount: 0 });
+      expect((await checkBridgeBackupUpgradeCompatibility(backupDirectory)).compatible).toBe(true);
+      const restoreDirectory = join(fixture.root, `restore-v${formatVersion}`);
+      const restored = await restoreBridgeBackup({ backupDirectory, outputDirectory: restoreDirectory });
+      expect(readdirSync(restoreDirectory)).toEqual(["bridge.db"]);
+      expect(readFileSync(restored.databasePath)).toEqual(originalDatabase);
+      const restoredDatabase = new DatabaseSync(restored.databasePath);
+      try {
+        expect(restoredDatabase.prepare("SELECT content FROM tmux_session_actions WHERE action_id = ?").get(action.actionId))
+          .toEqual({ content: action.content });
+        expect(restoredDatabase.prepare("SELECT local_path FROM web_task_attachments WHERE attachment_id = 'one-file'").get())
+          .toEqual({ local_path: join(fixture.root, "missing-attachment.txt") });
+      } finally { restoredDatabase.close(); }
+      expect(readFileSync(manifestPath)).toEqual(originalManifest);
+      expect(readFileSync(join(backupDirectory, "bridge.db"))).toEqual(originalDatabase);
     });
-    expect((await verifyBridgeBackup(secondBackup)).attachmentCount).toBe(3);
+  }
 
-    walWriter.close();
-    database.close();
-  });
-
-  it("backs up and relocates Tmux task attachments referenced in durable session actions", async () => {
-    const root = makeTemporaryDirectory();
-    const databasePath = join(root, "runtime", "bridge.db");
-    mkdirSync(join(root, "runtime"), { recursive: true });
-    const database = new StateDatabase(databasePath);
-    const roots = defaultBridgeAttachmentRoots(databasePath, root);
-    const migratedAttachmentRoot = join(root, "home", ".feishu-codex-bridge", "tmux-dashboard-attachments");
-    const legacyAttachmentRoot = join(root, "tmp", "feishu-codex-bridge", "tmux-dashboard-attachments");
-    roots.tmux = [migratedAttachmentRoot, legacyAttachmentRoot];
-    mkdirSync(migratedAttachmentRoot, { recursive: true });
-    const imageName = "9c7daf93-0aa0-4e8a-a214-5475796af882.jpg";
-    const imagePath = join(migratedAttachmentRoot, imageName);
-    const legacyImagePath = join(legacyAttachmentRoot, imageName);
-    writeFileSync(imagePath, Buffer.from([0xff, 0xd8, 0xff, 1, 2, 3]));
-    const session = database.recordTmuxSession({ id: "$1", name: "backup-test", cwd: root, createdAt: 10 });
-    const action = database.beginTmuxSessionAction({
-      sessionRecordId: session.record_id,
-      deviceId: null,
-      actionType: "task_submit",
-      requestId: "backup-tmux-request",
-      content: `请查看我附上的图片：<image name=[Image #1] path="${legacyImagePath}">`,
-    });
-    expect(action.duplicate).toBe(false);
-    database.finishTmuxSessionAction(action.actionId, "confirmed");
-    database.close();
-
-    const backupDirectory = join(root, "backup-v2");
-    const backup = await createBridgeBackup({ databasePath, outputDirectory: backupDirectory, attachmentRoots: roots });
-    expect(backup.attachmentCount).toBe(1);
-    const manifest = JSON.parse(readFileSync(join(backupDirectory, "manifest.json"), "utf8")) as {
-      formatVersion: number;
-      attachments: Array<{ kind: string; file: string; references: Array<{ kind: string; key: string; index?: number }> }>;
-    };
-    expect(manifest.formatVersion).toBe(2);
-    expect(manifest.attachments[0]).toMatchObject({
-      kind: "tmux",
-      references: [{ kind: "tmux", key: action.actionId, index: 0 }],
-    });
-    expect((await verifyBridgeBackup(backupDirectory)).attachmentCount).toBe(1);
-
-    const restoreDirectory = join(root, "restored-tmux");
-    const restored = await restoreBridgeBackup({ backupDirectory, outputDirectory: restoreDirectory });
-    expect(restored.attachmentCount).toBe(1);
-    const restoredDatabase = new DatabaseSync(restored.databasePath);
-    try {
-      const row = restoredDatabase.prepare("SELECT content FROM tmux_session_actions WHERE action_id = ?")
-        .get(action.actionId) as { content: string };
-      const restoredAttachmentPath = join(restoreDirectory, manifest.attachments[0]!.file);
-      expect(row.content).toContain(restoredAttachmentPath);
-      expect(existsSync(restoredAttachmentPath)).toBe(true);
-    } finally {
-      restoredDatabase.close();
-    }
-  });
-
-  it("refuses an incomplete v1 restore when the database still references Tmux attachments", async () => {
-    const root = makeTemporaryDirectory();
-    const databasePath = join(root, "runtime", "bridge.db");
-    mkdirSync(join(root, "runtime"), { recursive: true });
-    const database = new StateDatabase(databasePath);
-    const roots = defaultBridgeAttachmentRoots(databasePath, root);
-    const tmuxAttachmentRoot = roots.tmux[roots.tmux.length - 1]!;
-    mkdirSync(tmuxAttachmentRoot, { recursive: true });
-    const imagePath = join(tmuxAttachmentRoot, "9c7daf93-0aa0-4e8a-a214-5475796af882.jpg");
-    writeFileSync(imagePath, Buffer.from([0xff, 0xd8, 0xff, 1]));
-    const session = database.recordTmuxSession({ id: "$1", name: "legacy-test", cwd: root, createdAt: 11 });
-    const action = database.beginTmuxSessionAction({
-      sessionRecordId: session.record_id,
-      deviceId: null,
-      actionType: "task_submit",
-      requestId: "legacy-tmux-request",
-      content: `<image name=[Image #1] path="${imagePath}">`,
-    });
-    database.close();
-    const backupDirectory = join(root, "legacy-backup");
-    await createBridgeBackup({ databasePath, outputDirectory: backupDirectory, attachmentRoots: roots });
-
-    const manifestPath = join(backupDirectory, "manifest.json");
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { formatVersion: number; attachments: unknown[] };
-    manifest.formatVersion = 1;
-    manifest.attachments = [];
-    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-    rmSync(join(backupDirectory, "attachments"), { recursive: true, force: true });
-
-    expect((await verifyBridgeBackup(backupDirectory)).attachmentCount).toBe(0);
-    const restoreDirectory = join(root, "incomplete-restore");
-    await expect(restoreBridgeBackup({ backupDirectory, outputDirectory: restoreDirectory }))
-      .rejects.toThrow("旧版备份没有保存 tmux 附件");
-    expect(existsSync(restoreDirectory)).toBe(false);
-    expect(action.actionId).toBeTruthy();
-  });
-
-  it("refuses an existing destination and cleans the reserved output after a failed attachment copy", async () => {
-    const root = makeTemporaryDirectory();
-    const databasePath = join(root, "runtime", "bridge.db");
-    mkdirSync(join(root, "runtime"), { recursive: true });
-    const database = new StateDatabase(databasePath);
-    const roots = defaultBridgeAttachmentRoots(databasePath, root);
-    mkdirSync(roots.web[0], { recursive: true });
-    const missingPath = join(roots.web[0], "missing.txt");
-    database.createStagedWebTaskAttachment({
-      attachmentId: "missing-file",
-      fileName: "missing.txt",
-      mimeType: "text/plain",
-      sizeBytes: 1,
-      localPath: missingPath,
-    });
-    const existingOutput = join(root, "already-there");
+  it("refuses existing backup and restore destinations without overwriting their contents", async () => {
+    const fixture = await makeSimpleBackup();
+    const existingOutput = join(fixture.root, "already-there");
     mkdirSync(existingOutput);
-    await expect(createBridgeBackup({ databasePath, outputDirectory: existingOutput, attachmentRoots: roots }))
+    writeFileSync(join(existingOutput, "keep.txt"), "preserved");
+    await expect(createBridgeBackup({ databasePath: join(fixture.root, "runtime", "bridge.db"), outputDirectory: existingOutput }))
       .rejects.toThrow(/refusing to overwrite/);
-    const failedOutput = join(root, "failed-output");
-    await expect(createBridgeBackup({ databasePath, outputDirectory: failedOutput, attachmentRoots: roots }))
-      .rejects.toThrow(/missing/);
-    expect(existsSync(failedOutput)).toBe(false);
-    expect(lstatSync(existingOutput).isDirectory()).toBe(true);
-    expect(readdirNames(existingOutput)).toEqual([]);
-    database.close();
+    await expect(restoreBridgeBackup({ backupDirectory: fixture.backupDirectory, outputDirectory: existingOutput }))
+      .rejects.toThrow(/refusing to overwrite/);
+    expect(readdirSync(existingOutput)).toEqual(["keep.txt"]);
+    expect(readFileSync(join(existingOutput, "keep.txt"), "utf8")).toBe("preserved");
   });
 
-  it("rejects traversal and symlink artifacts in an untrusted backup", async () => {
+  it("removes staged output when the source is not a Bridge database", async () => {
+    const root = makeTemporaryDirectory();
+    const databasePath = join(root, "unrelated.db");
+    const unrelated = new DatabaseSync(databasePath);
+    unrelated.exec("CREATE TABLE unrelated (value TEXT)");
+    unrelated.close();
+    const outputDirectory = join(root, "failed-output");
+    await expect(createBridgeBackup({ databasePath, outputDirectory })).rejects.toThrow("not a Bridge database");
+    expect(existsSync(outputDirectory)).toBe(false);
+    expect(readdirSync(root).filter((name) => name.includes("bridge-stage"))).toEqual([]);
+  });
+
+  it("rejects traversal in the SQLite artifact path", async () => {
     const fixture = await makeSimpleBackup();
     const manifestPath = join(fixture.backupDirectory, "manifest.json");
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { attachments: Array<{ file: string }> };
-    manifest.attachments[0].file = "../outside.txt";
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    manifest.database.file = "../outside.db";
     writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
-    await expect(verifyBridgeBackup(fixture.backupDirectory)).rejects.toThrow(/escapes|invalid artifact/);
-
-    const second = await makeSimpleBackup();
-    const secondManifest = JSON.parse(readFileSync(join(second.backupDirectory, "manifest.json"), "utf8")) as {
-      attachments: Array<{ file: string }>;
-    };
-    const attachmentPath = join(second.backupDirectory, secondManifest.attachments[0].file);
-    const outsidePath = join(second.root, "outside.txt");
-    writeFileSync(outsidePath, "outside");
-    rmSync(attachmentPath);
-    symlinkSync(outsidePath, attachmentPath);
-    await expect(verifyBridgeBackup(second.backupDirectory)).rejects.toThrow(/symlink/);
+    await expect(verifyBridgeBackup(fixture.backupDirectory)).rejects.toThrow("database record is invalid");
   });
 
-  it("lists and inspects manifest metadata without claiming artifact hash verification", async () => {
+  it.each(["bridge.db", "manifest.json"])("rejects a symlink for %s in an untrusted backup", async (file) => {
     const fixture = await makeSimpleBackup();
-    const unrelatedDirectory = join(fixture.root, "unrelated");
-    mkdirSync(unrelatedDirectory);
+    const artifactPath = join(fixture.backupDirectory, file);
+    const outsidePath = join(fixture.root, file);
+    writeFileSync(outsidePath, readFileSync(artifactPath));
+    rmSync(artifactPath);
+    symlinkSync(outsidePath, artifactPath);
+    await expect(verifyBridgeBackup(fixture.backupDirectory)).rejects.toThrow("symlink");
+  });
+
+  it("rejects non-SQLite artifacts and attachment declarations in new backups", async () => {
+    const fixture = await makeSimpleBackup();
+    writeFileSync(join(fixture.backupDirectory, "config.json"), "{}");
+    await expect(verifyBridgeBackup(fixture.backupDirectory)).rejects.toThrow("unexpected artifact");
+    rmSync(join(fixture.backupDirectory, "config.json"));
+    const manifestPath = join(fixture.backupDirectory, "manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    manifest.attachments = [{ file: "../outside.txt" }];
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    await expect(verifyBridgeBackup(fixture.backupDirectory)).rejects.toThrow("no attachments");
+  });
+
+  it("lists and inspects manifest metadata without claiming SQLite hash verification", async () => {
+    const fixture = await makeSimpleBackup();
+    mkdirSync(join(fixture.root, "unrelated"));
     const invalidDirectory = join(fixture.root, "broken-backup");
     mkdirSync(invalidDirectory);
     writeFileSync(join(invalidDirectory, "manifest.json"), "not json");
-
     const metadata = await inspectBridgeBackupMetadata(fixture.backupDirectory);
-    expect(metadata).toMatchObject({
-      programVersion: "test-version",
-      attachmentCount: 1,
-      attachmentBytes: 3,
-      contentHashesVerified: false,
-    });
+    expect(metadata).toMatchObject({ scope: "sqlite", programVersion: "test-version", attachmentCount: 0,
+      attachmentBytes: 0, contentHashesVerified: false });
     const entries = await listBridgeBackups(fixture.root);
     expect(entries).toHaveLength(2);
     expect(entries.find((entry) => entry.status === "metadata")?.metadata).toMatchObject(metadata);
     expect(entries.find((entry) => entry.status === "invalid")?.error).toContain("JSON");
-
-    const logged: string[] = [];
-    const originalLog = console.log;
-    console.log = (...values: unknown[]) => logged.push(values.join(" "));
-    try {
+    const logged = await captureCliOutput(async () => {
       await runBackupCli(["inspect", "--backup", fixture.backupDirectory]);
       await runBackupCli(["list", "--dir", fixture.root]);
       await runBackupCli(["check-upgrade", "--backup", fixture.backupDirectory]);
-    } finally {
-      console.log = originalLog;
-    }
-    expect(JSON.parse(logged[0] ?? "{}")).toMatchObject({ contentHashesVerified: false });
+    });
+    expect(JSON.parse(logged[0] ?? "{}")).toMatchObject({ scope: "sqlite", contentHashesVerified: false });
     expect(JSON.parse(logged[1] ?? "[]")).toHaveLength(2);
     expect(JSON.parse(logged[2] ?? "{}")).toMatchObject({ compatible: true });
+    writeFileSync(join(fixture.backupDirectory, "bridge.db"), "tampered");
+    expect(await inspectBridgeBackupMetadata(fixture.backupDirectory)).toEqual(metadata);
+    await expect(verifyBridgeBackup(fixture.backupDirectory)).rejects.toThrow("database hash or size");
+  });
+
+  it("creates and restores SQLite via CLI while ignoring obsolete attachment-root flags", async () => {
+    const fixture = await makeSimpleBackup();
+    const backupDirectory = join(fixture.root, "cli-backup");
+    const outputDirectory = join(fixture.root, "cli-restore");
+    const logged = await captureCliOutput(async () => {
+      await runBackupCli(["create", "--db", join(fixture.root, "runtime", "bridge.db"), "--out", backupDirectory,
+        "--data-root", "/unused-install", "--web-root", "/unused-web", "--direct-root", "/unused-direct", "--aamp-root", "/unused-aamp"]);
+      await runBackupCli(["verify", "--backup", backupDirectory]);
+      await runBackupCli(["restore", "--backup", backupDirectory, "--out", outputDirectory]);
+    });
+    for (const result of logged) expect(JSON.parse(result)).toMatchObject({ scope: "sqlite", attachmentCount: 0 });
+    expect(readdirSync(backupDirectory).sort()).toEqual(["bridge.db", "manifest.json"]);
+    expect(readdirSync(outputDirectory)).toEqual(["bridge.db"]);
   });
 
   it("rejects backup list directories with more than the bounded entry limit", async () => {
@@ -402,21 +333,12 @@ describe("Bridge backup", () => {
     oldSchemaDatabase.exec("ALTER TABLE tasks DROP COLUMN worker_pid");
     oldSchemaDatabase.close();
     const oldSchemaBackup = join(fixture.root, "old-schema-backup");
-    await createBridgeBackup({
-      databasePath,
-      outputDirectory: oldSchemaBackup,
-      attachmentRoots: defaultBridgeAttachmentRoots(databasePath, fixture.root),
-      programVersion: "old-version",
-    });
+    await createBridgeBackup({ databasePath, outputDirectory: oldSchemaBackup, programVersion: "old-version" });
     const backupDatabasePath = join(oldSchemaBackup, "bridge.db");
     const originalBackupDatabase = readFileSync(backupDatabasePath);
-
     const compatibility = await checkBridgeBackupUpgradeCompatibility(oldSchemaBackup);
-    expect(compatibility).toMatchObject({
-      sourceProgramVersion: "old-version",
-      compatible: true,
-      sourceSchemaFingerprint: (await verifyBridgeBackup(oldSchemaBackup)).schemaFingerprint,
-    });
+    expect(compatibility).toMatchObject({ sourceProgramVersion: "old-version", compatible: true,
+      sourceSchemaFingerprint: (await verifyBridgeBackup(oldSchemaBackup)).schemaFingerprint });
     expect(compatibility.sourceSchemaFingerprint).not.toBe(compatibility.migratedSchemaFingerprint);
     expect(readFileSync(backupDatabasePath)).toEqual(originalBackupDatabase);
   });
@@ -426,35 +348,35 @@ async function makeSimpleBackup(): Promise<{ root: string; backupDirectory: stri
   const root = makeTemporaryDirectory();
   const databasePath = join(root, "runtime", "bridge.db");
   mkdirSync(join(root, "runtime"), { recursive: true });
-  const roots = defaultBridgeAttachmentRoots(databasePath, root);
-  mkdirSync(roots.web[0], { recursive: true });
-  const filePath = join(roots.web[0], "one.txt");
-  writeFileSync(filePath, "one");
   const database = new StateDatabase(databasePath);
-  database.createStagedWebTaskAttachment({
-    attachmentId: "one-file",
-    fileName: "one.txt",
-    mimeType: "text/plain",
-    sizeBytes: 3,
-    localPath: filePath,
-  });
+  database.createStagedWebTaskAttachment({ attachmentId: "one-file", fileName: "one.txt", mimeType: "text/plain",
+    sizeBytes: 3, localPath: join(root, "missing-attachment.txt") });
   database.close();
   const backupDirectory = join(root, "backup");
-  await createBridgeBackup({
-    databasePath,
-    outputDirectory: backupDirectory,
-    attachmentRoots: roots,
-    programVersion: "test-version",
-  });
+  await createBridgeBackup({ databasePath, outputDirectory: backupDirectory, programVersion: "test-version" });
   return { root, backupDirectory };
+}
+
+function addTmuxAttachmentReference(database: StateDatabase, root: string): { actionId: string; content: string } {
+  const session = database.recordTmuxSession({ id: "$1", name: "backup-test", cwd: root, createdAt: 10 });
+  const imagePath = join(root, ".feishu-codex-bridge", "tmux-dashboard-attachments", "9c7daf93-0aa0-4e8a-a214-5475796af882.jpg");
+  const content = `请查看图片：<image name=[Image #1] path="${imagePath}">`;
+  const action = database.beginTmuxSessionAction({ sessionRecordId: session.record_id, deviceId: null,
+    actionType: "task_submit", requestId: "backup-tmux-request", content });
+  database.finishTmuxSessionAction(action.actionId, "confirmed");
+  return { actionId: action.actionId, content };
+}
+
+async function captureCliOutput(action: () => Promise<void>): Promise<string[]> {
+  const logged: string[] = [];
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => logged.push(values.join(" "));
+  try { await action(); } finally { console.log = originalLog; }
+  return logged;
 }
 
 function makeTemporaryDirectory(): string {
   const path = mkdtempSync(join(tmpdir(), "bridge-backup-test-"));
   temporaryDirectories.push(path);
   return path;
-}
-
-function readdirNames(path: string): string[] {
-  return readdirSync(path);
 }

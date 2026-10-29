@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,77 @@ afterEach(async () => {
 });
 
 describe("WebPairingAuth", () => {
+  for (const transport of ["cookie", "bearer", "loopback-cookie"] as const) {
+    it(`refreshes an existing ${transport} device UA on its next login without changing its identity`, () => {
+      const db = new StateDatabase(":memory:");
+      const auth = new WebPairingAuth({ db, allowLocalRequests: transport === "loopback-cookie" });
+      const original = fakeRequest("203.0.113.20");
+      original.headers["user-agent"] = "Mozilla/5.0 (Linux; Android 14; Phone) Chrome/129.0.0.0";
+      const token = auth.claimPairing(original, auth.startPairing().code);
+      const before = db.listWebAuthSessions()[0]!;
+      const renamed = "我的工作手机";
+      db.updateWebAuthSessionDeviceName(before.sessionId, renamed);
+      const returning = fakeRequest(transport === "loopback-cookie" ? "127.0.0.1" : "203.0.113.20");
+      returning.headers[transport === "bearer" ? "authorization" : "cookie"] = transport === "bearer"
+        ? `Bearer ${token}` : `bridge_session=${token}`;
+      const upgradedUA = original.headers["user-agent"] + " BridgeApp/0.6.0 (Android)";
+      returning.headers["user-agent"] = upgradedUA;
+      try {
+        expect(auth.status(returning).authenticated).toBe(true);
+        const admin = fakeRequest("203.0.113.20", `bridge_session=${token}`);
+        // Missing UA headers on a subsequent request must not erase metadata.
+        const devices = new WebPairingAuth({ db }).listDevices(admin)!;
+        expect(devices).toHaveLength(1);
+        expect(devices[0]).toMatchObject({
+          sessionId: before.sessionId, current: true, deviceName: renamed,
+          userAgent: upgradedUA, createdAt: before.createdAt, expiresAt: before.expiresAt,
+        });
+        expect(db.listWebAuthSessions()[0]?.userAgent).toBe(upgradedUA);
+        db.revokeWebAuthSession(before.sessionId, new Date().toISOString());
+        const rejected = fakeRequest("203.0.113.20", `bridge_session=${token}`);
+        rejected.headers["user-agent"] = "untrusted replacement";
+        expect(auth.isAuthorized(rejected)).toBe(false);
+        expect(db.listWebAuthSessions()[0]?.userAgent).toBe(upgradedUA);
+      } finally { db.close(); }
+    });
+  }
+
+  it("retains an appended Bridge marker on a long system user agent", () => {
+    const auth = new WebPairingAuth();
+    const request = fakeRequest("203.0.113.21");
+    const token = auth.claimPairing(request, auth.startPairing().code);
+    request.headers.cookie = `bridge_session=${token}`;
+    const ua = "Mozilla/5.0 (Linux; Android 14) " + "system-detail ".repeat(50) + "BridgeApp/0.6.0 (Android)";
+    request.headers["user-agent"] = ua;
+    expect(auth.listDevices(request)?.[0]?.userAgent).toBe(ua);
+  });
+
+  it("throttles last-seen writes while checking metadata changes and revocation on every request", () => {
+    const db = new StateDatabase(":memory:");
+    let now = Date.now();
+    const auth = new WebPairingAuth({ db, now: () => now });
+    const remote = fakeRequest("203.0.113.20");
+    const token = auth.claimPairing(remote, auth.startPairing().code);
+    const request = fakeRequest("203.0.113.20", `bridge_session=${token}`);
+    const touch = spyOn(db, "touchWebAuthSession");
+    try {
+      now += 1_000;
+      expect(auth.isAuthorized(request)).toBe(true);
+      expect(auth.isAuthorized(request)).toBe(true);
+      expect(touch).toHaveBeenCalledTimes(0);
+      now += 60_000;
+      expect(auth.isAuthorized(request)).toBe(true);
+      expect(auth.isAuthorized(request)).toBe(true);
+      expect(touch).toHaveBeenCalledTimes(1);
+      request.headers["user-agent"] = "upgraded browser";
+      expect(auth.isAuthorized(request)).toBe(true);
+      expect(touch).toHaveBeenCalledTimes(2);
+      db.revokeWebAuthSession(db.listWebAuthSessions()[0]!.sessionId, new Date(now).toISOString());
+      expect(auth.isAuthorized(request)).toBe(false);
+      expect(touch).toHaveBeenCalledTimes(2);
+    } finally { touch.mockRestore(); db.close(); }
+  });
+
   it("pairs a non-local device and restores its session after restart", async () => {
     const directory = await mkdtemp(join(tmpdir(), "bridge-web-auth-"));
     temporaryDirectories.push(directory);

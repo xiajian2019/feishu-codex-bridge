@@ -1,0 +1,16 @@
+.upload-manager-status,
+.upload-manager-notice { position: fixed; z-index: 420; display: grid; min-width: min(360px, calc(100vw - 32px)); gap: 5px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 11px; color: var(--ink); background: var(--card); box-shadow: 0 12px 32px #17211b26; font-size: 12px; }
+.upload-manager-status,
+.upload-manager-notice { top: calc(var(--bridge-safe-top, env(safe-area-inset-top, 0px)) + 74px); left: 50%; transform: translateX(-50%); }
+.upload-manager-status strong,
+.upload-manager-notice strong { color: var(--accent); }
+.upload-manager-status span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-manager-status progress { width: 100%; height: 6px; accent-color: var(--accent); }
+.upload-manager-status small { color: var(--muted); }
+.upload-manager-status button { justify-self: end; min-height: 28px; padding: 3px 8px; font-size: 12px; }
+:root[data-theme="dark"] .upload-manager-status,
+:root[data-theme="dark"] .upload-manager-notice { border-color: #303b48; color: #d8dee9; background: #202832; box-shadow: 0 12px 32px #0006; }
+@media (max-width: 760px) {
+  .upload-manager-status,
+  .upload-manager-notice { min-width: 0; max-width: calc(100vw - 32px); }
+}

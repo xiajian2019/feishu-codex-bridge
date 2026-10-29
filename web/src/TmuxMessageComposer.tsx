@@ -9,7 +9,8 @@ import {
   type ChatModelAdapter,
   type ThreadUserMessage,
 } from "@assistant-ui/react";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
+import { createPortal } from "react-dom";
 
 import {
   beginDebugLogCapture,
@@ -20,7 +21,7 @@ import {
   logDebugDiagnostic,
   subscribeDebugLogCapture,
 } from "./debug-log-capture.js";
-import { fetchShortcutConfig, getActionToken, recordShortcutUse, watchRemoteShortcutConfig } from "./api.js";
+import { fetchShortcutConfig, recordShortcutUse } from "./api.js";
 import { readShortcutConfigCache, subscribeShortcutConfigInvalidation } from "./shortcut-config-cache.js";
 import {
   type ShortcutCategory,
@@ -39,11 +40,13 @@ import {
   type DraftAttachment,
 } from "./tmux-draft-store.js";
 import { readCodexSkillCache, writeCodexSkillCache } from "./skill-cache.js";
+import { getLocalDraftScope } from "./local-draft-scope.js";
+import { isMobileApp, shareMobileBlob } from "./mobile-runtime.js";
+import { uploadFileInChunks, type DownloadUploadPhase, type UploadMetric } from "./download-upload.js";
 
 const TmuxShortcutPalette = lazy(() => import("./TmuxShortcutPalette.js").then((module) => ({ default: module.TmuxShortcutPalette })));
 
 const API_ROOT = "/tmux-dashboard/api";
-const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
 function macComposerTerminalShortcut(event: KeyboardEvent, composerEmpty: boolean): TerminalShortcut | null {
   if (
@@ -136,6 +139,7 @@ type TmuxMessageComposerProps = {
   onSessionFileForwardConsumed: (requestId: string) => void;
   diagnosticSessionActive: boolean;
   disabled: boolean;
+  sendDisabled: boolean;
   sending: boolean;
   placeholder: string;
   onSubmit: (text: string) => Promise<ComposerSubmissionResult>;
@@ -149,21 +153,35 @@ type TmuxMessageComposerProps = {
   onExportScrollDiagnostics: () => void;
 };
 
-async function uploadAttachment(file: File): Promise<string> {
-  const response = await fetch(API_ROOT + "/attachments", {
-    method: "POST",
-    headers: {
-      "content-type": file.type || "application/octet-stream",
-      "x-file-name": encodeURIComponent(file.name),
-      "X-Bridge-Action-Token": await getActionToken(),
+type AttachmentUploadProgress = {
+  bytes: number;
+  total: number;
+  phase: DownloadUploadPhase;
+};
+
+async function uploadAttachment(
+  file: File,
+  signal: AbortSignal,
+  onProgress: (progress: AttachmentUploadProgress) => void,
+): Promise<string> {
+  let phase: DownloadUploadPhase = "preparing";
+  let bytes = 0;
+  const uploaded = await uploadFileInChunks(file, {
+    endpoint: API_ROOT + "/attachments/uploads",
+    parallel: true,
+    signal,
+    onPhase: (nextPhase) => {
+      phase = nextPhase;
+      if (phase === "saving") bytes = file.size;
+      onProgress({ bytes, total: file.size, phase });
     },
-    body: file,
+    onProgress: (nextBytes, saving) => {
+      bytes = nextBytes;
+      onProgress({ bytes, total: file.size, phase: saving ? "saving" : phase });
+    },
+    onMetric: (metric: UploadMetric) => logDebugDiagnostic("tmux-upload", metric.type, metric),
   });
-  const payload = await response.json() as { path?: string; error?: string };
-  if (!response.ok || typeof payload.path !== "string") {
-    throw new Error(payload.error || "Attachment upload failed (" + response.status + ").");
-  }
-  return payload.path;
+  return uploaded.filePath;
 }
 
 function escapePromptAttribute(value: string): string {
@@ -235,7 +253,31 @@ function ImagePreview({ file, onOpen }: { file: File; onOpen: (file: File) => vo
 
 function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): ReactElement {
   const previewUrl = useFileObjectUrl(file);
-  return (
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    const previousFocus = document.activeElement;
+    closeButtonRef.current?.focus({ preventScroll: true });
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onCloseRef.current();
+      } else if (event.key === "Tab") {
+        event.preventDefault();
+        closeButtonRef.current?.focus({ preventScroll: true });
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus({ preventScroll: true });
+    };
+  }, []);
+
+  return createPortal(
     <div
       className="dashboard-image-lightbox"
       role="dialog"
@@ -245,8 +287,10 @@ function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): 
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      <button className="dashboard-image-lightbox-close" type="button" aria-label="关闭图片预览" onClick={onClose}>×</button>
-      <div className="dashboard-image-lightbox-content">
+      <button ref={closeButtonRef} className="dashboard-image-lightbox-close" type="button" aria-label="关闭图片预览" onClick={onClose}>×</button>
+      <div className="dashboard-image-lightbox-content" onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}>
         {previewUrl ? (
           <img
             src={previewUrl}
@@ -256,11 +300,13 @@ function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): 
           />
         ) : <span>图片加载中…</span>}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
-function downloadDebugLog(file: File): void {
+function downloadDebugLog(file: File): void | Promise<void> {
+  if (isMobileApp()) return shareMobileBlob(file, file.name);
   const url = URL.createObjectURL(file);
   const link = document.createElement("a");
   link.href = url;
@@ -274,10 +320,11 @@ function downloadDebugLog(file: File): void {
 
 type ComposerFieldsProps = TmuxMessageComposerProps & {
   preparing: boolean;
+  attachmentProgress: Readonly<Record<string, AttachmentUploadProgress>>;
   onSendStart: () => void;
 };
 
-function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending, placeholder, preparing, onSendStart, onSubmit, onSubmitCommand, onAttachmentError, onOpenFiles, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
+function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sendDisabled, sending, placeholder, preparing, attachmentProgress, onSendStart, onSubmit, onSubmitCommand, onAttachmentError, onOpenFiles, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
   const aui = useAui();
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [shortcutCategory, setShortcutCategory] = useState<ShortcutCategory>("favorites");
@@ -295,7 +342,8 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
   const skillsSearchTimerRef = useRef<number | null>(null);
   const [debugLogActive, setDebugLogActive] = useState(() => isDebugLogCaptureActive());
   const [debugLogBusy, setDebugLogBusy] = useState(false);
-  const controlsDisabled = disabled || sending || preparing || debugLogBusy;
+  const inputDisabled = disabled || sending || preparing || debugLogBusy;
+  const controlsDisabled = disabled || sendDisabled || sending || preparing || debugLogBusy;
   const debugLogControlsDisabled = sending || preparing || debugLogBusy || (disabled && !debugLogActive);
   const composerFormRef = useRef<HTMLFormElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -337,6 +385,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
     skillsRequestRef.current = controller;
     const requestSequence = ++skillsRequestSequenceRef.current;
     const cacheKey = "tmux-session:" + targetSessionId;
+    const cacheScope = getLocalDraftScope();
     const cached = readCodexSkillCache(cacheKey, isCodexSkillList);
     if (cached) {
       setCodexSkills(cached);
@@ -352,7 +401,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
         .then(({ skills, refreshing, fresh }) => {
           if (controller.signal.aborted || requestSequence !== skillsRequestSequenceRef.current) return;
           setCodexSkills(skills);
-          if (fresh) writeCodexSkillCache(cacheKey, skills);
+          if (fresh) writeCodexSkillCache(cacheKey, skills, cacheScope);
           setSkillsLoading(false);
           if (refreshing && refreshAttempt < 8) {
             skillsRefreshTimerRef.current = window.setTimeout(() => {
@@ -515,12 +564,10 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
       setShortcutStore(readShortcutConfigCache() ?? { groups: [], shortcuts: [] });
       refresh();
     });
-    const unsubscribeRemote = watchRemoteShortcutConfig();
     refresh();
     return () => {
       cancelled = true;
       unsubscribe();
-      unsubscribeRemote();
     };
   }, []);
 
@@ -735,7 +782,10 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
       const file = finishDebugLogCapture();
       if (!file) return;
       if (import.meta.env.DEV) await aui.composer.addAttachment(file);
-      else downloadDebugLog(file);
+      else {
+        const download = downloadDebugLog(file);
+        if (download) await download;
+      }
     } catch (error) {
       onAttachmentError(error instanceof Error ? error.message : "Could not attach the debug log.");
     } finally {
@@ -767,7 +817,11 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
   const renderComposerAction = (shortcut: ShortcutDefinition): ReactElement | null => {
     const track = (): void => { void handleShortcutUse(shortcut.id); };
     const terminalAction = (value: string): ReactElement => (
-      <button key={shortcut.id} className="dashboard-keybar-button is-icon" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.detail || shortcut.title} disabled={controlsDisabled} onClick={() => { track(); void onTerminalShortcut(value as TerminalShortcut); }}>{shortcut.title}</button>
+      <button key={shortcut.id} className={`dashboard-keybar-button is-icon${shortcut.actionKey === "terminal-enter" ? " is-enter" : ""}`} type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.detail || shortcut.title} disabled={controlsDisabled} onClick={() => { track(); void onTerminalShortcut(value as TerminalShortcut); }}>
+        {shortcut.actionKey === "terminal-enter"
+          ? <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 4v7a4 4 0 0 1-4 4H4m5-5-5 5 5 5" /></svg>
+          : shortcut.title}
+      </button>
     );
     switch (shortcut.actionKey) {
       case "attachment":
@@ -834,7 +888,11 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
       <ComposerPrimitive.Root
         className="dashboard-composer"
         ref={composerFormRef}
-        onSubmit={() => {
+        onSubmit={(event: FormEvent<HTMLFormElement>) => {
+          if (controlsDisabled) {
+            event.preventDefault();
+            return;
+          }
           setSkillsPickerOpen(false);
           skillTriggerRangeRef.current = null;
           if (aui.composer.getState().isEmpty) return;
@@ -844,22 +902,30 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
       >
         <div className="dashboard-composer-images" aria-label="Attachments to send">
           <ComposerPrimitive.Attachments>
-            {({ attachment }) => (
-              <AttachmentPrimitive.Root
+            {({ attachment }) => {
+              const progress = attachmentProgress[attachment.id];
+              const percent = progress && progress.total > 0
+                ? Math.min(100, Math.floor(progress.bytes / progress.total * 100))
+                : 0;
+              return <AttachmentPrimitive.Root
                 className={"dashboard-composer-image" + (attachment.file?.type.startsWith("image/") ? "" : " is-file")}
                 key={attachment.id}
               >
                 {attachment.file?.type.startsWith("image/")
                   ? <ImagePreview file={attachment.file} onOpen={setPreviewFile} />
                   : <span className="dashboard-composer-file-name" title={attachment.name}>{attachment.name}</span>}
+                {progress ? <span className="dashboard-composer-upload-progress" role="status" aria-live="polite">
+                  <progress max={progress.total || 1} value={Math.min(progress.bytes, progress.total || 1)} aria-label={`${attachment.name} 上传进度`} />
+                  <span>{uploadPhaseText(progress.phase)} {percent}%</span>
+                </span> : null}
                 <AttachmentPrimitive.Remove
                   className="dashboard-composer-image-remove"
                   type="button"
                   aria-label={"Remove " + attachment.name}
                   disabled={controlsDisabled}
                 >×</AttachmentPrimitive.Remove>
-              </AttachmentPrimitive.Root>
-            )}
+              </AttachmentPrimitive.Root>;
+            }}
           </ComposerPrimitive.Attachments>
         </div>
         <div className="dashboard-composer-input-slot">
@@ -871,8 +937,8 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
             maxLength={8_000}
             minRows={2}
             maxRows={6}
-            disabled={controlsDisabled}
-            submitMode="enter"
+            disabled={inputDisabled}
+            submitMode={sendDisabled ? "none" : "enter"}
             unstable_insertNewlineOnTouchEnter
             unstable_focusOnRunStart={false}
             unstable_focusOnScrollToBottom={false}
@@ -1005,7 +1071,8 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
             className="dashboard-compose-send"
             type="button"
             disabled={controlsDisabled}
-            aria-label={sending || preparing ? "正在发送" : "发送消息"}
+            aria-label={sendDisabled ? "等待连接恢复后发送" : sending || preparing ? "正在发送" : "发送消息"}
+            title={sendDisabled ? "连接不可用，恢复后可发送" : undefined}
           ><span className="dashboard-send-label">{sending || preparing ? "发送中…" : "发送"}</span><span aria-hidden="true">↑</span></ComposerPrimitive.Send>
         </div>
       </ComposerPrimitive.Root>
@@ -1030,7 +1097,16 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sending,
 
 export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactElement {
   const [preparing, setPreparing] = useState(false);
+  const [attachmentProgress, setAttachmentProgress] = useState<Record<string, AttachmentUploadProgress>>({});
   const runtimeRef = useRef<AssistantRuntime | null>(null);
+  const attachmentUploads = useRef(new Set<AbortController>());
+  useEffect(() => {
+    setAttachmentProgress({});
+    return () => {
+      for (const upload of attachmentUploads.current) upload.abort();
+      attachmentUploads.current.clear();
+    };
+  }, [props.sessionId]);
   const submitRef = useRef(props.onSubmit);
   const attachmentErrorRef = useRef(props.onAttachmentError);
   const forwardConsumedRef = useRef(props.onSessionFileForwardConsumed);
@@ -1042,12 +1118,6 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
   const attachmentAdapter = useMemo<AttachmentAdapter>(() => ({
     accept: "*",
     async add({ file }) {
-      if (file.size > MAX_ATTACHMENT_BYTES) {
-        const message = "Each attachment must be 10 MB or smaller.";
-        attachmentErrorRef.current(message);
-        throw new Error(message);
-      }
-
       const id = ["attachment", Date.now(), Math.random()].join("-");
       if (props.sessionId) await saveDraftAttachment(props.sessionId, id, file);
       return {
@@ -1061,17 +1131,33 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
     },
     async remove() {},
     async send(attachment) {
+      const upload = new AbortController();
+      attachmentUploads.current.add(upload);
       try {
-        const path = await uploadAttachment(attachment.file);
+        const path = await uploadAttachment(attachment.file, upload.signal, (progress) => {
+          setAttachmentProgress((current) => ({ ...current, [attachment.id]: progress }));
+        });
+        setAttachmentProgress((current) => {
+          const next = { ...current };
+          delete next[attachment.id];
+          return next;
+        });
         return {
           ...attachment,
           status: { type: "complete" },
           content: [{ type: "text", text: path }],
         };
       } catch (error) {
+        setAttachmentProgress((current) => {
+          const next = { ...current };
+          delete next[attachment.id];
+          return next;
+        });
         setPreparing(false);
         attachmentErrorRef.current(error instanceof Error ? error.message : "Attachment upload failed.");
         throw error;
+      } finally {
+        attachmentUploads.current.delete(upload);
       }
     },
   }), [props.sessionId]);
@@ -1149,6 +1235,7 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
   useEffect(() => {
     const sessionId = props.sessionId;
     if (!sessionId) return;
+    const draftScope = getLocalDraftScope();
     const composer = runtime.thread.composer;
     let cancelled = false;
     let restored = false;
@@ -1167,10 +1254,10 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
           lastModified: attachment.file?.lastModified ?? 0,
         }));
       if (!state.text && attachments.length === 0) {
-        clearDraftMetadata(sessionId);
+        clearDraftMetadata(sessionId, draftScope);
         return;
       }
-      saveDraftMetadata(sessionId, { text: state.text, attachments });
+      saveDraftMetadata(sessionId, { text: state.text, attachments }, draftScope);
     };
     const persist = (): void => {
       if (!restored || cancelled) return;
@@ -1246,10 +1333,22 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
       <ComposerFields
         {...props}
         preparing={preparing}
+        attachmentProgress={attachmentProgress}
         onSendStart={() => {
           if (!runtime.thread.composer.getState().isEmpty) setPreparing(true);
         }}
       />
     </AssistantRuntimeProvider>
   );
+}
+
+function uploadPhaseText(phase: DownloadUploadPhase): string {
+  switch (phase) {
+    case "preparing": return "准备中";
+    case "creating": return "创建上传任务";
+    case "reading": return "读取文件";
+    case "uploading": return "上传中";
+    case "confirming": return "Mac 正在写入";
+    case "saving": return "保存到 Mac";
+  }
 }

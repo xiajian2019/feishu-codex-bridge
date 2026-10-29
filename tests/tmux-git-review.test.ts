@@ -39,7 +39,7 @@ import {
   stripGitReviewMarkers,
   type GitReviewAnchor,
 } from "../web/src/git-review-drafts.js";
-import { failPendingTmuxSubmissionsOnDisconnect } from "../web/src/TmuxDashboard.js";
+import { failPendingTmuxSubmissionsOnDisconnect } from "../web/src/tmux-terminal-utils.js";
 import type { WebSocket } from "ws";
 
 const temporaryRoots: string[] = [];

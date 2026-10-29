@@ -1,4 +1,5 @@
 import type VConsole from "vconsole";
+import { copyMobileText, isMobileApp, shareMobileBlob } from "./mobile-runtime.js";
 
 type ExportPlugin = InstanceType<typeof VConsole.VConsolePlugin>;
 type DebugWindow = Window & {
@@ -37,6 +38,13 @@ export async function installKeyboardLogExport(vConsole: VConsole, constructor: 
   const exportLogs = (): void => {
     const logs = getLogs();
     if (!logs) return;
+    if (isMobileApp()) {
+      const fileName = "tmux-debug-" + new Date().toISOString().replace(/[:.]/g, "-") + ".log";
+      void shareMobileBlob(new Blob([logs], { type: "text/plain;charset=utf-8" }), fileName)
+        .then(() => message("已打开日志保存或分享，采集已暂停。"))
+        .catch((failure: unknown) => message(failure instanceof Error ? failure.message : "日志导出失败。"));
+      return;
+    }
     const url = URL.createObjectURL(new Blob([logs], { type: "text/plain;charset=utf-8" }));
     const link = document.createElement("a");
     link.href = url;
@@ -50,6 +58,11 @@ export async function installKeyboardLogExport(vConsole: VConsole, constructor: 
   const copyLogs = (): void => {
     const logs = getLogs();
     if (!logs) return;
+    if (isMobileApp()) {
+      void copyMobileText(logs).then(() => message("已复制全部调试日志，采集已暂停。"))
+        .catch((failure: unknown) => message(failure instanceof Error ? failure.message : "日志复制失败。"));
+      return;
+    }
     // HTTP LAN pages do not have navigator.clipboard; run synchronously in the tap gesture.
     const field = document.getElementById("tmux-log-export-text") as HTMLTextAreaElement | null;
     if (!field) return;

@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { setLocalDraftScope } from "../web/src/local-draft-scope.js";
 
 import {
   CODEX_SKILL_CACHE_TTL_MS,
@@ -8,9 +9,11 @@ import {
 } from "../web/src/skill-cache.js";
 
 const cacheKey = "test-skill-cache";
+beforeEach(() => setLocalDraftScope("a".repeat(43), "https://skills.fixture"));
 
 afterEach(() => {
   clearCodexSkillCache(cacheKey);
+  setLocalDraftScope(null);
 });
 describe("Codex skill cache", () => {
   it("keeps valid skill metadata in the local cache for one day", () => {

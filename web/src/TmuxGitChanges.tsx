@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { Link, useNavigate, useParams } from "react-router";
 
 import { getJson } from "./api.js";
+import { downloadBridgeFile, isMobileApp } from "./mobile-runtime.js";
 import "./git-review.css";
 import {
   createGitReviewDraftForward,
@@ -339,6 +340,7 @@ interface GitChangeDiffProps {
   rangeStart: GitReviewAnchor | null;
   rangeError: string;
   onClearSelection: () => void;
+  reviewAction: ReactElement;
 }
 
 const GitChangeDiff = memo(function GitChangeDiff({
@@ -354,8 +356,10 @@ const GitChangeDiff = memo(function GitChangeDiff({
   formattedText,
   showTextPreview,
   onAddAnchor,
-  rangeStart, rangeError, onClearSelection,
+  rangeStart, rangeError, onClearSelection, reviewAction,
 }: GitChangeDiffProps): ReactElement {
+  const [downloadError, setDownloadError] = useState("");
+  useEffect(() => setDownloadError(""), [selectedFile?.path]);
   const renderedPatch = useMemo(() => selectedPatch
     ? selectedFile
       ? renderReviewablePatch(selectedPatch, selectedFile, data.headCommit, onAddAnchor, rangeStart)
@@ -375,8 +379,8 @@ const GitChangeDiff = memo(function GitChangeDiff({
           <strong title={selectedFile?.path}>{selectedFile ? selectedFile.path : "完整 diff"}</strong>
           {selectedFile?.oldPath ? <span>来自 {selectedFile.oldPath}</span> : null}
         </div>
-        {selectedFile ? (
-          <div className="tmux-git-changes-file-actions">
+        <div className="tmux-git-changes-file-actions">
+          {selectedFile ? <>
             <span>{formatSizeKb(filePreview?.sizeBytes ?? selectedFile.sizeBytes)}</span>
             {filePreview?.kind === "text" && selectedPatch && selectedFile.status !== "untracked" ? (
               <>
@@ -386,11 +390,19 @@ const GitChangeDiff = memo(function GitChangeDiff({
             ) : null}
             {selectedFile.downloadable ? (
               <a href={gitFileUrl(sessionId, data.gitRoot, selectedFile.path, "download")}
-                download={selectedFile.path.split("/").pop()}>下载</a>
+                download={selectedFile.path.split("/").pop()} onClick={(event) => {
+                  if (!isMobileApp()) return;
+                  event.preventDefault();
+                  setDownloadError("");
+                  void downloadBridgeFile(gitFileUrl(sessionId, data.gitRoot, selectedFile.path, "download"), selectedFile.path.split("/").pop())
+                    .catch((failure: unknown) => setDownloadError(failure instanceof Error ? failure.message : "文件下载失败。"));
+                }}>下载</a>
             ) : null}
-          </div>
-        ) : null}
+          </> : null}
+          {reviewAction}
+        </div>
       </header>
+      {downloadError ? <p className="tmux-git-changes-message is-error" role="alert">{downloadError}</p> : null}
       {selectedFile && (!showTextPreview || selectedFile.status === "untracked") && filePreview?.kind !== "binary" ? <div className="tmux-git-range-hint" role="status">
         <span>{rangeStart ? `已选${rangeStart.side === "old" ? "旧" : "新"}行 ${rangeStart.side === "old" ? rangeStart.oldLine : rangeStart.newLine}${rangeStart.kind === "range" ? `–${rangeStart.side === "old" ? rangeStart.oldEndLine : rangeStart.newEndLine}` : ""}，点上方“意见”填写` : "点击起止行号选择范围，再点上方“意见”"}</span>
         {rangeStart ? <button type="button" onClick={onClearSelection}>清除选择</button> : null}
@@ -447,6 +459,7 @@ const GitChangesWorkspace = memo(function GitChangesWorkspace({ sessionId, data 
   const [mobilePane, setMobilePane] = useState<"files" | "diff">("files");
   const [reviewOpen, setReviewOpen] = useState(false);
   const reviewTriggerRef = useRef<HTMLButtonElement>(null);
+  const diffReviewTriggerRef = useRef<HTMLButtonElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const [commentEditor, setCommentEditor] = useState<{ anchor: GitReviewAnchor; commentId?: string } | null>(null);
   const [commentEditorText, setCommentEditorText] = useState("");
@@ -622,9 +635,17 @@ const GitChangesWorkspace = memo(function GitChangesWorkspace({ sessionId, data 
     document.addEventListener("keydown", onKeyDown, true);
     return () => {
       cancelAnimationFrame(frame); document.removeEventListener("keydown", onKeyDown, true);
-      if (previousFocus?.isConnected) previousFocus.focus(); else reviewTriggerRef.current?.focus();
+      if (previousFocus?.isConnected && previousFocus.getClientRects().length) previousFocus.focus();
+      else [diffReviewTriggerRef.current, reviewTriggerRef.current].find((button) => button?.getClientRects().length)?.focus();
     };
   }, [overlayOpen]);
+
+  const reviewLabel = `意见${rangeSelection ? ` · ${rangeSelection.kind === "range" ? ((rangeSelection.side === "old" ? rangeSelection.oldEndLine! - rangeSelection.oldLine! : rangeSelection.newEndLine! - rangeSelection.newLine!) + 1) : 1} 行` : comments.length ? ` ${comments.length}` : ""}`;
+  const openReview = (): void => {
+    setStageError("");
+    if (rangeSelection) { setCommentEditor({ anchor: rangeSelection }); setCommentEditorText(""); setCommentEditorError(""); }
+    else setReviewOpen(true);
+  };
 
   return (
     <div className="tmux-git-review-workspace">
@@ -633,12 +654,8 @@ const GitChangesWorkspace = memo(function GitChangesWorkspace({ sessionId, data 
           <button type="button" role="tab" aria-selected={mobilePane === "files"} onClick={() => setMobilePane("files")}>文件 {data.files.length}</button>
           <button type="button" role="tab" aria-selected={mobilePane === "diff"} onClick={() => setMobilePane("diff")}>Diff</button>
         </div>
-        <button ref={reviewTriggerRef} type="button" className="tmux-git-review-trigger" onClick={() => {
-          setStageError("");
-          if (rangeSelection) { setCommentEditor({ anchor: rangeSelection }); setCommentEditorText(""); setCommentEditorError(""); }
-          else setReviewOpen(true);
-        }}>
-          意见{rangeSelection ? ` · ${rangeSelection.kind === "range" ? ((rangeSelection.side === "old" ? rangeSelection.oldEndLine! - rangeSelection.oldLine! : rangeSelection.newEndLine! - rangeSelection.newLine!) + 1) : 1} 行` : comments.length ? ` ${comments.length}` : ""}
+        <button ref={reviewTriggerRef} type="button" className="tmux-git-review-trigger" aria-haspopup="dialog" onClick={openReview}>
+          {reviewLabel}
         </button>
       </div>
       <section className="tmux-git-changes-layout" data-mobile-pane={mobilePane}>
@@ -665,6 +682,7 @@ const GitChangesWorkspace = memo(function GitChangesWorkspace({ sessionId, data 
           onAddAnchor={handleAddAnchor}
           rangeStart={rangeSelection} rangeError={rangeError}
           onClearSelection={() => { setRangeStart(null); setRangeSelection(null); setRangeError(""); }}
+          reviewAction={<button ref={diffReviewTriggerRef} type="button" className="tmux-git-review-trigger" aria-haspopup="dialog" onClick={openReview}>{reviewLabel}</button>}
         />
       </section>
       {reviewOpen ? createPortal(<div ref={overlayRef} className="tmux-git-review-backdrop" role="presentation"

@@ -205,6 +205,16 @@ export function App(): ReactElement {
   }, [loadOrganizationPreferences, preferencesRevision]);
 
   useEffect(() => {
+    const refreshAfterReconnect = (): void => {
+      if (navigator.onLine === false) return;
+      void loadTasks(true);
+      void loadOrganizationPreferences();
+    };
+    window.addEventListener("online", refreshAfterReconnect);
+    return () => window.removeEventListener("online", refreshAfterReconnect);
+  }, [loadOrganizationPreferences, loadTasks]);
+
+  useEffect(() => {
     if (!incomingTaskDraft || (!lastUpdated && !listError)) return;
     const incomingKey = JSON.stringify(incomingTaskDraft);
     if (handledTaskDraftRef.current === incomingKey) return;

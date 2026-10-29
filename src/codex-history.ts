@@ -199,10 +199,11 @@ export interface CodexHistoryUsageSnapshot {
 
 export interface CodexHistoryUsageSnapshotStore {
   getCodexUsageSnapshot(homeId: string): CodexHistoryUsageSnapshot | null;
-  saveCodexUsageSnapshot(
+  enqueueCodexUsageSnapshot(
     homeId: string,
     snapshot: CodexHistoryUsageSnapshot,
     finalizedDailyBuckets: CodexHistoryUsageDailyBucket[],
+    onError?: (error: Error) => void,
   ): void;
   listCodexUsageDailyBuckets(homeId: string): CodexHistoryUsageDailyBucket[];
 }
@@ -477,6 +478,7 @@ export class CodexHistoryService {
   private readonly listRefreshes = new Map<string, Promise<CodexThread[]>>();
   private readonly recoveryChecks = new Map<string, Promise<CodexHistoryRunRecoveryStatus>>();
   private readonly usageRefreshes = new Map<string, Promise<CodexHistoryUsageAccount>>();
+  private readonly latestUsageSnapshots = new Map<string, CodexHistoryUsageSnapshot>();
 
   constructor(options: CodexHistoryServiceOptions) {
     this.options = options;
@@ -698,9 +700,10 @@ export class CodexHistoryService {
   private async readUsageAccount(home: ResolvedCodexHistoryHome, snapshotDate: string): Promise<CodexHistoryUsageAccount> {
     const checkedAt = new Date(this.now()).toISOString();
     const store = this.options.usageSnapshotStore;
-    let cached: CodexHistoryUsageSnapshot | null = null;
+    let cached = this.latestUsageSnapshots.get(home.id) ?? null;
     try {
-      cached = store?.getCodexUsageSnapshot(home.id) ?? null;
+      const persisted = store?.getCodexUsageSnapshot(home.id) ?? null;
+      if (persisted && (!cached || persisted.capturedAt > cached.capturedAt)) cached = persisted;
     } catch {
       // Keep account usage available when the optional persistence layer is unhealthy.
     }
@@ -778,14 +781,21 @@ export class CodexHistoryService {
         for (const bucket of tokenUsage.dailyUsageBuckets ?? []) {
           if (bucket.startDate < snapshotDate) finalizedBuckets.set(bucket.startDate, bucket.tokens);
         }
+        this.latestUsageSnapshots.set(home.id, snapshot);
+        const reportPersistenceError = (error: unknown): void => {
+          this.options.logger?.warn("failed to persist Codex account usage snapshot", {
+            homeId: home.id, snapshotDate,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        };
         try {
-          this.options.usageSnapshotStore?.saveCodexUsageSnapshot(
-            home.id,
-            snapshot,
+          this.options.usageSnapshotStore?.enqueueCodexUsageSnapshot(
+            home.id, snapshot,
             [...finalizedBuckets.entries()].map(([startDate, tokens]) => ({ startDate, tokens })),
+            reportPersistenceError,
           );
-        } catch {
-          // Return the fresh app-server response even if the optional cache write fails.
+        } catch (error) {
+          reportPersistenceError(error);
         }
         return {
           homeId: home.id,

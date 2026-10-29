@@ -1,0 +1,27 @@
+.downloads-upload-page { width: min(1080px, 100%); margin: 0 auto; padding: 20px 28px 40px; }
+.downloads-upload-header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.downloads-upload-header h1 { margin: 0; font-size: 22px; }
+.downloads-upload-header > span, .downloads-upload-note, .downloads-upload-state, .downloads-upload-file > span { color: var(--muted); font-size: 12px; }
+.downloads-upload-card { border: 1px solid var(--line); border-radius: 12px; padding: 16px; background: var(--card); }
+.downloads-upload-card.is-dragging { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.downloads-upload-toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+.downloads-upload-toolbar button, .downloads-upload-state button { min-height: 32px; }
+.downloads-upload-note { margin: 10px 0; }
+.downloads-upload-empty { padding: 36px 12px; text-align: center; color: var(--muted); border: 1px dashed var(--line); border-radius: 8px; font-size: 13px; }
+.downloads-upload-list { margin: 0; padding: 0; list-style: none; }
+.downloads-upload-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+.downloads-upload-file { min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.downloads-upload-file strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.downloads-upload-file > span { flex-shrink: 0; }
+.downloads-upload-state { display: flex; align-items: center; gap: 8px; }
+.downloads-upload-state button { padding: 3px 8px; font-size: 12px; }
+.downloads-upload-item progress { grid-column: 1 / -1; width: 100%; height: 6px; accent-color: var(--accent); }
+.downloads-upload-path { grid-column: 1 / -1; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.downloads-upload-error, .downloads-upload-state .is-error { color: var(--danger); }
+.downloads-upload-error { grid-column: 1 / -1; font-size: 13px; margin: 0; }
+@media (max-width: 760px) {
+  .downloads-upload-page { padding: 16px 14px 28px; }
+  .downloads-upload-card { padding: 12px; }
+  .downloads-upload-item { grid-template-columns: minmax(0, 1fr); }
+  .downloads-upload-state { justify-content: flex-start; flex-wrap: wrap; }
+}

@@ -1,0 +1,58 @@
+.mobile-download-status {
+  position: fixed;
+  z-index: 430;
+  top: calc(var(--bridge-safe-top, env(safe-area-inset-top, 0px)) + 8px);
+  left: 50%;
+  width: min(390px, calc(100vw - var(--bridge-safe-left, 0px) - var(--bridge-safe-right, 0px) - 20px));
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  color: var(--ink);
+  background: var(--card);
+  box-shadow: 0 8px 28px #17211b26;
+  transform: translateX(-50%);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.mobile-download-status.is-collapsed { width: max-content; max-width: calc(100vw - 24px); border-radius: 24px; }
+.mobile-download-status button { min-height: 32px; padding: 4px 7px; border: 0; border-radius: 6px; color: inherit; background: transparent; font-size: 12px; }
+.mobile-download-status button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.mobile-download-header { display: flex; align-items: center; gap: 4px; padding: 4px 6px; }
+.mobile-download-heading { display: flex; flex: 1; align-items: center; gap: 7px; min-width: 0; text-align: left; }
+.mobile-download-heading > svg:first-child { flex: 0 0 auto; color: var(--accent); }
+.mobile-download-heading > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-download-heading > small { margin-left: auto; color: var(--muted); font-size: 11px; font-weight: 400; white-space: nowrap; }
+.mobile-download-heading > svg:last-child { flex: 0 0 auto; color: var(--muted); }
+.mobile-download-status .mobile-download-clear { flex: 0 0 auto; color: var(--muted); font-size: 11px; font-weight: 400; }
+.mobile-download-list { display: grid; gap: 0; max-height: min(310px, 38dvh); margin: 0; padding: 0 12px; overflow: auto; overscroll-behavior: contain; list-style: none; }
+.mobile-download-item { min-width: 0; padding: 9px 0 10px; border-top: 1px solid var(--line); }
+.mobile-download-item-heading { display: flex; align-items: center; gap: 6px; min-height: 22px; }
+.mobile-download-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.mobile-download-status .mobile-download-dismiss { display: grid; flex: 0 0 32px; width: 32px; margin: -5px -6px -5px 0; padding: 0; place-items: center; color: var(--muted); }
+.mobile-download-metrics { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 8px; margin-top: 3px; font-size: 11px; }
+.mobile-download-metrics strong { color: var(--accent); font-weight: 500; }
+.mobile-download-metrics > span { color: var(--muted); font-variant-numeric: tabular-nums; }
+.mobile-download-item.is-error .mobile-download-metrics strong,
+.mobile-download-item.is-error .mobile-download-message { color: var(--danger); }
+.mobile-download-item.is-paused .mobile-download-metrics strong { color: var(--muted); }
+.mobile-download-progress { display: block; width: 100%; height: 5px; margin-top: 7px; overflow: hidden; border: 0; border-radius: 4px; background: var(--line); accent-color: var(--accent); }
+.mobile-download-progress::-webkit-progress-bar { border-radius: 4px; background: var(--line); }
+.mobile-download-progress::-webkit-progress-value { border-radius: 4px; background: var(--accent); }
+.mobile-download-progress::-moz-progress-bar { border-radius: 4px; background: var(--accent); }
+.mobile-download-progress:indeterminate { background: linear-gradient(90deg, var(--line) 0%, var(--accent) 50%, var(--line) 100%); background-size: 200% 100%; animation: mobile-download-pulse 1.8s linear infinite; }
+.mobile-download-progress:indeterminate::-webkit-progress-bar { background: transparent; }
+.mobile-download-item.is-paused .mobile-download-progress:indeterminate { animation-play-state: paused; }
+.mobile-download-saved-name,
+.mobile-download-message { margin: 5px 0 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.mobile-download-footer { padding: 5px 12px 8px; border-top: 1px solid var(--line); }
+.mobile-download-footer button { color: var(--accent); padding-left: 0; }
+.mobile-download-footer p { margin: 3px 0; color: var(--danger); font-size: 11px; overflow-wrap: anywhere; }
+.mobile-download-announcement { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+:root[data-theme="dark"] .mobile-download-status { box-shadow: 0 8px 28px #0006; }
+@keyframes mobile-download-pulse { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+@media (prefers-reduced-motion: reduce) { .mobile-download-progress:indeterminate { animation: none; } }
+@media (max-width: 360px) {
+  .mobile-download-header { padding-right: 4px; padding-left: 4px; }
+  .mobile-download-heading { gap: 5px; }
+  .mobile-download-list { padding-right: 10px; padding-left: 10px; }
+}

@@ -138,7 +138,7 @@ describe("CodexHistoryService", () => {
           dailyUsageBuckets: [{ startDate: "2026-10-23", tokens: 42 }],
         },
       }),
-      saveCodexUsageSnapshot: () => undefined,
+      enqueueCodexUsageSnapshot: () => undefined,
       listCodexUsageDailyBuckets: () => [],
     };
     try {
@@ -183,7 +183,7 @@ describe("CodexHistoryService", () => {
     let savedBuckets: Array<{ startDate: string; tokens: number }> = [];
     const snapshotStore: CodexHistoryUsageSnapshotStore = {
       getCodexUsageSnapshot: () => previousSnapshot,
-      saveCodexUsageSnapshot: (_homeId, _snapshot, finalizedDailyBuckets) => {
+      enqueueCodexUsageSnapshot: (_homeId, _snapshot, finalizedDailyBuckets) => {
         savedBuckets = finalizedDailyBuckets;
       },
       listCodexUsageDailyBuckets: () => [{ startDate: "2026-10-22", tokens: 72_700_228 }],
