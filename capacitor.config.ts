@@ -7,6 +7,9 @@ const config: CapacitorConfig = {
   appId: "dev.feishu.codex.bridge",
   appName: "Bridge",
   webDir: "dist/mobile",
+  plugins: {
+    LocalNotifications: { smallIcon: "ic_stat_bridge", presentationOptions: ["banner", "sound", "list"] },
+  },
   // Plugin calls can contain pairing credentials, including in debug builds.
   loggingBehavior: "none",
   // Packaged assets only. A remote server.url would replace the trusted app UI.

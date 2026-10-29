@@ -8,7 +8,7 @@ import { CodeTextViewer } from "./CodeTextViewer.js";
 import { BridgeImage } from "./BridgeMedia.js";
 import { isBridgeApiPath } from "./mobile-connection.js";
 import { useSystemNavigation } from "./WebNavigation.js";
-import { copyMobileText, downloadBridgeFile, getBridgeOrigin, isMobileApp, openBridgeExternal } from "./mobile-runtime.js";
+import { copyMobileImage, copyMobileText, downloadBridgeFile, getBridgeOrigin, isMobileApp, openBridgeExternal } from "./mobile-runtime.js";
 import { normalizeSessionPathInput, sessionPathName, sessionPathParent } from "./tmux-session-path.js";
 import { useMobileBack } from "./use-mobile-back.js";
 
@@ -372,13 +372,17 @@ export function TmuxSessionFiles(): ReactElement {
 
   const copyPreview = async (file: FilePreview): Promise<void> => {
     if (file.type === "image") {
-      if (isMobileApp()) { await shareFile(file.relativePath, file.name); return; }
       try {
-        await copyImageToClipboard(file.blob);
+        if (isMobileApp()) await copyMobileImage(file.blob);
+        else await copyImageToClipboard(file.blob);
         setError("");
         setNotice(`已复制图片：${file.relativePath}`);
         return;
-      } catch {
+      } catch (copyError) {
+        if (isMobileApp()) {
+          setError(copyError instanceof Error ? copyError.message : "图片复制失败，可保存或分享后重试。");
+          return;
+        }
         // Fall through to copying the relative file name.
       }
     } else {
@@ -764,9 +768,9 @@ export function TmuxSessionFiles(): ReactElement {
                 >
                   <SessionFileActionIcon action="download" />
                 </a>
-                {!(isMobileApp() && preview.type === "image") ? <button type="button" aria-label={`复制 ${preview.name}`} title="复制内容" onClick={() => void copyPreview(preview)}>
+                <button type="button" aria-label={`复制 ${preview.name}`} title="复制内容" onClick={() => void copyPreview(preview)}>
                   <SessionFileActionIcon action="copy" />
-                </button> : null}
+                </button>
                 <button
                   type="button"
                   aria-label={`转发 ${preview.name} 到 Session 聊天框`}

@@ -32,6 +32,7 @@ const ExecutionMachines = lazy(() => import("./ExecutionMachines.js").then((modu
 const DemoCatalog = lazy(() => import("./DemoCatalog.js").then((module) => ({ default: module.DemoCatalog })));
 const JjTools = lazy(() => import("./JjTools.js").then((module) => ({ default: module.JjTools })));
 const UploadDownloads = lazy(() => import("./UploadDownloads.js").then((module) => ({ default: module.UploadDownloads })));
+const MobileInboxPage = lazy(() => import("./MobileInboxPage.js").then((module) => ({ default: module.MobileInboxPage })));
 
 function LegacyDirectTasksRedirect() {
   const location = useLocation();
@@ -207,6 +208,7 @@ async function mountApp(): Promise<void> {
                 <Suspense fallback={<div className="route-loading">页面加载中…</div>}>
                   <Routes>
                   <Route path="/" element={<App />} />
+                  <Route path="/mobile-inbox" element={<MobileInboxPage />} />
                   <Route path="/tasks/:source/:taskId" element={<TaskDetailPage />} />
                   <Route path="/direct-tasks" element={<LegacyDirectTasksRedirect />} />
                   <Route path="/codex-history" element={<BackendFeatureGate feature="codex-history"><CodexHistory /></BackendFeatureGate>} />

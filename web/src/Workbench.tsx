@@ -18,6 +18,7 @@ import {
   type WorkbenchTarget,
 } from "./workbench-api.js";
 import "./workbench.css";
+import { isMobileApp } from "./mobile-runtime.js";
 
 interface WorkbenchSnapshot {
   inbox: WorkbenchInbox;
@@ -108,6 +109,12 @@ async function pollWorkbenchInbox(quiet: boolean): Promise<void> {
 }
 
 function observeWorkbenchNotifications(notifications: WorkbenchNotification[], enabled: boolean): void {
+  if (isMobileApp()) {
+    void import("./mobile-notifications.js").then((module) => module.observeMobileNotifications(notifications)).catch(() => {
+      // Native permission or delivery failures never suppress the authoritative in-app inbox.
+    });
+    return;
+  }
   if (!initialNotificationBaselineEstablished) {
     for (const notification of notifications) rememberSeenNotification(notification.id);
     initialNotificationBaselineEstablished = true;
@@ -151,7 +158,7 @@ export function WorkbenchNotifications(): null {
   const { pathname } = useLocation();
   const isTmuxPage = pathname === "/tmux-dashboard" || pathname.startsWith("/tmux-dashboard/");
   useEffect(() => {
-    if (isTmuxPage) return;
+    if (isTmuxPage && !isMobileApp()) return;
     const goToNotification = (route: string): void => { void navigate(route); };
     navigateToNotification = goToNotification;
     const stopPolling = startForegroundPolling(async () => { await refreshWorkbenchInbox({ quiet: true }); }, 30_000);
@@ -173,11 +180,11 @@ export function WorkbenchNotifications(): null {
   return null;
 }
 
-export function Workbench(): ReactElement {
+export function Workbench({ initialPanel = null }: { initialPanel?: "actions" | "notifications" | null } = {}): ReactElement {
   const navigate = useNavigate();
   const snapshot = useSyncExternalStore(subscribeWorkbenchSnapshot, getWorkbenchSnapshot, getWorkbenchSnapshot);
   const { inbox, loading, error, settingsError } = snapshot;
-  const [activePanel, setActivePanel] = useState<"actions" | "notifications" | null>(null);
+  const [activePanel, setActivePanel] = useState<"actions" | "notifications" | null>(initialPanel);
   const [dismissingId, setDismissingId] = useState<string | null>(null);
   const [respondingId, setRespondingId] = useState<string | null>(null);
   const [actionErrors, setActionErrors] = useState<Record<string, string>>({});

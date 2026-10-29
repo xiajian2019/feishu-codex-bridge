@@ -1,7 +1,7 @@
 import { useState, type FormEvent, type ReactElement } from "react";
 
 import { getActionToken, getJson } from "./api.js";
-import { BridgeImage } from "./BridgeMedia.js";
+import { BridgeImage, useBridgeMediaUrl } from "./BridgeMedia.js";
 import { copyMobileText, downloadBridgeFile, isMobileApp } from "./mobile-runtime.js";
 
 type PreviewKind = "image" | "pdf" | "text" | "unknown";
@@ -184,6 +184,7 @@ export function LinkTools({ embedded = false }: { embedded?: boolean }): ReactEl
 }
 
 function PreviewBody({ preview }: { preview: LinkPreviewResponse }): ReactElement {
+  const pdf = useBridgeMediaUrl(isMobileApp() && preview.kind === "pdf" ? preview.previewUrl : undefined);
   if (preview.kind === "image") {
     return (
       <div className="link-tools-image-preview">
@@ -192,8 +193,10 @@ function PreviewBody({ preview }: { preview: LinkPreviewResponse }): ReactElemen
     );
   }
   if (preview.kind === "pdf") {
-    if (isMobileApp()) return <p role="status">PDF 可保存到系统后打开。请点击上方“保存或分享”，通过系统面板或文件管理器打开文件。</p>;
-    return <iframe className="link-tools-pdf-preview" src={preview.previewUrl} title={preview.fileName} />;
+    if (pdf.error) return <p className="link-tools-error" role="alert">{pdf.error}。也可使用上方“保存或分享”。</p>;
+    if (pdf.loading) return <p role="status">正在读取 PDF…</p>;
+    return <>{isMobileApp() ? <p>已保留内嵌预览；如设备无法显示，也可使用上方“保存或分享”在系统中打开。</p> : null}
+      <iframe className="link-tools-pdf-preview" src={isMobileApp() ? pdf.url : preview.previewUrl} title={preview.fileName} /></>;
   }
   if (preview.kind === "text") {
     return (

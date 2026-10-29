@@ -1,4 +1,6 @@
 ext {
+    // Match the toolchain already used by Filesystem, FileTransfer and Barcode Scanner.
+    kotlin_version = '2.2.20'
     minSdkVersion = 26
     compileSdkVersion = 36
     targetSdkVersion = 36

@@ -8,6 +8,7 @@ import { isAppForeground } from "./foreground-polling.js";
 import { clearLocalDraftsAfterDeviceRevocation } from "./local-draft-cleanup.js";
 import type { AuthStatus } from "./pairing-diagnostics.js";
 import { parseApkUpdate, type MobileApkUpdate, type ApkUpdatePhase } from "./mobile-apk-update.js";
+import type { MobileShare } from "./mobile-handoff.js";
 export type { MobileApkUpdate } from "./mobile-apk-update.js";
 
 export const MOBILE_RESUME_EVENT = "bridge:mobile-resume";
@@ -258,6 +259,21 @@ export async function openMobileDemo(id: string, path: string): Promise<void> {
 export async function copyMobileText(value: string): Promise<void> {
   const native = await import("./mobile-native.js");
   await native.copyText(value);
+}
+
+export async function copyMobileImage(blob: Blob): Promise<void> {
+  await (await import("./mobile-native.js")).copyImage(blob);
+}
+
+export async function listMobileShares(): Promise<MobileShare[]> { return (await import("./mobile-native.js")).listIncomingShares(); }
+export async function readMobileShareFiles(share: MobileShare): Promise<File[]> { return (await import("./mobile-native.js")).incomingShareFiles(share); }
+export async function getMobileNotificationPermission(request = false): Promise<string> { return (await import("./mobile-native.js")).nativeNotificationPermission(request); }
+export async function sendMobileNotification(options: { id: number; title: string; category: string; server: string; scope: string; route: string }): Promise<boolean> {
+  return (await import("./mobile-native.js")).showNativeNotification(options);
+}
+
+export async function scanMobilePairingQr(): Promise<string | null> {
+  return (await import("./mobile-native.js")).scanPairingQr();
 }
 
 export async function setMobileShakeEnabled(enabled: boolean): Promise<void> {

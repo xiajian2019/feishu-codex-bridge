@@ -5,6 +5,8 @@ import { isMobileApp, setMobileShakeEnabled } from "./mobile-runtime.js";
 import { useTheme, type ThemeMode } from "./theme.js";
 import { fetchWorkbenchSettings, updateWorkbenchSettings, type WorkbenchNotificationSettings } from "./workbench-api.js";
 import "./workbench.css";
+import { readMobileNotificationPreferences, updateMobileNotificationPreferences, type MobileNotificationPreferences } from "./mobile-notifications.js";
+import { getMobileNotificationPermission } from "./mobile-runtime.js";
 
 export function SystemSettings(): ReactElement {
   const { mode, setMode } = useTheme();
@@ -17,6 +19,19 @@ export function SystemSettings(): ReactElement {
   const [shakeEnabled, setShakeEnabled] = useState(readMobileShakeEnabled);
   const [shakeBusy, setShakeBusy] = useState(false);
   const [shakeError, setShakeError] = useState("");
+  const [nativePreferences, setNativePreferences] = useState<MobileNotificationPreferences>(readMobileNotificationPreferences);
+  const [nativePermission, setNativePermission] = useState("读取中");
+  const [nativeBusy, setNativeBusy] = useState(false);
+  const [nativeError, setNativeError] = useState("");
+  useEffect(() => {
+    if (isMobileApp()) void getMobileNotificationPermission().then(setNativePermission).catch(() => setNativePermission("暂不可读"));
+  }, []);
+  const updateNative = (patch: Partial<Omit<MobileNotificationPreferences, "enabledAt">>): void => {
+    if (nativeBusy) return;
+    setNativeBusy(true); setNativeError("");
+    void updateMobileNotificationPreferences(patch).then(setNativePreferences).then(() => getMobileNotificationPermission()).then(setNativePermission)
+      .catch((cause: unknown) => setNativeError(cause instanceof Error ? cause.message : "原生通知设置失败。" )).finally(() => setNativeBusy(false));
+  };
 
   const loadNotifications = useCallback(async (): Promise<void> => {
     setNotificationLoading(true);
@@ -107,9 +122,16 @@ export function SystemSettings(): ReactElement {
           </label>
         ) : null}
       </section>
+      {isMobileApp() ? <section className="system-settings-notifications" aria-label="本机原生通知">
+        <h2>本机原生通知与恢复</h2><p className="workbench-settings-note">设置只作用当前环境和当前设备。系统权限：{nativePermission}。前台检测到新事件后发原生通知；后台即时推送尚未配置，不承诺退出 App 后获知新事件。</p>
+        <NotificationPreferenceRow title="启用本机原生通知" description="仅提示有新动态；点击后验证环境和设备并打开关联页面。" checked={nativePreferences.enabled} disabled={nativeBusy} onChange={(enabled) => updateNative({ enabled })} />
+        {([ ["completion", "完成通知"], ["failure", "失败通知"], ["action", "待处理通知"] ] as const).map(([key, title]) => <NotificationPreferenceRow key={key} title={title} description="在当前设备接收此类事件；站内记录不受本开关影响。" checked={nativePreferences[key]} disabled={nativeBusy} onChange={(enabled) => updateNative({ [key]: enabled })} />)}
+        <NotificationPreferenceRow title="恢复上次工作页面" description="按环境和设备恢复；通知、分享及显式打开目标优先，不恢复执行操作。" checked={nativePreferences.restoreLocation} disabled={nativeBusy} onChange={(restoreLocation) => updateNative({ restoreLocation })} />
+        {nativeError ? <p className="workbench-page-error" role="alert">{nativeError}</p> : null}
+      </section> : null}
       <section className="system-settings-notifications" aria-label="通知偏好">
         <header className="workbench-page-header">
-          <div><h2>通知偏好</h2><p className="workbench-settings-note">站内通知保留在任务面板；浏览器通知在页面打开时检查新通知，并需要浏览器授权。</p></div>
+          <div><h2>通知偏好</h2><p className="workbench-settings-note">{isMobileApp() ? "以下事件类别由后端保存；本机原生通知另由上方设备设置控制。待处理中心始终可查看已有记录。" : "站内通知保留在任务面板；浏览器通知在页面打开时检查新通知，并需要浏览器授权。"}</p></div>
           <button type="button" onClick={() => setNotificationRevision((value) => value + 1)} disabled={notificationLoading}>刷新</button>
         </header>
         {notificationError ? <div className="workbench-page-error" role="alert">{notificationError}<button type="button" onClick={() => setNotificationRevision((value) => value + 1)}>重试</button></div> : null}
@@ -119,7 +141,7 @@ export function SystemSettings(): ReactElement {
             <NotificationPreferenceRow title="任务完成" description="任务执行完成时显示站内通知。" checked={notifications.completion} disabled={notificationSaving !== null} onChange={(checked) => void updateNotification("completion", checked)} />
             <NotificationPreferenceRow title="任务失败" description="任务执行失败时显示站内通知。" checked={notifications.failure} disabled={notificationSaving !== null} onChange={(checked) => void updateNotification("failure", checked)} />
             <NotificationPreferenceRow title="等待处理" description="有问题或审批需要处理时显示站内通知。" checked={notifications.action} disabled={notificationSaving !== null} onChange={(checked) => void updateNotification("action", checked)} />
-            <NotificationPreferenceRow title="浏览器系统通知" description={typeof Notification === "undefined" ? "此浏览器不支持系统通知。" : `浏览器权限：${Notification.permission}`} checked={notifications.browser} disabled={notificationSaving !== null || typeof Notification === "undefined"} onChange={(checked) => void updateNotification("browser", checked)} />
+            <NotificationPreferenceRow title={isMobileApp() ? "Web 通知兼容偏好（原有）" : "浏览器系统通知"} description={isMobileApp() ? "此项不控制 App 原生通知；原生权限与开关见上方本机设置。" : typeof Notification === "undefined" ? "此浏览器不支持系统通知。" : `浏览器权限：${Notification.permission}`} checked={notifications.browser} disabled={notificationSaving !== null || typeof Notification === "undefined"} onChange={(checked) => void updateNotification("browser", checked)} />
           </> : !notificationLoading && !notificationError ? <p className="workbench-muted">通知偏好暂不可用。</p> : null}
         </section>
       </section>
