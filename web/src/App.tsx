@@ -9,6 +9,10 @@ import {
   useState,
 } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router";
+import { useMobileBack } from "./use-mobile-back.js";
+import { startForegroundPolling } from "./foreground-polling.js";
+import { getLocalDraftScope } from "./local-draft-scope.js";
+import { getMobileConnection, isMobileApp, listMobileShares, readMobileShareFiles } from "./mobile-runtime.js";
 
 import {
   createTask,
@@ -70,7 +74,9 @@ type DeskTaskListItem = Extract<TaskListItem, { source: "desk" }>;
 
 interface SelectedTaskAttachment extends TaskAttachment {
   previewUrl?: string;
+  mobileShareFile?: string;
 }
+type MobileTaskShare = { id: string; project: string; scope: string; server: string };
 
 const EMPTY_FILTERS: Filters = { q: "", state: "", source: "", project: "", mode: "" };
 
@@ -117,6 +123,7 @@ export function App(): ReactElement {
   }, [navigate, searchParams]);
   const [createOpen, setCreateOpen] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
+  useMobileBack(createOpen, () => closeCreateTask(), 100);
   const [createError, setCreateError] = useState<string | null>(null);
   const [newDescription, setNewDescription] = useState("");
   const [newAttachments, setNewAttachments] = useState<SelectedTaskAttachment[]>([]);
@@ -128,6 +135,11 @@ export function App(): ReactElement {
   const [keepDraftOnProjectChange, setKeepDraftOnProjectChange] = useState(false);
   const [newCreateWorktree, setNewCreateWorktree] = useState(false);
   const incomingTaskDraft = parseWorkbenchNewTaskDraft(location.state);
+  const [mobileShareImport, setMobileShareImport] = useState<MobileTaskShare | null>(null);
+  const mobileImportingRef = useRef(false);
+  const mobileImportedFilesRef = useRef(new Set<string>());
+  const mobileViewActiveRef = useRef(true);
+  useEffect(() => { mobileViewActiveRef.current = true; return () => { mobileViewActiveRef.current = false; }; }, []);
 
   const listAbortRef = useRef<AbortController | null>(null);
   const listRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -219,18 +231,22 @@ export function App(): ReactElement {
     const incomingKey = JSON.stringify(incomingTaskDraft);
     if (handledTaskDraftRef.current === incomingKey) return;
     handledTaskDraftRef.current = incomingKey;
+    const nativeShare = (location.state as { mobileShareImport?: MobileTaskShare } | null)?.mobileShareImport;
+    const validShare = isMobileApp() && nativeShare && nativeShare.scope === getLocalDraftScope()
+      && nativeShare.server === getMobileConnection()?.server && nativeShare.project === incomingTaskDraft.projectKey ? nativeShare : null;
+    setMobileShareImport(validShare ?? null); mobileImportedFilesRef.current.clear();
     const projectAvailable = Boolean(incomingTaskDraft.projectKey && filterOptions.projects.includes(incomingTaskDraft.projectKey));
     setCreateError(projectAvailable || !incomingTaskDraft.projectKey
       ? null
       : `项目 ${incomingTaskDraft.projectKey} 当前未登记或不可用；描述已保留，请手动选择项目。`);
     setNewAttachments([]);
-    setAttachmentRestoreNotice(false);
+    setAttachmentRestoreNotice(validShare ? loadTaskCreateDraft(validShare.project)?.hadStagedAttachments ?? false : false);
     setNewProjectKey(projectAvailable ? incomingTaskDraft.projectKey! : "");
     setNewMode(projectAvailable ? incomingTaskDraft.mode ?? "" : "");
     setNewDescription(incomingTaskDraft.description);
-    setNewCreateWorktree(false);
+    setNewCreateWorktree(validShare ? loadTaskCreateDraft(validShare.project)?.createWorktree ?? false : false);
     setKeepDraftOnProjectChange(!projectAvailable && Boolean(incomingTaskDraft.projectKey));
-    setNewTaskDraftNotice(incomingTaskDraft.source === "history"
+    setNewTaskDraftNotice(validShare ? "手机分享只加入新任务草稿，确认提交后才执行；原分享继续保存在本机收件箱。" : incomingTaskDraft.source === "history"
       ? `History 草稿只沿用提供的项目和描述；Home 与模型不会继承，新任务按项目当前配置执行。${incomingTaskDraft.projectKey ? "" : "未提供精确匹配的项目，请手动选择。"}`
       : `已带入源任务的项目、mode${incomingTaskDraft.mode ? `（${incomingTaskDraft.mode}）` : ""}和描述；附件未复制。点击“提交任务”后才会创建新任务。${projectAvailable ? "" : "项目不可用时，mode 不会套用到其他项目。"}`);
     setCreateOpen(true);
@@ -278,16 +294,12 @@ export function App(): ReactElement {
 
   useEffect(() => {
     if (streamStatus === "connected") return;
-    const timer = setInterval(() => {
-      void loadTasks(true);
-    }, 10_000);
-    return () => clearInterval(timer);
+    return startForegroundPolling(async () => { await loadTasks(true); }, 10_000);
   }, [loadTasks, streamStatus]);
 
   useEffect(() => {
     if (appliedFilters.source === "desk" || streamStatus !== "connected") return;
-    const timer = setInterval(() => void loadTasks(true), 10_000);
-    return () => clearInterval(timer);
+    return startForegroundPolling(async () => { await loadTasks(true); }, 10_000);
   }, [appliedFilters.source, loadTasks, streamStatus]);
 
   useEffect(() => {
@@ -353,6 +365,7 @@ export function App(): ReactElement {
 
   const closeCreateTask = (): void => {
     if (createBusy || attachmentsBusy) return;
+    setMobileShareImport(null); mobileImportedFilesRef.current.clear();
     const hadStagedAttachments = newAttachments.length > 0 || attachmentRestoreNotice;
     saveTaskCreateDraft(newProjectKey, newDescription, hadStagedAttachments, newCreateWorktree);
     setCreateOpen(false);
@@ -366,6 +379,7 @@ export function App(): ReactElement {
 
   const selectCreateProject = (projectKey: string): void => {
     if (projectKey === newProjectKey) return;
+    setMobileShareImport(null); mobileImportedFilesRef.current.clear();
     const discardedSelectedAttachments = newAttachments.length > 0;
     saveTaskCreateDraft(newProjectKey, newDescription, newAttachments.length > 0 || attachmentRestoreNotice, newCreateWorktree);
     const draft = loadTaskCreateDraft(projectKey);
@@ -409,6 +423,39 @@ export function App(): ReactElement {
       setAttachmentsBusy(false);
     }
   };
+
+  const importMobileShareAttachments = async (): Promise<void> => {
+    const incoming = mobileShareImport;
+    if (!incoming || mobileImportingRef.current || incoming.project !== newProjectKey) return;
+    mobileImportingRef.current = true; setAttachmentsBusy(true); setCreateError(null);
+    const assertTarget = (): void => {
+      if (!mobileViewActiveRef.current || getLocalDraftScope() !== incoming.scope || getMobileConnection()?.server !== incoming.server
+        || createDraftSnapshotRef.current?.projectKey !== incoming.project) throw new Error("草稿或环境已变化，未继续导入，原分享仍保留。");
+    };
+    try {
+      assertTarget();
+      const share = (await listMobileShares()).find((item) => item.id === incoming.id); assertTarget();
+      if (!share) throw new Error("找不到原分享，请回到分享收件箱重试。");
+      const pending = share.files.filter((file) => !mobileImportedFilesRef.current.has(`${share.id}:${file.id}`));
+      if (newAttachments.length + pending.length > 10 || pending.some((file) => file.size > 25 * 1024 * 1024)) throw new Error("任务沿用每次 10 个附件、每个 25 MiB 的现有限制；原分享仍保留，可选择 Tmux 目标。");
+      const files = await readMobileShareFiles({ ...share, files: pending }); assertTarget();
+      for (let index = 0; index < files.length; index++) {
+        assertTarget();
+        const file = files[index]!;
+        const attachment = await uploadTaskAttachment(file); assertTarget();
+        const key = `${share.id}:${pending[index]!.id}`;
+        mobileImportedFilesRef.current.add(key);
+        const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
+        if (previewUrl) previewUrlsRef.current.add(previewUrl);
+        setNewAttachments((current) => [...current, { ...attachment, mobileShareFile: key, ...(previewUrl ? { previewUrl } : {}) }]);
+        setAttachmentRestoreNotice(false);
+      }
+    } catch (cause) { if (mobileViewActiveRef.current) setCreateError(cause instanceof Error ? cause.message : "分享附件导入失败，原件仍在收件箱。"); }
+    finally { mobileImportingRef.current = false; if (mobileViewActiveRef.current) setAttachmentsBusy(false); }
+  };
+  useEffect(() => {
+    if (createOpen && mobileShareImport?.project === newProjectKey) void importMobileShareAttachments();
+  }, [createOpen, mobileShareImport?.id]);
 
   const removeSelectedAttachment = async (attachment: SelectedTaskAttachment): Promise<void> => {
     try {
@@ -644,6 +691,7 @@ export function App(): ReactElement {
             <form className="task-create-form dialog-body" onSubmit={(event) => void handleCreateTask(event)}>
               {newTaskDraftNotice ? <p className="workbench-status-note" role="status">{newTaskDraftNotice}</p> : null}
               <label>项目<Select ariaLabel="任务项目" value={newProjectKey} placeholder="选择项目" options={filterOptions.projects} onChange={selectCreateProject} disabled={createBusy || attachmentsBusy} /></label>
+              {mobileShareImport?.project === newProjectKey ? <button type="button" disabled={createBusy || attachmentsBusy} onClick={() => void importMobileShareAttachments()}>重试导入分享附件（不提交任务）</button> : null}
               <PromptTemplatePicker
                 projectKey={newProjectKey}
                 projects={filterOptions.projects}

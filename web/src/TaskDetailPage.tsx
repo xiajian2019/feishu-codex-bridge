@@ -35,6 +35,9 @@ const DESK_STATUS_LABELS: Record<string, string> = {
   WAITING_REVIEW: "待验收", ACCEPTED: "已验收", FAILED: "失败", CANCELED: "已取消",
 };
 
+import { startForegroundPolling } from "./foreground-polling.js";
+import { useMobileBack } from "./use-mobile-back.js";
+
 export function TaskDetailPage(): ReactElement {
   const { source: sourceParam, taskId: taskIdParam } = useParams();
   const source = sourceParam === "direct" ? "direct" : sourceParam === "aamp" ? "aamp" : "desk";
@@ -60,6 +63,7 @@ export function TaskDetailPage(): ReactElement {
   const [reviewBusy, setReviewBusy] = useState(false);
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
+  useMobileBack(filesOpen, () => setFilesOpen(false), 10, { escape: false, restoreFocus: false });
   const [currentFileTarget, setCurrentFileTarget] = useState<{ path: string; sequence: number } | null>(null);
   const filesRef = useRef<HTMLDetailsElement | null>(null);
   const fileOpenSequence = useRef(0);
@@ -120,8 +124,7 @@ export function TaskDetailPage(): ReactElement {
 
   useEffect(() => { void load(); }, [load, refresh]);
   useEffect(() => {
-    const timer = setInterval(() => void load(true), 10_000);
-    return () => clearInterval(timer);
+    return startForegroundPolling(async () => { await load(true); }, 10_000);
   }, [load]);
 
   const updateDraft = (value: string): void => {

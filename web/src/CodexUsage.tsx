@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState, type ReactElement } from "rea
 
 import { consumeCodexResetCredit, fetchCodexUsage } from "./api.js";
 import { preserveLastSuccessfulCodexUsage } from "./codex-usage-utils.js";
+import { useMobileBack } from "./use-mobile-back.js";
+import { startForegroundPolling } from "./foreground-polling.js";
 import type {
   CodexResetCreditConsumeOutcome,
   CodexUsageResetCredit,
@@ -45,11 +47,7 @@ export function CodexUsage(): ReactElement {
   }, []);
 
   useEffect(() => {
-    void loadUsage();
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") void loadUsage();
-    }, REFRESH_INTERVAL_MS);
-    return () => window.clearInterval(timer);
+    return startForegroundPolling(async () => { await loadUsage(); }, REFRESH_INTERVAL_MS);
   }, [loadUsage]);
 
   return (
@@ -105,6 +103,7 @@ export function CodexUsageDialog({
   onClose: () => void;
 }): ReactElement {
   const [refreshing, setRefreshing] = useState(false);
+  useMobileBack(true, onClose, 200);
 
   return (
     <div
@@ -337,6 +336,11 @@ function ResetCreditDialog({
   onConfirm: () => Promise<void>;
 }): ReactElement {
   const [refreshingDetails, setRefreshingDetails] = useState(false);
+  useMobileBack(true, () => {
+    if (consumeBusy) return;
+    if (confirmingCredit) onCancelConfirm();
+    else onClose();
+  }, 210);
   const sortedCredits = Array.isArray(credits)
     ? [...credits].sort((left, right) => {
       const statusOrder = Number(right.status === "available") - Number(left.status === "available");

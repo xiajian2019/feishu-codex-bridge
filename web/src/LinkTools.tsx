@@ -193,9 +193,10 @@ function PreviewBody({ preview }: { preview: LinkPreviewResponse }): ReactElemen
     );
   }
   if (preview.kind === "pdf") {
-    if (pdf.error) return <p className="link-tools-error" role="alert">{pdf.error}</p>;
+    if (pdf.error) return <p className="link-tools-error" role="alert">{pdf.error}。也可使用上方“保存或分享”。</p>;
     if (pdf.loading) return <p role="status">正在读取 PDF…</p>;
-    return <iframe className="link-tools-pdf-preview" src={isMobileApp() ? pdf.url : preview.previewUrl} title={preview.fileName} />;
+    return <>{isMobileApp() ? <p>已保留内嵌预览；如设备无法显示，也可使用上方“保存或分享”在系统中打开。</p> : null}
+      <iframe className="link-tools-pdf-preview" src={isMobileApp() ? pdf.url : preview.previewUrl} title={preview.fileName} /></>;
   }
   if (preview.kind === "text") {
     return (

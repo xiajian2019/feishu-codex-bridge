@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
+import { useMobileBack } from "./use-mobile-back.js";
 import { describeDevice, deviceAccessEnvironment, deviceAuthorizationState, deviceExpiry, deviceLastUsed, matchesDeviceSearch, sameModelCounts, selectableDeviceIds, sortDeviceAuthorizations, type DeviceAuthorization } from "./device-authorizations.js";
 
 function date(value: string | null | undefined): string {
@@ -19,6 +20,7 @@ export function DeviceAuthorizations({ devices, loading, busy, onRefresh, onRena
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [pendingRevoke, setPendingRevoke] = useState<DeviceAuthorization[] | null>(null);
+  useMobileBack(Boolean(pendingRevoke), () => { if (!busy) setPendingRevoke(null); }, 2000);
   const selectAllRef = useRef<HTMLInputElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const now = Date.now();

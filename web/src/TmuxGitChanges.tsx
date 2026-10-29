@@ -4,6 +4,7 @@ import { Link, useNavigate, useParams } from "react-router";
 
 import { getJson } from "./api.js";
 import { downloadBridgeFile, isMobileApp } from "./mobile-runtime.js";
+import { useMobileBack } from "./use-mobile-back.js";
 import "./git-review.css";
 import {
   createGitReviewDraftForward,
@@ -464,6 +465,9 @@ const GitChangesWorkspace = memo(function GitChangesWorkspace({ sessionId, data 
   const [commentEditor, setCommentEditor] = useState<{ anchor: GitReviewAnchor; commentId?: string } | null>(null);
   const [commentEditorText, setCommentEditorText] = useState("");
   const [commentEditorError, setCommentEditorError] = useState("");
+  useMobileBack(reviewOpen, () => setReviewOpen(false), 1200);
+  useMobileBack(Boolean(commentEditor), () => setCommentEditor(null), 1210);
+  useMobileBack(mobilePane === "diff", () => setMobilePane("files"), 1, { escape: false, restoreFocus: false });
   const [stageError, setStageError] = useState("");
   const [rangeStart, setRangeStart] = useState<GitReviewAnchor | null>(null);
   const [rangeSelection, setRangeSelection] = useState<GitReviewAnchor | null>(null);

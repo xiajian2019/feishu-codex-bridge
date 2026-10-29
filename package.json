@@ -96,6 +96,7 @@
     "@capacitor/file-transfer": "2.0.6",
     "@capacitor/filesystem": "8.1.5",
     "@capacitor/ios": "8.5.3",
+    "@capacitor/local-notifications": "8.3.1",
     "@capacitor/share": "8.0.3",
     "@codemirror/lang-css": "^6.3.1",
     "@codemirror/lang-html": "^6.4.12",

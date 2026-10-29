@@ -503,6 +503,7 @@ CREATE TABLE IF NOT EXISTS tmux_sessions (
     project_key TEXT,
     codex_home_id TEXT,
     working_directory TEXT NOT NULL,
+    working_directory_override TEXT,
     tmux_created_at INTEGER NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
@@ -3971,9 +3972,10 @@ export class StateDatabase {
     const inferredProject = this.db.prepare(
       "SELECT name FROM projects WHERE path = ? AND status = 'available' LIMIT 1",
     ).get(resolvedCwd) as { name: string } | undefined;
-    const projectKey = options.projectKey ?? inferredProject?.name ?? null;
+    const hasExplicitProjectKey = Object.hasOwn(options, "projectKey");
+    const projectKey = hasExplicitProjectKey ? options.projectKey! : inferredProject?.name ?? null;
     const existing = this.db.prepare(
-      `SELECT record_id, session_name, project_key, working_directory, last_seen_at, ended_at, created_by_device_id, workspace_id
+      `SELECT record_id, session_name, project_key, working_directory, working_directory_override, last_seen_at, ended_at, created_by_device_id, workspace_id
        FROM tmux_sessions WHERE tmux_session_id = ? AND tmux_created_at = ? AND ended_at IS NULL
        ORDER BY first_seen_at DESC LIMIT 1`,
     ).get(session.id, session.createdAt) as {
@@ -3981,6 +3983,7 @@ export class StateDatabase {
       session_name: string;
       project_key: string | null;
       working_directory: string;
+      working_directory_override: string | null;
       last_seen_at: string;
       ended_at: string | null;
       created_by_device_id: string | null;
@@ -3991,13 +3994,14 @@ export class StateDatabase {
       const current = existing;
       const refreshAfter = new Date(this.now().getTime() - 60_000).toISOString();
       const refreshedLastSeen = current.last_seen_at <= refreshAfter ? now : current.last_seen_at;
-      const nextProjectKey = projectKey ?? current.project_key;
+      const nextProjectKey = hasExplicitProjectKey ? projectKey : current.project_key;
+      const nextWorkingDirectory = current.working_directory_override ?? session.cwd;
       const nextDeviceId = current.created_by_device_id ?? options.createdByDeviceId ?? null;
       const nextWorkspaceId = options.workspaceId ?? current.workspace_id;
       if (
         current.session_name !== session.name
         || current.project_key !== nextProjectKey
-        || current.working_directory !== session.cwd
+        || current.working_directory !== nextWorkingDirectory
         || current.last_seen_at !== refreshedLastSeen
         || current.ended_at !== null
         || current.created_by_device_id !== nextDeviceId
@@ -4008,7 +4012,7 @@ export class StateDatabase {
           ended_at = NULL, created_by_device_id = ?, workspace_id = ? WHERE record_id = ?`).run(
             session.name,
             nextProjectKey,
-            session.cwd,
+            nextWorkingDirectory,
             refreshedLastSeen,
             nextDeviceId,
             nextWorkspaceId,
@@ -4020,9 +4024,9 @@ export class StateDatabase {
 
     const recordId = randomUUID();
     this.db.prepare(`INSERT INTO tmux_sessions
-      (record_id, tmux_session_id, session_name, project_key, working_directory,
+      (record_id, tmux_session_id, session_name, project_key, working_directory, working_directory_override,
        tmux_created_at, first_seen_at, last_seen_at, ended_at, created_by_device_id, workspace_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`).run(
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?, ?)`).run(
         recordId,
         session.id,
         session.name,
@@ -4089,6 +4093,20 @@ export class StateDatabase {
     const row = this.db.prepare("SELECT * FROM tmux_sessions WHERE record_id = ?")
       .get(recordId) as Record<string, unknown> | undefined;
     return row ? mapTmuxSession(row) : null;
+  }
+
+  public setTmuxSessionWorkingDirectory(
+    recordId: string,
+    actualDirectory: string,
+    overrideDirectory: string | null,
+  ): StoredTmuxSession | null {
+    const current = this.getTmuxSession(recordId);
+    if (!current || current.ended_at !== null || current.suspended_at !== null) return null;
+    const workingDirectory = overrideDirectory ?? actualDirectory;
+    this.db.prepare(`UPDATE tmux_sessions
+      SET working_directory = ?, working_directory_override = ?, last_seen_at = ?
+      WHERE record_id = ?`).run(workingDirectory, overrideDirectory, this.timestamp(), current.record_id);
+    return this.getTmuxSession(current.record_id);
   }
 
   public recordTmuxSessionOpen(tmuxSessionId: string): StoredTmuxSession | null {
@@ -4251,7 +4269,7 @@ export class StateDatabase {
 
   public resumeTmuxSession(recordId: string, session: { id: string; name: string; cwd: string; createdAt: number }): StoredTmuxSession | null {
     const result = this.db.prepare(`UPDATE tmux_sessions SET
-      tmux_session_id = ?, session_name = ?, working_directory = ?, tmux_created_at = ?,
+      tmux_session_id = ?, session_name = ?, working_directory = COALESCE(working_directory_override, ?), tmux_created_at = ?,
       last_seen_at = ?, suspended_at = NULL, ended_at = NULL
       WHERE record_id = ? AND ended_at IS NULL AND suspended_at IS NOT NULL`).run(
         session.id,
@@ -4563,6 +4581,7 @@ export class StateDatabase {
     addColumnIfMissing(this.db, "tmux_session_actions", "working_directory", "TEXT NOT NULL DEFAULT ''");
     addColumnIfMissing(this.db, "tmux_session_actions", "submission_fingerprint", "TEXT");
     addColumnIfMissing(this.db, "tmux_sessions", "codex_home_id", "TEXT");
+    addColumnIfMissing(this.db, "tmux_sessions", "working_directory_override", "TEXT");
     addColumnIfMissing(this.db, "tmux_sessions", "workspace_id", "TEXT");
     addColumnIfMissing(this.db, "tmux_sessions", "open_count", "INTEGER NOT NULL DEFAULT 0");
     addColumnIfMissing(this.db, "tmux_sessions", "last_opened_at", "TEXT");
@@ -5153,6 +5172,7 @@ function mapTmuxSession(row: Record<string, unknown>): StoredTmuxSession {
     project_key: nullableString(row.project_key),
     codex_home_id: nullableString(row.codex_home_id),
     working_directory: String(row.working_directory),
+    working_directory_override: nullableString(row.working_directory_override),
     tmux_created_at: Number(row.tmux_created_at),
     first_seen_at: String(row.first_seen_at),
     last_seen_at: String(row.last_seen_at),

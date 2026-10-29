@@ -7,6 +7,8 @@ import {
 } from "@assistant-ui/react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { startForegroundPolling } from "./foreground-polling.js";
+import { useMobileBack } from "./use-mobile-back.js";
 import {
   createContext,
   useContext,
@@ -794,13 +796,11 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
   }, [homeId, threadId, expectedUpdatedAt, listCheckedAt]);
 
   useEffect(() => {
-    const controller = new AbortController();
-    let checking = false;
-    const refreshWriterStatus = async (): Promise<void> => {
-      if (checking || controller.signal.aborted) return;
-      checking = true;
+    setWriterStatus(null);
+    return startForegroundPolling(async (signal) => {
       try {
-        const next = await fetchCodexThreadWriterStatus(homeId, threadId, controller.signal);
+        const next = await fetchCodexThreadWriterStatus(homeId, threadId, signal);
+        if (signal.aborted) return;
         setWriterStatus(next);
         const localRun = next.localRun;
         if (localRun) {
@@ -825,20 +825,11 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
               });
         }
       } catch {
-        if (!controller.signal.aborted) {
+        if (!signal.aborted) {
           setWriterStatus({ state: "unknown", checkedAt: new Date().toISOString() });
         }
-      } finally {
-        checking = false;
       }
-    };
-    setWriterStatus(null);
-    void refreshWriterStatus();
-    const timer = window.setInterval(() => void refreshWriterStatus(), 4_000);
-    return () => {
-      controller.abort();
-      window.clearInterval(timer);
-    };
+    }, 4_000);
   }, [homeId, threadId]);
 
   const liveRunId = liveRun?.runId;
@@ -846,18 +837,16 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
   const liveRunTurnIndex = liveRun?.turnIndex;
   useEffect(() => {
     if (!liveRunId || (liveRunState !== "running" && liveRunState !== "cancelling")) return;
-    const controller = new AbortController();
-    let cancelled = false;
-    const poll = async (): Promise<void> => {
+    return startForegroundPolling(async (signal) => {
       try {
         const next = await fetchCodexThreadUpdates(
           homeId,
           threadId,
           liveRunId,
           liveCursorRef.current,
-          controller.signal,
+          signal,
         );
-        if (cancelled || controller.signal.aborted) return;
+        if (signal.aborted) return;
         if (next.resetRequired) {
           liveCursorRef.current = 0;
           setLiveRun((current) => current?.runId === next.runId
@@ -882,26 +871,19 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
             setRunNotice(next.recovery?.error
               ?? "Bridge 已重启，无法继续跟踪上一轮；请核对 Codex 历史后再提交。");
           }
-          const refreshed = await fetchCodexThreadDetail(homeId, threadId, controller.signal);
-          if (cancelled || controller.signal.aborted) return;
+          const refreshed = await fetchCodexThreadDetail(homeId, threadId, signal);
+          if (signal.aborted) return;
           setDetail(refreshed);
           setImagePreviews(buildTurnImagePreviews(homeId, threadId, refreshed.imageAttachments ?? []));
           writeCodexHistoryDetailCache(refreshed, draftScope);
           setLiveRun(null);
         }
       } catch (nextError: unknown) {
-        if (!cancelled && !controller.signal.aborted) {
+        if (!signal.aborted) {
           setError(nextError instanceof Error ? nextError.message : String(nextError));
         }
       }
-    };
-    void poll();
-    const timer = window.setInterval(() => void poll(), 1_200);
-    return () => {
-      cancelled = true;
-      controller.abort();
-      window.clearInterval(timer);
-    };
+    }, 1_200);
   }, [homeId, threadId, liveRunId, liveRunTurnIndex]);
 
   const thread = detail?.thread ?? { id: threadId };
@@ -1559,6 +1541,7 @@ function CodexFilePreviewDialog({
   const [text, setText] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  useMobileBack(true, onClose, 100);
   const previewUrl = codexFilePreviewUrl(homeId, threadId, target.relativePath);
   const fileName = target.relativePath.split("/").filter(Boolean).at(-1) ?? target.relativePath;
   const extension = fileName.split(".").pop()?.toLowerCase() ?? "";

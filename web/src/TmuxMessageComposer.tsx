@@ -9,7 +9,7 @@ import {
   type ChatModelAdapter,
   type ThreadUserMessage,
 } from "@assistant-ui/react";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent, type ReactElement } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type ReactElement } from "react";
 import { createPortal } from "react-dom";
 
 import {
@@ -42,6 +42,7 @@ import {
 import { readCodexSkillCache, writeCodexSkillCache } from "./skill-cache.js";
 import { getLocalDraftScope } from "./local-draft-scope.js";
 import { isMobileApp, shareMobileBlob } from "./mobile-runtime.js";
+import { useMobileBack } from "./use-mobile-back.js";
 import { uploadFileInChunks, type DownloadUploadPhase, type UploadMetric } from "./download-upload.js";
 
 const TmuxShortcutPalette = lazy(() => import("./TmuxShortcutPalette.js").then((module) => ({ default: module.TmuxShortcutPalette })));
@@ -252,6 +253,7 @@ function ImagePreview({ file, onOpen }: { file: File; onOpen: (file: File) => vo
 }
 
 function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): ReactElement {
+  useMobileBack(true, onClose, 500);
   const previewUrl = useFileObjectUrl(file);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const onCloseRef = useRef(onClose);
@@ -334,6 +336,8 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sendDisa
   const [skillsLoading, setSkillsLoading] = useState(false);
   const [skillsLoadError, setSkillsLoadError] = useState<string | null>(null);
   const [skillsPickerOpen, setSkillsPickerOpen] = useState(false);
+  useMobileBack(skillsPickerOpen, () => setSkillsPickerOpen(false), 45);
+  useMobileBack(shortcutsOpen, () => setShortcutsOpen(false), 61);
   const [skillSearchQuery, setSkillSearchQuery] = useState("");
   const [activeSkillIndex, setActiveSkillIndex] = useState(0);
   const skillsRequestRef = useRef<AbortController | null>(null);
@@ -1231,19 +1235,23 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
 
   const runtime = useLocalRuntime(chatModel, { adapters: { attachments: attachmentAdapter } });
   runtimeRef.current = runtime;
+  const runtimeLoading = useSyncExternalStore(runtime.thread.subscribe, () => runtime.thread.getState().isLoading);
 
   useEffect(() => {
     const sessionId = props.sessionId;
-    if (!sessionId) return;
+    if (!sessionId || runtimeLoading) return;
     const draftScope = getLocalDraftScope();
     const composer = runtime.thread.composer;
     let cancelled = false;
     let restored = false;
     let saveTimer = 0;
+    // The runtime can detach before this effect cleans up. Keep the last real
+    // composer state rather than reading its temporary empty replacement.
+    let latestState = composer.getState();
 
     const flushDraft = (): void => {
       if (!restored || cancelled) return;
-      const state = composer.getState();
+      const state = latestState;
       const attachments: DraftAttachment[] = state.attachments
         .filter((attachment) => attachment.status.type !== "complete")
         .map((attachment) => ({
@@ -1260,7 +1268,8 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
       saveDraftMetadata(sessionId, { text: state.text, attachments }, draftScope);
     };
     const persist = (): void => {
-      if (!restored || cancelled) return;
+      if (!restored || cancelled || runtime.thread.getState().isLoading) return;
+      latestState = composer.getState();
       window.clearTimeout(saveTimer);
       saveTimer = window.setTimeout(flushDraft, 180);
     };
@@ -1326,7 +1335,7 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
       window.removeEventListener("pagehide", flushBeforePageHide);
       document.removeEventListener("visibilitychange", flushWhenHidden);
     };
-  }, [props.sessionFileForward, props.sessionId, runtime]);
+  }, [props.sessionFileForward, props.sessionId, runtime, runtimeLoading]);
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>

@@ -45,6 +45,17 @@ assert.equal(await runtime.checkMobileConnection(), true);
 const oldScope = getLocalDraftScope();
 assert.ok(oldScope?.includes(scope));
 
+if (scenario === "background") {
+  const { setAppForeground } = await import("../../web/src/foreground-polling.js");
+  setAppForeground(false);
+  const before = calls.length;
+  await assert.rejects(fetch("/api/messages", { method: "POST", body: "must wait" }), { name: "AbortError" });
+  assert.equal(calls.length, before);
+  setAppForeground(true);
+  assert.equal((await fetch("/api/messages", { method: "POST", body: "user retries" })).status, 200);
+  process.exit(0);
+}
+
 if (scenario === "write-active") {
   const sending = fetch("/api/messages", { method: "POST", body: "old environment message" });
   await assert.rejects(runtime.switchMobileConnection(targetServer), /请求正在提交/);

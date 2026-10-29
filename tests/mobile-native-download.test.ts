@@ -3,6 +3,22 @@ import { fileURLToPath } from "node:url";
 
 const fixture = fileURLToPath(new URL("./fixtures/mobile-native-download.ts", import.meta.url));
 const scenarios = [
+  ["android-open-cold", "queues a cold-start link without bypassing authenticated routing"],
+  ["android-open-warm", "coalesces duplicate warm launch links"],
+  ["android-local-notice", "posts an opt-in local notice without automatic permission prompts and retains its scoped target"],
+  ["android-share-import", "reads native inbox files without credentials and leaves draft choice to the user"],
+  ["android-share-invalid-uri", "rejects a native inbox URI that is not a local file before fetching"],
+  ["android-restored", "restores OS download tracking after native lifecycle startup and opens the completed file by native ID"],
+  ["android-cancel", "cancels one active system download and ignores its delayed completion callback"],
+  ["android-export-large", "exports more than 8 MiB using bounded chunks and a native file URI"],
+  ["ios-export-large", "shares an iOS export above 8 MiB without whole-file Base64 conversion"],
+  ["android-export-failure", "preserves a readable export failure and releases only temporary transfer data"],
+  ["android-image-copy", "copies a real Android image URI instead of substituting text or file saving"],
+  ["ios-image-copy", "uses the iOS image clipboard contract"],
+  ["android-scan-success", "restores a callable native scanner alongside the existing camera and image paths"],
+  ["android-scan-cancel", "treats native scanner cancellation as a recoverable choice"],
+  ["android-scan-failure", "reports native scanner failure without hiding other scanner choices"],
+  ["android-motion-permission", "keeps the manual environment entry usable when motion permission is denied"],
   ["android-apk-success", "verifies an APK before handing it to the installer and does not claim installation succeeded"],
   ["android-apk-invalid", "rejects a damaged APK before installation or saving and removes the failed download"],
   ["android-apk-cancel", "retains a verified APK after installer permission refusal so the user can retry"],

@@ -3,6 +3,7 @@ package dev.feishu.codex.bridge;
 import android.Manifest;
 import android.app.DownloadManager;
 import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
@@ -72,6 +73,74 @@ public class BridgeUpdaterPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void saveFile(PluginCall call) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && !isPublicStorageGranted()) {
+            requestPermissionForAlias(PUBLIC_STORAGE, call, "permissionCallback");
+            return;
+        }
+        getBridge().execute(() -> {
+            try {
+                File source = cachedTransferFile(call.getString("uri"));
+                String name = "Bridge-" + java.util.UUID.randomUUID() + "-" + sanitizeFileName(call.getString("fileName", "bridge-file"));
+                String mime = call.getString("mimeType", mimeTypeFor(name));
+                copyToDownloads(source, name, mime);
+                JSObject result = new JSObject(); result.put("fileName", name); result.put("size", source.length()); call.resolve(result);
+            } catch (Exception error) { call.reject("无法保存文件，请检查文件、存储权限和剩余空间。", "DOWNLOAD_SAVE_FAILED"); }
+        });
+    }
+
+    @PluginMethod
+    public void copyImage(PluginCall call) {
+        try {
+            File source = cachedTransferFile(call.getString("uri"));
+            if (!mimeTypeFor(source.getName()).startsWith("image/")) throw new IOException("not an image");
+            Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", source);
+            ClipboardManager clipboard = (ClipboardManager) getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+            if (clipboard == null) throw new IOException("clipboard unavailable");
+            clipboard.setPrimaryClip(ClipData.newUri(getContext().getContentResolver(), "Bridge image", uri));
+            call.resolve();
+        } catch (Exception error) { call.reject("图片复制失败，可重试或使用保存/分享。", "IMAGE_COPY_FAILED"); }
+    }
+
+    private File cachedTransferFile(String rawUri) throws IOException {
+        Uri uri = rawUri == null ? null : Uri.parse(rawUri);
+        if (uri == null || !"file".equals(uri.getScheme()) || uri.getPath() == null) throw new IOException("invalid cached URI");
+        return BridgeTransferFiles.requireTransferFile(getContext().getCacheDir(), uri.getPath());
+    }
+
+    private void copyToDownloads(File source, String name, String mime) throws IOException {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContentResolver resolver = getContext().getContentResolver();
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.Downloads.DISPLAY_NAME, name);
+            values.put(MediaStore.Downloads.MIME_TYPE, mime);
+            values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+            values.put(MediaStore.Downloads.IS_PENDING, 1);
+            Uri destination = resolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values);
+            if (destination == null) throw new IOException("cannot create destination");
+            try {
+                try (FileInputStream input = new FileInputStream(source); OutputStream output = resolver.openOutputStream(destination)) {
+                    if (output == null) throw new IOException("destination unavailable");
+                    byte[] buffer = new byte[65536]; int count;
+                    while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+                }
+                values.clear(); values.put(MediaStore.Downloads.IS_PENDING, 0);
+                resolver.update(destination, values, null, null);
+            } catch (IOException | RuntimeException error) { resolver.delete(destination, null, null); throw error; }
+        } else {
+            File directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+            if (!directory.exists() && !directory.mkdirs()) throw new IOException("cannot access downloads");
+            File destination = new File(directory, name);
+            if (!destination.createNewFile()) throw new IOException("file already exists");
+            try (FileInputStream input = new FileInputStream(source); FileOutputStream output = new FileOutputStream(destination)) {
+                byte[] buffer = new byte[65536]; int count;
+                while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+            } catch (IOException error) { destination.delete(); throw error; }
+            MediaScannerConnection.scanFile(getContext(), new String[]{destination.getPath()}, new String[]{mime}, null);
+        }
+    }
+
+    @PluginMethod
     public void getDownloads(PluginCall call) {
         JSArray requestedIds = call.getArray("ids");
         if (requestedIds == null || requestedIds.length() > 100) {
@@ -80,18 +149,12 @@ public class BridgeUpdaterPlugin extends Plugin {
         }
         long[] ids = new long[requestedIds.length()];
         for (int index = 0; index < requestedIds.length(); index++) {
-            Object value = requestedIds.opt(index);
-            if (!(value instanceof Number)) {
+            Long id = BridgePluginNumbers.positiveSafeLong(requestedIds.opt(index));
+            if (id == null) {
                 call.reject("下载编号无效。", "INVALID_DOWNLOAD_IDS");
                 return;
             }
-            double numericId = ((Number) value).doubleValue();
-            if (Double.isNaN(numericId) || Double.isInfinite(numericId) || numericId <= 0
-                || numericId > 9_007_199_254_740_991d || numericId != Math.rint(numericId)) {
-                call.reject("下载编号无效。", "INVALID_DOWNLOAD_IDS");
-                return;
-            }
-            ids[index] = ((Number) value).longValue();
+            ids[index] = id;
         }
         JSArray downloads = new JSArray();
         if (ids.length == 0) {
@@ -221,6 +284,39 @@ public class BridgeUpdaterPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void cancelDownload(PluginCall call) {
+        Long id = BridgePluginNumbers.positiveSafeLong(call, "id");
+        if (id == null || id <= 0) { call.reject("下载编号无效。"); return; }
+        DownloadManager manager = (DownloadManager) getContext().getSystemService(Context.DOWNLOAD_SERVICE);
+        if (manager == null) { call.reject("系统下载不可用。"); return; }
+        try (Cursor cursor = manager.query(new DownloadManager.Query().setFilterById(id))) {
+            if (cursor == null || !cursor.moveToFirst()) { call.reject("找不到此下载，请在系统下载中确认。"); return; }
+            boolean completed = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)) == DownloadManager.STATUS_SUCCESSFUL;
+            if (!completed) manager.remove(id);
+            JSObject result = new JSObject(); result.put("cancelled", !completed); call.resolve(result);
+        } catch (Exception error) { call.reject("无法取消此下载，请在系统下载中操作。"); }
+    }
+
+    @PluginMethod
+    public void openDownloadedFile(PluginCall call) {
+        Long id = BridgePluginNumbers.positiveSafeLong(call, "id");
+        if (id == null || id <= 0) { call.reject("下载编号无效。"); return; }
+        DownloadManager manager = (DownloadManager) getContext().getSystemService(Context.DOWNLOAD_SERVICE);
+        if (manager == null) { call.reject("系统下载不可用。"); return; }
+        try {
+            Uri uri = manager.getUriForDownloadedFile(id);
+            if (uri == null) { call.reject("下载文件已移除或尚未完成，请重新下载。"); return; }
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            String mime = manager.getMimeTypeForDownloadedFile(id);
+            intent.setDataAndType(uri, mime == null ? "application/octet-stream" : mime);
+            intent.setClipData(ClipData.newRawUri("Bridge download", uri));
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            getActivity().startActivity(intent);
+            call.resolve();
+        } catch (Exception error) { call.reject("没有可打开此文件的应用，请在系统下载中查看或分享。"); }
+    }
+
+    @PluginMethod
     public void openDownloads(PluginCall call) {
         try {
             Intent intent = new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS);
@@ -239,6 +335,7 @@ public class BridgeUpdaterPlugin extends Plugin {
             return;
         }
         if ("saveApk".equals(call.getMethodName())) saveApk(call);
+        else if ("saveFile".equals(call.getMethodName())) saveFile(call);
         else if ("save".equals(call.getMethodName())) saveBlob(call);
         else enqueueDownload(call);
     }
@@ -383,10 +480,12 @@ public class BridgeUpdaterPlugin extends Plugin {
         String root = new File(getContext().getCacheDir(), "bridge-downloads").getCanonicalPath() + File.separator;
         if (!file.isFile() || !file.getPath().startsWith(root) || !file.getName().endsWith(".apk")) throw new IOException("更新文件已失效，请重新下载。");
         String hash = call.getString("sha256", "");
-        Long size = call.getLong("size");
-        Long version = call.getLong("versionCode");
-        if (!hash.matches("[a-f0-9]{64}") || size == null || size < 1 || version == null || version < 1
-            || !getContext().getPackageName().equals(call.getString("packageName"))) throw new IOException("更新校验信息无效。");
+        Long size = BridgePluginNumbers.positiveSafeLong(call, "size");
+        Long version = BridgePluginNumbers.positiveSafeLong(call, "versionCode");
+        if (!hash.matches("[a-f0-9]{64}")) throw new IOException("更新校验信息无效（SHA-256），请重新检查更新。");
+        if (size == null) throw new IOException("更新校验信息无效（文件大小），请重新检查更新。");
+        if (version == null) throw new IOException("更新校验信息无效（版本号），请重新检查更新。");
+        if (!getContext().getPackageName().equals(call.getString("packageName"))) throw new IOException("更新校验信息无效（包名），请重新检查更新。");
         if (file.length() != size) throw new IOException("更新包大小不符，请重新下载。");
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         try (FileInputStream input = new FileInputStream(file)) {
@@ -416,7 +515,7 @@ public class BridgeUpdaterPlugin extends Plugin {
         getBridge().execute(() -> {
             try {
                 File source = verifiedApk(call);
-                String name = "Bridge-" + call.getLong("versionCode") + "-" + System.currentTimeMillis() + ".apk";
+                String name = "Bridge-" + BridgePluginNumbers.positiveSafeLong(call, "versionCode") + "-" + System.currentTimeMillis() + ".apk";
                 String mimeType = "application/vnd.android.package-archive";
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     ContentResolver resolver = getContext().getContentResolver();
@@ -496,7 +595,6 @@ public class BridgeUpdaterPlugin extends Plugin {
             return expectedAuthority.equals(supplied.getAuthority()) ? supplied : null;
         }
         if (!"file".equals(supplied.getScheme()) || supplied.getPath() == null) return null;
-
         File downloaded = new File(supplied.getPath());
         File downloadRoot = new File(getContext().getCacheDir(), "bridge-downloads");
         try {
@@ -504,12 +602,11 @@ public class BridgeUpdaterPlugin extends Plugin {
             String rootPath = downloadRoot.getCanonicalFile().getPath() + File.separator;
             if (!canonicalFile.isFile()
                 || !canonicalFile.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".apk")
-                || !canonicalFile.getPath().startsWith(rootPath)) {
-                return null;
-            }
+                || !canonicalFile.getPath().startsWith(rootPath)) return null;
             return FileProvider.getUriForFile(getContext(), expectedAuthority, canonicalFile);
         } catch (IOException error) {
             return null;
         }
     }
+
 }

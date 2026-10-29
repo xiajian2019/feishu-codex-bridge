@@ -1,6 +1,17 @@
 export const VCONSOLE_VISIBILITY_CHANGE_EVENT = "feishu-codex-bridge:vconsole-visibility-change";
 
 const VCONSOLE_VISIBILITY_STORAGE_KEY = "feishu-codex-bridge.vconsole-visible";
+export const MOBILE_SHAKE_PREFERENCE_EVENT = "bridge:shake-preference";
+const MOBILE_SHAKE_KEY = "bridge.mobile.shake-enabled";
+let shakeEnabled = true;
+export function readMobileShakeEnabled(): boolean {
+  try { return window.localStorage.getItem(MOBILE_SHAKE_KEY) !== "false"; } catch { return shakeEnabled; }
+}
+export function writeMobileShakeEnabled(enabled: boolean): void {
+  shakeEnabled = enabled;
+  try { window.localStorage.setItem(MOBILE_SHAKE_KEY, String(enabled)); } catch { /* Keep the preference for this process. */ }
+  window.dispatchEvent(new Event(MOBILE_SHAKE_PREFERENCE_EVENT));
+}
 
 export function readVConsoleVisible(): boolean {
   if (typeof window === "undefined") return true;

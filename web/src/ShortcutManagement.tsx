@@ -37,6 +37,8 @@ type ShortcutDraft = {
 const EMPTY_GROUP: GroupDraft = { title: "", icon: "⌘", description: "", surface: "palette", layout: "grid" };
 const EMPTY_SHORTCUT: ShortcutDraft = { groupId: "", title: "", detail: "", kind: "send", value: "", actionKey: "", displayMode: "closed", enabled: true, dangerous: false };
 
+import { useMobileBack } from "./use-mobile-back.js";
+
 export function ShortcutManagement(): ReactElement {
   const [store, setStore] = useState<ShortcutStore>(() => readShortcutConfigCache() ?? { groups: [], shortcuts: [] });
   const [skillCatalog, setSkillCatalog] = useState<CodexSkillRecord[]>([]);
@@ -52,6 +54,8 @@ export function ShortcutManagement(): ReactElement {
   const [skillsLoading, setSkillsLoading] = useState(true);
   const [skillsLoadError, setSkillsLoadError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  useMobileBack(showGroupForm, () => { if (!busy) setShowGroupForm(false); }, 80);
+  useMobileBack(showShortcutForm, () => { if (!busy) setShowShortcutForm(false); }, 80);
   const [error, setError] = useState<string | null>(null);
   const loadGeneration = useRef(0);
 

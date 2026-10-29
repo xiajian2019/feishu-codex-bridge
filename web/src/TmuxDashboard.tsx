@@ -35,6 +35,7 @@ import {
   shouldRefreshSessionListOnVisibilityChange,
 } from "./tmux-session-refresh-policy.js";
 import { useTheme } from "./theme.js";
+import { useMobileBack } from "./use-mobile-back.js";
 
 const TmuxMessageComposer = lazy(() => import("./TmuxMessageComposer.js").then((module) => ({ default: module.TmuxMessageComposer })));
 const TmuxHistoryInspector = lazy(() => import("./TmuxSessionHistory.js").then((module) => ({ default: module.TmuxSessionHistory })));
@@ -374,6 +375,11 @@ export function TmuxDashboard(): ReactElement {
   const [newProjectName, setNewProjectName] = useState("");
   const [newWorkingDirectory, setNewWorkingDirectory] = useState("");
   const [newTaskDescription, setNewTaskDescription] = useState("");
+  const [sessionEditTargetId, setSessionEditTargetId] = useState<string | null>(null);
+  const [sessionEditName, setSessionEditName] = useState("");
+  const [sessionEditWorkingDirectory, setSessionEditWorkingDirectory] = useState("");
+  const [sessionEditBusy, setSessionEditBusy] = useState(false);
+  const [sessionEditError, setSessionEditError] = useState("");
   const [trackedTaskOpen, setTrackedTaskOpen] = useState(false);
   const [trackedTaskDescription, setTrackedTaskDescription] = useState("");
   const [trackedTaskBusy, setTrackedTaskBusy] = useState(false);
@@ -386,6 +392,11 @@ export function TmuxDashboard(): ReactElement {
   const [sendingMessage, setSendingMessage] = useState(false);
   const [terminalSelection, setTerminalSelection] = useState<TerminalSelectionDisplay | null>(null);
   const [sessionInspector, setSessionInspector] = useState<SessionInspector | null>(null);
+  useMobileBack(createOpen, () => { if (!createBusy) setCreateOpen(false); }, 100);
+  useMobileBack(Boolean(sessionEditTargetId), () => { if (!sessionEditBusy) setSessionEditTargetId(null); }, 100);
+  useMobileBack(trackedTaskOpen, () => { if (!trackedTaskBusy) setTrackedTaskOpen(false); }, 100);
+  useMobileBack(Boolean(sessionInspector), () => setSessionInspector(null), 900);
+  useMobileBack(projectPickerOpen, () => setProjectPickerOpen(false), 110);
   const terminalHostRef = useRef<HTMLDivElement | null>(null);
   const projectPickerRef = useRef<HTMLDivElement | null>(null);
   const terminalInstanceRef = useRef<Terminal | null>(null);
@@ -765,6 +776,7 @@ export function TmuxDashboard(): ReactElement {
   }, [projectQuery, projects]);
   const selectedProject = projects.find((project) => project.name === newProjectName) ?? null;
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? null;
+  const sessionEditTarget = sessions.find((session) => session.id === sessionEditTargetId) ?? null;
   const terminalVisible = Boolean(selectedSession) && (!isMobile || mobileView === "terminal");
   const selectedCodexHomeLabel = selectedSession
     ? resolveCodexHomeLabel(selectedSession.codexHomeId, codexHomes, codexUsageAccount)
@@ -858,6 +870,7 @@ export function TmuxDashboard(): ReactElement {
     setNavigationCollapsed(false);
     setMobileView("sessions");
   };
+  useMobileBack(isMobile && mobileView === "terminal", showSessionsOnMobile, 0, { escape: false, restoreFocus: false });
 
   const refreshSessionsList = useCallback(async (): Promise<void> => {
     if (sessionsRefreshing) return;
@@ -1472,6 +1485,51 @@ export function TmuxDashboard(): ReactElement {
     setCreateOpen(true);
   };
 
+  const openSessionEditDialog = (): void => {
+    if (!selectedSession || selectedSession.endedAt || selectedSession.suspendedAt) return;
+    setSessionEditTargetId(selectedSession.id);
+    setSessionEditName(selectedSession.name);
+    setSessionEditWorkingDirectory(selectedSession.cwd);
+    setSessionEditError("");
+  };
+
+  const closeSessionEditDialog = (): void => {
+    if (sessionEditBusy) return;
+    setSessionEditTargetId(null);
+    setSessionEditError("");
+  };
+
+  const saveSessionEdit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    if (!sessionEditTarget) {
+      setSessionEditError("Session 已不存在，请刷新列表。");
+      return;
+    }
+    setSessionEditBusy(true);
+    setSessionEditError("");
+    try {
+      const result = await requestApi<{ session: TmuxSession }>(`/sessions/${encodeURIComponent(sessionEditTarget.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name: sessionEditName.trim(),
+          workingDirectory: sessionEditWorkingDirectory.trim(),
+        }),
+      });
+      const updated = normalizeTmuxSession(result.session);
+      if (!updated) throw new Error("更新接口返回了无法识别的 Session，请刷新列表。");
+      setSessions((current) => current.map((session) => session.id === sessionEditTarget.id && session.createdAt === sessionEditTarget.createdAt
+        ? { ...session, ...updated }
+        : session));
+      setSessionEditTargetId(null);
+      setToast({ message: `Session「${updated.name}」已更新。`, isError: false });
+      void loadSessions(true);
+    } catch (editError) {
+      setSessionEditError(editError instanceof Error ? editError.message : "无法更新 Session。");
+    } finally {
+      setSessionEditBusy(false);
+    }
+  };
+
   const openProjectPicker = (): void => {
     setProjectQuery(selectedProject ? "" : newWorkingDirectory);
     setProjectActiveIndex(Math.max(0, projects.findIndex((project) => project.name === newProjectName)));
@@ -1863,7 +1921,7 @@ export function TmuxDashboard(): ReactElement {
         <section className="dashboard-workspace" aria-label="Session terminal">
           <div className="dashboard-workspace-toolbar">
             <button className="dashboard-mobile-back" type="button" onClick={showSessionsOnMobile} aria-label="Back to sessions">‹</button>
-            <div className="dashboard-active-session"><div><strong>{selectedSession?.name ?? "No session selected"}</strong><span title={selectedSession?.cwd}>{selectedSession?.workspaceBranch ? `任务分支 ${selectedSession.workspaceBranch} · ${selectedSession.workspaceStatus ?? "工作区"} · ` : ""}{selectedSession?.cwd ?? "Choose a session to open its terminal"}</span></div></div>
+            <div className="dashboard-active-session"><div><div className="dashboard-active-session-title"><strong>{selectedSession?.name ?? "No session selected"}</strong>{selectedSession ? <button className="dashboard-active-session-edit" type="button" onClick={openSessionEditDialog} disabled={Boolean(selectedSession.endedAt || selectedSession.suspendedAt)} aria-label="编辑 Session 名称和工作目录" title="编辑 Session 名称和工作目录"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m4 16.5-.8 4.3 4.3-.8L19 8.5 15.5 5z" /><path d="m13.8 6.7 3.5 3.5" /></svg></button> : null}</div><span title={selectedSession?.cwd}>{selectedSession?.workspaceBranch ? `任务分支 ${selectedSession.workspaceBranch} · ${selectedSession.workspaceStatus ?? "工作区"} · ` : ""}{selectedSession?.cwd ?? "Choose a session to open its terminal"}</span></div></div>
             {selectedSession ? (
               <div className="dashboard-codex-inline" aria-label="Session 账号与操作">
                 <button
@@ -2004,6 +2062,18 @@ export function TmuxDashboard(): ReactElement {
           /></Suspense> : null}
         </section>
       </section>
+      {sessionEditTarget ? (
+        <div className="dashboard-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSessionEditDialog(); }}>
+          <form className="dashboard-modal dashboard-session-edit-modal" onSubmit={(event) => void saveSessionEdit(event)}>
+            <div className="dashboard-modal-heading"><div><p className="dashboard-eyebrow">SESSION SETTINGS</p><h2>编辑 Session</h2></div><button type="button" onClick={closeSessionEditDialog} aria-label="Close" disabled={sessionEditBusy}>×</button></div>
+            <label className="dashboard-modal-field">Session 名称<input value={sessionEditName} onChange={(event) => setSessionEditName(event.target.value)} required maxLength={64} pattern="[A-Za-z0-9][A-Za-z0-9_.-]*" autoComplete="off" autoFocus disabled={sessionEditBusy} /></label>
+            <label className="dashboard-modal-field">Working directory<input value={sessionEditWorkingDirectory} onChange={(event) => setSessionEditWorkingDirectory(event.target.value)} required maxLength={4096} autoComplete="off" disabled={sessionEditBusy} /></label>
+            <p className="muted">该目录仅用于 Git 变更和文件浏览，不会修改当前 pane 的目录；正在运行的 Codex 会继续使用原工作目录。</p>
+            {sessionEditError ? <div className="error" role="alert">{sessionEditError}</div> : null}
+            <div className="dashboard-modal-actions"><button className="dashboard-action" type="button" onClick={closeSessionEditDialog} disabled={sessionEditBusy}>取消</button><button className="dashboard-submit" type="submit" disabled={sessionEditBusy || !sessionEditName.trim() || !sessionEditWorkingDirectory.trim()}>{sessionEditBusy ? "保存中…" : "保存"}</button></div>
+          </form>
+        </div>
+      ) : null}
       {createOpen ? (
         <div className="dashboard-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setCreateOpen(false); }}>
           <form className="dashboard-modal" onSubmit={(event) => void createSession(event)}>

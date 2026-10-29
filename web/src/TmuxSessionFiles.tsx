@@ -8,8 +8,9 @@ import { CodeTextViewer } from "./CodeTextViewer.js";
 import { BridgeImage } from "./BridgeMedia.js";
 import { isBridgeApiPath } from "./mobile-connection.js";
 import { useSystemNavigation } from "./WebNavigation.js";
-import { copyMobileText, downloadBridgeFile, getBridgeOrigin, isMobileApp, openBridgeExternal } from "./mobile-runtime.js";
+import { copyMobileImage, copyMobileText, downloadBridgeFile, getBridgeOrigin, isMobileApp, openBridgeExternal } from "./mobile-runtime.js";
 import { normalizeSessionPathInput, sessionPathName, sessionPathParent } from "./tmux-session-path.js";
+import { useMobileBack } from "./use-mobile-back.js";
 
 const API_ROOT = "/tmux-dashboard/api";
 const PREVIEW_TEXT_LIMIT = 2 * 1024 * 1024;
@@ -265,6 +266,22 @@ export function TmuxSessionFiles(): ReactElement {
   const [pathNavigationBusy, setPathNavigationBusy] = useState(false);
   const [filenameQuery, setFilenameQuery] = useState("");
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const previewAbortRef = useRef<AbortController | null>(null);
+  const previewGeneration = useRef(0);
+  const closePreview = useCallback((): void => {
+    previewGeneration.current += 1;
+    previewAbortRef.current?.abort();
+    setPreview(null); setPreviewHistory([]); setPreviewNavigationBusy(false);
+  }, []);
+  useMobileBack(Boolean(preview) || previewNavigationBusy, closePreview, 80);
+  useMobileBack(true, () => {
+    if (currentPath) setCurrentPath(sessionPathParent(currentPath));
+    else navigate(`/tmux-dashboard?session=${encodeURIComponent(sessionId)}`);
+  }, 0, { escape: false, restoreFocus: false });
+
+  useEffect(() => {
+    return () => { previewGeneration.current += 1; previewAbortRef.current?.abort(); };
+  }, [sessionId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -292,13 +309,12 @@ export function TmuxSessionFiles(): ReactElement {
     if (!preview) return;
     const closeOnEscape = (event: KeyboardEvent): void => {
       if (event.key === "Escape") {
-        setPreview(null);
-        setPreviewHistory([]);
+        closePreview();
       }
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [preview]);
+  }, [preview, closePreview]);
 
   const breadcrumbSegments = useMemo(() => currentPath.split("/").filter(Boolean), [currentPath]);
   const visibleEntries = useMemo(() => {
@@ -357,11 +373,16 @@ export function TmuxSessionFiles(): ReactElement {
   const copyPreview = async (file: FilePreview): Promise<void> => {
     if (file.type === "image") {
       try {
-        await copyImageToClipboard(file.blob);
+        if (isMobileApp()) await copyMobileImage(file.blob);
+        else await copyImageToClipboard(file.blob);
         setError("");
         setNotice(`已复制图片：${file.relativePath}`);
         return;
-      } catch {
+      } catch (copyError) {
+        if (isMobileApp()) {
+          setError(copyError instanceof Error ? copyError.message : "图片复制失败，可保存或分享后重试。");
+          return;
+        }
         // Fall through to copying the relative file name.
       }
     } else {
@@ -420,19 +441,24 @@ export function TmuxSessionFiles(): ReactElement {
   }, [currentPath, sessionId]);
 
   const openPreview = useCallback(async (entry: SessionFileEntry, directoryPath = currentPath): Promise<boolean> => {
+    previewAbortRef.current?.abort();
+    const controller = new AbortController(); previewAbortRef.current = controller;
+    const generation = ++previewGeneration.current;
     setError("");
     setNotice("");
     const relativePath = fileRelativePath(directoryPath, entry.name);
     const extension = fileExtension(entry.name);
     if (IMAGE_EXTENSIONS.has(extension)) {
       try {
-        const response = await fetch(sessionFilesUrl(sessionId, "download", relativePath));
+        const response = await fetch(sessionFilesUrl(sessionId, "download", relativePath), { signal: controller.signal });
         if (!response.ok) throw new Error(await responseError(response));
         const blob = await response.blob();
+        if (controller.signal.aborted || generation !== previewGeneration.current) return false;
         const url = URL.createObjectURL(blob);
         setPreview({ name: entry.name, relativePath, size: entry.size, type: "image", url, blob });
         return true;
       } catch (previewError) {
+        if (controller.signal.aborted) return false;
         setError(previewError instanceof Error ? previewError.message : "Could not preview this image.");
         return false;
       }
@@ -446,17 +472,23 @@ export function TmuxSessionFiles(): ReactElement {
       return false;
     }
     try {
-      const response = await fetch(sessionFilesUrl(sessionId, "download", relativePath));
+      const response = await fetch(sessionFilesUrl(sessionId, "download", relativePath), { signal: controller.signal });
       if (!response.ok) throw new Error(await responseError(response));
-      setPreview({ name: entry.name, relativePath, size: entry.size, type: extension === "md" || extension === "markdown" ? "markdown" : "text", text: await response.text() });
+      const text = await response.text();
+      if (controller.signal.aborted || generation !== previewGeneration.current) return false;
+      setPreview({ name: entry.name, relativePath, size: entry.size, type: extension === "md" || extension === "markdown" ? "markdown" : "text", text });
       return true;
     } catch (previewError) {
+      if (controller.signal.aborted) return false;
       setError(previewError instanceof Error ? previewError.message : "Could not preview this file.");
       return false;
     }
   }, [currentPath, sessionId]);
 
   const openSessionFilePreview = useCallback(async (relativePath: string): Promise<boolean> => {
+    previewAbortRef.current?.abort();
+    const controller = new AbortController(); previewAbortRef.current = controller;
+    const generation = ++previewGeneration.current;
     setError("");
     setNotice("");
     const name = lastPathPart(relativePath);
@@ -466,7 +498,8 @@ export function TmuxSessionFiles(): ReactElement {
       return false;
     }
     try {
-      const directory = await getJson<SessionFileListing>(sessionFilesUrl(sessionId, "list", directoryPath));
+      const directory = await getJson<SessionFileListing>(sessionFilesUrl(sessionId, "list", directoryPath), { signal: controller.signal });
+      if (controller.signal.aborted || generation !== previewGeneration.current) return false;
       const entry = directory.entries.find((candidate) => candidate.name === name);
       if (!entry) throw new Error("链接指向的文件不存在或不在此 session 的工作目录内。");
       if (entry.type === "directory") {
@@ -474,6 +507,7 @@ export function TmuxSessionFiles(): ReactElement {
       }
       return await openPreview(entry, directoryPath);
     } catch (openError) {
+      if (controller.signal.aborted) return false;
       setError(openError instanceof Error ? openError.message : "无法打开这个 Markdown 链接。");
       return false;
     }
@@ -705,7 +739,7 @@ export function TmuxSessionFiles(): ReactElement {
       </section>
 
       {preview ? (
-        <div className="tmux-files-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) { setPreview(null); setPreviewHistory([]); } }}>
+        <div className="tmux-files-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closePreview(); }}>
           <section className="tmux-files-preview" role="dialog" aria-modal="true" aria-label={`预览 ${preview.name}`}>
             <header>
               <strong title={preview.name}>{preview.name}</strong>
@@ -725,7 +759,7 @@ export function TmuxSessionFiles(): ReactElement {
                   href={sessionFilesUrl(sessionId, "download", preview.relativePath)}
                   download={preview.name}
                   aria-label={`下载 ${preview.name}`}
-                  title="下载"
+                  title={isMobileApp() && preview.type === "image" ? "保存图片" : "下载"}
                   onClick={(event) => {
                     if (!isMobileApp()) return;
                     event.preventDefault();
@@ -745,7 +779,7 @@ export function TmuxSessionFiles(): ReactElement {
                 >
                   <SessionFileActionIcon action="forward" />
                 </button>
-                <button type="button" onClick={() => { setPreview(null); setPreviewHistory([]); }} aria-label="关闭预览" title="关闭预览">×</button>
+                <button type="button" onClick={closePreview} aria-label="关闭预览" title="关闭预览">×</button>
               </div>
             </header>
             {error ? <div className="tmux-files-message tmux-files-preview-feedback is-error" role="alert">{error}</div> : null}

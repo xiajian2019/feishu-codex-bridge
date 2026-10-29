@@ -46,11 +46,15 @@ export function useSystemNavigation(): SystemNavigationState {
   return state;
 }
 
+import { useMobileBack } from "./use-mobile-back.js";
+
 export function WebNavigation(): ReactElement {
   const { collapsed, toggle } = useSystemNavigation();
   const location = useLocation();
-  const systemActive = location.pathname.startsWith("/system-management") || location.pathname === "/pair-admin";
+  const systemActive = location.pathname.startsWith("/system-management") || location.pathname === "/pair-admin"
+    || (isMobileApp() && ["/mobile-inbox", "/mobile-shares"].includes(location.pathname));
   const [systemOpen, setSystemOpen] = useState(systemActive);
+  useMobileBack(systemOpen, () => setSystemOpen(false), 1000);
   const [popoverPosition, setPopoverPosition] = useState<{ top: number; left: number } | null>(null);
   const systemTriggerRef = useRef<HTMLButtonElement | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
@@ -141,7 +145,7 @@ export function WebNavigation(): ReactElement {
             onClick={closePopovers}
           >{page.label}</NavLink>
         ))}
-        {isMobileApp() ? (
+        {isMobileApp() ? <>
           <button
             className="web-navigation-submenu-action"
             type="button"
@@ -151,7 +155,9 @@ export function WebNavigation(): ReactElement {
               openMobileConnectionSettings();
             }}
           >App 连接</button>
-        ) : null}
+          <NavLink to="/mobile-inbox" role="menuitem" className={({ isActive }) => isActive ? "is-active" : undefined} onClick={closePopovers}>待处理</NavLink>
+          <NavLink to="/mobile-shares" role="menuitem" className={({ isActive }) => isActive ? "is-active" : undefined} onClick={closePopovers}>分享收件箱</NavLink>
+        </> : null}
       </div>,
       document.body,
     )
