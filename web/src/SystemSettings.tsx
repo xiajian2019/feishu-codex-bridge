@@ -85,7 +85,7 @@ export function SystemSettings(): ReactElement {
       <h1>系统设置</h1>
       <section className="system-settings-panel" aria-label="界面设置">
         {isMobileApp() ? <>
-          <label className="system-settings-row"><span>摇一摇切换环境</span><input type="checkbox" checked={shakeEnabled} disabled={shakeBusy} onChange={(event) => {
+          <label className="system-settings-row"><span>大幅摇晃两下切换环境</span><input type="checkbox" checked={shakeEnabled} disabled={shakeBusy} onChange={(event) => {
             const enabled = event.target.checked;
             setShakeBusy(true); setShakeError("");
             void setMobileShakeEnabled(enabled).then(() => setShakeEnabled(enabled)).catch((cause: unknown) => {

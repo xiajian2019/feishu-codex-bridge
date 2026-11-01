@@ -9,7 +9,7 @@ try {
     .map((name) => ({ name, code: readFileSync(resolve(root, "dist", platform, "assets", name), "utf8") }));
   const webAssets = assets("web");
   const appAssets = assets("mobile");
-  const leaked = webAssets.filter(({ code }) => /BridgeCredentials|CapacitorHttp|bridge\.mobile\.server/.test(code));
+  const leaked = webAssets.filter(({ code }) => /BridgeCredentials|BridgeComposerData|BridgeNativeTheme|BridgeSSH|BridgeConnectBotSSH|CapacitorHttp|bridge\.mobile\.server/.test(code));
   if (leaked.length) throw new Error("浏览器产物包含 App 运行时：" + leaked.map(({ name }) => name).join(", "));
   if (!appAssets.some(({ code }) => code.includes("BridgeCredentials"))) throw new Error("App 产物缺少原生凭据插件。");
   const webHtml = readFileSync(resolve(root, "dist/web/index.html"), "utf8");

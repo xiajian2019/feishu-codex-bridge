@@ -1,10 +1,14 @@
 import type { ReactElement } from "react";
+import { useLocation } from "react-router";
 
 import { useBridgeConnection } from "./connection-state.js";
 import "./connection-status.css";
+import { isStandaloneSshPath } from "./ssh-route.js";
 
 export function BridgeConnectionStatus(): ReactElement | null {
+  const location = useLocation();
   const connection = useBridgeConnection();
+  if (isStandaloneSshPath(location.pathname)) return null;
   if (connection.browserOnline && (connection.api === "connected" || connection.api === "unknown") && !connection.lastError) return null;
 
   const offline = !connection.browserOnline;

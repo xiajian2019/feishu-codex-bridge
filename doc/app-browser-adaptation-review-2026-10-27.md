@@ -299,7 +299,7 @@ App 权限文案应能区分“尚未授权 / 已拒绝 / 需去系统设置 / �
 
 ### APP-16 摇一摇只能是快捷入口，不能是唯一入口
 
-**源码确认 + 待真机验证。** 当前 [mobile-shake.ts](../web/src/mobile-shake.ts) 已调整为固定时间窗口和两次明显反向晃动，有模拟不同采样频率的测试；[mobile-native.ts](../web/src/mobile-native.ts) 实际依赖 WebView DeviceMotion，不是原生 SensorManager/CoreMotion，也没有完整跨平台权限申请流程。
+**源码确认 + 待真机验证。** 当前 [mobile-shake.ts](../web/src/mobile-shake.ts) 要求两次持续且较强的反向晃动，有模拟桌面碰撞、回弹及不同采样频率的测试；[mobile-native.ts](../web/src/mobile-native.ts) 实际依赖 WebView DeviceMotion，不是原生 SensorManager/CoreMotion，也没有完整跨平台权限申请流程。
 
 建议：保留系统管理里的手动连接/环境入口，提供关闭或灵敏度设置；相机等关键流程避免误触；Android 用真实设备采样校准，iOS 未验证前不承诺同等可用。环境弹窗当前是网页弹层，是否改原生见 APP-07。
 

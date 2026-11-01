@@ -1,9 +1,13 @@
 package dev.feishu.codex.bridge;
 
 import android.os.Bundle;
-import com.getcapacitor.BridgeActivity;
 
-public class MainActivity extends BridgeActivity {
+public class MainActivity extends BridgeConnectBotSshActivity {
+    @Override
+    protected boolean isEmbeddedSshHost() {
+        return true;
+    }
+
     @Override
     public void onCreate(Bundle savedInstanceState) {
         if (savedInstanceState != null && savedInstanceState.getBoolean("bridgeShareDurable", false)) {
@@ -13,6 +17,10 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(BridgeCredentialsPlugin.class);
         registerPlugin(BridgeUpdaterPlugin.class);
         registerPlugin(BridgeShareInboxPlugin.class);
+        registerPlugin(BridgeNativeThemePlugin.class);
+        registerPlugin(BridgeComposerDataPlugin.class);
+        registerPlugin(BridgeSSHPlugin.class);
+        registerPlugin(BridgeConnectBotSSHPlugin.class);
         super.onCreate(savedInstanceState);
     }
 

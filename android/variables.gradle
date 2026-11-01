@@ -1,8 +1,11 @@
 ext {
     // Match the toolchain already used by Filesystem, FileTransfer and Barcode Scanner.
-    kotlin_version = '2.2.20'
+    // ConnectBot cbssh/termlib 0.5.0/0.3.13 publish Kotlin 2.4 metadata.
+    kotlin_version = '2.4.20'
     minSdkVersion = 26
-    compileSdkVersion = 36
+    // ConnectBot termlib 0.3.13 declares minCompileSdk=37.
+    compileSdkVersion = 37
+    compileSdkMinorApiLevel = 2
     targetSdkVersion = 36
     androidxActivityVersion = '1.11.0'
     androidxAppCompatVersion = '1.7.1'

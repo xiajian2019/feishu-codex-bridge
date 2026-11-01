@@ -36,6 +36,7 @@ import {
 } from "./tmux-session-refresh-policy.js";
 import { useTheme } from "./theme.js";
 import { useMobileBack } from "./use-mobile-back.js";
+import { TmuxSshShortcut } from "./TmuxSshShortcut.js";
 
 const TmuxMessageComposer = lazy(() => import("./TmuxMessageComposer.js").then((module) => ({ default: module.TmuxMessageComposer })));
 const TmuxHistoryInspector = lazy(() => import("./TmuxSessionHistory.js").then((module) => ({ default: module.TmuxSessionHistory })));
@@ -59,6 +60,27 @@ type TmuxSession = {
   workspaceStatus?: string | null;
   snapshot: { savedAt: string } | null;
 };
+
+function parseSessionFileForward(value: unknown): SessionFileForwardRequest | null {
+  if (typeof value !== "object" || value === null) return null;
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.id !== "string" || typeof candidate.sessionId !== "string" || typeof candidate.text !== "string") return null;
+  const images = Array.isArray(candidate.images)
+    ? candidate.images.flatMap((image): Array<{ name: string; url: string }> => {
+      if (typeof image !== "object" || image === null) return [];
+      const record = image as Record<string, unknown>;
+      return typeof record.name === "string" && typeof record.url === "string"
+        ? [{ name: record.name, url: record.url }]
+        : [];
+    })
+    : [];
+  return {
+    id: candidate.id,
+    sessionId: candidate.sessionId,
+    text: candidate.text,
+    ...(images.length > 0 ? { images } : {}),
+  };
+}
 
 type TmuxResurrectStatus = {
   installed: boolean;
@@ -349,18 +371,7 @@ export function TmuxDashboard(): ReactElement {
   const [sessionsRefreshing, setSessionsRefreshing] = useState(false);
   const [sessionFileForward, setSessionFileForward] = useState<SessionFileForwardRequest | null>(() => {
     const state = location.state as { sessionFileForward?: unknown } | null;
-    const request = state?.sessionFileForward;
-    if (typeof request !== "object" || request === null) return null;
-    const candidate = request as Record<string, unknown>;
-    return typeof candidate.id === "string"
-      && typeof candidate.sessionId === "string"
-      && typeof candidate.text === "string"
-      ? {
-        id: candidate.id,
-        sessionId: candidate.sessionId,
-        text: candidate.text,
-      }
-      : null;
+    return parseSessionFileForward(state?.sessionFileForward);
   });
   const [search, setSearch] = useState("");
   const [backendStatus, setBackendStatus] = useState<"connecting" | "online" | "offline">("connecting");
@@ -450,11 +461,9 @@ export function TmuxDashboard(): ReactElement {
 
   useEffect(() => {
     const state = location.state as { sessionFileForward?: unknown } | null;
-    const incoming = state?.sessionFileForward;
-    if (!incoming || typeof incoming !== "object") return;
-    const forward = incoming as Record<string, unknown>;
-    if (typeof forward.id !== "string" || typeof forward.sessionId !== "string" || typeof forward.text !== "string") return;
-    setSessionFileForward({ id: forward.id, sessionId: forward.sessionId, text: forward.text });
+    const forward = parseSessionFileForward(state?.sessionFileForward);
+    if (!forward) return;
+    setSessionFileForward(forward);
     setSessionInspector(null);
     navigate(`${location.pathname}${location.search}${location.hash}`, { replace: true, state: null });
   }, [location.hash, location.pathname, location.search, location.state, navigate]);
@@ -1797,6 +1806,7 @@ export function TmuxDashboard(): ReactElement {
                 aria-label={`Backend ${backendStatus}`}
                 title={`Backend ${backendStatus}`}
               />
+              <TmuxSshShortcut onError={(message) => setToast({ message, isError: true })} />
               <button
                 className={`dashboard-action dashboard-icon-button dashboard-refresh-button${sessionsRefreshing ? " is-refreshing" : ""}`}
                 type="button"
@@ -2039,6 +2049,7 @@ export function TmuxDashboard(): ReactElement {
           {terminalVisible ? <Suspense fallback={null}><TmuxMessageComposer
             key={selectedSession?.id ?? "no-session"}
             sessionId={selectedSession?.id ?? null}
+            sessionCreatedAt={selectedSession?.createdAt ?? null}
             sessionFileForward={selectedSession?.id === sessionFileForward?.sessionId ? sessionFileForward : null}
             onSessionFileForwardConsumed={(requestId) => {
               setSessionFileForward((current) => current?.id === requestId ? null : current);

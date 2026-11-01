@@ -1536,7 +1536,12 @@ export class CodexHistoryService {
       configuredHome,
       ...configuredHomes.map((path) => normalizePath(path, homeDirectory)),
     ]);
-    return paths.map((path) => buildHome(path, primaryHome));
+    const configuredSqliteHome = resolveConfiguredSqliteHome(
+      this.options.environment,
+      this.options.cwd,
+      homeDirectory,
+    );
+    return paths.map((path) => buildHome(path, primaryHome, configuredHome, configuredSqliteHome));
   }
 
   private async queryHome(home: ResolvedCodexHistoryHome, query: CodexHistoryQuery): Promise<CodexThread[]> {
@@ -2093,8 +2098,20 @@ export function discoverCodexHistoryHomes(
     homeDirectory,
   );
   const primaryHome = codexAccountsRoot(configuredHome, homeDirectory);
+  const configuredSqliteHome = resolveConfiguredSqliteHome(environment, undefined, homeDirectory);
   return discoverCodexHomePaths(environment, homeDirectory)
-    .map((path) => toPublicHome(buildHome(normalizePath(path, homeDirectory), primaryHome)));
+    .map((path) => toPublicHome(buildHome(normalizePath(path, homeDirectory), primaryHome, configuredHome, configuredSqliteHome)));
+}
+
+function resolveConfiguredSqliteHome(
+  environment: Record<string, string | undefined> | undefined,
+  cwd: string | undefined,
+  homeDirectory: string,
+): string | undefined {
+  const configured = environment?.CODEX_SQLITE_HOME?.trim();
+  if (!configured) return undefined;
+  const expanded = configured.replace(/^~(?=\/|$)/, homeDirectory);
+  return normalizePath(resolve(cwd ?? process.cwd(), expanded), homeDirectory);
 }
 
 function codexAccountsRoot(configuredHome: string, homeDirectory: string): string {
@@ -2154,7 +2171,7 @@ function codexHistorySourceFingerprint(home: ResolvedCodexHistoryHome): string |
       const file = statSync(join(home.sqliteHome!, name));
       return `${name}:${file.size}:${file.mtimeMs}:${file.ino}`;
     }).join("\n");
-    return createHash("sha256").update(snapshot).digest("hex");
+    return createHash("sha256").update(`${home.sqliteHome}\n${snapshot}`).digest("hex");
   } catch {
     return null;
   }
@@ -2214,9 +2231,18 @@ function threadSortTimestamp(thread: CodexThread, sortKey: CodexThreadSortKey): 
   return fallback === null ? 0 : fallback / 1_000;
 }
 
-function buildHome(path: string, primaryHome: string): ResolvedCodexHistoryHome {
+function buildHome(
+  path: string,
+  primaryHome: string,
+  configuredHome: string,
+  configuredSqliteHome?: string,
+): ResolvedCodexHistoryHome {
   const available = existsSync(path) && isDirectory(path);
-  const sqliteHome = available ? findSqliteHome(path) : undefined;
+  const sqliteHome = available
+    ? (path === configuredHome && configuredSqliteHome
+      ? configuredSqliteHome
+      : findSqliteHome(path, path === primaryHome))
+    : undefined;
   const relativeToAccounts = relative(join(primaryHome, "accounts"), path);
   const accountName = relativeToAccounts && !relativeToAccounts.startsWith("..")
     ? relativeToAccounts.split("/")[0]
@@ -2234,8 +2260,12 @@ function buildHome(path: string, primaryHome: string): ResolvedCodexHistoryHome 
   };
 }
 
-function findSqliteHome(homePath: string): string | undefined {
+function findSqliteHome(homePath: string, primary: boolean): string | undefined {
   const nested = join(homePath, "sqlite");
+  // The primary Home follows Codex's default SQLite location. Additional
+  // account Homes retain the nested layout used by existing installations.
+  // An explicit CODEX_SQLITE_HOME for the configured Home takes precedence.
+  if (primary && hasStateDatabase(homePath)) return homePath;
   if (hasStateDatabase(nested)) return nested;
   if (hasStateDatabase(homePath)) return homePath;
   return undefined;

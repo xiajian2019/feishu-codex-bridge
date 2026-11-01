@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import * as QRCode from "qrcode";
+import { useLocation } from "react-router";
 import { useMobileBack } from "./use-mobile-back.js";
 import { startForegroundPolling, isAppForeground } from "./foreground-polling.js";
 import { getActionToken } from "./api.js";
@@ -12,6 +13,7 @@ import { clearBridgeJsonCache, isTransientBridgeFailure, markBridgeRequestFailur
 
 import { PairingClaim } from "./PairingClaim.js";
 import { recordAuthStatus, type AuthStatus } from "./pairing-diagnostics.js";
+import { isStandaloneSshPath } from "./ssh-route.js";
 import { DeviceAuthorizations } from "./DeviceAuthorizations.js";
 import "./device-authorizations.css";
 import { describeDevice, deviceAuthorizationState, type DeviceAuthorization as WebAuthDevice } from "./device-authorizations.js";
@@ -33,12 +35,15 @@ interface PairingInfo {
 }
 
 export function AuthGate({ children }: { children: ReactNode }): ReactElement {
+  const location = useLocation();
+  const standaloneSsh = isStandaloneSshPath(location.pathname);
   const [status, setStatus] = useState<AuthStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [offlineFallback, setOfflineFallback] = useState(false);
   const pairingClaimRef = useRef<Promise<AuthStatus> | null>(null);
 
   useEffect(() => {
+    if (standaloneSsh) return;
     let cancelled = false;
     void loadAuthStatus(pairingClaimRef)
       .then((nextStatus) => {
@@ -56,10 +61,10 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [standaloneSsh]);
 
   useEffect(() => {
-    if (!status && !offlineFallback) return;
+    if (standaloneSsh || (!status && !offlineFallback)) return;
     let cancelled = false;
     let pending = false;
     const revalidate = (): void => {
@@ -93,8 +98,9 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
       window.removeEventListener("focus", revalidate);
       document.removeEventListener("visibilitychange", revalidate);
     };
-  }, [offlineFallback, status?.authenticated]);
+  }, [offlineFallback, standaloneSsh, status?.authenticated]);
 
+  if (standaloneSsh) return <>{children}</>;
   if (status?.authenticated || offlineFallback) return <Fragment key={getLocalDraftScope() ?? "legacy"}>{children}</Fragment>;
   if (!status && !error) return <AuthShell><div className="route-loading">正在检查访问权限…</div></AuthShell>;
   return <AuthShell><PairingClaim status={status} error={error} onRefresh={async () => {

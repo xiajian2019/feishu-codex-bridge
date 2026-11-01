@@ -108,13 +108,15 @@ const EMPTY_FILTERS: HistoryFilters = {
   status: "",
 };
 
+// Version 2 discards details cached before SQLite Home selection was fixed.
+const CODEX_HISTORY_DETAIL_CACHE_VERSION = 2;
 const CODEX_HISTORY_DETAIL_CACHE_TTL_MS = 60 * 60 * 1_000;
 const CODEX_HISTORY_LIST_VERSION_MAX_AGE_MS = 30 * 1_000;
 const CODEX_HISTORY_DETAIL_CACHE_MAX_CHARS = 600_000;
 const CODEX_HISTORY_DETAIL_CACHE_MAX_ENTRIES = 3;
 
 interface CodexHistoryDetailCacheEntry {
-  version: 1;
+  version: number;
   cachedAt: number;
   detail: CodexHistoryDetailResponse;
 }
@@ -152,7 +154,7 @@ function readCodexHistoryDetailCache(homeId: string, threadId: string): CodexHis
     if (!raw) return null;
     const entry = JSON.parse(raw) as CodexHistoryDetailCacheEntry;
     const ageMs = Date.now() - entry.cachedAt;
-    if (entry.version !== 1 || !Number.isFinite(entry.cachedAt) || ageMs < 0 || ageMs > CODEX_HISTORY_DETAIL_CACHE_TTL_MS
+    if (entry.version !== CODEX_HISTORY_DETAIL_CACHE_VERSION || !Number.isFinite(entry.cachedAt) || ageMs < 0 || ageMs > CODEX_HISTORY_DETAIL_CACHE_TTL_MS
       || entry.detail?.home?.id !== homeId || entry.detail?.thread?.id !== threadId) {
       window.localStorage.removeItem(key);
       return null;
@@ -175,7 +177,7 @@ function writeCodexHistoryDetailCache(detail: CodexHistoryDetailResponse, expect
     thread: detail.thread.cwd ? { ...detail.thread, path: null } : detail.thread,
     imageAttachments: detail.imageAttachments,
   };
-  const entry: CodexHistoryDetailCacheEntry = { version: 1, cachedAt: Date.now(), detail: cachedDetail };
+  const entry: CodexHistoryDetailCacheEntry = { version: CODEX_HISTORY_DETAIL_CACHE_VERSION, cachedAt: Date.now(), detail: cachedDetail };
   try {
     const encoded = JSON.stringify(entry);
     if (encoded.length > CODEX_HISTORY_DETAIL_CACHE_MAX_CHARS) return;
@@ -208,7 +210,7 @@ function pruneCodexHistoryDetailCache(): void {
       if (!key?.startsWith(prefix)) continue;
       try {
         const value = JSON.parse(window.localStorage.getItem(key) ?? "null") as Partial<CodexHistoryDetailCacheEntry> | null;
-        if (!value || value.version !== 1 || typeof value.cachedAt !== "number" || !Number.isFinite(value.cachedAt)
+        if (!value || value.version !== CODEX_HISTORY_DETAIL_CACHE_VERSION || typeof value.cachedAt !== "number" || !Number.isFinite(value.cachedAt)
           || now - Number(value.cachedAt) > CODEX_HISTORY_DETAIL_CACHE_TTL_MS) {
           window.localStorage.removeItem(key);
           index -= 1;

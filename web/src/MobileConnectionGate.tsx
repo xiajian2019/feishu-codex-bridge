@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactElement, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactElement, type ReactNode } from "react";
 import { parseMobilePairingInput } from "./mobile-connection.js";
 import {
   checkMobileApkUpdate, checkMobileConnection, disconnectMobileConnection, downloadMobileApkUpdate, getMobileConnection,
@@ -15,6 +15,9 @@ import { apkUpdateStorageKey, readApkUpdateState, shouldOfferApkUpdate, type Apk
 import "./mobile-app.css";
 import { useMobileBack } from "./use-mobile-back.js";
 import { useLocation, useNavigate } from "react-router";
+import { isStandaloneSshPath } from "./ssh-route.js";
+import MobileSshLogin from "./MobileSshLogin.js";
+import { onNativeSshReturnToWorkbench } from "./ssh-connectbot-native.js";
 import { MobileHandoffShell, MobileNavigationBridge } from "./MobileHandoff.js";
 
 type ConnectionState = "loading" | "setup" | "ready" | "unavailable";
@@ -22,10 +25,21 @@ type ConnectionState = "loading" | "setup" | "ready" | "unavailable";
 export default function MobileConnectionGate({ children }: { children: ReactNode }): ReactElement {
   return <MobileHandoffShell><MobileConnectionContent>{children}</MobileConnectionContent><MobileDownloadStatus /></MobileHandoffShell>;
 }
-function MobileConnectionContent({ children }: { children: ReactNode }): ReactElement {
+export function MobileConnectionContent({ children }: { children: ReactNode }): ReactElement {
   const location = useLocation();
   const navigate = useNavigate();
   const [state, setState] = useState<ConnectionState>("loading");
+  const [mode, setMode] = useState<"bridge" | "ssh">(() => {
+    if (isStandaloneSshPath(location.pathname)) return "ssh";
+    try { return window.localStorage.getItem("bridge.connection.mode") === "ssh" ? "ssh" : "bridge"; }
+    catch { return "bridge"; }
+  });
+  const selectMode = (next: "bridge" | "ssh"): void => {
+    setMode(next);
+    try { window.localStorage.setItem("bridge.connection.mode", next); } catch { /* preference only */ }
+    if (next === "bridge" && isStandaloneSshPath(location.pathname)) navigate("/", { replace: true });
+    setEditing(true);
+  };
   const [address, setAddress] = useState("");
   const [pairingInput, setPairingInput] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -45,8 +59,22 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
   const [environmentBusy, setEnvironmentBusy] = useState<string | null>(null);
   const [environmentMessage, setEnvironmentMessage] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState("读取中…");
+  const returnToWorkbench = useCallback((): void => {
+    setMode("bridge");
+    setEditing(false);
+    setError(null);
+    setScannerOpen(false);
+    setEnvironmentDialogOpen(false);
+    try { window.localStorage.setItem("bridge.connection.mode", "bridge"); } catch { /* preference only */ }
+    if (isStandaloneSshPath(location.pathname)) navigate("/", { replace: true });
+    if (state !== "ready" && getMobileConnection()?.token) setRevision((value) => value + 1);
+  }, [location.pathname, navigate, state]);
+  const returnToWorkbenchRef = useRef(returnToWorkbench);
+  returnToWorkbenchRef.current = returnToWorkbench;
   useMobileBack(environmentDialogOpen, () => { if (!environmentBusy) setEnvironmentDialogOpen(false); }, 220);
-  useMobileBack(editing, () => { if (!busy) { setEditing(false); setError(null); } }, 50);
+  useMobileBack(editing || mode === "ssh", () => {
+    if (!busy) returnToWorkbench();
+  }, 50);
 
   const saveApkState = (update: MobileApkUpdate, state: ApkUpdateState): void => {
     apkStateRef.current = state;
@@ -54,10 +82,15 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
     try { window.localStorage.setItem(apkUpdateStorageKey(update.server), JSON.stringify(state)); } catch { /* Recheck installed version on resume even without storage. */ }
   };
 
+  useEffect(() => {
+    if (isStandaloneSshPath(location.pathname)) setMode("ssh");
+  }, [location.pathname]);
+
   useEffect(() => { void getMobileAppVersion().then(setAppVersion).catch(() => setAppVersion("暂不可读")); }, []);
   useEffect(() => {
     if ((location.state as { mobileOpenConnectionSettings?: boolean } | null)?.mobileOpenConnectionSettings !== true) return;
-    setAddress(getMobileConnection()?.server ?? ""); setEditing(true); setError(null);
+    setAddress(getMobileConnection()?.server ?? ""); setMode("bridge"); setEditing(true); setError(null);
+    try { window.localStorage.setItem("bridge.connection.mode", "bridge"); } catch { /* preference only */ }
     navigate("/", { replace: true, state: null });
   }, [location.state, navigate]);
 
@@ -67,7 +100,8 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
     const settings = (event: Event): void => {
       const requestedServer = event instanceof CustomEvent && typeof event.detail?.server === "string" ? event.detail.server : null;
       setAddress(requestedServer ?? getMobileConnection()?.server ?? "");
-      setError(null); setPairingInput(""); setEditing(true);
+      setError(null); setPairingInput(""); setMode("bridge"); setEditing(true);
+      try { window.localStorage.setItem("bridge.connection.mode", "bridge"); } catch { /* preference only */ }
       setEnvironmentDialogOpen(false);
     };
     window.addEventListener(MOBILE_CONNECTION_EVENT, changed);
@@ -89,6 +123,17 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
       window.removeEventListener(MOBILE_SETTINGS_EVENT, settings);
     };
   }, [revision]);
+
+  useEffect(() => {
+    let disposed = false;
+    let removeListener: (() => void) | undefined;
+    void onNativeSshReturnToWorkbench(() => {
+      if (!disposed) returnToWorkbenchRef.current();
+    }).then((listener) => {
+      if (disposed) void listener.remove(); else removeListener = () => { void listener.remove(); };
+    }).catch(() => { /* Browser and unsupported native platforms do not expose SSH. */ });
+    return () => { disposed = true; removeListener?.(); };
+  }, []);
 
   useEffect(() => {
     const openEnvironmentDialog = (): void => {
@@ -256,7 +301,7 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
 
   if (scannerOpen) return <MobilePairingScanner onPair={scanAndPair} onClose={() => setScannerOpen(false)} />;
 
-  if (state === "ready" && !editing) return <>
+  if (state === "ready" && !editing && mode === "bridge") return <>
     <MobileNavigationBridge />
     {apkUpdate ? (
       <aside className="mobile-update-banner" role="status">
@@ -277,22 +322,33 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
     {environmentDialog}
   </>;
 
-  return <main className="mobile-connect-page">
-    <section className="mobile-connect-card" aria-labelledby="mobile-connect-title">
+  return <main className="mobile-connect-page mobile-connection-page">
+    <section className="mobile-connect-card mobile-connection-center" aria-labelledby="mobile-connect-title">
       <header className="mobile-connect-header">
         <div className="mobile-connect-brand-row">
           <div className="mobile-connect-mark" aria-hidden="true">B</div>
           <div className="mobile-connect-brand-copy">
-            <strong>Bridge App</strong>
-            <span className={`mobile-connect-status is-${state}`}>
+            <h1 id="mobile-connect-title">连接你的 Mac</h1>
+            <span className={`mobile-connect-status is-${mode === "ssh" ? "ssh" : state}`}>
               <i aria-hidden="true" />
-              {state === "loading" ? "检查连接" : state === "unavailable" ? "连接不可用" : getMobileConnection()?.token ? "已配对" : "未配对"}
+              Bridge App · {mode === "ssh" ? "SSH 直接连接" : state === "loading" ? "检查连接" : state === "unavailable" ? "连接不可用" : getMobileConnection()?.token ? "已配对" : "未配对"}
             </span>
           </div>
+          {(editing || mode === "ssh") && getMobileConnection()?.token && <button type="button" className="mobile-connect-return" disabled={busy}
+            onClick={returnToWorkbench}>返回工作台</button>}
         </div>
-        <h1 id="mobile-connect-title">连接你的 Bridge</h1>
-        <p className="mobile-connect-description">把 Mac 上的会话、任务和文件带到手机。</p>
       </header>
+      <nav className="mobile-workspace-switcher" aria-label="选择连接方式">
+        <button type="button" className={`mobile-workspace-switcher-item${mode === "bridge" ? " is-active" : ""}`}
+          aria-pressed={mode === "bridge"} onClick={() => selectMode("bridge")}>
+          Bridge
+        </button>
+        <button type="button" className={`mobile-workspace-switcher-item${mode === "ssh" ? " is-active" : ""}`}
+          aria-pressed={mode === "ssh"} onClick={() => selectMode("ssh")}>
+          SSH / Mac
+        </button>
+      </nav>
+      {mode === "ssh" ? <MobileSshLogin /> : <>
       {getMobileConnection()?.token ? <CompatibilityNotice /> : null}
       {state === "loading" && !editing ? <p role="status">正在恢复连接…</p> : <>
         {state === "unavailable" && !editing ? <>
@@ -306,14 +362,7 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
             <button type="button" className="mobile-connect-secondary" onClick={() => { setEditing(true); setError(null); }}>更换连接</button>
           </div>
         </> : <form onSubmit={(event) => { void submit(event); }}>
-          <section className="mobile-connect-method" aria-labelledby="mobile-connect-method-title">
-            <div className="mobile-connect-section-heading">
-              <div>
-                <span id="mobile-connect-method-title">快速连接</span>
-                <small>推荐</small>
-              </div>
-              <span>约 10 秒完成</span>
-            </div>
+          <section className="mobile-connect-method" aria-label="快速连接">
             <button className="mobile-connect-scan" type="button" disabled={busy}
               onClick={() => { setError(null); setScannerOpen(true); }}>
               <span className="mobile-connect-scan-icon" aria-hidden="true">▦</span>
@@ -346,31 +395,32 @@ function MobileConnectionContent({ children }: { children: ReactNode }): ReactEl
           <div className="mobile-connect-actions">
             <button type="submit" className="mobile-connect-primary" disabled={busy || !pairingInput.trim()}>{busy ? "正在配对…" : "连接并配对"}<span aria-hidden="true">→</span></button>
           </div>
-          {editing && getMobileConnection()?.token && <div className="mobile-connect-existing-actions">
-            <button type="button" className="mobile-connect-secondary" disabled={busy}
-              onClick={() => { setEditing(false); setError(null); }}>返回当前连接</button>
+        </form>}
+        {getMobileConnection()?.token ? <details className="mobile-connect-maintenance">
+          <summary>连接维护与 App 更新</summary>
+          {editing && <div className="mobile-connect-existing-actions">
             <button type="button" className="mobile-connect-danger" disabled={busy}
               onClick={() => {
                 setBusy(true);
                 void disconnectMobileConnection().catch(() => {}).finally(() => { setBusy(false); setEditing(false); });
               }}>断开并清除本机配对</button>
           </div>}
-        </form>}
-        {getMobileConnection()?.token ? <details className="mobile-connect-update">
-          <summary>App 更新</summary>
-          <div className="mobile-connect-update-heading">
-            <span className="mobile-connect-update-icon" aria-hidden="true">↓</span>
-            <div>
-              <strong>手动更新 App</strong>
-              <p>从当前已配对的 Bridge 下载最新 APK，保存后再手动安装。</p>
+          <div className="mobile-connect-update">
+            <div className="mobile-connect-update-heading">
+              <span className="mobile-connect-update-icon" aria-hidden="true">↓</span>
+              <div>
+                <strong>手动更新 App</strong>
+                <p>从当前已配对的 Bridge 下载最新 APK，保存后再手动安装。</p>
+              </div>
             </div>
+            <button type="button" className="mobile-connect-update-button" onClick={() => void downloadLatestApk()} disabled={busy || apkDownloadBusy || apkUpdateBusy}>
+              {apkDownloadBusy ? "正在准备下载…" : "手动下载 APK"}
+            </button>
+            {apkDownloadMessage ? <p className="mobile-connect-update-message" role="status">{apkDownloadMessage}</p> : null}
+            {apkUpdateError ? <p className="mobile-connect-error" role="alert">{apkUpdateError}</p> : null}
           </div>
-          <button type="button" className="mobile-connect-update-button" onClick={() => void downloadLatestApk()} disabled={busy || apkDownloadBusy || apkUpdateBusy}>
-            {apkDownloadBusy ? "正在准备下载…" : "手动下载 APK"}
-          </button>
-          {apkDownloadMessage ? <p className="mobile-connect-update-message" role="status">{apkDownloadMessage}</p> : null}
-          {apkUpdateError ? <p className="mobile-connect-error" role="alert">{apkUpdateError}</p> : null}
         </details> : null}
+      </>}
       </>}
     </section>
     {environmentDialog}

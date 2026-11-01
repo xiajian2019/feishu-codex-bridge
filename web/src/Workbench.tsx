@@ -19,6 +19,7 @@ import {
 } from "./workbench-api.js";
 import "./workbench.css";
 import { isMobileApp } from "./mobile-runtime.js";
+import { isStandaloneSshPath } from "./ssh-route.js";
 
 interface WorkbenchSnapshot {
   inbox: WorkbenchInbox;
@@ -157,8 +158,9 @@ export function WorkbenchNotifications(): null {
   const navigate = useNavigate();
   const { pathname } = useLocation();
   const isTmuxPage = pathname === "/tmux-dashboard" || pathname.startsWith("/tmux-dashboard/");
+  const isSshPage = isStandaloneSshPath(pathname);
   useEffect(() => {
-    if (isTmuxPage && !isMobileApp()) return;
+    if (isSshPage || (isTmuxPage && !isMobileApp())) return;
     const goToNotification = (route: string): void => { void navigate(route); };
     navigateToNotification = goToNotification;
     const stopPolling = startForegroundPolling(async () => { await refreshWorkbenchInbox({ quiet: true }); }, 30_000);
@@ -176,7 +178,7 @@ export function WorkbenchNotifications(): null {
       window.removeEventListener("offline", handleOffline);
       if (navigateToNotification === goToNotification) navigateToNotification = null;
     };
-  }, [isTmuxPage, navigate]);
+  }, [isSshPage, isTmuxPage, navigate]);
   return null;
 }
 

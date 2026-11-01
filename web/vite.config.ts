@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 
-import { defineConfig } from "vite";
+import { defineConfig, normalizePath } from "vite";
 import react from "@vitejs/plugin-react";
 
 const webRoot = fileURLToPath(new URL(".", import.meta.url));
@@ -12,7 +12,12 @@ export default defineConfig({
   root: webRoot,
   plugins: [react()],
   resolve: {
-    alias: [{ find: /^\.\/mobile-runtime\.js$/, replacement: fileURLToPath(new URL("./src/mobile-runtime.browser.ts", import.meta.url)) }],
+    alias: [
+      { find: /^\.\/mobile-runtime\.js$/, replacement: fileURLToPath(new URL("./src/mobile-runtime.browser.ts", import.meta.url)) },
+      { find: /^\.\/ssh-native\.js$/, replacement: fileURLToPath(new URL("./src/ssh-native.browser.ts", import.meta.url)) },
+      { find: /^\.\/ssh-connectbot-native\.js$/, replacement: fileURLToPath(new URL("./src/ssh-connectbot-native.browser.ts", import.meta.url)) },
+      { find: /^\.\/native-theme\.js$/, replacement: fileURLToPath(new URL("./src/native-theme.browser.ts", import.meta.url)) },
+    ],
   },
   build: {
     outDir: fileURLToPath(new URL("../dist/web", import.meta.url)),
@@ -22,6 +27,13 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 5173,
     strictPort: true,
+    watch: {
+      // Native projects and generated assets must not invalidate the Web dev server.
+      // Keep shared web/src modules watched, even when they also serve the App.
+      ignored: ["../android/**", "../ios/**", "../dist/**"].map((path) =>
+        normalizePath(fileURLToPath(new URL(path, import.meta.url))),
+      ),
+    },
     proxy: {
       "/tmux-dashboard/api": {
         target: tmuxApiTarget,

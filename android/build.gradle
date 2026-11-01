@@ -1,5 +1,7 @@
 // Top-level build file where you can add configuration options common to all sub-projects/modules.
 
+apply from: "variables.gradle"
+
 buildscript {
 
     repositories {
@@ -7,7 +9,9 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        classpath 'com.android.tools.build:gradle:8.13.0'
+        classpath 'com.android.tools.build:gradle:9.4.0'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.20'
+        classpath 'org.jetbrains.kotlin:compose-compiler-gradle-plugin:2.4.20'
         classpath 'com.google.gms:google-services:4.4.4'
 
         // NOTE: Do not place your application dependencies here; they belong
@@ -15,12 +19,44 @@ buildscript {
     }
 }
 
-apply from: "variables.gradle"
-
 allprojects {
     repositories {
         google()
         mavenCentral()
+    }
+}
+
+// Capacitor's generated Android modules still request the legacy AGP/Kotlin
+// versions. Resolve those buildscript requests to the project toolchain while
+// AGP built-in Kotlin is explicitly disabled during this migration.
+gradle.beforeProject { project ->
+    project.buildscript.configurations.configureEach { configuration ->
+        configuration.resolutionStrategy.eachDependency { details ->
+            if (details.requested.group == 'com.android.tools.build'
+                && details.requested.name == 'gradle') {
+                details.useVersion('9.4.0')
+            }
+            if (details.requested.group == 'org.jetbrains.kotlin'
+                && details.requested.name == 'kotlin-gradle-plugin') {
+                details.useVersion(rootProject.ext.kotlin_version)
+            }
+        }
+    }
+}
+
+// API 37.2 is an Android SDK minor API level. Apply the same expanded
+// compileSdk declaration to Capacitor's generated Android library modules;
+// otherwise those modules fall back to the base platforms/android-37.0 path.
+subprojects { subproject ->
+    subproject.afterEvaluate {
+        def androidExtension = subproject.extensions.findByName('android')
+        if (androidExtension != null) {
+            androidExtension.compileSdk {
+                version = release(rootProject.ext.compileSdkVersion) {
+                    minorApiLevel = rootProject.ext.compileSdkMinorApiLevel
+                }
+            }
+        }
     }
 }
 

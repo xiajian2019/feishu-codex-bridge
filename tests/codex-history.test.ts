@@ -86,6 +86,108 @@ describe("CodexHistoryService", () => {
     }
   });
 
+  it("uses the default Home's root and an account's nested store when both exist", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bridge-codex-history-layout-"));
+    const secondHome = join(directory, "accounts", "second");
+    const paths = [directory, join(directory, "sqlite"), secondHome, join(secondHome, "sqlite")];
+    for (const path of paths) {
+      await mkdir(path, { recursive: true });
+      await writeFile(join(path, "state_5.sqlite"), "");
+    }
+    const primary = realpathSync.native(directory);
+    const second = realpathSync.native(secondHome);
+    const continuationHomes: string[] = [];
+    try {
+      const service = new CodexHistoryService({
+        executable: "unused-in-test",
+        environment: { CODEX_HOME: directory },
+        createClient: (home) => {
+          const isPrimary = home.path === primary;
+          const correctStore = home.sqliteHome === (isPrimary ? primary : join(second, "sqlite"));
+          const id = isPrimary ? "primary-thread" : "second-thread";
+          return {
+            listThreads: async () => ({
+              data: correctStore ? [{ id, source: "cli", updatedAt: 10, status: { type: "idle" } }] : [],
+              nextCursor: null,
+              backwardsCursor: null,
+            }),
+            readThread: async (threadId, includeTurns) => ({
+              thread: { id: threadId, turns: includeTurns && correctStore ? [{ id: "turn-1", items: [] }] : [] },
+            }),
+            close: async () => undefined,
+          };
+        },
+        createInteractiveClient: (_home, environment) => {
+          continuationHomes.push(environment.CODEX_SQLITE_HOME!);
+          return {
+            forkThread: async () => "forked-thread",
+            close: async () => undefined,
+          } as unknown as CodexAppServerInteractiveClient;
+        },
+      });
+      const homes = service.listHomes();
+      const primaryHome = homes.find((home) => home.path === primary)!;
+      const accountHome = homes.find((home) => home.path === second)!;
+      const list = await service.listThreads({
+        sourceKinds: ["cli"], archived: "active", sortKey: "updated_at", sortDirection: "desc", limit: 10, offset: 0,
+      });
+      expect(list.items.map((item) => item.thread.id).sort()).toEqual(["primary-thread", "second-thread"]);
+      expect((await service.readThread(primaryHome.id, "primary-thread")).thread.turns).toHaveLength(1);
+      expect((await service.readThread(accountHome.id, "second-thread")).thread.turns).toHaveLength(1);
+      await service.forkThread(primaryHome.id, "primary-thread");
+      await service.forkThread(accountHome.id, "second-thread");
+      expect(continuationHomes).toEqual([primary, join(second, "sqlite")]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("honors an explicit SQLite Home without reusing a list cached for another store", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bridge-codex-history-explicit-sqlite-"));
+    const nested = join(directory, "sqlite");
+    await mkdir(nested, { recursive: true });
+    await writeFile(join(directory, "state_5.sqlite"), "");
+    await writeFile(join(nested, "state_5.sqlite"), "");
+    const primary = realpathSync.native(directory);
+    const nestedHome = realpathSync.native(nested);
+    const cache = new Map<string, { sourceFingerprint: string; payloadJson: string; refreshedAt: string }>();
+    const queried: string[] = [];
+    const query = {
+      sourceKinds: ["cli"] as const, archived: "active" as const, sortKey: "updated_at" as const,
+      sortDirection: "desc" as const, limit: 10, offset: 0,
+    };
+    const makeService = (sqliteHome?: string) => new CodexHistoryService({
+      executable: "unused-in-test",
+      environment: { CODEX_HOME: directory, ...(sqliteHome ? { CODEX_SQLITE_HOME: sqliteHome } : {}) },
+      listCacheStore: {
+        getCodexHistoryListCache: (homeId, filterKey) => cache.get(`${homeId}:${filterKey}`) ?? null,
+        saveCodexHistoryListCache: (homeId, filterKey, sourceFingerprint, payloadJson) => {
+          cache.set(`${homeId}:${filterKey}`, { sourceFingerprint, payloadJson, refreshedAt: new Date().toISOString() });
+        },
+      },
+      createClient: (home) => {
+        queried.push(home.sqliteHome!);
+        return {
+          listThreads: async () => ({
+            data: [{ id: home.sqliteHome === nestedHome ? "nested-thread" : "root-thread", source: "cli", updatedAt: 10 }],
+            nextCursor: null,
+            backwardsCursor: null,
+          }),
+          close: async () => undefined,
+        };
+      },
+    });
+    try {
+      const explicit = await makeService(nestedHome).listThreads({ ...query, sourceKinds: [...query.sourceKinds] });
+      expect(explicit.items.map((item) => item.thread.id)).toEqual(["nested-thread"]);
+      const standard = await makeService().listThreads({ ...query, sourceKinds: [...query.sourceKinds] });
+      expect(standard.items.map((item) => item.thread.id)).toEqual(["root-thread"]);
+      expect(queried).toEqual([nestedHome, primary]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a failed home visible while returning threads from another home", async () => {
     const directory = await mkdtemp(join(tmpdir(), "bridge-codex-history-errors-"));
     const brokenHome = join(directory, "broken");

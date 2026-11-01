@@ -132,10 +132,12 @@ async function fetchSessionCodexSkills(
 
 export type ComposerSubmissionResult = { ok: boolean; message?: string };
 export type { TerminalShortcut };
-export type SessionFileForwardRequest = { id: string; sessionId: string; text: string };
+export type SessionFileForwardImage = { name: string; url: string };
+export type SessionFileForwardRequest = { id: string; sessionId: string; text: string; images?: SessionFileForwardImage[] };
 
 type TmuxMessageComposerProps = {
   sessionId: string | null;
+  sessionCreatedAt: number | null;
   sessionFileForward: SessionFileForwardRequest | null;
   onSessionFileForwardConsumed: (requestId: string) => void;
   diagnosticSessionActive: boolean;
@@ -192,6 +194,24 @@ function escapePromptAttribute(value: string): string {
     .replaceAll('"', "&quot;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+async function fetchForwardImage(image: SessionFileForwardImage, signal: AbortSignal): Promise<File> {
+  let url: URL;
+  try {
+    url = new URL(image.url, window.location.href);
+  } catch {
+    throw new Error("转发图片地址无效。");
+  }
+  const page = new URL(window.location.href);
+  if (url.origin !== page.origin || !url.pathname.startsWith("/tmux-dashboard/api/attachments/images/")) {
+    throw new Error("转发图片不属于当前 Bridge。");
+  }
+  const response = await fetch(url.pathname + url.search, { credentials: "same-origin", signal });
+  if (!response.ok) throw new Error(`读取转发图片失败（${response.status}）。`);
+  const blob = await response.blob();
+  if (!blob.type.startsWith("image/")) throw new Error("转发附件不是图片。");
+  return new File([blob], image.name.trim() || "转发图片", { type: blob.type });
 }
 
 function useFileObjectUrl(file: File | null): string {
@@ -326,7 +346,7 @@ type ComposerFieldsProps = TmuxMessageComposerProps & {
   onSendStart: () => void;
 };
 
-function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sendDisabled, sending, placeholder, preparing, attachmentProgress, onSendStart, onSubmit, onSubmitCommand, onAttachmentError, onOpenFiles, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
+function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, disabled, sendDisabled, sending, placeholder, preparing, attachmentProgress, onSendStart, onSubmit, onSubmitCommand, onAttachmentError, onOpenFiles, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
   const aui = useAui();
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [shortcutCategory, setShortcutCategory] = useState<ShortcutCategory>("favorites");
@@ -388,10 +408,17 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sendDisa
     const controller = new AbortController();
     skillsRequestRef.current = controller;
     const requestSequence = ++skillsRequestSequenceRef.current;
-    const cacheKey = "tmux-session:" + targetSessionId;
+    const cacheKey = "tmux-session:" + targetSessionId + ":" + (sessionCreatedAt ?? "unknown");
     const cacheScope = getLocalDraftScope();
+    const saveNativeSkills = (skills: CodexSkillOption[]): void => {
+      if (import.meta.env.VITE_BRIDGE_MOBILE !== "true" || sessionCreatedAt === null) return;
+      void import("./composer-native-data.js")
+        .then((module) => module.saveNativeComposerSessionSkills(cacheScope, targetSessionId, sessionCreatedAt, skills))
+        .catch(() => {});
+    };
     const cached = readCodexSkillCache(cacheKey, isCodexSkillList);
     if (cached) {
+      saveNativeSkills(cached);
       setCodexSkills(cached);
       setSkillsLoading(false);
       setSkillsLoadError(null);
@@ -405,7 +432,10 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sendDisa
         .then(({ skills, refreshing, fresh }) => {
           if (controller.signal.aborted || requestSequence !== skillsRequestSequenceRef.current) return;
           setCodexSkills(skills);
-          if (fresh) writeCodexSkillCache(cacheKey, skills, cacheScope);
+          if (fresh) {
+            writeCodexSkillCache(cacheKey, skills, cacheScope);
+            saveNativeSkills(skills);
+          }
           setSkillsLoading(false);
           if (refreshing && refreshAttempt < 8) {
             skillsRefreshTimerRef.current = window.setTimeout(() => {
@@ -459,7 +489,7 @@ function ComposerFields({ sessionId, diagnosticSessionActive, disabled, sendDisa
       skillsRequestRef.current?.abort();
       skillsRequestRef.current = null;
     };
-  }, [sessionId]);
+  }, [sessionId, sessionCreatedAt]);
 
   const rememberComposerSelection = (): void => {
     const input = inputRef.current;
@@ -1245,6 +1275,7 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
     let cancelled = false;
     let restored = false;
     let saveTimer = 0;
+    const forwardImageController = new AbortController();
     // The runtime can detach before this effect cleans up. Keep the last real
     // composer state rather than reading its temporary empty replacement.
     let latestState = composer.getState();
@@ -1311,14 +1342,31 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
         const trimmedEnd = currentText.replace(/\n+$/, "");
         const lines = trimmedEnd.split("\n");
         let removedMatchingLines = false;
-        while (lines[lines.length - 1] === props.sessionFileForward.text) {
-          lines.pop();
-          removedMatchingLines = true;
+        if (props.sessionFileForward.text) {
+          while (lines[lines.length - 1] === props.sessionFileForward.text) {
+            lines.pop();
+            removedMatchingLines = true;
+          }
         }
         const baseText = removedMatchingLines ? lines.join("\n") : currentText;
-        const separator = baseText && !baseText.endsWith("\n") ? "\n" : "";
-        composer.setText(`${baseText}${separator}${props.sessionFileForward.text}`);
-        forwardConsumedRef.current(props.sessionFileForward.id);
+        if (props.sessionFileForward.text) {
+          const separator = baseText && !baseText.endsWith("\n") ? "\n" : "";
+          composer.setText(`${baseText}${separator}${props.sessionFileForward.text}`);
+        }
+        for (const image of props.sessionFileForward.images ?? []) {
+          if (cancelled) return;
+          try {
+            const file = await fetchForwardImage(image, forwardImageController.signal);
+            if (cancelled) return;
+            if (composer.getState().attachments.some((current) => current.name === file.name && current.file?.size === file.size)) continue;
+            await composer.addAttachment(file);
+          } catch (error) {
+            if (!cancelled && !forwardImageController.signal.aborted) {
+              attachmentErrorRef.current(error instanceof Error ? error.message : "转发图片读取失败。");
+            }
+          }
+        }
+        if (!cancelled) forwardConsumedRef.current(props.sessionFileForward.id);
       }
       if (!cancelled) {
         restored = true;
@@ -1331,6 +1379,7 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
       window.clearTimeout(saveTimer);
       flushDraft();
       cancelled = true;
+      forwardImageController.abort();
       unsubscribe();
       window.removeEventListener("pagehide", flushBeforePageHide);
       document.removeEventListener("visibilitychange", flushWhenHidden);

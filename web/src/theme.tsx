@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { syncNativeTheme } from "./native-theme.js";
 
 export type ThemeMode = "system" | "dark" | "light";
 export type ResolvedTheme = "dark" | "light";
@@ -42,6 +43,7 @@ export function ThemeProvider({ children }: { children: ReactNode }): ReactNode 
     document.documentElement.dataset.theme = resolvedTheme;
     document.documentElement.style.colorScheme = resolvedTheme;
     window.localStorage.setItem(THEME_STORAGE_KEY, mode);
+    syncNativeTheme(resolvedTheme);
   }, [mode, resolvedTheme]);
 
   const value = useMemo(() => ({ mode, resolvedTheme, setMode }), [mode, resolvedTheme]);

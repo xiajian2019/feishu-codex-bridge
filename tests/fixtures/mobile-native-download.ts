@@ -282,6 +282,48 @@ if (scenario?.startsWith("android-scan-")) {
   assert.equal(nativeScans[0]?.cameraDirection, 1);
   process.exit(0);
 }
+if (scenario === "android-motion-detection") {
+  let clock = 0;
+  let detected = 0;
+  Object.defineProperty(performance, "now", { configurable: true, value: () => clock });
+  Object.assign(windowEvents, { DeviceMotionEvent: {} });
+  windowEvents.addEventListener("bridge:mobile-shake", () => { detected++; });
+  await native.installNativeLifecycle();
+  const trace = (start: number, end: number, changes: Array<[number, number]>): void => {
+    for (clock = start; clock <= end; clock += 20) {
+      const x = changes.findLast(([at]) => at <= clock)?.[1] ?? 0;
+      const event = Object.assign(new Event("devicemotion"), {
+        acceleration: null,
+        accelerationIncludingGravity: { x, y: 0, z: 9.81 },
+      });
+      windowEvents.dispatchEvent(event);
+    }
+  };
+  trace(0, 1_000, [[200, 45], [280, -45], [320, 18], [340, -8], [360, 0]]);
+  assert.equal(detected, 0);
+  trace(1_100, 1_800, [[1_200, 22], [1_320, 0], [1_600, -22], [1_720, 0]]);
+  assert.equal(detected, 1);
+  await native.setShakeEnabled(false);
+  trace(3_500, 4_300, [[3_600, 22], [3_720, 0], [4_000, -22], [4_120, 0]]);
+  assert.equal(detected, 1);
+  await native.setShakeEnabled(true);
+  documentEvents.visibilityState = "hidden";
+  documentEvents.dispatchEvent(new Event("visibilitychange"));
+  trace(4_500, 5_300, [[4_600, 22], [4_720, 0], [5_000, -22], [5_120, 0]]);
+  assert.equal(detected, 1);
+  documentEvents.visibilityState = "visible";
+  documentEvents.dispatchEvent(new Event("visibilitychange"));
+  trace(5_500, 5_800, [[5_600, 22], [5_720, 0]]);
+  documentEvents.visibilityState = "hidden";
+  documentEvents.dispatchEvent(new Event("visibilitychange"));
+  documentEvents.visibilityState = "visible";
+  documentEvents.dispatchEvent(new Event("visibilitychange"));
+  trace(5_900, 6_200, [[6_000, -22], [6_120, 0]]);
+  assert.equal(detected, 1);
+  trace(6_220, 6_700, [[6_400, 22], [6_520, 0]]);
+  assert.equal(detected, 2);
+  process.exit(0);
+}
 if (scenario === "android-motion-permission") {
   const rows = new Map<string, string>();
   let permission = "denied";

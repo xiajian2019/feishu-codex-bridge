@@ -51,6 +51,7 @@ import { useMobileBack } from "./use-mobile-back.js";
 export function WebNavigation(): ReactElement {
   const { collapsed, toggle } = useSystemNavigation();
   const location = useLocation();
+  const pages = PAGES;
   const systemActive = location.pathname.startsWith("/system-management") || location.pathname === "/pair-admin"
     || (isMobileApp() && ["/mobile-inbox", "/mobile-shares"].includes(location.pathname));
   const [systemOpen, setSystemOpen] = useState(systemActive);
@@ -179,7 +180,7 @@ export function WebNavigation(): ReactElement {
           title={collapsed ? "展开顶部菜单" : "收起顶部菜单"}
         ><span aria-hidden="true">☰</span></button>
         <div id="web-navigation-menu" className="web-navigation-menu" hidden={collapsed}>
-          {PAGES.map((page) => (
+          {pages.map((page) => (
             <NavLink key={page.to} to={page.to} end={page.end} onClick={closePopovers}>
               {page.label}
             </NavLink>

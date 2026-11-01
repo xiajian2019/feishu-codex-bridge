@@ -777,6 +777,7 @@ pre {
 .dashboard-sidebar-heading h2 { margin: 0; font-size: 14px; white-space: nowrap; }
 .dashboard-sidebar-heading h2 span { margin-left: 4px; color: #7e8a9a; font-size: 11px; }
 .dashboard-session-tools { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+.dashboard-session-tools .dashboard-ssh-shortcut { width: 32px; min-width: 32px; height: 32px; min-height: 32px; }
 .dashboard-add { width: 32px; min-height: 32px; padding: 0; color: #c5f3d8; font-size: 21px; }
 .dashboard-field { display: grid; gap: 6px; margin-bottom: 12px; color: #8d9aaa; font-size: 9px; font-weight: 800; letter-spacing: .08em; }
 .dashboard-field select, .dashboard-filter input, .dashboard-modal-field input, .dashboard-modal-field select {
@@ -2760,25 +2761,32 @@ button.secondary,
   .direct-detail-meta { gap: 2px 10px; }
 }
 
-.tmux-history-page { width: min(1080px, 100%); margin: 0 auto; padding: 24px clamp(14px, 3vw, 30px) 48px; color: var(--ink); }
+.tmux-history-page { width: min(1080px, 100%); margin: 0 auto; padding: 18px clamp(14px, 3vw, 30px) 48px; color: var(--ink); }
 .tmux-history-header, .tmux-history-header-actions, .tmux-history-filter, .tmux-history-record > header, .tmux-history-record > header > div, .tmux-history-record > footer, .tmux-history-pagination { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
-.tmux-history-header { justify-content: space-between; margin-bottom: 22px; }
+.tmux-history-header { justify-content: flex-start; gap: 8px; margin-bottom: 8px; }
 .tmux-history-heading { min-width: 0; }
-.tmux-history-heading h1 { margin: 0 0 5px; font-size: clamp(22px, 3vw, 30px); }
-.tmux-history-heading > p:last-child { margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-.tmux-history-session-context { display: grid; gap: 3px; margin-top: 7px; }
-.tmux-history-session-context strong { font-size: 13px; }
-.tmux-history-session-context span, .tmux-history-session-context code { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
-.tmux-history-header-actions { flex: 0 0 auto; }
-.tmux-history-header-actions a { display: inline-flex; min-height: 36px; align-items: center; justify-content: center; padding: 6px 10px; border: 1px solid var(--line); border-radius: 9px; color: var(--ink); background: var(--card); font-size: 12px; font-weight: 700; text-decoration: none; }
-.tmux-history-filter { margin-bottom: 10px; }
+.tmux-history-heading h1 { margin: 0; font-size: clamp(22px, 3vw, 30px); }
+.tmux-history-header-actions { flex: 0 0 auto; margin-left: auto; gap: 6px; }
+.tmux-history-header-actions > a, .tmux-history-header-actions > button { display: inline-grid; width: 36px; min-width: 36px; height: 36px; min-height: 36px; place-items: center; padding: 0; border: 1px solid var(--line); border-radius: 9px; color: var(--ink); background: var(--card); text-decoration: none; }
+.tmux-history-header-actions > a:hover, .tmux-history-header-actions > button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.tmux-history-icon { display: block; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.tmux-history-filter { margin-bottom: 2px; }
 .tmux-history-filter input { min-width: 0; min-height: 40px; flex: 1; font-size: 16px; }
 .tmux-history-filter button, .tmux-history-header-actions button, .tmux-history-pagination button { min-height: 36px; }
-.tmux-history-total { margin: 10px 0; color: var(--muted); font-size: 12px; }
+.tmux-history-total { margin: 4px 0 6px; color: var(--muted); font-size: 12px; }
+.tmux-history-action-error { margin: 8px 0; color: var(--danger); font-size: 12px; }
 .tmux-history-list { display: grid; gap: 10px; }
-.tmux-history-record { display: grid; min-width: 0; gap: 9px; padding: 15px 0; border-bottom: 1px solid var(--line); color: var(--ink); }
+.tmux-history-record { display: grid; min-width: 0; gap: 5px; padding: 15px 0; border-bottom: 1px solid var(--line); color: var(--ink); }
 .tmux-history-record-session { margin: 0; color: var(--muted); font-size: 11px; font-weight: 700; overflow-wrap: anywhere; }
 .tmux-history-record > header { justify-content: space-between; color: var(--muted); font-size: 11px; }
+.tmux-history-record-meta { gap: 7px !important; }
+.tmux-history-record-actions { display: inline-flex; align-items: center; gap: 3px; margin-left: 1px; }
+.tmux-history-record-action { display: inline-grid; width: 32px; min-width: 32px; height: 32px; min-height: 32px; place-items: center; padding: 0; border: 0; border-radius: 7px; color: var(--muted); background: transparent; }
+:root[data-theme="dark"] .tmux-history-record-action { border: 0; background: transparent; }
+.tmux-history-record-action:hover:not(:disabled) { color: var(--accent); background: transparent; }
+.tmux-history-record-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tmux-history-record-action.is-copied { color: var(--accent); }
+.tmux-history-record-action:disabled { cursor: not-allowed; opacity: .35; }
 .tmux-history-record > header time { white-space: nowrap; }
 .tmux-history-record > footer { justify-content: space-between; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
 .tmux-history-record > pre { max-height: 360px; margin: 0; overflow: auto; color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -2870,9 +2878,7 @@ button.secondary,
 .dashboard-session-worktree { color: var(--accent); font-size: 10px; overflow-wrap: anywhere; }
 .dashboard-task-create-modal textarea { box-sizing: border-box; width: 100%; min-height: 140px; resize: vertical; font: inherit; font-size: 16px; }
 @media (max-width: 620px) {
-  .tmux-history-header { align-items: flex-start; gap: 12px; }
-  .tmux-history-header-actions { width: 100%; }
-  .tmux-history-header-actions > * { flex: 1; }
+  .tmux-history-header { align-items: center; gap: 8px; }
   .tmux-history-record > footer { align-items: flex-start; flex-direction: column; gap: 4px; }
   .tmux-history-record > pre { font-size: 12px; }
   .tmux-history-lightbox { padding: 12px; }

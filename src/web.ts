@@ -3429,6 +3429,8 @@ function isSpaRoute(pathname: string): boolean {
     || pathname === "/codex-history"
     || /^\/codex-history\/[^/]+\/[^/]+$/.test(pathname)
     || pathname === "/demos"
+    || pathname === "/ssh"
+    || pathname.startsWith("/ssh/")
     || pathname === "/link-tools"
     || pathname === "/system-management/jj"
     || pathname === "/system-management/uploads"

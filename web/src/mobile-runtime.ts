@@ -2,7 +2,7 @@ import { createMobileFetch, isBridgeApiPath, normalizeBridgeServer, parseMobileP
 import { createMobileConnectionSwitch } from "./mobile-connection-switch.js";
 import { readBridgeJson } from "./bridge-json.js";
 import { assertBridgeApiSupported, bridgeFeatureUnavailable, parseBridgeCapabilities, setBridgeCapabilities } from "./client-capabilities.js";
-import { LOCAL_DRAFT_SCOPE_EVENT, scopedStorageKey, setLocalDraftScope } from "./local-draft-scope.js";
+import { LOCAL_DRAFT_SCOPE_EVENT, getLocalDraftScope, scopedStorageKey, setLocalDraftScope } from "./local-draft-scope.js";
 import { clearMobileDownloadScope, restoreMobileDownloads } from "./mobile-download-manager.js";
 import { isAppForeground } from "./foreground-polling.js";
 import { clearLocalDraftsAfterDeviceRevocation } from "./local-draft-cleanup.js";
@@ -114,6 +114,8 @@ export async function checkMobileConnection(): Promise<boolean> {
     setLocalDraftScope(status.draftScope, selected.server);
     try { restoreMobileDownloads(window.localStorage, scopedStorageKey("mobile-downloads")); }
     catch { restoreMobileDownloads(null, null); }
+    // Sync is independent of login and never blocks an offline-capable SSH page.
+    void import("./composer-native-data.js").then((module) => module.syncNativeComposerData()).catch(() => {});
   }
   if (!status.authenticated) await forgetMobileCredential();
   return status.authenticated;
@@ -169,8 +171,14 @@ export async function switchMobileConnection(address: string): Promise<boolean> 
 }
 
 function commitMobileConnection(next: MobileConnection): void {
+  const previous = connection;
+  const previousScope = getLocalDraftScope();
   window.localStorage.setItem(SERVER_KEY, next.server);
   connection = next;
+  if (!previous || previous.server !== next.server || previous.token !== next.token) {
+    void import("./composer-native-data.js")
+      .then((module) => module.deactivateNativeComposerScope(previousScope, next.server)).catch(() => {});
+  }
   // Keep the old draft scope until reload: pagehide must flush old drafts to the
   // old namespace, never into the newly selected server's namespace.
   window.dispatchEvent(new Event(MOBILE_CONNECTION_EVENT));
