@@ -215,6 +215,26 @@ export type ShortcutStore = {
   shortcuts: ShortcutDefinition[];
 };
 
+/** Match the Web composer's compatibility handling for older Bridge servers. */
+export function normalizeShortcutStore(result: Partial<ShortcutStore>): ShortcutStore {
+  const composerDefaults = new Map(DEFAULT_COMPOSER_SHORTCUTS.map((shortcut) => [shortcut.id, shortcut]));
+  return {
+    groups: Array.isArray(result.groups)
+      ? result.groups.map((group) => group.id === "composer" && group.surface !== "composer" ? { ...group, surface: "composer" } : group)
+      : [],
+    shortcuts: Array.isArray(result.shortcuts)
+      ? result.shortcuts.map((shortcut) => {
+        const fallback = shortcut.groupId === "composer" && !shortcut.actionKey
+          ? composerDefaults.get(shortcut.id)
+          : undefined;
+        return fallback
+          ? { ...fallback, ...shortcut, actionKey: fallback.actionKey, displayMode: fallback.displayMode }
+          : shortcut;
+      })
+      : [],
+  };
+}
+
 export const DEFAULT_COMPOSER_SHORTCUTS: readonly ShortcutDefinition[] = [
   { id: "composer-tui-panel", groupId: "composer", title: "TUI", detail: "打开 Codex TUI 按键", kind: "insert", value: "", enabled: true, builtIn: true, dangerous: false, actionKey: "codex-panel", displayMode: "both", sortOrder: 1, operationCount: 0 },
   { id: "composer-tui-answer", groupId: "composer", title: "答题", detail: "Shift+←：回答待处理问题 / 编辑排队消息", kind: "terminal", value: "codex-answer", enabled: true, builtIn: true, dangerous: false, actionKey: "terminal-answer", displayMode: "expanded", sortOrder: 6, operationCount: 0 },

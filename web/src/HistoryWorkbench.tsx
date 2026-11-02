@@ -10,6 +10,8 @@ import {
   type ReactNode,
 } from "react";
 import { useNavigate } from "react-router";
+import { useMobileBack } from "./use-mobile-back.js";
+import { startForegroundPolling } from "./foreground-polling.js";
 
 import { fetchCodexHistory, fetchProjects } from "./api.js";
 import {
@@ -85,6 +87,7 @@ export function HistoryPreferenceControls({
 }): ReactElement {
   const [tagText, setTagText] = useState(preference.tags.join(", "));
   const [tagDialogOpen, setTagDialogOpen] = useState(false);
+  useMobileBack(tagDialogOpen, () => { if (!saving) setTagDialogOpen(false); }, 150);
   useEffect(() => setTagText(preference.tags.join(", ")), [preference.tags]);
   return (
     <>
@@ -267,6 +270,10 @@ export function HistoryWorkbench({
   const [forwardLoading, setForwardLoading] = useState(false);
   const [forwardError, setForwardError] = useState("");
   const [cloneNotice, setCloneNotice] = useState("");
+  useMobileBack(queueOpen, () => { if (!queueBusy) setQueueOpen(false); }, 200);
+  useMobileBack(toolsOpen, () => setToolsOpen(false), 200);
+  useMobileBack(Boolean(utilityDialog), () => setUtilityDialog(null), 200);
+  useMobileBack(menuOpen, () => setMenuOpen(false), 90);
   const selectedText = useMemo(
     () => buildForwardedHistoryText(messages, selectedMessageIds, title),
     [messages, selectedMessageIds, title],
@@ -400,17 +407,14 @@ export function HistoryWorkbench({
   }, [target]);
 
   useEffect(() => {
-    const controller = new AbortController();
     setActions([]);
     setActionAnswers({});
     setActionNotice("");
     setActionsError("");
     setActionsLoading(true);
-    void refreshActions(controller.signal);
-    const timer = window.setInterval(() => { void refreshActions(controller.signal); }, 4_000);
+    const stopPolling = startForegroundPolling(refreshActions, 4_000);
     return () => {
-      controller.abort();
-      window.clearInterval(timer);
+      stopPolling();
     };
   }, [refreshActions]);
 

@@ -17,6 +17,7 @@ import "./styles.css";
 const TmuxDashboard = lazy(() => import("./TmuxDashboard.js").then((module) => ({ default: module.TmuxDashboard })));
 const TmuxSessionFiles = lazy(() => import("./TmuxSessionFiles.js").then((module) => ({ default: module.TmuxSessionFiles })));
 const TmuxSessionHistory = lazy(() => import("./TmuxSessionHistory.js").then((module) => ({ default: module.TmuxSessionHistory })));
+const SshPage = lazy(() => import("./SshPage.js").then((module) => ({ default: module.SshPage })));
 const TmuxGitChanges = lazy(() => import("./TmuxGitChanges.js").then((module) => ({ default: module.TmuxGitChanges })));
 const CodexHistory = lazy(() => import("./CodexHistory.js").then((module) => ({ default: module.CodexHistory })));
 const ShortcutManagement = lazy(() => import("./ShortcutManagement.js").then((module) => ({ default: module.ShortcutManagement })));
@@ -32,6 +33,7 @@ const ExecutionMachines = lazy(() => import("./ExecutionMachines.js").then((modu
 const DemoCatalog = lazy(() => import("./DemoCatalog.js").then((module) => ({ default: module.DemoCatalog })));
 const JjTools = lazy(() => import("./JjTools.js").then((module) => ({ default: module.JjTools })));
 const UploadDownloads = lazy(() => import("./UploadDownloads.js").then((module) => ({ default: module.UploadDownloads })));
+const MobileInboxPage = lazy(() => import("./MobileInboxPage.js").then((module) => ({ default: module.MobileInboxPage })));
 
 function LegacyDirectTasksRedirect() {
   const location = useLocation();
@@ -207,11 +209,13 @@ async function mountApp(): Promise<void> {
                 <Suspense fallback={<div className="route-loading">页面加载中…</div>}>
                   <Routes>
                   <Route path="/" element={<App />} />
+                  <Route path="/mobile-inbox" element={<MobileInboxPage />} />
                   <Route path="/tasks/:source/:taskId" element={<TaskDetailPage />} />
                   <Route path="/direct-tasks" element={<LegacyDirectTasksRedirect />} />
                   <Route path="/codex-history" element={<BackendFeatureGate feature="codex-history"><CodexHistory /></BackendFeatureGate>} />
                   <Route path="/codex-history/:homeId/:threadId" element={<BackendFeatureGate feature="codex-history"><CodexHistory /></BackendFeatureGate>} />
                   <Route path="/demos" element={<DemoCatalog />} />
+                  <Route path="/ssh" element={<SshPage />} />
                   <Route path="/link-tools" element={<Navigate to="/system-management/uploads?tab=download" replace />} />
                   <Route path="/system-management/jj" element={<JjTools />} />
                   <Route path="/system-management/uploads" element={<UploadDownloads />} />

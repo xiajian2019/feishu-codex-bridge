@@ -24,6 +24,8 @@
 .bridge-connection-copy strong { font-size: 12px; }
 .bridge-connection-copy small { overflow-wrap: anywhere; font-size: 11px; }
 .bridge-connection-banner time { margin-left: auto; color: inherit; font-size: 10px; white-space: nowrap; }
+.bridge-connection-dismiss { display: grid; width: 24px; min-width: 24px; height: 24px; min-height: 24px; margin-left: auto; place-items: center; padding: 0; border: 1px solid currentColor; border-radius: 50%; color: inherit; background: transparent; font-size: 18px; line-height: 1; cursor: pointer; pointer-events: auto; }
+.bridge-connection-dismiss:hover { background: #00000012; }
 :root[data-theme="dark"] .bridge-connection-banner { border-color: #594c2b; color: #f1d69b; background: #292519; }
 :root[data-theme="dark"] .bridge-connection-banner.is-unreachable { border-color: #51353a; color: #f0c9cc; background: #241b1e; }
 :root[data-theme="dark"] .bridge-connection-banner.is-stale { border-color: #315843; color: #bce9ca; background: #1d3025; }

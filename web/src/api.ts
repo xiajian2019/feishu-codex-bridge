@@ -19,7 +19,7 @@ import type {
   TaskDetailResponse,
   TaskListResponse,
 } from "./types.js";
-import { DEFAULT_COMPOSER_SHORTCUTS, type ShortcutDefinition, type ShortcutDisplayMode, type ShortcutGroup, type ShortcutKind, type ShortcutStore, type ShortcutSurface } from "./tmux-shortcuts.js";
+import { normalizeShortcutStore, type ShortcutDefinition, type ShortcutDisplayMode, type ShortcutGroup, type ShortcutKind, type ShortcutStore, type ShortcutSurface } from "./tmux-shortcuts.js";
 import { invalidateShortcutConfigCache, loadShortcutConfig, readShortcutConfigCache, readShortcutConfigRevision, writeShortcutConfigCache } from "./shortcut-config-cache.js";
 import { clearCodexSkillCache, readCodexSkillCache, writeCodexSkillCache } from "./skill-cache.js";
 import { isMobileApp, mobileStreamUrl, MOBILE_RESUME_EVENT } from "./mobile-runtime.js";
@@ -351,6 +351,7 @@ export async function updateCodexSkillPreferences(skills: CodexSkillPreference[]
     body: JSON.stringify({ skills }),
   });
   clearCodexSkillCache(CODEX_SKILLS_CACHE_KEY);
+  if (typeof window !== "undefined") window.dispatchEvent(new Event("bridge:composer-data-invalidated"));
 }
 
 export async function createProject(input: { name: string; path: string; status: ProjectStatus }): Promise<ProjectRecord> {
@@ -388,24 +389,7 @@ export function fetchShortcutConfig(options: { force?: boolean } = {}): Promise<
 
 async function readShortcutConfig(): Promise<ShortcutStore> {
   const result = await getJson<{ groups: ShortcutGroup[]; shortcuts: ShortcutDefinition[]; revision?: string }>("/api/shortcut-config");
-  const composerDefaults = new Map(DEFAULT_COMPOSER_SHORTCUTS.map((shortcut) => [shortcut.id, shortcut]));
-  const shortcuts = Array.isArray(result.shortcuts)
-    ? result.shortcuts.map((shortcut) => {
-      const fallback = shortcut.groupId === "composer" && !shortcut.actionKey
-        ? composerDefaults.get(shortcut.id)
-        : undefined;
-      return fallback
-        ? { ...fallback, ...shortcut, actionKey: fallback.actionKey, displayMode: fallback.displayMode }
-        : shortcut;
-    })
-    : [];
-  const store: ShortcutStore = {
-    groups: Array.isArray(result.groups)
-      ? result.groups.map((group) => group.id === "composer" && group.surface !== "composer" ? { ...group, surface: "composer" } : group)
-      : [],
-    shortcuts,
-  };
-  return store;
+  return normalizeShortcutStore(result);
 }
 
 export async function createShortcutGroup(input: {

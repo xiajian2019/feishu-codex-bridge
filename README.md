@@ -10,10 +10,10 @@
 
 | 功能 | 用途 |
 | --- | --- |
-| Tmux Dashboard | 从手机或浏览器查看 Bridge 主机上已有的 tmux session，向选中的 Codex session 发送消息，并浏览该 session 工作目录中的文件；可用 `tmux-resurrect` + `tmux-continuum` 按 Session 保存、挂起和恢复 Mac 重启前的状态。 |
+| Tmux Dashboard | 从手机或浏览器查看 Bridge 主机上已有的 tmux session，向选中的 Codex session 发送消息，并浏览该 session 工作目录中的文件；可用 `tmux-resurrect` + `tmux-continuum` 按 Session 保存、挂起，并在重启后通过 CLI 手动恢复。 |
 | 飞书 Direct | 从飞书提交文字、图片或文件任务，查看执行状态、续问或取消任务。 |
 | Web Task Desk | 从浏览器为已登记项目创建 Codex 任务，查看运行记录、附加文件、续问和处理支持的重试/审核操作。 |
-| Codex History | 搜索不同 Codex home 的会话，并通过 Codex SDK 继续已有会话。 |
+| Codex History | 主要从 Codex state SQLite 搜索不同 Codex home 的会话；详情仍通过 app-server 读取，续聊通过 Codex SDK。 |
 | 本机 Demo | 从统一目录发现并打开 Bridge 主机上运行的本地模型/实验 Demo；入口通过 Bridge 代理，不要求手机直连 Demo 的 Python 端口。 |
 | 上传下载 | 系统管理 → 上传下载，支持多选上传、进度、取消和同名自动编号；也可提交链接，由 Mac 通过配置的 VPN/HTTP/SOCKS 代理预览或下载。文件保存到 `~/Downloads`。 |
 | 设备与运维 | 配对和撤销浏览器设备，查看运行状态；每天凌晨 1 点自动备份 SQLite，也可手动创建、校验和恢复。 |
@@ -44,7 +44,7 @@ flowchart LR
     WebState --> Browser
 ```
 
-手机接续 tmux、飞书 Direct 和 Web Task Desk 是不同入口。Direct 与 Web 任务保留各自的状态流程；图中的 Codex SDK 表示它们使用同一 SDK 执行器类型，不表示任务记录合并。Codex History 则通过 Codex app-server 读取会话，通过 Codex SDK 继续会话。
+手机接续 tmux、飞书 Direct 和 Web Task Desk 是不同入口。Direct 与 Web 任务保留各自的状态流程；图中的 Codex SDK 表示它们使用同一 SDK 执行器类型，不表示任务记录合并。Codex History 列表主要读取 Codex state SQLite，详情通过 Codex app-server 读取，续聊通过 Codex SDK 继续会话。
 
 ## 使用前提
 

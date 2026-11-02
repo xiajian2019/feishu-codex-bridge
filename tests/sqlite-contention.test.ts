@@ -177,7 +177,9 @@ describe("SQLite contention during usage refresh and page reload", () => {
     expect(f.connection.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 5_000 });
     f.writer.exec("ROLLBACK");
     expect((await fetch(url + "/tmux-dashboard/api/sessions?includeHomes=0")).status).toBe(200);
-    expect(f.db.getLatestTmuxSession(session.id)?.last_seen_at).not.toBe(saved.last_seen_at);
+    // Session GET is a read-only overlay now; tmux/SQLite reconciliation is
+    // explicit (tmux:restore), so a second page read still must not write.
+    expect(f.db.getLatestTmuxSession(session.id)?.last_seen_at).toBe(saved.last_seen_at);
   }, 15_000);
 
   it("never falls back to an ended or recreated session record when the writer is busy", () => {

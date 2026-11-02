@@ -57,6 +57,12 @@ interface SkillMetadata {
   description_en?: string;
 }
 
+interface SkillMetadataCache {
+  byFile: Map<string, SkillMetadata | null>;
+  fileBySkillId: Map<string, string>;
+  uniqueSkills: number;
+}
+
 const MAX_SKILL_FILE_BYTES = 256 * 1024;
 const MAX_DISCOVERY_DIRECTORIES = 4_000;
 const MAX_DISCOVERY_DEPTH = 12;
@@ -73,20 +79,28 @@ export async function discoverCodexSkills(options: {
   const roots = buildSourceRoots(options.codexHomePath, options.projectCwd, homeDirectory);
   const sources: CodexSkillSource[] = [];
   const skills: DiscoveredCodexSkill[] = [];
-  const visitedSkillFiles = new Set<string>();
+  const metadataCache: SkillMetadataCache = { byFile: new Map(), fileBySkillId: new Map(), uniqueSkills: 0 };
   let visitedDirectoryCount = 0;
 
   for (const source of roots) {
-    const result = await scanSkillRoot(source, visitedSkillFiles, () => {
+    const result = await scanSkillRoot(source, metadataCache, () => {
       visitedDirectoryCount += 1;
       return visitedDirectoryCount <= MAX_DISCOVERY_DIRECTORIES;
-    }, skills.length);
+    });
     sources.push({ scope: source.scope, scopeKey: resolve(source.rootPath), complete: result.complete });
     skills.push(...result.skills);
-    if (skills.length >= MAX_DISCOVERED_SKILLS || visitedDirectoryCount > MAX_DISCOVERY_DIRECTORIES) break;
+    if (visitedDirectoryCount > MAX_DISCOVERY_DIRECTORIES) break;
   }
 
-  return { sources, skills: skills.slice(0, MAX_DISCOVERED_SKILLS) };
+  // A single file exposed through the user's global skills directory belongs
+  // to that shared scope, even if a CODEX_HOME or project also links to it.
+  // Separate files with the same name keep their existing scope precedence.
+  const userFiles = new Set(skills.filter((skill) => skill.scope === "user")
+    .map((skill) => metadataCache.fileBySkillId.get(skill.id)));
+  return {
+    sources,
+    skills: skills.filter((skill) => skill.scope === "user" || !userFiles.has(metadataCache.fileBySkillId.get(skill.id))),
+  };
 }
 
 function buildSourceRoots(codexHomePath: string, projectCwd: string, homeDirectory: string): SkillSourceRoot[] {
@@ -142,9 +156,8 @@ function isPathWithin(root: string, candidate: string): boolean {
 
 async function scanSkillRoot(
   source: SkillSourceRoot,
-  visitedSkillFiles: Set<string>,
+  metadataCache: SkillMetadataCache,
   countDirectory: () => boolean,
-  alreadyDiscovered: number,
 ): Promise<{ complete: boolean; skills: DiscoveredCodexSkill[] }> {
   const rootPath = resolve(source.rootPath);
   let canonicalRoot: string;
@@ -155,12 +168,13 @@ async function scanSkillRoot(
     return isMissingPath(error) ? { complete: true, skills: [] } : { complete: false, skills: [] };
   }
 
-  const pending = [{ path: canonicalRoot, depth: 0 }];
+  const pending = [{ path: canonicalRoot, logicalPath: "", depth: 0 }];
   const visitedDirectories = new Set<string>();
+  const visitedSkillFiles = new Set<string>();
   const discovered: DiscoveredCodexSkill[] = [];
   let complete = true;
 
-  while (pending.length > 0 && alreadyDiscovered + discovered.length < MAX_DISCOVERED_SKILLS) {
+  while (pending.length > 0) {
     const current = pending.pop()!;
     let canonicalDirectory: string;
     try {
@@ -179,11 +193,26 @@ async function scanSkillRoot(
             const canonicalSkillPath = await realpath(skillPath);
             if (visitedSkillFiles.has(canonicalSkillPath)) continue;
             visitedSkillFiles.add(canonicalSkillPath);
-            const metadata = await readSkillMetadata(canonicalSkillPath);
+            // Count a physical skill once while retaining its logical scopes.
+            // Otherwise shared account directories can exhaust the limit twice.
+            let metadata = metadataCache.byFile.get(canonicalSkillPath);
+            if (metadata === undefined) {
+              metadata = await readSkillMetadata(canonicalSkillPath);
+              if (metadata && metadataCache.uniqueSkills >= MAX_DISCOVERED_SKILLS) {
+                complete = false;
+                continue;
+              }
+              metadataCache.byFile.set(canonicalSkillPath, metadata);
+              if (metadata) metadataCache.uniqueSkills += 1;
+            }
             if (!metadata) continue;
-            const relativeSkillPath = relative(canonicalRoot, canonicalSkillPath).split(sep).join("/");
+            // Keep the path under the logical source even when its skill
+            // directory is a symlink to a file outside that source root.
+            const relativeSkillPath = join(current.logicalPath, entry.name).split(sep).join("/");
             const scope = inferredScope(source.scope, relativeSkillPath);
-            discovered.push(toDiscoveredSkill(scope, rootPath, relativeSkillPath, metadata));
+            const skill = toDiscoveredSkill(scope, rootPath, relativeSkillPath, metadata);
+            metadataCache.fileBySkillId.set(skill.id, canonicalSkillPath);
+            discovered.push(skill);
           } catch (error) {
             if (!isMissingPath(error)) complete = false;
           }
@@ -194,7 +223,9 @@ async function scanSkillRoot(
         if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
         const childPath = join(canonicalDirectory, entry.name);
         try {
-          if ((await stat(childPath)).isDirectory()) pending.push({ path: childPath, depth: current.depth + 1 });
+          if ((await stat(childPath)).isDirectory()) {
+            pending.push({ path: childPath, logicalPath: join(current.logicalPath, entry.name), depth: current.depth + 1 });
+          }
         } catch (error) {
           if (!isMissingPath(error)) complete = false;
         }
@@ -204,7 +235,7 @@ async function scanSkillRoot(
     }
   }
 
-  if (pending.length > 0 || alreadyDiscovered + discovered.length >= MAX_DISCOVERED_SKILLS) complete = false;
+  if (pending.length > 0) complete = false;
   return { complete, skills: discovered };
 }
 

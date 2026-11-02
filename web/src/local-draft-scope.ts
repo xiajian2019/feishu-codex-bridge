@@ -1,9 +1,18 @@
-let activeDraftScope: string | null = null;
+// Keep the authenticated namespace while Vite replaces this module. Composer
+// effects can restart before auth revalidation runs again.
+const draftScopeState: { value: string | null } = import.meta.hot?.data.draftScopeState ?? { value: null };
+if (import.meta.hot) import.meta.hot.data.draftScopeState = draftScopeState;
+export const LOCAL_DRAFT_SCOPE_EVENT = "bridge:draft-scope-change";
+function changeScope(next: string | null): void {
+  if (next === draftScopeState.value) return;
+  draftScopeState.value = next;
+  if (typeof window !== "undefined") window.dispatchEvent?.(new Event(LOCAL_DRAFT_SCOPE_EVENT));
+}
 
 /** The server derives this opaque value from the installation and current device session. */
 export function setLocalDraftScope(value: string | null | undefined, server?: string): void {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]{32,128}$/.test(value)) {
-    activeDraftScope = null;
+    changeScope(null);
     return;
   }
   // Callers handling App auth must supply the API origin, not the WebView origin.
@@ -11,17 +20,17 @@ export function setLocalDraftScope(value: string | null | undefined, server?: st
   // Browser storage is already origin-isolated; keep its existing opaque scope
   // so upgrading the browser frontend does not orphan previously scoped drafts.
   const origin = server ?? "";
-  activeDraftScope = origin ? `${encodeURIComponent(new URL(origin).origin)}:${value}` : value;
+  changeScope(origin ? `${encodeURIComponent(new URL(origin).origin)}:${value}` : value);
 }
 
 const STORAGE_PREFIX = "bridge:scoped:v1:";
-export function scopedStorageKey(category: string, id = "", scope = activeDraftScope): string | null {
+export function scopedStorageKey(category: string, id = "", scope = draftScopeState.value): string | null {
   return scope ? `${STORAGE_PREFIX}${encodeURIComponent(scope)}:${category}:${encodeURIComponent(id)}` : null;
 }
 
 /** Only the current device/environment is cleared; theme and other environments survive. */
 export function clearScopedClientStorage(): void {
-  const prefix = activeDraftScope ? `${STORAGE_PREFIX}${encodeURIComponent(activeDraftScope)}:` : null;
+  const prefix = draftScopeState.value ? `${STORAGE_PREFIX}${encodeURIComponent(draftScopeState.value)}:` : null;
   if (typeof window === "undefined") return;
   // Legacy data cannot be attributed safely. Never auto-import it; remove it on
   // explicit logout/revocation together with the current sensitive namespace.
@@ -40,5 +49,5 @@ export function clearScopedClientStorage(): void {
 }
 
 export function getLocalDraftScope(): string | null {
-  return activeDraftScope;
+  return draftScopeState.value;
 }

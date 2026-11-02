@@ -1,5 +1,5 @@
 import { expect, it } from "bun:test";
-import { parseApkUpdate, readApkUpdateState, shouldOfferApkUpdate, apkUpdateStorageKey } from "../web/src/mobile-apk-update.js";
+import { parseApkUpdate, readApkUpdateState, shouldOfferApkUpdate, decideApkUpdate, apkUpdateStorageKey } from "../web/src/mobile-apk-update.js";
 import { allocateMobileVersion } from "../scripts/mobile-version.mjs";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -36,6 +36,16 @@ it("offers a newer package on first check and after cancelled installation, isol
   expect(shouldOfferApkUpdate(other, 100, readApkUpdateState(storage, other), 999)).toBe(true);
   values.set(apkUpdateStorageKey(update.server), JSON.stringify({ ...state, phase: "downloading" }));
   expect(readApkUpdateState(storage, update).phase).toBe("error");
+});
+it("shows a manually checked update despite snooze and retains a verified download", () => {
+  const update = parseApkUpdate(metadata, "https://bridge.fixture");
+  const saved = { revision: update.revision, phase: "downloaded" as const, snoozeUntil: 10_000, uri: "file:///verified.apk" };
+  expect(decideApkUpdate(update, 100, saved, false, 1_000).offer).toBe(false);
+  const manual = decideApkUpdate(update, 100, saved, true, 1_000);
+  expect(manual.offer).toBe(true);
+  expect(manual.state).toEqual({ ...saved, snoozeUntil: 0 });
+  expect(decideApkUpdate(update, 200, saved, true, 1_000)).toEqual({ state: { ...saved, phase: "installed" }, offer: false });
+  expect(decideApkUpdate(update, 300, saved, true, 1_000).offer).toBe(false);
 });
 it("allocates increasing Android versions across same-instant builds and clock rollback", async () => {
   const root = await mkdtemp(join(tmpdir(), "bridge-version-"));

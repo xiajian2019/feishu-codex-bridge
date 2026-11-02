@@ -31,12 +31,33 @@ const shares: Array<{ options: { files: string[] }; pending: ReturnType<typeof d
 const enqueues: Array<{ options: Record<string, unknown>; pending: ReturnType<typeof deferred<{ id: number; fileName: string }>> }> = [];
 const queries: Array<{ ids: number[]; pending: ReturnType<typeof deferred<{ downloads: NativeDownloadStatus[] }>> }> = [];
 const removedDirectories: string[] = [];
+const openedDownloads: number[] = [];
+const cancelledDownloads: number[] = [];
+const cacheChunks: Uint8Array[] = [];
+const savedFiles: Array<Record<string, unknown>> = [];
+const copiedImages: Array<Record<string, unknown>> = [];
 const verifications: Array<Record<string, unknown>> = [];
 const installations: Array<Record<string, unknown>> = [];
 const apkSaves: Array<Record<string, unknown>> = [];
+const clipboardWrites: Array<Record<string, unknown>> = [];
+const nativeScans: Array<Record<string, unknown>> = [];
+const appListeners = new Map<string, (event: any) => void>();
+let nativeMotionListener: ((event: { x: number; y: number; z: number; timestampMs: number }) => void) | undefined;
+const nativeMotionEnabled: boolean[] = [];
+let notificationAction: ((event: any) => void) | undefined;
+let shareReceived: ((event: { id?: string; error?: string }) => void) | undefined;
+let nativePermission = "granted";
+let permissionPrompts = 0;
+const notices: Array<Record<string, any>> = [];
+const incomingShare = { id: "00000000-0000-0000-0000-000000000001", text: "shared text", createdAt: 1,
+  files: [{ id: "00000000-0000-0000-0000-000000000002", name: "test.png", type: "image/png", size: 3 }] };
 const timers = new Map<number, () => void>();
 let timerSequence = 0;
 const windowEvents = new EventTarget();
+const localRows = new Map<string, string>();
+const sessionRows = new Map<string, string>();
+Object.assign(windowEvents, { localStorage: { getItem: (key: string) => localRows.get(key) ?? null, setItem: (key: string, value: string) => { localRows.set(key, value); } },
+  sessionStorage: { getItem: (key: string) => sessionRows.get(key) ?? null, setItem: (key: string, value: string) => { sessionRows.set(key, value); } } });
 const documentEvents = Object.assign(new EventTarget(), { visibilityState: "visible" });
 Object.defineProperty(documentEvents, "hidden", { get: () => documentEvents.visibilityState === "hidden" });
 Object.defineProperty(globalThis, "window", { configurable: true, value: windowEvents });
@@ -50,8 +71,32 @@ Object.defineProperty(globalThis, "setTimeout", { value: (callback: () => void) 
 Object.defineProperty(globalThis, "clearTimeout", { value: (id: number) => { timers.delete(id); } });
 
 mock.module("@capacitor/core", () => ({
-  Capacitor: { isNativePlatform: () => true, getPlatform: () => android ? "android" : "ios" },
-  registerPlugin: (name: string) => name === "BridgeUpdater" ? {
+  Capacitor: { isNativePlatform: () => true, getPlatform: () => android ? "android" : "ios",
+    isPluginAvailable: (name: string) => name === "BridgeMotion" && (scenario === "android-native-motion" || scenario === "android-native-motion-fallback"),
+    convertFileSrc: (uri: string) => "https://native.fixture/" + encodeURIComponent(uri) },
+  registerPlugin: (name: string) => name === "BridgeMotion" ? {
+    addListener: async (_event: string, callback: typeof nativeMotionListener) => {
+      nativeMotionListener = callback; return { remove: async () => {
+        nativeMotionListener = undefined;
+        if (scenario === "android-native-motion-fallback") throw new Error("fixture listener removal failed");
+      } };
+    },
+    setEnabled: async ({ enabled }: { enabled: boolean }) => {
+      nativeMotionEnabled.push(enabled);
+      if (scenario === "android-native-motion-fallback" && enabled) throw new Error("fixture sensor unavailable");
+      return { available: true };
+    },
+  } : name === "BridgeShareInbox" ? {
+    addListener: async (_event: string, callback: typeof shareReceived) => { shareReceived = callback; return { remove: async () => {} }; },
+    listShares: async () => ({ shares: [incomingShare] }),
+    getFile: async () => ({ uri: scenario === "android-share-invalid-uri" ? "https://evil.fixture/private" : "file:///fixture-inbox/test" }),
+  } : name === "BridgeUpdater" ? {
+    saveFile: async (options: Record<string, unknown>) => {
+      savedFiles.push(options);
+      if (scenario === "android-export-failure") throw new Error("fixture storage full");
+      return { fileName: options.fileName as string, size: cacheChunks.reduce((size, chunk) => size + chunk.length, 0) };
+    },
+    copyImage: async (options: Record<string, unknown>) => { copiedImages.push(options); },
     verifyApk: async (options: Record<string, unknown>) => {
       verifications.push(options);
       if (scenario === "android-apk-invalid") throw new Error("更新包摘要不符");
@@ -61,6 +106,8 @@ mock.module("@capacitor/core", () => ({
       if (scenario === "android-apk-cancel") throw new Error("请允许 Bridge 安装未知来源应用后重试。");
     },
     saveApk: async (options: Record<string, unknown>) => { apkSaves.push(options); return { fileName: "verified.apk" }; },
+    cancelDownload: async ({ id }: { id: number }) => { cancelledDownloads.push(id); return { cancelled: true }; },
+    openDownloadedFile: async ({ id }: { id: number }) => { openedDownloads.push(id); },
     download: (options: Record<string, unknown>) => {
       const pending = deferred<{ id: number; fileName: string }>();
       enqueues.push({ options, pending });
@@ -73,15 +120,34 @@ mock.module("@capacitor/core", () => ({
     },
   } : {},
 }));
-mock.module("@capacitor/app", () => ({ App: {} }));
+mock.module("@capacitor/app", () => ({ App: {
+  addListener: async (event: string, callback: (event: any) => void) => { appListeners.set(event, callback); return { remove: async () => {} }; },
+  getLaunchUrl: async () => scenario === "android-open-cold" ? { url: "bridgecodex://open?server=https%3A%2F%2Fmac.fixture&path=%2Fmobile-inbox" } : undefined,
+} }));
+mock.module("@capacitor/local-notifications", () => ({ LocalNotifications: {
+  addListener: async (_event: string, callback: typeof notificationAction) => { notificationAction = callback; return { remove: async () => {} }; },
+  checkPermissions: async () => ({ display: nativePermission }),
+  requestPermissions: async () => { permissionPrompts++; return { display: nativePermission }; },
+  createChannel: async () => {},
+  schedule: async (options: Record<string, any>) => { notices.push(options); },
+} }));
 mock.module("@capacitor/browser", () => ({ Browser: {} }));
-mock.module("@capacitor/clipboard", () => ({ Clipboard: {} }));
-mock.module("@capacitor/barcode-scanner", () => ({ CapacitorBarcodeScanner: {} }));
+mock.module("@capacitor/clipboard", () => ({ Clipboard: { write: async (options: Record<string, unknown>) => { clipboardWrites.push(options); } } }));
+mock.module("@capacitor/barcode-scanner", () => ({ CapacitorBarcodeScanner: { scanBarcode: async (options: Record<string, unknown>) => {
+  nativeScans.push(options);
+  if (scenario === "android-scan-cancel") throw new Error("scan cancelled");
+  if (scenario === "android-scan-failure") throw new Error("camera permission denied");
+  return { ScanResult: " bridgecodex://connect?fixture=pairing " };
+} } }));
 mock.module("@capacitor/filesystem", () => ({
   Directory: { Cache: "CACHE" },
   Filesystem: {
     readdir: async () => ({ files: [] }),
     mkdir: async () => {},
+    writeFile: async ({ path, data }: { path: string; data: string }) => {
+      cacheChunks.push(Buffer.from(data, "base64")); return { uri: "file:///fixture-cache/" + path };
+    },
+    appendFile: async ({ data }: { data: string }) => { cacheChunks.push(Buffer.from(data, "base64")); },
     getUri: async ({ path }: { path: string }) => ({ uri: "file:///fixture-cache/" + path }),
     stat: async () => ({ size: 100 }),
     rmdir: async ({ path }: { path: string }) => { removedDirectories.push(path); },
@@ -115,6 +181,228 @@ const emit = (patch: Partial<Progress> = {}) => {
   const event = { type: "download", url, bytes: 11, lengthComputable: false, contentLength: 999, ...patch };
   for (const listener of listeners) listener(event);
 };
+
+if (scenario === "android-open-cold" || scenario === "android-open-warm") {
+  await native.installNativeLifecycle();
+  const { getMobileOpens } = await import("../../web/src/mobile-handoff.js");
+  const url = "bridgecodex://open?server=https%3A%2F%2Fmac.fixture&path=%2Fmobile-inbox";
+  appListeners.get("appUrlOpen")!({ url });
+  appListeners.get("appUrlOpen")!({ url });
+  assert.equal(getMobileOpens().length, 1);
+  assert.equal(getMobileOpens()[0]?.kind, "route");
+  process.exit(0);
+}
+if (scenario === "android-local-notice") {
+  await native.installNativeLifecycle();
+  const options = { id: 100, title: "new action", category: "action", server: "https://mac.fixture", scope: "fixture-device", route: "/tasks/desk/t1" };
+  nativePermission = "denied";
+  assert.equal(await native.showNativeNotification(options), false); assert.equal(notices.length, 0); assert.equal(permissionPrompts, 0);
+  nativePermission = "granted";
+  assert.equal(await native.showNativeNotification(options), true);
+  assert.equal(notices.length, 1);
+  assert.deepEqual(notices[0]?.notifications[0].extra, { server: options.server, scope: options.scope, route: options.route });
+  notificationAction!({ notification: notices[0]!.notifications[0] });
+  assert.equal((await import("../../web/src/mobile-handoff.js")).getMobileOpens()[0]?.server, options.server);
+  assert.equal(permissionPrompts, 0);
+  process.exit(0);
+}
+if (scenario === "android-share-import" || scenario === "android-share-invalid-uri") {
+  let requests = 0;
+  Object.defineProperty(globalThis, "fetch", { configurable: true, value: async (_url: string, init?: RequestInit) => {
+    requests++; assert.equal(init, undefined); return new Response(new Uint8Array([1, 2, 3]));
+  } });
+  await native.installNativeLifecycle();
+  const shares = await native.listIncomingShares(); assert.deepEqual(shares, [incomingShare]);
+  if (scenario === "android-share-invalid-uri") {
+    await assert.rejects(native.incomingShareFiles(incomingShare), /地址无效/); assert.equal(requests, 0);
+  } else {
+    const files = await native.incomingShareFiles(incomingShare);
+    assert.equal(files[0]?.name, "test.png"); assert.equal(files[0]?.type, "image/png"); assert.equal(files[0]?.size, 3);
+    shareReceived!({ id: incomingShare.id });
+    assert.equal((await import("../../web/src/mobile-handoff.js")).getMobileOpens().length, 0, "a share does not navigate away from an editor or execute anything");
+  }
+  process.exit(0);
+}
+
+if (scenario === "android-restored") {
+  await native.installNativeLifecycle();
+  const { restoreMobileDownloads } = await import("../../web/src/mobile-download-manager.js");
+  const storage = { getItem: () => JSON.stringify({ version: 1, tasks: [{ id: "restored", fileName: "old.pdf", destination: "downloads",
+    state: "downloading", downloadedBytes: 50, totalBytes: 100, nativeId: 801, updatedAt: Date.now() }] }), setItem() {}, removeItem() {} };
+  restoreMobileDownloads(storage, "fixture-device");
+  assert.deepEqual(queries[0]?.ids, [801]);
+  queries[0]!.pending.resolve({ downloads: [{ id: 801, fileName: "old.pdf", state: "done", downloadedBytes: 100, totalBytes: 100 }] });
+  await until(() => getMobileDownloads()[0]?.state === "done");
+  await native.openDownloadedFile("restored");
+  assert.deepEqual(openedDownloads, [801]);
+  process.exit(0);
+}
+if (scenario === "android-cancel") {
+  const pending = native.downloadBridgeFile(url, "report.pdf", token);
+  enqueues[0]!.pending.resolve({ id: 701, fileName: "report.pdf" }); await pending;
+  const id = getMobileDownloads()[0]!.id;
+  await native.cancelMobileDownload(id);
+  assert.deepEqual(cancelledDownloads, [701]);
+  assert.equal(getMobileDownloads()[0]?.state, "cancelled");
+  queries[0]!.pending.resolve({ downloads: [{ id: 701, fileName: "report.pdf", state: "done", downloadedBytes: 100, totalBytes: 100 }] });
+  await until(() => !hasAndroidMobileDownloads());
+  assert.equal(getMobileDownloads()[0]?.state, "cancelled");
+  await assert.rejects(native.openDownloadedFile(id), /系统下载/);
+  assert.deepEqual(openedDownloads, []);
+  process.exit(0);
+}
+if (scenario === "android-export-large" || scenario === "ios-export-large" || scenario === "android-export-failure") {
+  const bytes = new Uint8Array(9 * 1024 * 1024 + 7).map((_, index) => index % 251);
+  const blob = new Blob([bytes], { type: "text/plain" });
+  Object.defineProperty(blob, "arrayBuffer", { value: () => { throw new Error("must not read the entire Blob"); } });
+  const pending = native.shareBlob(blob, "large.log");
+  if (scenario === "ios-export-large") {
+    await until(() => shares.length > 0);
+    shares[0]!.pending.resolve({ activityType: "fixture-save" });
+  }
+  if (scenario === "android-export-failure") {
+    await assert.rejects(pending, /storage full/);
+    assert.equal(getMobileDownloads()[0]?.state, "error");
+  } else {
+    await pending;
+    assert.equal(getMobileDownloads()[0]?.state, "done");
+    assert.equal(getMobileDownloads()[0]?.downloadedBytes, bytes.length);
+  }
+  assert.ok(cacheChunks.length > 1);
+  assert.ok(cacheChunks.every((chunk) => chunk.length <= 512 * 1024));
+  assert.deepEqual(Buffer.concat(cacheChunks), Buffer.from(bytes));
+  if (android) {
+    assert.ok(String(savedFiles[0]?.uri).startsWith("file:///fixture-cache/bridge-downloads/"));
+    assert.equal(savedFiles[0]?.mimeType, blob.type);
+    assert.equal(savedFiles[0]?.data, undefined);
+    assert.equal(removedDirectories.length, 1);
+  } else assert.equal(savedFiles.length, 0);
+  process.exit(0);
+}
+if (scenario === "android-image-copy" || scenario === "ios-image-copy") {
+  const bytes = new Uint8Array([137, 80, 78, 71]);
+  await native.copyImage(new Blob([bytes], { type: "image/png" }));
+  if (android) {
+    assert.equal(copiedImages.length, 1);
+    assert.ok(String(copiedImages[0]?.uri).endsWith("/clipboard.png"));
+    assert.deepEqual(Buffer.concat(cacheChunks), Buffer.from(bytes));
+    assert.equal(clipboardWrites.length, 0, "Android must copy an image URI, not plain Base64 text");
+    assert.equal(removedDirectories.length, 0, "recipient still needs the image URI");
+  } else assert.equal(clipboardWrites[0]?.image, "data:image/png;base64," + Buffer.from(bytes).toString("base64"));
+  process.exit(0);
+}
+if (scenario?.startsWith("android-scan-")) {
+  if (scenario === "android-scan-failure") await assert.rejects(native.scanPairingQr(), /permission denied/);
+  else assert.equal(await native.scanPairingQr(), scenario === "android-scan-cancel" ? null : "bridgecodex://connect?fixture=pairing");
+  assert.equal(nativeScans.length, 1);
+  assert.equal(nativeScans[0]?.cameraDirection, 1);
+  process.exit(0);
+}
+if (scenario === "android-native-motion-fallback") {
+  let clock = 0;
+  let detected = 0;
+  Object.defineProperty(performance, "now", { configurable: true, value: () => clock });
+  Object.assign(windowEvents, { DeviceMotionEvent: {} });
+  windowEvents.addEventListener("bridge:mobile-shake", () => { detected++; });
+  await native.installNativeLifecycle();
+  for (clock = 0; clock <= 1_000; clock += 20) {
+    const x = [[120, 22], [240, 0], [520, -22], [640, 0]].findLast(([at]) => at! <= clock)?.[1] ?? 0;
+    windowEvents.dispatchEvent(Object.assign(new Event("devicemotion"), { acceleration: null,
+      accelerationIncludingGravity: { x, y: 0, z: 9.81 } }));
+  }
+  assert.equal(detected, 1);
+  assert.equal(nativeMotionEnabled.at(-1), false);
+  process.exit(0);
+}
+if (scenario === "android-native-motion") {
+  let clock = 0;
+  let detected = 0;
+  Object.defineProperty(performance, "now", { configurable: true, value: () => clock });
+  windowEvents.addEventListener("bridge:mobile-shake", () => { detected++; });
+  await native.installNativeLifecycle();
+  assert.equal(nativeMotionEnabled.at(-1), true);
+  assert.ok(nativeMotionListener);
+  const trace = (start: number, end: number, changes: Array<[number, number]>): void => {
+    for (clock = start; clock <= end; clock += 40) {
+      const x = changes.findLast(([at]) => at <= clock)?.[1] ?? 0;
+      nativeMotionListener!({ x, y: 0, z: 9.81, timestampMs: clock });
+    }
+  };
+  // The native workspace can cover the WebView while the Android activity stays foregrounded.
+  documentEvents.visibilityState = "hidden";
+  documentEvents.dispatchEvent(new Event("visibilitychange"));
+  trace(0, 1_000, [[120, 22], [240, 0], [520, -22], [640, 0]]);
+  assert.equal(detected, 1);
+  appListeners.get("appStateChange")!({ isActive: false });
+  trace(2_500, 3_500, [[2_620, 22], [2_740, 0], [3_020, -22], [3_140, 0]]);
+  assert.equal(detected, 1);
+  appListeners.get("appStateChange")!({ isActive: true });
+  await native.setShakeEnabled(false);
+  assert.equal(nativeMotionEnabled.at(-1), false);
+  trace(4_000, 5_000, [[4_120, 22], [4_240, 0], [4_520, -22], [4_640, 0]]);
+  assert.equal(detected, 1);
+  await native.setShakeEnabled(true);
+  assert.equal(nativeMotionEnabled.at(-1), true);
+  trace(5_500, 6_500, [[5_620, 22], [5_740, 0], [6_020, -22], [6_140, 0]]);
+  assert.equal(detected, 2);
+  process.exit(0);
+}
+if (scenario === "android-motion-detection") {
+  let clock = 0;
+  let detected = 0;
+  Object.defineProperty(performance, "now", { configurable: true, value: () => clock });
+  Object.assign(windowEvents, { DeviceMotionEvent: {} });
+  windowEvents.addEventListener("bridge:mobile-shake", () => { detected++; });
+  await native.installNativeLifecycle();
+  const trace = (start: number, end: number, changes: Array<[number, number]>): void => {
+    for (clock = start; clock <= end; clock += 20) {
+      const x = changes.findLast(([at]) => at <= clock)?.[1] ?? 0;
+      const event = Object.assign(new Event("devicemotion"), {
+        acceleration: null,
+        accelerationIncludingGravity: { x, y: 0, z: 9.81 },
+      });
+      windowEvents.dispatchEvent(event);
+    }
+  };
+  trace(0, 1_000, [[200, 45], [280, -45], [320, 18], [340, -8], [360, 0]]);
+  assert.equal(detected, 0);
+  trace(1_100, 1_800, [[1_200, 22], [1_320, 0], [1_600, -22], [1_720, 0]]);
+  assert.equal(detected, 1);
+  await native.setShakeEnabled(false);
+  trace(3_500, 4_300, [[3_600, 22], [3_720, 0], [4_000, -22], [4_120, 0]]);
+  assert.equal(detected, 1);
+  await native.setShakeEnabled(true);
+  documentEvents.visibilityState = "hidden";
+  documentEvents.dispatchEvent(new Event("visibilitychange"));
+  trace(4_500, 5_300, [[4_600, 22], [4_720, 0], [5_000, -22], [5_120, 0]]);
+  assert.equal(detected, 1);
+  documentEvents.visibilityState = "visible";
+  documentEvents.dispatchEvent(new Event("visibilitychange"));
+  trace(5_500, 5_800, [[5_600, 22], [5_720, 0]]);
+  documentEvents.visibilityState = "hidden";
+  documentEvents.dispatchEvent(new Event("visibilitychange"));
+  documentEvents.visibilityState = "visible";
+  documentEvents.dispatchEvent(new Event("visibilitychange"));
+  trace(5_900, 6_200, [[6_000, -22], [6_120, 0]]);
+  assert.equal(detected, 1);
+  trace(6_220, 6_700, [[6_400, 22], [6_520, 0]]);
+  assert.equal(detected, 2);
+  process.exit(0);
+}
+if (scenario === "android-motion-permission") {
+  const rows = new Map<string, string>();
+  let permission = "denied";
+  Object.assign(windowEvents, { localStorage: { getItem: (key: string) => rows.get(key) ?? null, setItem: (key: string, value: string) => { rows.set(key, value); } },
+    DeviceMotionEvent: { requestPermission: async () => permission } });
+  await assert.rejects(native.setShakeEnabled(true), /传感器权限/);
+  assert.equal(rows.size, 0);
+  await native.setShakeEnabled(false);
+  assert.equal([...rows.values()][0], "false");
+  permission = "granted";
+  await native.setShakeEnabled(true);
+  assert.equal([...rows.values()][0], "true");
+  process.exit(0);
+}
 
 if (scenario?.startsWith("android-apk-")) {
   const update = { available: true as const, revision: "a".repeat(64), sha256: "a".repeat(64), size: 100,

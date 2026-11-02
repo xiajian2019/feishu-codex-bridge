@@ -1,13 +1,16 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
 import { getBunRuntime } from "./bun-runtime.js";
 import type { ForegroundCodexIdentity } from "./tmux-review.js";
 
-const SESSION_FORMAT = "#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_path}\t#{session_created}";
+// session_path is the directory recorded when a Session is created. The active
+// pane path follows a codex-worktree handoff (and ordinary `cd` commands), which
+// is the directory the Dashboard must use for files and Git changes.
+const SESSION_FORMAT = "#{session_id}\t#{session_name}\t#{session_windows}\t#{session_attached}\t#{pane_current_path}\t#{session_created}";
 
 export interface TmuxSession {
   id: string;
@@ -239,17 +242,39 @@ export async function createSession(name: string, requestedCwd?: string): Promis
     throw new ValidationError("Session names must start with a letter or number and use only letters, numbers, dot, dash, or underscore.");
   }
 
-  const expandedCwd = requestedCwd?.trim().replace(/^~(?=\/|$)/, homedir());
-  const cwd = resolve(expandedCwd || homedir());
-  const cwdStat = await stat(cwd).catch(() => null);
-  if (!cwdStat?.isDirectory()) {
-    throw new ValidationError("The working directory does not exist or is not a directory.");
-  }
-
+  const cwd = await resolveWorkingDirectory(requestedCwd);
   await runTmux(["new-session", "-d", "-s", name, "-c", cwd]);
   const createdSession = (await listSessions()).find((session) => session.name === name);
   if (!createdSession) throw new Error("tmux created the session, but it was not returned by list-sessions.");
   return createdSession;
+}
+
+export async function resolveWorkingDirectory(requestedCwd?: string): Promise<string> {
+  const expandedCwd = requestedCwd?.trim().replace(/^~(?=\/|$)/, homedir());
+  const requestedDirectory = resolve(expandedCwd || homedir());
+  const cwd = await realpath(requestedDirectory).catch(() => null);
+  if (!cwd) {
+    throw new ValidationError("The working directory does not exist or is not a directory.");
+  }
+  const cwdStat = await stat(cwd).catch(() => null);
+  if (!cwdStat?.isDirectory()) {
+    throw new ValidationError("The working directory does not exist or is not a directory.");
+  }
+  return cwd;
+}
+
+export async function updateSession(id: string, name: string, requestedCwd: string): Promise<TmuxSession> {
+  if (!isSessionId(id)) throw new ValidationError("Invalid tmux session id.");
+  if (!isValidSessionName(name)) {
+    throw new ValidationError("Session names must start with a letter or number and use only letters, numbers, dot, dash, or underscore.");
+  }
+  await resolveWorkingDirectory(requestedCwd);
+  const session = await findSession(id);
+  if (!session) throw new SessionNotFoundError("Session no longer exists.");
+  if (session.name !== name) await runTmux(["rename-session", "-t", id, name]);
+  const updated = await findSession(id);
+  if (!updated) throw new SessionNotFoundError("Session no longer exists.");
+  return updated;
 }
 
 export async function killSession(id: string): Promise<void> {
@@ -268,7 +293,9 @@ export async function findSession(id: string): Promise<TmuxSession | undefined> 
 export async function getCurrentPanePath(id: string, knownSession?: TmuxSession): Promise<string> {
   if (!isSessionId(id)) throw new ValidationError("Invalid tmux session id.");
   if (!knownSession && !(await findSession(id))) throw new SessionNotFoundError("Session no longer exists.");
-  const cwd = resolve(await runTmux(["display-message", "-p", "-t", id, "#{pane_current_path}"]));
+  const requestedDirectory = resolve(await runTmux(["display-message", "-p", "-t", id, "#{pane_current_path}"]));
+  const cwd = await realpath(requestedDirectory).catch(() => null);
+  if (!cwd) throw new ValidationError("The tmux pane working directory is unavailable.");
   const cwdStat = await stat(cwd).catch(() => null);
   if (!cwdStat?.isDirectory()) throw new ValidationError("The tmux pane working directory is unavailable.");
   return cwd;
@@ -287,10 +314,12 @@ export async function inspectReviewPane(id: string, knownSession?: TmuxSession):
   ]);
   const [paneId, panePidValue, paneTty, currentCommand, ...cwdParts] = details.split("\t");
   const panePid = Number(panePidValue);
-  const cwd = resolve(cwdParts.join("\t"));
+  const requestedDirectory = resolve(cwdParts.join("\t"));
   if (!paneId || !/^%\d+$/.test(paneId) || !Number.isSafeInteger(panePid) || panePid < 1 || !paneTty || !cwdParts.length) {
     throw new ValidationError("The active tmux pane is unavailable.");
   }
+  const cwd = await realpath(requestedDirectory).catch(() => null);
+  if (!cwd) throw new ValidationError("The tmux pane working directory is unavailable.");
   const cwdStat = await stat(cwd).catch(() => null);
   if (!cwdStat?.isDirectory()) throw new ValidationError("The tmux pane working directory is unavailable.");
 
@@ -310,6 +339,16 @@ export async function setCodexHomeForSession(id: string, codexHomePath: string |
   }
 }
 
+/** Only infer the default Home when the OS actually exposed an environment. */
+export function parseCodexHomeEnvironment(value: string, homeDirectory = homedir()): string | undefined {
+  const environment = value.replaceAll("\0", " ");
+  if (!/(?:^|\s)(?:HOME|PATH|SHELL)=/.test(environment)) return undefined;
+  const match = /(?:^|\s)CODEX_HOME=(.*?)(?=\s[A-Za-z_][A-Za-z\d_]*=|$)/.exec(environment);
+  if (!match) return resolve(homeDirectory, ".codex");
+  const path = match[1]!.trim().replace(/^(['"])(.*)\1$/, "$2");
+  return path ? resolve(path.replace(/^~(?=\/|$)/, homeDirectory)) : undefined;
+}
+
 export async function inspectCodexHome(
   id: string,
   knownSession?: TmuxSession,
@@ -320,16 +359,18 @@ export async function inspectCodexHome(
   try {
     const panePid = Number(await runTmux(["display-message", "-p", "-t", id, "#{pane_pid}"]));
     if (!Number.isSafeInteger(panePid) || panePid < 1) return { status: "unavailable" };
-    const processRows = await runCommand("ps", ["-ww", "-axo", "pid=,ppid=,command="]);
-    const processInfo = processRows.split(/\r?\n/).flatMap((line) => {
-      const match = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);
-      return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3]! }] : [];
+    // Avoid collecting command lines (which may be large or sensitive) for
+    // unrelated processes. Fetch them only for the selected pane's descendants.
+    const rows = await runCommand("ps", ["-axo", "pid=,ppid="]);
+    const processes = rows.split(/\r?\n/).flatMap((line) => {
+      const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+      return match ? [{ pid: Number(match[1]), ppid: Number(match[2]) }] : [];
     });
     const depths = new Map<number, number>([[panePid, 0]]);
     let changed = true;
     while (changed) {
       changed = false;
-      for (const process of processInfo) {
+      for (const process of processes) {
         const parentDepth = depths.get(process.ppid);
         if (parentDepth !== undefined && !depths.has(process.pid)) {
           depths.set(process.pid, parentDepth + 1);
@@ -337,23 +378,32 @@ export async function inspectCodexHome(
         }
       }
     }
-    const codexProcesses = processInfo
-      .filter((process) => depths.has(process.pid) && /(?:^|[\\/\s])codex(?:\.js)?(?:$|[\s/])/i.test(process.command))
-      .sort((left, right) => (depths.get(right.pid) ?? 0) - (depths.get(left.pid) ?? 0));
-    if (codexProcesses.length === 0) return { status: "not-running" };
-
-    for (const process of codexProcesses.slice(0, 24)) {
-      try {
-        const commandWithEnvironment = await runCommand("ps", ["eww", "-p", String(process.pid), "-o", "command="]);
-        const match = /(?:^|\s)CODEX_HOME=(.*?)(?=\s[A-Za-z_][A-Za-z\d_]*=|$)/.exec(commandWithEnvironment);
-        if (match) {
-          const value = match[1]!.trim().replace(/^(['"])(.*)\1$/, "$2");
-          if (value) return { status: "running", path: resolve(value.replace(/^~(?=\/|$)/, homedir())) };
-        }
-        return { status: "running", path: resolve(homedir(), ".codex") };
-      } catch {
-        // Try the next Codex process if the operating system denies this process listing.
+    const descendants = [...depths.entries()].sort((left, right) => right[1] - left[1]);
+    const codexProcesses: number[] = [];
+    for (let offset = 0; offset < Math.min(descendants.length, 128); offset += 8) {
+      const group = descendants.slice(offset, offset + 8);
+      const commands = await Promise.all(group.map(async ([pid]) => {
+        try { return { pid, command: await runCommand("ps", ["-ww", "-p", String(pid), "-o", "command="]) }; }
+        catch { return null; }
+      }));
+      for (const process of commands) {
+        if (process && /(?:^|[\\/\s])codex(?:\.js)?(?:$|[\s/])/i.test(process.command)) codexProcesses.push(process.pid);
       }
+    }
+    if (codexProcesses.length === 0) return { status: descendants.length > 128 ? "unavailable" : "not-running" };
+    for (const pid of codexProcesses.slice(0, 24)) {
+      if (process.platform === "linux") {
+        try {
+          const environment = await readFile(`/proc/${pid}/environ`, "utf8");
+          const path = parseCodexHomeEnvironment(environment);
+          if (path) return { status: "running", path };
+        } catch { /* Fall back to ps when /proc is unavailable or access is denied. */ }
+      }
+      try {
+        const environment = await runCommand("ps", ["eww", "-p", String(pid), "-o", "command="]);
+        const path = parseCodexHomeEnvironment(environment);
+        if (path) return { status: "running", path };
+      } catch { /* Try the next Codex process if this one became inaccessible. */ }
     }
     return { status: "unavailable" };
   } catch {

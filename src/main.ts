@@ -8,7 +8,6 @@ import { isDirectExecutionMode, loadConfig, parseExecutionMode } from "./config.
 import { buildCodexAppServerEnvironment, CodexAppServerClient } from "./codex-app-server.js";
 import { CodexHistoryService } from "./codex-history.js";
 import { isExecutableCodexPath, resolveCodexCliPath } from "./codex-path.js";
-import { LocalCodexNotificationInbox } from "./codex-notification-inbox.js";
 import { StateDatabase } from "./db.js";
 import { defaultBridgeAttachmentRoots } from "./bridge-backup.js";
 import { BridgeBackupScheduler } from "./backup-scheduler.js";
@@ -573,10 +572,6 @@ async function runDirectMode(
       statePath: join(dirname(dbPath), "codex-local-notifications.json"),
     })
     : null;
-  const notificationInbox = config.localNotifications.enabled
-    && config.localNotifications.mode === "hook"
-    ? new LocalCodexNotificationInbox({ logger })
-    : null;
   let stopPromise: Promise<void> | undefined;
   const stop = (): Promise<void> => {
     if (stopPromise) return stopPromise;
@@ -585,13 +580,6 @@ async function runDirectMode(
         await localNotifications?.stop();
       } catch (error) {
         logger.warn("failed to stop local Codex notifications", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-      try {
-        await notificationInbox?.stop();
-      } catch (error) {
-        logger.warn("failed to stop local notification inbox", {
           error: error instanceof Error ? error.message : String(error),
         });
       }
@@ -623,7 +611,6 @@ async function runDirectMode(
     if (dashboard) logger.info("dashboard listening", { url: await dashboard.start() });
     await runtime.start();
     await startLocalNotifications(localNotifications, config.localNotifications.intervalSeconds, logger);
-    await startNotificationInbox(notificationInbox, logger);
     if (args.once) {
       await runtime.runOnce();
       await localNotifications?.pollOnce();
@@ -681,10 +668,6 @@ async function runAampMode(
       statePath: join(dirname(dbPath), "codex-local-notifications.json"),
     })
     : null;
-  const notificationInbox = config.localNotifications.enabled
-    && config.localNotifications.mode === "hook"
-    ? new LocalCodexNotificationInbox({ logger })
-    : null;
   const auth = config.web.enabled
     ? new WebPairingAuth({ db })
     : null;
@@ -729,7 +712,6 @@ async function runAampMode(
     stopping = true;
     try {
       await localNotifications?.stop();
-      await notificationInbox?.stop();
       if (runtimeStarted && config.aamp.stopOnShutdown) {
         await runtime.stop();
       } else {
@@ -771,7 +753,6 @@ async function runAampMode(
     await runtime.start();
     runtimeStarted = true;
     await startLocalNotifications(localNotifications, config.localNotifications.intervalSeconds, logger);
-    await startNotificationInbox(notificationInbox, logger);
     logger.info("official AAMP runtime started", {
       profile: config.lark.profile,
       relay: config.relay.aampHost ?? "official-default",
@@ -800,21 +781,6 @@ async function startLocalNotifications(
     logger.info("local Codex system notifications enabled", { intervalSeconds });
   } catch (error) {
     logger.warn("local Codex system notifications disabled after startup failure", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-}
-
-async function startNotificationInbox(
-  inbox: LocalCodexNotificationInbox | null,
-  logger: Logger,
-): Promise<void> {
-  if (!inbox) return;
-  try {
-    await inbox.start();
-    logger.info("official Codex notify inbox enabled");
-  } catch (error) {
-    logger.warn("official Codex notify inbox disabled after startup failure", {
       error: error instanceof Error ? error.message : String(error),
     });
   }

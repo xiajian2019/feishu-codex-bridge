@@ -10,6 +10,7 @@ import { bindMobileTerminalTouch, type TerminalSelectionDisplay } from "./termin
 import { copyMobileText, isMobileApp } from "./mobile-runtime.js";
 import { scopedStorageKey } from "./local-draft-scope.js";
 import "./jj-tools.css";
+import { isAppForeground, startForegroundPolling } from "./foreground-polling.js";
 
 interface JjRun {
   id: string;
@@ -94,22 +95,16 @@ export function JjTools(): ReactElement {
   const reportError = (failure: unknown): void => setError(failure instanceof Error ? failure.message : String(failure));
 
   useEffect(() => {
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout>;
-    const refresh = async (): Promise<void> => {
+    return startForegroundPolling(async (signal) => {
       try {
-        const next = await getJson<JjStatus>("/api/jj", { signal: controller.signal });
-        if (controller.signal.aborted) return;
+        const next = await getJson<JjStatus>("/api/jj", { signal });
+        if (signal.aborted) return;
         setStatus(next);
         setSelectedId((previous) => next.runs.some((run) => run.id === previous) ? previous : next.runs[0]?.id ?? "");
       } catch (failure) {
-        if (!controller.signal.aborted) reportError(failure);
-      } finally {
-        if (!controller.signal.aborted) timer = setTimeout(() => void refresh(), 2_000);
+        if (!signal.aborted) reportError(failure);
       }
-    };
-    void refresh();
-    return () => { controller.abort(); clearTimeout(timer); };
+    }, 2_000);
   }, []);
 
   const sendInput = useCallback((data: string): void => {
@@ -145,6 +140,7 @@ export function JjTools(): ReactElement {
     const unbindTouch = bindMobileTerminalTouch(host, terminal, setSelection, { enableDesktopSelection: true });
     const input = terminal.onData(sendInput);
     const resize = (): void => {
+      if (!isAppForeground() || navigator.onLine === false) return;
       if (host.clientWidth < 20 || host.clientHeight < 20) return;
       fit.fit();
       if (currentRun.current?.id === selectedId && currentRun.current.state === "running") {
@@ -156,15 +152,14 @@ export function JjTools(): ReactElement {
     resize();
     let offset = 0;
     let sized = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async (): Promise<void> => {
+    const stopPolling = startForegroundPolling(async (signal): Promise<boolean> => {
       let keepPolling = true;
       try {
-        const snapshot = await getJson<JjSnapshot>(`/api/jj/runs/${selectedId}?offset=${offset}`, { signal: controller.signal });
-        if (controller.signal.aborted) return;
+        const snapshot = await getJson<JjSnapshot>(`/api/jj/runs/${selectedId}?offset=${offset}`, { signal });
+        if (signal.aborted || controller.signal.aborted) return false;
         if (snapshot.truncated) terminal.write("\r\n[较早输出已截断]\r\n");
         if (snapshot.output) terminal.write(snapshot.output, () => {
-          if (!controller.signal.aborted) setLogLines(terminalLogLines(terminal));
+          if (!signal.aborted && !controller.signal.aborted) setLogLines(terminalLogLines(terminal));
         });
         offset = snapshot.offset;
         currentRun.current = snapshot;
@@ -173,14 +168,12 @@ export function JjTools(): ReactElement {
         setStatus((previous) => previous ? { ...previous, runs: previous.runs.map((run) => run.id === snapshot.id ? snapshot : run) } : previous);
         keepPolling = snapshot.state === "running";
       } catch (failure) {
-        if (!controller.signal.aborted) reportError(failure);
-      } finally {
-        if (keepPolling && !controller.signal.aborted) timer = setTimeout(() => void poll(), 350);
+        if (!signal.aborted && !controller.signal.aborted) reportError(failure);
       }
-    };
-    void poll();
+      return keepPolling;
+    }, 350);
     return () => {
-      controller.abort(); clearTimeout(timer); observer.disconnect(); input.dispose(); links.dispose(); unbindTouch();
+      stopPolling(); controller.abort(); observer.disconnect(); input.dispose(); links.dispose(); unbindTouch();
       terminal.dispose(); terminalRef.current = null; currentRun.current = null;
     };
   }, [selectedId, reload, post, sendInput]);

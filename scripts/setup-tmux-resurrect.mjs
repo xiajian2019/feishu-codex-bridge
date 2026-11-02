@@ -133,7 +133,7 @@ function main() {
   writeFileSync(configPath, installSourceLine(), { encoding: "utf8" });
   const running = spawnSync("tmux", ["has-session"], { stdio: "ignore" }).status === 0;
   if (running) run("tmux", ["source-file", configPath], { stdio: "inherit" });
-  console.log("tmux-resurrect + tmux-continuum 已安装并接入 tmux 配置。Dashboard 会按具体 Session 保存/恢复；continuum 负责定时保存，Bridge 负责按 Session 恢复。");
+  console.log("tmux-resurrect + tmux-continuum 已安装并接入 tmux 配置。Dashboard 会按具体 Session 保存快照；continuum 负责定时保存，重启后的恢复请显式运行 bun run tmux:restore。");
   console.log(JSON.stringify(describe(), null, 2));
 }
 

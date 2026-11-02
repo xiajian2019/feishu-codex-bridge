@@ -18,6 +18,9 @@ import {
   type WorkbenchTarget,
 } from "./workbench-api.js";
 import "./workbench.css";
+import { isMobileApp } from "./mobile-runtime.js";
+import { isStandaloneSshPath } from "./ssh-route.js";
+import { bridgeTransportMayBeReachable } from "./connection-state.js";
 
 interface WorkbenchSnapshot {
   inbox: WorkbenchInbox;
@@ -62,7 +65,7 @@ export function refreshWorkbenchInbox(options: { quiet?: boolean } = {}): Promis
 async function pollWorkbenchInbox(quiet: boolean): Promise<void> {
   const mutationRevision = inboxMutationRevision;
   publishWorkbenchSnapshot({ ...workbenchSnapshot, loading: quiet ? workbenchSnapshot.loading : true, error: null });
-  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+  if (!bridgeTransportMayBeReachable()) {
     publishWorkbenchSnapshot({
       ...workbenchSnapshot,
       loading: false,
@@ -76,7 +79,7 @@ async function pollWorkbenchInbox(quiet: boolean): Promise<void> {
     fetchWorkbenchInbox(),
     fetchWorkbenchSettings(),
   ]);
-  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+  if (!bridgeTransportMayBeReachable()) {
     publishWorkbenchSnapshot({
       ...workbenchSnapshot,
       loading: false,
@@ -108,6 +111,12 @@ async function pollWorkbenchInbox(quiet: boolean): Promise<void> {
 }
 
 function observeWorkbenchNotifications(notifications: WorkbenchNotification[], enabled: boolean): void {
+  if (isMobileApp()) {
+    void import("./mobile-notifications.js").then((module) => module.observeMobileNotifications(notifications)).catch(() => {
+      // Native permission or delivery failures never suppress the authoritative in-app inbox.
+    });
+    return;
+  }
   if (!initialNotificationBaselineEstablished) {
     for (const notification of notifications) rememberSeenNotification(notification.id);
     initialNotificationBaselineEstablished = true;
@@ -144,17 +153,18 @@ function rememberSeenNotification(id: string): void {
   }
 }
 
+import { startForegroundPolling } from "./foreground-polling.js";
+
 export function WorkbenchNotifications(): null {
   const navigate = useNavigate();
   const { pathname } = useLocation();
   const isTmuxPage = pathname === "/tmux-dashboard" || pathname.startsWith("/tmux-dashboard/");
+  const isSshPage = isStandaloneSshPath(pathname);
   useEffect(() => {
-    if (isTmuxPage) return;
+    if (isSshPage || (isTmuxPage && !isMobileApp())) return;
     const goToNotification = (route: string): void => { void navigate(route); };
     navigateToNotification = goToNotification;
-    void refreshWorkbenchInbox();
-    const timer = window.setInterval(() => void refreshWorkbenchInbox({ quiet: true }), 30_000);
-    const handleOnline = (): void => { void refreshWorkbenchInbox(); };
+    const stopPolling = startForegroundPolling(async () => { await refreshWorkbenchInbox({ quiet: true }); }, 30_000);
     const handleOffline = (): void => {
       publishWorkbenchSnapshot({
         ...workbenchSnapshot,
@@ -163,28 +173,21 @@ export function WorkbenchNotifications(): null {
         inbox: { ...workbenchSnapshot.inbox, connection: { ...workbenchSnapshot.inbox.connection, state: "disconnected" } },
       });
     };
-    const handleVisibility = (): void => {
-      if (document.visibilityState === "visible") void refreshWorkbenchInbox({ quiet: true });
-    };
-    window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
-    document.addEventListener("visibilitychange", handleVisibility);
     return () => {
-      window.clearInterval(timer);
-      window.removeEventListener("online", handleOnline);
+      stopPolling();
       window.removeEventListener("offline", handleOffline);
-      document.removeEventListener("visibilitychange", handleVisibility);
       if (navigateToNotification === goToNotification) navigateToNotification = null;
     };
-  }, [isTmuxPage, navigate]);
+  }, [isSshPage, isTmuxPage, navigate]);
   return null;
 }
 
-export function Workbench(): ReactElement {
+export function Workbench({ initialPanel = null }: { initialPanel?: "actions" | "notifications" | null } = {}): ReactElement {
   const navigate = useNavigate();
   const snapshot = useSyncExternalStore(subscribeWorkbenchSnapshot, getWorkbenchSnapshot, getWorkbenchSnapshot);
   const { inbox, loading, error, settingsError } = snapshot;
-  const [activePanel, setActivePanel] = useState<"actions" | "notifications" | null>(null);
+  const [activePanel, setActivePanel] = useState<"actions" | "notifications" | null>(initialPanel);
   const [dismissingId, setDismissingId] = useState<string | null>(null);
   const [respondingId, setRespondingId] = useState<string | null>(null);
   const [actionErrors, setActionErrors] = useState<Record<string, string>>({});

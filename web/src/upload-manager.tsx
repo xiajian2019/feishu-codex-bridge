@@ -3,6 +3,7 @@ import { uploadToDownloads, type DownloadUploadPhase, type DownloadUploadResult,
 import { logDebugDiagnostic } from "./debug-log-capture.js";
 import { copyMobileText, isMobileApp } from "./mobile-runtime.js";
 import "./upload-manager.css";
+import { isAppForeground } from "./foreground-polling.js";
 
 export type GlobalUploadState = DownloadUploadPhase | "queued" | "done" | "error" | "cancelled";
 export type GlobalUploadTask = {
@@ -79,6 +80,7 @@ export function UploadManagerProvider({ children }: { children: ReactNode }): Re
 
   const startPending = useCallback(async (): Promise<void> => {
     if (runningRef.current) return;
+    if (isMobileApp() && !isAppForeground()) return;
     const pending = tasksRef.current.filter((task) => ["queued", "error", "cancelled"].includes(task.state));
     if (!pending.length) return;
     prepareSystemNotification();
@@ -103,7 +105,7 @@ export function UploadManagerProvider({ children }: { children: ReactNode }): Re
         } catch (error) {
           patchTask(task.id, {
             state: controller.signal.aborted ? "cancelled" : "error",
-            error: controller.signal.aborted ? undefined : error instanceof Error ? error.message : "上传失败，请重试。",
+            error: controller.signal.aborted ? controller.signal.reason instanceof Error ? controller.signal.reason.message : "上传已取消。" : error instanceof Error ? error.message : "上传失败，请重试。",
           });
           if (controller.signal.aborted) break;
         }
@@ -115,6 +117,15 @@ export function UploadManagerProvider({ children }: { children: ReactNode }): Re
   }, [patchTask, prepareSystemNotification, showCompletedNotification]);
 
   const cancel = useCallback((): void => { controllerRef.current?.abort(); }, []);
+  useEffect(() => {
+    if (!isMobileApp()) return;
+    const pause = (): void => {
+      if (!isAppForeground()) controllerRef.current?.abort(new Error("App 已进入后台，本次上传结果未确认；请回前台检查 Mac 的 Downloads 后再手动重试。"));
+    };
+    window.addEventListener("bridge:foreground-change", pause);
+    document.addEventListener("visibilitychange", pause);
+    return () => { window.removeEventListener("bridge:foreground-change", pause); document.removeEventListener("visibilitychange", pause); };
+  }, []);
 
   const remove = useCallback((id: number): void => {
     if (tasksRef.current.some((task) => task.id === id && ["uploading", "reading", "confirming", "saving", "creating", "preparing"].includes(task.state))) return;
@@ -188,6 +199,7 @@ function GlobalUploadStatus({ tasks, notice, onCancel }: { tasks: GlobalUploadTa
   const percent = current.file.size > 0 ? Math.floor(current.sent / current.file.size * 100) : 0;
   return <div className="upload-manager-status" role="status" aria-live="polite">
     <strong>正在上传</strong><span title={current.file.name}>{current.file.name}</span>
+    {isMobileApp() ? <small>上传期间请保持 App 在前台；中断后需手动确认并重试。</small> : null}
     <progress max={current.file.size || 1} value={Math.min(current.sent, current.file.size || 1)} aria-label={`${current.file.name} 上传进度`} />
     <small>{percent}% · {uploadManagerPhaseText(current.state)}{queued ? ` · 还有 ${queued} 个` : ""}</small>
     <button type="button" onClick={onCancel} disabled={current.state === "saving"}>取消</button>

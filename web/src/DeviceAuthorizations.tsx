@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
+import { useMobileBack } from "./use-mobile-back.js";
 import { describeDevice, deviceAccessEnvironment, deviceAuthorizationState, deviceExpiry, deviceLastUsed, matchesDeviceSearch, sameModelCounts, selectableDeviceIds, sortDeviceAuthorizations, type DeviceAuthorization } from "./device-authorizations.js";
 
 function date(value: string | null | undefined): string {
   return value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "未知";
 }
 
-export function DeviceAuthorizations({ devices, loading, busy, onRefresh, onRename, onExtend, onRevoke }: {
+export function DeviceAuthorizations({ devices, loading, busy, onRefresh, onRename, onExtend, onRevoke, onPair }: {
   devices: DeviceAuthorization[];
   loading: boolean;
   busy: boolean;
@@ -13,12 +14,14 @@ export function DeviceAuthorizations({ devices, loading, busy, onRefresh, onRena
   onRename: (device: DeviceAuthorization) => void;
   onExtend: (device: DeviceAuthorization) => Promise<void>;
   onRevoke: (devices: DeviceAuthorization[]) => Promise<void>;
+  onPair: (device: DeviceAuthorization) => void;
 }): ReactElement {
   const [tab, setTab] = useState<"active" | "history">("active");
   const [filter, setFilter] = useState<"all" | "same-model" | "unused" | "expiring">("all");
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [pendingRevoke, setPendingRevoke] = useState<DeviceAuthorization[] | null>(null);
+  useMobileBack(Boolean(pendingRevoke), () => { if (!busy) setPendingRevoke(null); }, 2000);
   const selectAllRef = useRef<HTMLInputElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const now = Date.now();
@@ -103,10 +106,13 @@ export function DeviceAuthorizations({ devices, loading, busy, onRefresh, onRena
               <dt>原始 UA</dt><dd><code>{device.userAgent || "未提供"}</code></dd>
             </dl><p>型号、浏览器和 IP 仅用于辨认，相同信息不代表同一台实体设备。访问入口记录最近一次已授权请求，后台刷新也会更新。</p></details>
           </div>
-          {state === "active" ? <div className="device-auth-entry-actions">
-            <button className="secondary" type="button" disabled={busy} onClick={() => onRename(device)}>名称 / 备注</button>
-            <button className="secondary" type="button" disabled={busy} onClick={() => void onExtend(device)}>延期一年</button>
-            <button className="device-revoke-button" type="button" disabled={busy} onClick={() => setPendingRevoke([device])}>撤销</button>
+          {state !== "revoked" && !device.revokedAt ? <div className="device-auth-entry-actions">
+            <button className="secondary" type="button" disabled={busy} aria-label={`为 ${profile.name} 授权 ${profile.shortId} 生成二维码`} onClick={() => onPair(device)}>生成二维码</button>
+            {state === "active" ? <>
+              <button className="secondary" type="button" disabled={busy} onClick={() => onRename(device)}>名称 / 备注</button>
+              <button className="secondary" type="button" disabled={busy} onClick={() => void onExtend(device)}>延期一年</button>
+              <button className="device-revoke-button" type="button" disabled={busy} onClick={() => setPendingRevoke([device])}>撤销</button>
+            </> : null}
           </div> : null}
         </article>;
       })}

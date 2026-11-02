@@ -1,4 +1,5 @@
 import { isMobileApp, mobileStreamUrl, MOBILE_RESUME_EVENT } from "./mobile-runtime.js";
+import { bridgeTransportMayBeReachable } from "./connection-state.js";
 
 const RELEASE_GRACE_MS = 1_500;
 const MAX_REPLAY_BYTES = 16 * 1024 * 1024;
@@ -58,6 +59,7 @@ export class TmuxTerminalTransport {
   public constructor(private readonly sessionId: string) {
     window.addEventListener("online", this.reconnectNow);
     window.addEventListener("offline", this.markOffline);
+    window.addEventListener("bridge:api-reachable", this.reconnectNow);
     document.addEventListener("visibilitychange", this.onVisibilityChange);
     window.addEventListener(MOBILE_RESUME_EVENT, this.forceReconnect);
   }
@@ -129,7 +131,7 @@ export class TmuxTerminalTransport {
     if (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING) return;
     if (!this.pathBuilder) return;
     if (isMobileApp() && document.visibilityState === "hidden") return;
-    if (navigator.onLine === false) {
+    if (!bridgeTransportMayBeReachable()) {
       this.emit({ type: "status", status: "OFFLINE" });
       return;
     }
@@ -144,7 +146,7 @@ export class TmuxTerminalTransport {
     const openSocket = (value: string): void => {
       if (this.disposed || requestGeneration !== this.connectionGeneration) return;
       this.connectionPending = false;
-      if (navigator.onLine === false || (isMobileApp() && document.visibilityState === "hidden")) return;
+      if (!bridgeTransportMayBeReachable() || (isMobileApp() && document.visibilityState === "hidden")) return;
       const address = new URL(value);
       address.protocol = address.protocol === "https:" ? "wss:" : "ws:";
       let nextSocket: WebSocket;
@@ -227,7 +229,7 @@ export class TmuxTerminalTransport {
   }
 
   private scheduleReconnect(): void {
-    if (this.disposed || this.listeners.size === 0 || this.reconnectTimer || navigator.onLine === false) return;
+    if (this.disposed || this.listeners.size === 0 || this.reconnectTimer || !bridgeTransportMayBeReachable()) return;
     const delay = Math.min(1_000 * 2 ** Math.min(this.reconnectAttempt, 4), 15_000);
     this.reconnectAttempt += 1;
     this.emit({ type: "status", status: this.everAttached ? "RECONNECTING" : "CONNECTING" });
@@ -277,6 +279,7 @@ export class TmuxTerminalTransport {
     window.clearTimeout(this.releaseTimer);
     window.removeEventListener("online", this.reconnectNow);
     window.removeEventListener("offline", this.markOffline);
+    window.removeEventListener("bridge:api-reachable", this.reconnectNow);
     document.removeEventListener("visibilitychange", this.onVisibilityChange);
     window.removeEventListener(MOBILE_RESUME_EVENT, this.forceReconnect);
     const previousSocket = this.socket;

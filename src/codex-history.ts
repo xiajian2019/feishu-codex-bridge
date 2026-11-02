@@ -36,6 +36,7 @@ import {
   type CodexAppServerInteractiveEvent,
 } from "./codex-interactive.js";
 import { unlinkOwnedCodexHistoryAttachment } from "./codex-history-attachments.js";
+import { DatabaseSync, type SqliteDatabase } from "./sqlite.js";
 import type { Logger } from "./types.js";
 
 export const CODEX_HISTORY_DEFAULT_SOURCE_KINDS: CodexThreadSourceKind[] = ["cli", "appServer"];
@@ -898,21 +899,23 @@ export class CodexHistoryService {
       throw new Error(`找不到 Codex home：${query.homeId || "(none)"}`);
     }
 
-    // Read every configured Home so the account filter can be applied to each
-    // thread's saved Home preference, rather than only its source account.
-    const results = await Promise.all(resolvedHomes.map(async (home) => {
+    // Read Homes sequentially. The normal path is a short read-only SQLite
+    // query; keeping the fallback bounded and sequential avoids starting one
+    // app-server/rollout scan per account at the same time.
+    const results: Array<{ home: ResolvedCodexHistoryHome; threads: CodexThread[] }> = [];
+    for (const home of resolvedHomes) {
       try {
         const threads = await this.queryHomeWithCache(home, query);
-        return { home, threads };
+        results.push({ home, threads });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         this.options.logger?.warn("failed to read local Codex history", {
           home: home.path,
           error: message,
         });
-        return { home: { ...home, error: message }, threads: [] as CodexThread[] };
+        results.push({ home: { ...home, error: message }, threads: [] as CodexThread[] });
       }
-    }));
+    }
 
     const sourceItems = results.flatMap(({ home, threads }) => threads.map((thread) => ({
       home: toPublicHome(home),
@@ -1536,10 +1539,28 @@ export class CodexHistoryService {
       configuredHome,
       ...configuredHomes.map((path) => normalizePath(path, homeDirectory)),
     ]);
-    return paths.map((path) => buildHome(path, primaryHome));
+    const configuredSqliteHome = resolveConfiguredSqliteHome(
+      this.options.environment,
+      this.options.cwd,
+      homeDirectory,
+    );
+    return paths.map((path) => buildHome(path, primaryHome, configuredHome, configuredSqliteHome));
   }
 
   private async queryHome(home: ResolvedCodexHistoryHome, query: CodexHistoryQuery): Promise<CodexThread[]> {
+    if (!home.available) throw new Error(`Codex home 不可用：${home.path}`);
+
+    // The state database is the normal list source. App-server remains the
+    // compatibility fallback for old/fixture Homes without a readable
+    // `threads` table; it is not used for the normal current layout and hence
+    // does not scan every local rollout directory on each page refresh.
+    const sqliteThreads = queryCodexThreadsFromSqlite(home.sqliteHome, query);
+    if (sqliteThreads) return sqliteThreads;
+
+    return this.queryHomeFromAppServer(home, query);
+  }
+
+  private async queryHomeFromAppServer(home: ResolvedCodexHistoryHome, query: CodexHistoryQuery): Promise<CodexThread[]> {
     if (!home.available) throw new Error(`Codex home 不可用：${home.path}`);
 
     const client = this.createClient(home);
@@ -2093,8 +2114,277 @@ export function discoverCodexHistoryHomes(
     homeDirectory,
   );
   const primaryHome = codexAccountsRoot(configuredHome, homeDirectory);
+  const configuredSqliteHome = resolveConfiguredSqliteHome(environment, undefined, homeDirectory);
   return discoverCodexHomePaths(environment, homeDirectory)
-    .map((path) => toPublicHome(buildHome(normalizePath(path, homeDirectory), primaryHome)));
+    .map((path) => toPublicHome(buildHome(normalizePath(path, homeDirectory), primaryHome, configuredHome, configuredSqliteHome)));
+}
+
+function resolveConfiguredSqliteHome(
+  environment: Record<string, string | undefined> | undefined,
+  cwd: string | undefined,
+  homeDirectory: string,
+): string | undefined {
+  const configured = environment?.CODEX_SQLITE_HOME?.trim();
+  if (!configured) return undefined;
+  const expanded = configured.replace(/^~(?=\/|$)/, homeDirectory);
+  return normalizePath(resolve(cwd ?? process.cwd(), expanded), homeDirectory);
+}
+
+function queryCodexThreadsFromSqlite(
+  sqliteHome: string | undefined,
+  query: CodexHistoryQuery,
+): CodexThread[] | null {
+  if (!sqliteHome) return null;
+  let candidates: string[];
+  try {
+    candidates = readdirSync(sqliteHome)
+      .filter((name) => /^state_\d+\.sqlite$/.test(name))
+      .sort((left, right) => Number(right.match(/(\d+)/)?.[1] ?? 0) - Number(left.match(/(\d+)/)?.[1] ?? 0));
+  } catch {
+    return null;
+  }
+  if (candidates.length === 0) return null;
+
+  for (const name of candidates) {
+    const databasePath = join(sqliteHome, name);
+    let database: SqliteDatabase;
+    try {
+      database = openReadonlyCodexHistoryDatabase(databasePath);
+    } catch (error) {
+      // Empty fixture files and older non-SQLite placeholders are not a
+      // usable state database. Keep the compatibility app-server fallback for
+      // those Homes without making a normal valid database depend on it.
+      if (!isUnsupportedCodexSqliteError(error)) throw error;
+      continue;
+    }
+    try {
+      let table: { name?: unknown } | undefined;
+      try {
+        table = database.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'threads' LIMIT 1",
+        ).get() as { name?: unknown } | undefined;
+      } catch (error) {
+        if (isUnsupportedCodexSqliteError(error)) continue;
+        throw error;
+      }
+      if (table?.name !== "threads") continue;
+      const columns = new Set(
+        (database.prepare("PRAGMA table_info(threads)").all() as Array<{ name?: unknown }>)
+          .flatMap((column) => typeof column.name === "string" ? [column.name] : []),
+      );
+      if (!columns.has("id")) continue;
+
+      const archivedColumn = columns.has("archived") ? sqliteColumn(columns, "archived") : null;
+      if (query.archived === "archived" && !archivedColumn) return [];
+      const where: string[] = [];
+      const parameters: Array<string | number | null> = [];
+      if (archivedColumn && query.archived !== "all") {
+        where.push(`COALESCE(${archivedColumn}, 0) = ?`);
+        parameters.push(query.archived === "archived" ? 1 : 0);
+      }
+      const sortColumn = query.sortKey === "created_at"
+        ? sqliteColumn(columns, "created_at_ms") !== "NULL" ? sqliteColumn(columns, "created_at_ms") : sqliteColumn(columns, "created_at")
+        : query.sortKey === "recency_at"
+          ? sqliteColumn(columns, "recency_at_ms") !== "NULL" ? sqliteColumn(columns, "recency_at_ms") : sqliteColumn(columns, "recency_at")
+          : sqliteColumn(columns, "updated_at_ms") !== "NULL" ? sqliteColumn(columns, "updated_at_ms") : sqliteColumn(columns, "updated_at");
+      const orderColumn = sortColumn === "NULL" ? "rowid" : sortColumn;
+      const selectColumns = [
+        "id", "name", "title", "preview", "first_user_message", "created_at", "created_at_ms",
+        "updated_at", "updated_at_ms", "recency_at", "recency_at_ms", "source", "thread_source",
+        "model_provider", "model", "reasoning_effort", "cwd", "archived", "status", "project_id",
+        "cli_version", "rollout_path", "git_sha", "git_branch", "git_origin_url",
+      ].map((column) => `${sqliteColumn(columns, column)} AS ${column}`).join(", ");
+      const rows = database.prepare(
+        `SELECT ${selectColumns} FROM threads${where.length ? ` WHERE ${where.join(" AND ")}` : ""}
+         ORDER BY ${orderColumn} ${query.sortDirection === "asc" ? "ASC" : "DESC"}, id ASC
+         LIMIT ?`,
+      ).all(...parameters, CODEX_HISTORY_MAX_SCAN + 1) as Array<Record<string, unknown>>;
+      if (rows.length > CODEX_HISTORY_MAX_SCAN) {
+        throw new Error(`本地历史最多扫描 ${CODEX_HISTORY_MAX_SCAN} 个线程，请先缩小搜索范围`);
+      }
+      const latestTurnStatuses = readLatestCodexTurnStatuses(sqliteHome, rows.map((row) => String(row.id)));
+      return rows
+        .map(sqliteThreadFromRow)
+        .map((thread) => latestTurnStatuses.has(thread.id)
+          ? { ...thread, status: { type: latestTurnStatuses.get(thread.id)! } }
+          : thread)
+        .filter((thread) => matchesSqliteThreadFilters(thread, query));
+    } finally {
+      database.close();
+    }
+  }
+  return null;
+}
+
+function openReadonlyCodexHistoryDatabase(databasePath: string): SqliteDatabase {
+  const isBun = typeof (globalThis as typeof globalThis & { Bun?: unknown }).Bun !== "undefined";
+  const Sqlite = DatabaseSync as unknown as new (
+    path: string,
+    options?: { readonly?: boolean; readOnly?: boolean },
+  ) => SqliteDatabase;
+  const database = new Sqlite(databasePath, isBun ? { readonly: true } : { readOnly: true });
+  database.exec("PRAGMA query_only = ON; PRAGMA busy_timeout = 1000;");
+  return database;
+}
+
+function isUnsupportedCodexSqliteError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /not a database|file is encrypted|unsupported file format|malformed/i.test(message);
+}
+
+function readLatestCodexTurnStatuses(sqliteHome: string, threadIds: string[]): Map<string, string> {
+  const wanted = [...new Set(threadIds.filter(Boolean))];
+  if (wanted.length === 0) return new Map();
+  let candidates: string[];
+  try {
+    candidates = readdirSync(sqliteHome)
+      .filter((name) => /^thread_history_\d+\.sqlite$/.test(name))
+      .sort((left, right) => Number(right.match(/(\d+)/)?.[1] ?? 0) - Number(left.match(/(\d+)/)?.[1] ?? 0));
+  } catch {
+    return new Map();
+  }
+  for (const name of candidates) {
+    let database: SqliteDatabase | undefined;
+    try {
+      database = openReadonlyCodexHistoryDatabase(join(sqliteHome, name));
+      const columns = new Set(
+        (database.prepare("PRAGMA table_info(thread_turns)").all() as Array<{ name?: unknown }>)
+          .flatMap((column) => typeof column.name === "string" ? [column.name] : []),
+      );
+      if (!columns.has("thread_id") || !columns.has("status")) {
+        database.close();
+        continue;
+      }
+      const result = new Map<string, string>();
+      const completedColumn = columns.has("completed_at") ? sqliteColumn(columns, "completed_at") : "NULL";
+      const startedColumn = columns.has("started_at") ? sqliteColumn(columns, "started_at") : "NULL";
+      for (let offset = 0; offset < wanted.length; offset += 500) {
+        const batch = wanted.slice(offset, offset + 500);
+        const placeholders = batch.map(() => "?").join(", ");
+        const rows = database.prepare(
+          `SELECT thread_id, status FROM thread_turns
+           WHERE thread_id IN (${placeholders})
+           ORDER BY COALESCE(${completedColumn}, ${startedColumn}, 0) DESC, turn_id DESC`,
+        ).all(...batch) as Array<{ thread_id?: unknown; status?: unknown }>;
+        for (const row of rows) {
+          const threadId = typeof row.thread_id === "string" ? row.thread_id : "";
+          if (!threadId || result.has(threadId)) continue;
+          const status = sqliteTurnStatus(row.status);
+          if (status) result.set(threadId, status);
+        }
+      }
+      database.close();
+      database = undefined;
+      return result;
+    } catch {
+      try { database?.close(); } catch { /* optional status metadata */ }
+      // A missing/old thread-history index must not turn a valid state DB into
+      // an app-server directory scan. The state rows still provide the list.
+      continue;
+    }
+  }
+  return new Map();
+}
+
+function sqliteTurnStatus(value: unknown): string | undefined {
+  const status = sqliteText(value)?.toLocaleLowerCase();
+  if (!status) return undefined;
+  if (["inprogress", "in_progress", "running", "active", "started"].includes(status)) return "active";
+  if (["failed", "error", "systemerror", "system_error"].includes(status)) return "systemError";
+  return "idle";
+}
+
+function sqliteColumn(columns: Set<string>, name: string): string {
+  return columns.has(name) ? `\"${name}\"` : "NULL";
+}
+
+function sqliteText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  return text.length > 0 ? text : undefined;
+}
+
+function sqliteNumber(value: unknown): number | undefined {
+  if (typeof value === "bigint") {
+    const converted = Number(value);
+    return Number.isSafeInteger(converted) ? converted : undefined;
+  }
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string" && value.trim()) {
+    const converted = Number(value);
+    return Number.isFinite(converted) ? converted : undefined;
+  }
+  return undefined;
+}
+
+function sqliteTimestampSeconds(milliseconds: unknown, seconds: unknown): number | undefined {
+  const ms = sqliteNumber(milliseconds);
+  if (ms !== undefined) return ms / 1_000;
+  return sqliteNumber(seconds);
+}
+
+function sqliteThreadFromRow(row: Record<string, unknown>): CodexThread {
+  // `source` is the app-server source-kind (cli/vscode/exec/...), while
+  // `thread_source` is a finer-grained origin such as `user` or `subagent`.
+  // Use the former for the History source filter and retain the latter as the
+  // additional threadSource field.
+  const source = sqliteText(row.source) ?? sqliteText(row.thread_source) ?? "cli";
+  const threadSource = sqliteText(row.thread_source) ?? source;
+  const name = sqliteText(row.name) ?? sqliteText(row.title) ?? null;
+  const preview = sqliteText(row.preview)
+    ?? sqliteText(row.first_user_message)
+    ?? name
+    ?? "";
+  const createdAt = sqliteTimestampSeconds(row.created_at_ms, row.created_at);
+  const updatedAt = sqliteTimestampSeconds(row.updated_at_ms, row.updated_at) ?? createdAt;
+  const recencyAt = sqliteTimestampSeconds(row.recency_at_ms, row.recency_at) ?? updatedAt ?? createdAt;
+  const archivedValue = sqliteNumber(row.archived);
+  const archived = archivedValue !== undefined
+    ? archivedValue !== 0
+    : row.archived === true || row.archived === "1";
+  const gitSha = sqliteText(row.git_sha);
+  const gitBranch = sqliteText(row.git_branch);
+  const gitOriginUrl = sqliteText(row.git_origin_url);
+  return {
+    id: String(row.id),
+    ...(name === null ? {} : { name }),
+    preview,
+    ...(createdAt === undefined ? {} : { createdAt }),
+    ...(updatedAt === undefined ? {} : { updatedAt }),
+    ...(recencyAt === undefined ? {} : { recencyAt }),
+    status: { type: sqliteText(row.status) ?? "idle" },
+    source,
+    threadSource,
+    ...(sqliteText(row.cwd) ? { cwd: sqliteText(row.cwd) } : {}),
+    ...(sqliteText(row.model_provider) ? { modelProvider: sqliteText(row.model_provider) } : {}),
+    ...(sqliteText(row.model) ? { model: sqliteText(row.model) } : {}),
+    ...(sqliteText(row.reasoning_effort) ? { reasoningEffort: sqliteText(row.reasoning_effort) } : {}),
+    ...(sqliteText(row.project_id) ? { projectId: sqliteText(row.project_id) } : {}),
+    ...(sqliteText(row.cli_version) ? { cliVersion: sqliteText(row.cli_version) } : {}),
+    ...(sqliteText(row.rollout_path) ? { path: sqliteText(row.rollout_path) } : {}),
+    ...(gitSha || gitBranch || gitOriginUrl ? { gitInfo: { sha: gitSha, branch: gitBranch, originUrl: gitOriginUrl } } : {}),
+    archived,
+  };
+}
+
+function matchesSqliteThreadFilters(thread: CodexThread, query: CodexHistoryQuery): boolean {
+  if (!matchesLocalFilters(thread, query)) return false;
+  if (query.sourceKinds?.length) {
+    const labels = [codexThreadSourceLabel(thread.source), codexThreadSourceLabel(thread.threadSource)];
+    if (!query.sourceKinds.some((source) => labels.includes(source))) return false;
+  }
+  if (query.modelProviders?.length && (!thread.modelProvider || !query.modelProviders.includes(thread.modelProvider))) {
+    return false;
+  }
+  const searchTerm = query.searchTerm?.trim().toLocaleLowerCase();
+  if (searchTerm) {
+    const haystack = [thread.id, thread.name, thread.preview, thread.cwd, thread.path]
+      .filter((value): value is string => typeof value === "string")
+      .join("\n")
+      .toLocaleLowerCase();
+    if (!haystack.includes(searchTerm)) return false;
+  }
+  return true;
 }
 
 function codexAccountsRoot(configuredHome: string, homeDirectory: string): string {
@@ -2131,6 +2421,9 @@ function buildListParams(
 
 function codexHistoryListCacheFilterKey(query: CodexHistoryQuery, archived: boolean): string {
   const filter = {
+    // Bump the partition when the list source changes so a pre-SQLite cache
+    // cannot keep app-server/rollout results alive for the normal page path.
+    source: "codex-state-sqlite-v1",
     archived,
     searchTerm: query.searchTerm ?? "",
     statuses: [...(query.statuses ?? [])].sort(),
@@ -2154,7 +2447,7 @@ function codexHistorySourceFingerprint(home: ResolvedCodexHistoryHome): string |
       const file = statSync(join(home.sqliteHome!, name));
       return `${name}:${file.size}:${file.mtimeMs}:${file.ino}`;
     }).join("\n");
-    return createHash("sha256").update(snapshot).digest("hex");
+    return createHash("sha256").update(`${home.sqliteHome}\n${snapshot}`).digest("hex");
   } catch {
     return null;
   }
@@ -2214,9 +2507,18 @@ function threadSortTimestamp(thread: CodexThread, sortKey: CodexThreadSortKey): 
   return fallback === null ? 0 : fallback / 1_000;
 }
 
-function buildHome(path: string, primaryHome: string): ResolvedCodexHistoryHome {
+function buildHome(
+  path: string,
+  primaryHome: string,
+  configuredHome: string,
+  configuredSqliteHome?: string,
+): ResolvedCodexHistoryHome {
   const available = existsSync(path) && isDirectory(path);
-  const sqliteHome = available ? findSqliteHome(path) : undefined;
+  const sqliteHome = available
+    ? (path === configuredHome && configuredSqliteHome
+      ? configuredSqliteHome
+      : findSqliteHome(path, path === primaryHome))
+    : undefined;
   const relativeToAccounts = relative(join(primaryHome, "accounts"), path);
   const accountName = relativeToAccounts && !relativeToAccounts.startsWith("..")
     ? relativeToAccounts.split("/")[0]
@@ -2234,8 +2536,12 @@ function buildHome(path: string, primaryHome: string): ResolvedCodexHistoryHome 
   };
 }
 
-function findSqliteHome(homePath: string): string | undefined {
+function findSqliteHome(homePath: string, primary: boolean): string | undefined {
   const nested = join(homePath, "sqlite");
+  // The primary Home follows Codex's default SQLite location. Additional
+  // account Homes retain the nested layout used by existing installations.
+  // An explicit CODEX_SQLITE_HOME for the configured Home takes precedence.
+  if (primary && hasStateDatabase(homePath)) return homePath;
   if (hasStateDatabase(nested)) return nested;
   if (hasStateDatabase(homePath)) return homePath;
   return undefined;

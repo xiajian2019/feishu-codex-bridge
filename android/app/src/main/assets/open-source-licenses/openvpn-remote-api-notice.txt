@@ -1,0 +1,9 @@
+OpenVPN for Android external API, version 0.7.64
+Copyright 2013-2014 Arne Schwabe
+
+The external API files are from the OpenVPN for Android remoteExample,
+licensed under the Apache License, Version 2.0. A copy of the license is
+included as Apache-2.0.txt. Source:
+https://github.com/schwabe/ics-openvpn/tree/v0.7.64/remoteExample
+
+This application does not bundle the OpenVPN for Android VPN client.

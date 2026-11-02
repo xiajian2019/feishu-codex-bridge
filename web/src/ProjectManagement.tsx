@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent, type ReactElement } from "react";
 import { createProject, fetchProjects, updateProject } from "./api.js";
 import type { ProjectRecord, ProjectStatus } from "./types.js";
+import { useMobileBack } from "./use-mobile-back.js";
 
 export function ProjectManagement(): ReactElement {
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
@@ -8,6 +9,7 @@ export function ProjectManagement(): ReactElement {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [formOpen, setFormOpen] = useState(false);
+  useMobileBack(formOpen, () => { if (!busy) setFormOpen(false); }, 100);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | "available" | "disabled" | "unavailable">("all");
   const [editing, setEditing] = useState<string | null>(null);

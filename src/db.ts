@@ -20,7 +20,7 @@ import {
   SHORTCUT_SURFACES,
   TASK_STATES,
 } from "./types.js";
-import type { WebAuthPairingRecord, WebAuthSessionRecord } from "./web-auth.js";
+import type { PairingClaimResult, WebAuthPairingRecord, WebAuthSessionRecord } from "./web-auth.js";
 import type { GitWorkspaceSnapshot } from "./run-artifacts.js";
 import type { PreparedTaskWorkspace } from "./git-workspaces.js";
 import type {
@@ -475,7 +475,11 @@ CREATE INDEX IF NOT EXISTS idx_shortcuts_group_order
 CREATE TABLE IF NOT EXISTS web_auth_pairings (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     code_hash TEXT NOT NULL,
-    expires_at TEXT NOT NULL
+    expires_at TEXT NOT NULL,
+    target_session_id TEXT,
+    target_code_hash TEXT,
+    target_token_hash TEXT,
+    target_revoked_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS web_auth_sessions (
@@ -503,6 +507,7 @@ CREATE TABLE IF NOT EXISTS tmux_sessions (
     project_key TEXT,
     codex_home_id TEXT,
     working_directory TEXT NOT NULL,
+    working_directory_override TEXT,
     tmux_created_at INTEGER NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
@@ -3853,27 +3858,65 @@ export class StateDatabase {
 
   public getWebAuthPairing(): WebAuthPairingRecord | null {
     const row = this.db
-      .prepare("SELECT code_hash, expires_at FROM web_auth_pairings WHERE id = 1")
-      .get() as { code_hash: string; expires_at: string } | undefined;
+      .prepare("SELECT code_hash, expires_at, target_session_id, target_code_hash, target_token_hash, target_revoked_at FROM web_auth_pairings WHERE id = 1")
+      .get() as { code_hash: string; expires_at: string; target_session_id: string | null; target_code_hash: string | null; target_token_hash: string | null; target_revoked_at: string | null } | undefined;
     if (!row) return null;
     const expiresAt = Date.parse(row.expires_at);
-    return Number.isFinite(expiresAt)
-      ? { codeHash: row.code_hash, expiresAt }
-      : null;
+    if (!Number.isFinite(expiresAt)) return null;
+    // Older Bridge/CLI versions replace only code_hash and expires_at. A target
+    // belongs solely to the code that issued it, not a later legacy pairing.
+    const oldWriterReplacedCode = row.target_code_hash !== null && row.target_code_hash !== row.code_hash;
+    const noTarget = row.target_code_hash === null && row.target_session_id === null && row.target_token_hash === null && row.target_revoked_at === null;
+    const target = oldWriterReplacedCode || noTarget ? null : {
+      // An incomplete target must never fall back to creating a new authorization.
+      sessionId: row.target_code_hash === row.code_hash ? row.target_session_id ?? "" : "",
+      tokenHash: row.target_token_hash ?? "", revokedAt: row.target_revoked_at,
+    };
+    return { codeHash: row.code_hash, expiresAt, target };
   }
 
   public saveWebAuthPairing(record: WebAuthPairingRecord): void {
     this.db
       .prepare(
-        `INSERT INTO web_auth_pairings (id, code_hash, expires_at)
-         VALUES (1, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET code_hash = excluded.code_hash, expires_at = excluded.expires_at`,
+        `INSERT INTO web_auth_pairings (id, code_hash, expires_at, target_session_id, target_code_hash, target_token_hash, target_revoked_at)
+         VALUES (1, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET code_hash = excluded.code_hash, expires_at = excluded.expires_at,
+           target_session_id = excluded.target_session_id, target_code_hash = excluded.target_code_hash,
+           target_token_hash = excluded.target_token_hash, target_revoked_at = excluded.target_revoked_at`,
       )
-      .run(record.codeHash, new Date(record.expiresAt).toISOString());
+      .run(record.codeHash, new Date(record.expiresAt).toISOString(), record.target?.sessionId ?? null,
+        record.target ? record.codeHash : null, record.target?.tokenHash ?? null, record.target?.revokedAt ?? null);
   }
 
-  public clearWebAuthPairing(): void {
-    this.db.prepare("DELETE FROM web_auth_pairings WHERE id = 1").run();
+  public clearWebAuthPairing(codeHash: string): void {
+    this.db.prepare("DELETE FROM web_auth_pairings WHERE id = 1 AND code_hash = ?").run(codeHash);
+  }
+
+  public consumeWebAuthPairing(pairing: WebAuthPairingRecord, session: WebAuthSessionRecord): PairingClaimResult {
+    return this.transaction(() => {
+      // Delete first to acquire the write lock and consume exactly the code that
+      // was validated, even when another Bridge process shares this database.
+      const consumed = this.db.prepare("DELETE FROM web_auth_pairings WHERE id = 1 AND code_hash = ? AND expires_at > ?")
+        .run(pairing.codeHash, session.lastSeenAt);
+      if (consumed.changes === 0) return "pairing_unavailable";
+      if (!pairing.target) {
+        this.createWebAuthSession(session);
+        return "ok";
+      }
+      const previous = this.db.prepare("SELECT token_hash, revoked_at, expires_at FROM web_auth_sessions WHERE session_id = ?")
+        .get(pairing.target.sessionId) as { token_hash: string; revoked_at: string | null; expires_at: string } | undefined;
+      if (!previous || previous.token_hash !== pairing.target.tokenHash || previous.revoked_at !== pairing.target.revokedAt) {
+        return "device_unavailable";
+      }
+      const expiresAt = Date.parse(previous.expires_at) > Date.parse(session.expiresAt) ? previous.expires_at : session.expiresAt;
+      this.db.prepare(`UPDATE web_auth_sessions SET token_hash = ?, user_agent = ?, remote_address = ?,
+        last_seen_at = ?, expires_at = ?, revoked_at = NULL, client_type = ?,
+        last_access_origin = ?, last_access_origin_at = ? WHERE session_id = ?`)
+        .run(session.tokenHash, session.userAgent, session.remoteAddress, session.lastSeenAt, expiresAt,
+          session.clientType ?? "unknown", session.lastAccessOrigin ?? null, session.lastAccessOriginAt ?? null,
+          pairing.target.sessionId);
+      return "ok";
+    });
   }
 
   public createWebAuthSession(record: WebAuthSessionRecord): void {
@@ -3971,9 +4014,10 @@ export class StateDatabase {
     const inferredProject = this.db.prepare(
       "SELECT name FROM projects WHERE path = ? AND status = 'available' LIMIT 1",
     ).get(resolvedCwd) as { name: string } | undefined;
-    const projectKey = options.projectKey ?? inferredProject?.name ?? null;
+    const hasExplicitProjectKey = Object.hasOwn(options, "projectKey");
+    const projectKey = hasExplicitProjectKey ? options.projectKey! : inferredProject?.name ?? null;
     const existing = this.db.prepare(
-      `SELECT record_id, session_name, project_key, working_directory, last_seen_at, ended_at, created_by_device_id, workspace_id
+      `SELECT record_id, session_name, project_key, working_directory, working_directory_override, last_seen_at, ended_at, created_by_device_id, workspace_id
        FROM tmux_sessions WHERE tmux_session_id = ? AND tmux_created_at = ? AND ended_at IS NULL
        ORDER BY first_seen_at DESC LIMIT 1`,
     ).get(session.id, session.createdAt) as {
@@ -3981,6 +4025,7 @@ export class StateDatabase {
       session_name: string;
       project_key: string | null;
       working_directory: string;
+      working_directory_override: string | null;
       last_seen_at: string;
       ended_at: string | null;
       created_by_device_id: string | null;
@@ -3991,13 +4036,14 @@ export class StateDatabase {
       const current = existing;
       const refreshAfter = new Date(this.now().getTime() - 60_000).toISOString();
       const refreshedLastSeen = current.last_seen_at <= refreshAfter ? now : current.last_seen_at;
-      const nextProjectKey = projectKey ?? current.project_key;
+      const nextProjectKey = hasExplicitProjectKey ? projectKey : current.project_key;
+      const nextWorkingDirectory = current.working_directory_override ?? session.cwd;
       const nextDeviceId = current.created_by_device_id ?? options.createdByDeviceId ?? null;
       const nextWorkspaceId = options.workspaceId ?? current.workspace_id;
       if (
         current.session_name !== session.name
         || current.project_key !== nextProjectKey
-        || current.working_directory !== session.cwd
+        || current.working_directory !== nextWorkingDirectory
         || current.last_seen_at !== refreshedLastSeen
         || current.ended_at !== null
         || current.created_by_device_id !== nextDeviceId
@@ -4008,7 +4054,7 @@ export class StateDatabase {
           ended_at = NULL, created_by_device_id = ?, workspace_id = ? WHERE record_id = ?`).run(
             session.name,
             nextProjectKey,
-            session.cwd,
+            nextWorkingDirectory,
             refreshedLastSeen,
             nextDeviceId,
             nextWorkspaceId,
@@ -4020,9 +4066,9 @@ export class StateDatabase {
 
     const recordId = randomUUID();
     this.db.prepare(`INSERT INTO tmux_sessions
-      (record_id, tmux_session_id, session_name, project_key, working_directory,
+      (record_id, tmux_session_id, session_name, project_key, working_directory, working_directory_override,
        tmux_created_at, first_seen_at, last_seen_at, ended_at, created_by_device_id, workspace_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`).run(
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?, ?)`).run(
         recordId,
         session.id,
         session.name,
@@ -4089,6 +4135,20 @@ export class StateDatabase {
     const row = this.db.prepare("SELECT * FROM tmux_sessions WHERE record_id = ?")
       .get(recordId) as Record<string, unknown> | undefined;
     return row ? mapTmuxSession(row) : null;
+  }
+
+  public setTmuxSessionWorkingDirectory(
+    recordId: string,
+    actualDirectory: string,
+    overrideDirectory: string | null,
+  ): StoredTmuxSession | null {
+    const current = this.getTmuxSession(recordId);
+    if (!current || current.ended_at !== null || current.suspended_at !== null) return null;
+    const workingDirectory = overrideDirectory ?? actualDirectory;
+    this.db.prepare(`UPDATE tmux_sessions
+      SET working_directory = ?, working_directory_override = ?, last_seen_at = ?
+      WHERE record_id = ?`).run(workingDirectory, overrideDirectory, this.timestamp(), current.record_id);
+    return this.getTmuxSession(current.record_id);
   }
 
   public recordTmuxSessionOpen(tmuxSessionId: string): StoredTmuxSession | null {
@@ -4241,6 +4301,17 @@ export class StateDatabase {
       .run(this.timestamp(), tmuxSessionId);
   }
 
+  public markTmuxSessionRecordEnded(recordId: string): void {
+    this.db.prepare("UPDATE tmux_sessions SET ended_at = ?, suspended_at = NULL WHERE record_id = ? AND ended_at IS NULL")
+      .run(this.timestamp(), recordId);
+  }
+
+  public markTmuxSessionRecordSuspended(recordId: string): StoredTmuxSession | null {
+    const result = this.db.prepare(`UPDATE tmux_sessions SET suspended_at = ?, ended_at = NULL
+      WHERE record_id = ? AND ended_at IS NULL AND suspended_at IS NULL`).run(this.timestamp(), recordId);
+    return result.changes > 0 ? this.getTmuxSession(recordId) : null;
+  }
+
   public markTmuxSessionSuspended(tmuxSessionId: string): StoredTmuxSession | null {
     const result = this.db.prepare(`UPDATE tmux_sessions
       SET suspended_at = ?, ended_at = NULL
@@ -4251,7 +4322,7 @@ export class StateDatabase {
 
   public resumeTmuxSession(recordId: string, session: { id: string; name: string; cwd: string; createdAt: number }): StoredTmuxSession | null {
     const result = this.db.prepare(`UPDATE tmux_sessions SET
-      tmux_session_id = ?, session_name = ?, working_directory = ?, tmux_created_at = ?,
+      tmux_session_id = ?, session_name = ?, working_directory = COALESCE(working_directory_override, ?), tmux_created_at = ?,
       last_seen_at = ?, suspended_at = NULL, ended_at = NULL
       WHERE record_id = ? AND ended_at IS NULL AND suspended_at IS NOT NULL`).run(
         session.id,
@@ -4531,6 +4602,10 @@ export class StateDatabase {
         ALTER TABLE codex_account_usage_snapshots_by_date RENAME TO codex_account_usage_snapshots;
       `);
     });
+    addColumnIfMissing(this.db, "web_auth_pairings", "target_session_id", "TEXT");
+    addColumnIfMissing(this.db, "web_auth_pairings", "target_code_hash", "TEXT");
+    addColumnIfMissing(this.db, "web_auth_pairings", "target_token_hash", "TEXT");
+    addColumnIfMissing(this.db, "web_auth_pairings", "target_revoked_at", "TEXT");
     addColumnIfMissing(this.db, "web_auth_sessions", "client_type", "TEXT NOT NULL DEFAULT 'unknown'");
     addColumnIfMissing(this.db, "web_auth_sessions", "last_access_origin", "TEXT");
     addColumnIfMissing(this.db, "web_auth_sessions", "last_access_origin_at", "TEXT");
@@ -4563,6 +4638,7 @@ export class StateDatabase {
     addColumnIfMissing(this.db, "tmux_session_actions", "working_directory", "TEXT NOT NULL DEFAULT ''");
     addColumnIfMissing(this.db, "tmux_session_actions", "submission_fingerprint", "TEXT");
     addColumnIfMissing(this.db, "tmux_sessions", "codex_home_id", "TEXT");
+    addColumnIfMissing(this.db, "tmux_sessions", "working_directory_override", "TEXT");
     addColumnIfMissing(this.db, "tmux_sessions", "workspace_id", "TEXT");
     addColumnIfMissing(this.db, "tmux_sessions", "open_count", "INTEGER NOT NULL DEFAULT 0");
     addColumnIfMissing(this.db, "tmux_sessions", "last_opened_at", "TEXT");
@@ -4828,7 +4904,7 @@ function isSqliteBusyError(error: unknown): boolean {
 
 function addColumnIfMissing(
   db: SqliteDatabase,
-  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts" | "shortcut_groups" | "tmux_sessions" | "tmux_session_actions" | "web_auth_sessions",
+  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts" | "shortcut_groups" | "tmux_sessions" | "tmux_session_actions" | "web_auth_pairings" | "web_auth_sessions",
   column: string,
   definition: string,
 ): void {
@@ -5153,6 +5229,7 @@ function mapTmuxSession(row: Record<string, unknown>): StoredTmuxSession {
     project_key: nullableString(row.project_key),
     codex_home_id: nullableString(row.codex_home_id),
     working_directory: String(row.working_directory),
+    working_directory_override: nullableString(row.working_directory_override),
     tmux_created_at: Number(row.tmux_created_at),
     first_seen_at: String(row.first_seen_at),
     last_seen_at: String(row.last_seen_at),

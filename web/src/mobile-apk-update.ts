@@ -46,3 +46,11 @@ export function readApkUpdateState(storage: Storage, update: MobileApkUpdate): A
 export function shouldOfferApkUpdate(update: MobileApkUpdate, installedBuild: number, state: ApkUpdateState, now = Date.now()): boolean {
   return update.versionCode > installedBuild && state.snoozeUntil <= now;
 }
+
+/** An explicit check overrides a previous snooze while retaining a verified download. */
+export function decideApkUpdate(update: MobileApkUpdate, installedBuild: number, state: ApkUpdateState,
+  manual = false, now = Date.now()): { state: ApkUpdateState; offer: boolean } {
+  if (installedBuild >= update.versionCode) return { state: { ...state, phase: "installed" }, offer: false };
+  const next = manual ? { ...state, snoozeUntil: 0 } : state;
+  return { state: next, offer: shouldOfferApkUpdate(update, installedBuild, next, now) };
+}

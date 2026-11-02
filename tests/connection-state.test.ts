@@ -3,8 +3,12 @@ import { setLocalDraftScope } from "../web/src/local-draft-scope.js";
 
 import {
   cacheBridgeJson,
+  bridgeTransportMayBeReachable,
+  getBridgeConnectionSnapshot,
   isTransientBridgeFailure,
   markBridgeCacheFallback,
+  markBridgeRequestFailure,
+  markBridgeRequestSuccess,
   readCachedBridgeJson,
   shouldCacheBridgeGet,
 } from "../web/src/connection-state.js";
@@ -72,6 +76,41 @@ describe("Bridge connection state cache", () => {
     expect(isTransientBridgeFailure(new TypeError("Failed to fetch"))).toBe(true);
     expect(isTransientBridgeFailure(new Error("bad request"), 422)).toBe(false);
     expect(isTransientBridgeFailure(new Error("gateway down"), 503)).toBe(true);
+  });
+
+  it("separates authentication and HTTP failures from a network outage", () => {
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    const windowEvents = new EventTarget();
+    let vpnRequests = 0;
+    windowEvents.addEventListener("bridge:api-network-unreachable", () => { vpnRequests += 1; });
+    Object.defineProperty(globalThis, "window", { configurable: true, value: windowEvents });
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { onLine: true } });
+    try {
+      markBridgeRequestFailure(new Error("unauthorized"), 401);
+      expect(getBridgeConnectionSnapshot()).toMatchObject({ failureKind: "api-auth-failed", browserOnline: true });
+      expect(vpnRequests).toBe(0);
+
+      markBridgeRequestFailure(new Error("gateway"), 503);
+      expect(getBridgeConnectionSnapshot()).toMatchObject({ failureKind: "api-response-error", browserOnline: true });
+      expect(vpnRequests).toBe(0);
+
+      markBridgeRequestFailure(new TypeError("Failed to fetch"));
+      expect(getBridgeConnectionSnapshot()).toMatchObject({ failureKind: "api-network-unreachable", browserOnline: true, target: "unknown" });
+      expect(vpnRequests).toBe(1);
+
+      windowEvents.dispatchEvent(new Event("bridge:mobile-vpn-target-unreachable"));
+      expect(getBridgeConnectionSnapshot()).toMatchObject({ failureKind: "target-unreachable", target: "unreachable" });
+      Object.defineProperty(globalThis, "navigator", { configurable: true, value: { onLine: false } });
+      markBridgeRequestSuccess();
+      expect(getBridgeConnectionSnapshot()).toMatchObject({ failureKind: null, api: "connected", target: "reachable", browserOnline: true });
+      expect(bridgeTransportMayBeReachable()).toBe(true);
+    } finally {
+      if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
+      else Reflect.deleteProperty(globalThis, "window");
+      if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
+      else Reflect.deleteProperty(globalThis, "navigator");
+    }
   });
 
   it("falls back for an HTML gateway error but rejects a successful empty response", async () => {
