@@ -53,10 +53,11 @@ describe("device authorization presentation", () => {
 
   it("renders compact identity and port summaries while keeping the raw UA in closed details", () => {
     const row = device({ current: true, clientType: "app", userAgent: WEBVIEW, lastAccessOrigin: "http://bridge.test:7130", lastAccessOriginAt: "2026-10-27T13:00:00.000Z" });
-    const html = renderToStaticMarkup(<DeviceAuthorizations devices={[row]} loading={false} busy={false} onRefresh={async () => {}} onRename={() => {}} onExtend={async () => {}} onRevoke={async () => {}} />);
+    const html = renderToStaticMarkup(<DeviceAuthorizations devices={[row]} loading={false} busy={false} onRefresh={async () => {}} onRename={() => {}} onExtend={async () => {}} onRevoke={async () => {}} onPair={() => {}} />);
     expect(html).toContain("Bridge App");
     expect(html).toContain("最近访问 :7130");
     expect(html).toContain("当前授权");
+    expect(html).toContain("为 华为手机 授权 ABCDEF12 生成二维码");
     expect(html.indexOf(WEBVIEW)).toBeGreaterThan(html.indexOf('<details class="device-auth-details">'));
     expect(html).not.toContain('<details class="device-auth-details" open');
     expect(html).not.toContain("role=\"dialog\"");

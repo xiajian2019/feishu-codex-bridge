@@ -1,4 +1,4 @@
-import { createMobileFetch, isBridgeApiPath, normalizeBridgeServer, parseMobilePairingInput, type MobileConnection } from "./mobile-connection.js";
+import { createMobileFetch, isBridgeApiPath, normalizeBridgeServer, normalizeConfiguredBridgeServer, parseMobilePairingInput, type MobileConnection } from "./mobile-connection.js";
 import { createMobileConnectionSwitch } from "./mobile-connection-switch.js";
 import { readBridgeJson } from "./bridge-json.js";
 import { assertBridgeApiSupported, bridgeFeatureUnavailable, parseBridgeCapabilities, setBridgeCapabilities } from "./client-capabilities.js";
@@ -9,6 +9,8 @@ import { clearLocalDraftsAfterDeviceRevocation } from "./local-draft-cleanup.js"
 import type { AuthStatus } from "./pairing-diagnostics.js";
 import { parseApkUpdate, type MobileApkUpdate, type ApkUpdatePhase } from "./mobile-apk-update.js";
 import type { MobileShare } from "./mobile-handoff.js";
+import { BridgeResponseError } from "./bridge-json.js";
+import { markBridgeRequestFailure, markBridgeRequestStart, markBridgeRequestSuccess, subscribeBridgeApiUnreachable } from "./connection-state.js";
 export type { MobileApkUpdate } from "./mobile-apk-update.js";
 
 export const MOBILE_RESUME_EVENT = "bridge:mobile-resume";
@@ -22,6 +24,8 @@ let originalFetch: typeof fetch | null = null;
 let initialization: Promise<void> | null = null;
 let downloadTrackingInstalled = false;
 let credentialQueue = Promise.resolve();
+let removeGlobalVpnRecovery: (() => void) | null = null;
+let migratedCredentialServer: string | null = null;
 const connectionSwitch = createMobileConnectionSwitch();
 
 export function isMobileApp(): boolean { return import.meta.env.VITE_BRIDGE_MOBILE === "true"; }
@@ -41,8 +45,8 @@ export function bridgeUrl(path: string): string {
   return new URL(url.pathname + url.search + url.hash, connection.server).toString();
 }
 
-export function openMobileConnectionSettings(server?: string): void {
-  window.dispatchEvent(new CustomEvent(MOBILE_SETTINGS_EVENT, { detail: server ? { server } : undefined }));
+export function openMobileConnectionSettings(server?: string, error?: string): void {
+  window.dispatchEvent(new CustomEvent(MOBILE_SETTINGS_EVENT, { detail: { ...(server ? { server } : {}), ...(error ? { error } : {}) } }));
 }
 
 function persistCredential(action: () => Promise<void>): Promise<void> {
@@ -69,14 +73,26 @@ async function initialize(): Promise<void> {
   }
   originalFetch ??= window.fetch.bind(window);
   const native = await import("./mobile-native.js");
-  let server: string | null = null;
+  let savedServer: string | null = null;
   try {
     const saved = window.localStorage.getItem(SERVER_KEY);
-    if (saved) server = normalizeBridgeServer(saved);
+    if (saved) savedServer = normalizeBridgeServer(saved);
   } catch { window.localStorage.removeItem(SERVER_KEY); }
+  const server = savedServer ? normalizeConfiguredBridgeServer(savedServer) : null;
   if (server) {
     try {
-      connection = { server, token: await native.getCredential(server) };
+      let token = await native.getCredential(server);
+      if (!token && savedServer !== server && savedServer) {
+        // Migrate the old exact-origin credential inside native storage. The
+        // token never enters localStorage or a URL.
+        token = await native.getCredential(savedServer);
+        if (token) {
+          await persistCredential(() => native.setCredential(server, token!));
+          migratedCredentialServer = savedServer;
+        }
+      }
+      connection = { server, token };
+      window.localStorage.setItem(SERVER_KEY, server);
     } catch {
       // A missing/locked credential must lead to pairing, never to a browser cookie fallback.
       connection = { server, token: null };
@@ -97,6 +113,10 @@ async function initialize(): Promise<void> {
       if (connection?.server === failed.server && connection.token === failed.token) void forgetMobileCredential().catch(() => {});
     },
   });
+  removeGlobalVpnRecovery ??= subscribeBridgeApiUnreachable(() => {
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+    void requestMobileVpnRecovery().catch(() => {});
+  });
   await native.installNativeLifecycle();
   document.documentElement.classList.add("bridge-mobile-app");
 }
@@ -104,45 +124,88 @@ async function initialize(): Promise<void> {
 export async function checkMobileConnection(): Promise<boolean> {
   if (!connection?.token) return false;
   const selected = connection;
-  const response = await fetch("/api/auth/status", { signal: AbortSignal.timeout(12_000), cache: "no-store" });
-  if (!response.ok) throw new Error("Bridge 暂时无法连接（" + response.status + "）。");
-  const status = await readBridgeJson<AuthStatus>(response);
-  if (selected !== connection) throw new DOMException("Bridge connection changed", "AbortError");
-  if (typeof status.authenticated !== "boolean") throw new Error("当前后端的鉴权响应不兼容，请检查服务版本。");
-  if (status.authenticated) {
-    setBridgeCapabilities(parseBridgeCapabilities(status.client));
-    setLocalDraftScope(status.draftScope, selected.server);
-    try { restoreMobileDownloads(window.localStorage, scopedStorageKey("mobile-downloads")); }
-    catch { restoreMobileDownloads(null, null); }
-    // Sync is independent of login and never blocks an offline-capable SSH page.
-    void import("./composer-native-data.js").then((module) => module.syncNativeComposerData()).catch(() => {});
+  markBridgeRequestStart();
+  let requestEnded = false;
+  try {
+    const response = await fetch("/api/auth/status", { signal: AbortSignal.timeout(12_000), cache: "no-store" });
+    if (!response.ok) {
+      const error = new Error(response.status === 401 || response.status === 403
+        ? "Bridge 配对已失效，请重新配对。" : "Bridge 暂时无法连接（" + response.status + "）。");
+      markBridgeRequestFailure(error, response.status);
+      requestEnded = true;
+      if (response.status === 401 || response.status === 403) await forgetMobileCredential();
+      throw error;
+    }
+    const status = await readBridgeJson<AuthStatus>(response);
+    if (selected !== connection) throw new DOMException("Bridge connection changed", "AbortError");
+    if (typeof status.authenticated !== "boolean") throw new Error("当前后端的鉴权响应不兼容，请检查服务版本。");
+    markBridgeRequestSuccess();
+    requestEnded = true;
+    if (status.authenticated) {
+      setBridgeCapabilities(parseBridgeCapabilities(status.client));
+      setLocalDraftScope(status.draftScope, selected.server);
+      try { restoreMobileDownloads(window.localStorage, scopedStorageKey("mobile-downloads")); }
+      catch { restoreMobileDownloads(null, null); }
+      // Sync is independent of login and never blocks an offline-capable SSH page.
+      void import("./composer-native-data.js").then((module) => module.syncNativeComposerData()).catch(() => {});
+      if (migratedCredentialServer) {
+        const native = await import("./mobile-native.js");
+        const oldServer = migratedCredentialServer;
+        migratedCredentialServer = null;
+        void persistCredential(() => native.removeCredential(oldServer)).catch(() => {});
+      }
+    }
+    if (!status.authenticated) await forgetMobileCredential();
+    return status.authenticated;
+  } catch (error) {
+    if (!requestEnded && !(error instanceof DOMException && error.name === "AbortError" && selected !== connection)) {
+      markBridgeRequestFailure(error, error instanceof BridgeResponseError ? error.status : undefined);
+    } else if (!requestEnded) {
+      markBridgeRequestFailure(error);
+    }
+    throw error;
   }
-  if (!status.authenticated) await forgetMobileCredential();
-  return status.authenticated;
+}
+
+/** Ask the Android side to probe the actual Bridge API origin before starting VPN. */
+export async function requestMobileVpnRecovery(): Promise<boolean> {
+  const selected = connection;
+  if (!selected?.token) return false;
+  let url: URL;
+  try { url = new URL(selected.server); }
+  catch { return false; }
+  const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : url.protocol === "http:" ? 80 : Number.NaN;
+  if (!url.hostname || !Number.isInteger(port) || port < 1 || port > 65535) return false;
+  const native = await import("./mobile-native.js");
+  if (selected !== connection) return false;
+  return native.requestMobileVpnRecovery({ host: url.hostname, port });
 }
 
 export async function pairMobileConnection(address: string, code: string): Promise<void> {
   if (!originalFetch) throw new Error("App 尚未初始化，请重新打开。");
   const parsed = parseMobilePairingInput(address, code);
+  const server = normalizeConfiguredBridgeServer(parsed.server);
   await connectionSwitch.run(async () => {
-    const response = await originalFetch!(new URL("/api/auth/mobile/pair", parsed.server), {
+    const response = await originalFetch!(new URL("/api/auth/mobile/pair", server), {
       method: "POST", credentials: "omit", redirect: "error", cache: "no-store",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify({ code: parsed.code }), signal: AbortSignal.timeout(15_000),
     });
     const result = await readBridgeJson<{ token?: string; error?: string }>(response);
-    if (!response.ok) throw new Error(result.error || "配对失败（" + response.status + "）。");
+    if (!response.ok) throw new Error(result.error === "device authorization changed or was revoked"
+      ? "设备授权已变化或撤销，请在设备管理中重新生成二维码。"
+      : result.error || "配对失败（" + response.status + "）。");
     if (!result.token || !/^[A-Za-z0-9_-]{40,128}$/.test(result.token)) throw new Error("Bridge 返回了无效的配对结果。");
     const native = await import("./mobile-native.js");
     const token = result.token;
-    await persistCredential(() => native.setCredential(parsed.server, token));
-    return { server: parsed.server, token };
+    await persistCredential(() => native.setCredential(server, token));
+    return { server, token };
   }, (next) => { commitMobileConnection(next); return true; });
 }
 
 export async function switchMobileConnection(address: string): Promise<boolean> {
   if (!isMobileApp()) return false;
-  const server = normalizeBridgeServer(address);
+  const server = normalizeConfiguredBridgeServer(address);
   const previous = connection;
   const next = await connectionSwitch.run(async () => {
     if (!originalFetch) throw new Error("App 尚未初始化，请重新打开。");
@@ -187,6 +250,7 @@ function commitMobileConnection(next: MobileConnection): void {
 export async function forgetMobileCredential(): Promise<void> {
   const server = connection?.server;
   if (!server) return;
+  migratedCredentialServer = null;
   clearMobileDownloadScope();
   const cleanup = clearLocalDraftsAfterDeviceRevocation();
   setLocalDraftScope(null);

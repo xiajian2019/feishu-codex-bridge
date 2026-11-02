@@ -26,6 +26,7 @@ import {
 import type { CodexUsageAccount } from "./types.js";
 import { useSystemNavigation } from "./WebNavigation.js";
 import { copyMobileText, getBridgeOrigin, isMobileApp, MOBILE_RESUME_EVENT } from "./mobile-runtime.js";
+import { bridgeTransportMayBeReachable } from "./connection-state.js";
 import { getTmuxTerminalRenderTheme } from "./tmux-terminal-theme.js";
 import { failPendingTmuxSubmissionsOnDisconnect, type TerminalSubmissionResult } from "./tmux-terminal-utils.js";
 import { getTmuxTerminalTransport, type TmuxTerminalTransport, type TmuxTerminalTransportEvent } from "./tmux-terminal-runtime.js";
@@ -376,6 +377,7 @@ export function TmuxDashboard(): ReactElement {
   const [search, setSearch] = useState("");
   const [backendStatus, setBackendStatus] = useState<"connecting" | "online" | "offline">("connecting");
   const [terminalStatus, setTerminalStatus] = useState("IDLE");
+  const [connectionBannerDismissed, setConnectionBannerDismissed] = useState(false);
   const [terminalEverAttached, setTerminalEverAttached] = useState(false);
   const [terminalInputEnabled, setTerminalInputEnabled] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -408,6 +410,9 @@ export function TmuxDashboard(): ReactElement {
   useMobileBack(trackedTaskOpen, () => { if (!trackedTaskBusy) setTrackedTaskOpen(false); }, 100);
   useMobileBack(Boolean(sessionInspector), () => setSessionInspector(null), 900);
   useMobileBack(projectPickerOpen, () => setProjectPickerOpen(false), 110);
+  useEffect(() => {
+    setConnectionBannerDismissed(false);
+  }, [selectedId, terminalStatus]);
   const terminalHostRef = useRef<HTMLDivElement | null>(null);
   const projectPickerRef = useRef<HTMLDivElement | null>(null);
   const terminalInstanceRef = useRef<Terminal | null>(null);
@@ -887,7 +892,7 @@ export function TmuxDashboard(): ReactElement {
     setError(null);
     setToast({ message: "正在刷新 Session 列表…", isError: false });
     try {
-      if (navigator.onLine === false) {
+      if (!bridgeTransportMayBeReachable()) {
         setBackendStatus("offline");
         setToast({ message: "当前设备已离线，无法刷新 Session 列表；恢复网络后请重试。", isError: true });
         return;
@@ -917,7 +922,9 @@ export function TmuxDashboard(): ReactElement {
     const busyKey = `${action}:${session.id}`;
     setResurrectBusy(busyKey);
     try {
-      await requestApi<{ ok: true }>(`/sessions/${encodeURIComponent(session.id)}/resurrect/${action}`, { method: "POST" });
+      await requestApi<{ ok: true }>(`/sessions/${encodeURIComponent(session.id)}/resurrect/${action}`, {
+        method: "POST", headers: { "X-Bridge-Session-Created-At": String(session.createdAt) },
+      });
       if (action === "restore") await loadSessions(true);
       await loadResurrectStatus();
       setToast({
@@ -1669,7 +1676,9 @@ export function TmuxDashboard(): ReactElement {
     const busyKey = `suspend:${session.id}`;
     setResurrectBusy(busyKey);
     try {
-      await requestApi(`/sessions/${encodeURIComponent(session.id)}/suspend`, { method: "POST" });
+      await requestApi(`/sessions/${encodeURIComponent(session.id)}/suspend`, {
+        method: "POST", headers: { "X-Bridge-Session-Created-At": String(session.createdAt) },
+      });
       if (selectedId === session.id) {
         setSelectedId(null);
         setTerminalInputEnabled(false);
@@ -1692,7 +1701,9 @@ export function TmuxDashboard(): ReactElement {
     const busyKey = `resume:${session.id}`;
     setResurrectBusy(busyKey);
     try {
-      const result = await requestApi<{ session: { id: string; name: string } }>(`/sessions/${encodeURIComponent(session.id)}/resume`, { method: "POST" });
+      const result = await requestApi<{ session: { id: string; name: string } }>(`/sessions/${encodeURIComponent(session.id)}/resume`, {
+        method: "POST", headers: { "X-Bridge-Session-Created-At": String(session.createdAt) },
+      });
       await loadSessions(true);
       setSelectedId(result.session.id);
       setTerminalInputEnabled(false);
@@ -1713,8 +1724,10 @@ export function TmuxDashboard(): ReactElement {
   const endSession = async (session: TmuxSession | null = selectedSession): Promise<void> => {
     if (!session || !window.confirm(`确认终结 Session「${session.name}」？这会永久结束它的可恢复状态；历史记录仍可查看。`)) return;
     try {
-      await requestApi<void>(`/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
-      const wasSelected = selectedId === session.id;
+      await requestApi<void>(`/sessions/${encodeURIComponent(session.id)}`, {
+        method: "DELETE", headers: { "X-Bridge-Session-Created-At": String(session.createdAt) },
+      });
+      const wasSelected = selectedId === session.id && selectedSession?.createdAt === session.createdAt;
       if (wasSelected) {
         sessionsLoadSequenceRef.current += 1;
         restoreSessionDetailRef.current = false;
@@ -1790,7 +1803,7 @@ export function TmuxDashboard(): ReactElement {
         ? "Session 连接发生错误，可以手动刷新连接。"
         : "Session 已断开，可以手动刷新连接。";
   const showConnectionBanner = Boolean(selectedSession)
-    && terminalStatus !== "ATTACHED" && terminalStatus !== "IDLE";
+    && terminalStatus !== "ATTACHED" && terminalStatus !== "IDLE" && !connectionBannerDismissed;
 
   return (
     <main className={`dashboard-page${mobileView === "terminal" ? " is-mobile-terminal" : ""}${navigationCollapsed ? " is-navigation-collapsed" : ""}`}>
@@ -2030,6 +2043,13 @@ export function TmuxDashboard(): ReactElement {
                   <path d="M5.6 9A7 7 0 0 1 18 6.3L20 8M4 16l2 1.7A7 7 0 0 0 18.4 15" />
                 </svg>
               </button>
+              <button
+                className="dashboard-connection-dismiss"
+                type="button"
+                onClick={() => setConnectionBannerDismissed(true)}
+                aria-label="关闭连接提示"
+                title="关闭提示"
+              >×</button>
             </div>
           ) : null}
           <div className={`dashboard-terminal-frame${selectedSession ? "" : " is-empty"}${selectedSession && terminalInputEnabled ? " is-terminal-interactive" : ""}`}>

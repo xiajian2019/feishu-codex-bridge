@@ -20,6 +20,7 @@ import {
 import "./workbench.css";
 import { isMobileApp } from "./mobile-runtime.js";
 import { isStandaloneSshPath } from "./ssh-route.js";
+import { bridgeTransportMayBeReachable } from "./connection-state.js";
 
 interface WorkbenchSnapshot {
   inbox: WorkbenchInbox;
@@ -64,7 +65,7 @@ export function refreshWorkbenchInbox(options: { quiet?: boolean } = {}): Promis
 async function pollWorkbenchInbox(quiet: boolean): Promise<void> {
   const mutationRevision = inboxMutationRevision;
   publishWorkbenchSnapshot({ ...workbenchSnapshot, loading: quiet ? workbenchSnapshot.loading : true, error: null });
-  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+  if (!bridgeTransportMayBeReachable()) {
     publishWorkbenchSnapshot({
       ...workbenchSnapshot,
       loading: false,
@@ -78,7 +79,7 @@ async function pollWorkbenchInbox(quiet: boolean): Promise<void> {
     fetchWorkbenchInbox(),
     fetchWorkbenchSettings(),
   ]);
-  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+  if (!bridgeTransportMayBeReachable()) {
     publishWorkbenchSnapshot({
       ...workbenchSnapshot,
       loading: false,

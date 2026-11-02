@@ -13,6 +13,11 @@ const PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 export interface WebAuthPairingRecord {
   codeHash: string;
   expiresAt: number;
+  target?: {
+    sessionId: string;
+    tokenHash: string;
+    revokedAt: string | null;
+  } | null;
 }
 
 export interface WebAuthSessionRecord {
@@ -34,8 +39,8 @@ export interface WebAuthDatabase {
   getOrCreateDraftInstallationId?(): string;
   getWebAuthPairing(): WebAuthPairingRecord | null;
   saveWebAuthPairing(record: WebAuthPairingRecord): void;
-  clearWebAuthPairing(): void;
-  createWebAuthSession(record: WebAuthSessionRecord): void;
+  clearWebAuthPairing(codeHash: string): void;
+  consumeWebAuthPairing(pairing: WebAuthPairingRecord, session: WebAuthSessionRecord): PairingClaimResult;
   getWebAuthSession(tokenHash: string): WebAuthSessionRecord | null;
   touchWebAuthSession(
     sessionId: string,
@@ -51,6 +56,8 @@ export interface WebAuthDatabase {
   revokeWebAuthSession(sessionId: string, revokedAt: string): void;
   revokeAllWebAuthSessions(revokedAt: string): void;
 }
+
+export type PairingClaimResult = "ok" | "pairing_unavailable" | "device_unavailable";
 
 interface PairingState extends WebAuthPairingRecord {
   failedAttempts: Map<string, FailedAttempt>;
@@ -269,11 +276,26 @@ export class WebPairingAuth {
   }
 
   public startPairing(): PairingStartResult {
+    return this.issuePairing();
+  }
+
+  public startDevicePairing(request: IncomingMessage, sessionId: string): PairingStartResult | null {
+    if (!this.isAuthorized(request)) return null;
+    const sessions = this.db?.listWebAuthSessions() ?? [...this.memorySessions.values()];
+    const session = sessions.find((item) => item.sessionId === sessionId);
+    // A revoked record cannot be revived, including historical rows whose
+    // revocation happened after expiry and cannot be distinguished from expiry.
+    if (!session || session.revokedAt !== null) return null;
+    return this.issuePairing({ sessionId, tokenHash: session.tokenHash, revokedAt: session.revokedAt });
+  }
+
+  private issuePairing(target: WebAuthPairingRecord["target"] = null): PairingStartResult {
     const code = formatPairingCode(generatePairingCode());
     const expiresAt = this.now() + PAIRING_TTL_MS;
     this.savePairing({
       codeHash: hashToken(code.replaceAll("-", "")),
       expiresAt,
+      target,
     });
     return { code, expiresAt };
   }
@@ -281,7 +303,6 @@ export class WebPairingAuth {
   public claimPairing(request: IncomingMessage, rawCode: string, clientType: "browser" | "app" = "browser"): string {
     const pairing = this.getPairing();
     if (!pairing || pairing.expiresAt <= this.now()) {
-      this.clearPairing();
       throw new Error("pairing code expired or unavailable");
     }
 
@@ -294,7 +315,6 @@ export class WebPairingAuth {
       throw new Error("invalid pairing code");
     }
 
-    this.clearPairing();
     const token = randomBytes(32).toString("base64url");
     const now = this.now();
     const accessOrigin = webAuthRequestOrigin(request);
@@ -312,7 +332,14 @@ export class WebPairingAuth {
       lastAccessOrigin: accessOrigin,
       lastAccessOriginAt: accessOrigin ? new Date(now).toISOString() : null,
     };
-    this.createSession(session);
+    const result = this.consumePairing(pairing, session);
+    if (result !== "ok") {
+      throw new Error(result === "device_unavailable" ? "device authorization changed or was revoked" : "pairing code expired or unavailable");
+    }
+    if (pairing.target) {
+      // Revalidate long-lived streams bound to the old credential immediately.
+      for (const listener of this.revocationListeners) listener();
+    }
     return token;
   }
 
@@ -327,7 +354,8 @@ export class WebPairingAuth {
     token: string,
     expiresAt?: string,
   ): void {
-    const expiresAtMs = expiresAt === undefined ? this.now() + SESSION_TTL_MS : Date.parse(expiresAt);
+    const effectiveExpiry = expiresAt ?? this.getSession(hashToken(token))?.expiresAt;
+    const expiresAtMs = effectiveExpiry === undefined ? this.now() + SESSION_TTL_MS : Date.parse(effectiveExpiry);
     const maxAgeSeconds = Number.isFinite(expiresAtMs)
       ? Math.max(1, Math.ceil((expiresAtMs - this.now()) / 1000))
       : Math.floor(SESSION_TTL_MS / 1000);
@@ -408,7 +436,7 @@ export class WebPairingAuth {
     const stored = this.db ? this.db.getWebAuthPairing() : this.memoryPairing;
     if (!stored) return null;
     if (stored.expiresAt <= this.now()) {
-      this.clearPairing();
+      this.clearPairing(stored.codeHash);
       return null;
     }
     return this.pairingState(stored);
@@ -431,9 +459,9 @@ export class WebPairingAuth {
     if (this.db) this.db.saveWebAuthPairing(record);
   }
 
-  private clearPairing(): void {
-    this.memoryPairing = null;
-    this.db?.clearWebAuthPairing();
+  private clearPairing(codeHash: string): void {
+    if (this.memoryPairing?.codeHash === codeHash) this.memoryPairing = null;
+    this.db?.clearWebAuthPairing(codeHash);
   }
 
   private getSession(tokenHash: string): WebAuthSessionRecord | null {
@@ -453,9 +481,29 @@ export class WebPairingAuth {
     return readCookie(request.headers.cookie, SESSION_COOKIE);
   }
 
-  private createSession(session: WebAuthSessionRecord): void {
-    if (this.db) this.db.createWebAuthSession(session);
-    else this.memorySessions.set(session.tokenHash, session);
+  private consumePairing(pairing: WebAuthPairingRecord, session: WebAuthSessionRecord): PairingClaimResult {
+    if (this.db) {
+      const result = this.db.consumeWebAuthPairing(pairing, session);
+      if (this.memoryPairing?.codeHash === pairing.codeHash) this.memoryPairing = null;
+      return result;
+    }
+    if (this.memoryPairing?.codeHash !== pairing.codeHash || pairing.expiresAt <= this.now()) return "pairing_unavailable";
+    this.memoryPairing = null;
+    if (!pairing.target) {
+      this.memorySessions.set(session.tokenHash, session);
+      return "ok";
+    }
+    const previous = this.memorySessions.get(pairing.target.tokenHash);
+    if (!previous || previous.sessionId !== pairing.target.sessionId || previous.revokedAt !== pairing.target.revokedAt) {
+      return "device_unavailable";
+    }
+    this.memorySessions.delete(previous.tokenHash);
+    this.memorySessions.set(session.tokenHash, {
+      ...session, sessionId: previous.sessionId, deviceName: previous.deviceName,
+      createdAt: previous.createdAt,
+      expiresAt: Date.parse(previous.expiresAt) > Date.parse(session.expiresAt) ? previous.expiresAt : session.expiresAt,
+    });
+    return "ok";
   }
 
   private touchSession(session: WebAuthSessionRecord, request: IncomingMessage): void {

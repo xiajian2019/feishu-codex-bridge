@@ -451,6 +451,18 @@ export class DashboardServer {
       sendJson(response, 200, { ok: true, expiresAt });
       return;
     }
+    const devicePairingMatch = /^\/api\/auth\/devices\/([^/]+)\/pairing\/start$/.exec(url.pathname);
+    if (request.method === "POST" && devicePairingMatch) {
+      const pairing = this.auth.startDevicePairing(request, decodeURIComponent(devicePairingMatch[1]));
+      if (!pairing) {
+        sendJson(response, 404, { error: "device not found or revoked" });
+        return;
+      }
+      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Referrer-Policy", "no-referrer");
+      sendJson(response, 200, { pairingUrl: buildPairingUrl(request, pairing.code), expiresAt: pairing.expiresAt });
+      return;
+    }
     const deviceRevokeMatch = /^\/api\/auth\/devices\/([^/]+)\/revoke$/.exec(url.pathname);
     if (request.method === "POST" && deviceRevokeMatch) {
       const sessionId = decodeURIComponent(deviceRevokeMatch[1]);
@@ -467,6 +479,8 @@ export class DashboardServer {
         return;
       }
       const pairing = this.auth.startPairing();
+      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Referrer-Policy", "no-referrer");
       sendJson(response, 200, {
         pairingUrl: buildPairingUrl(request, pairing.code),
         expiresAt: pairing.expiresAt,
@@ -1192,6 +1206,7 @@ export class DashboardServer {
   }
 
   private async claimPairing(request: IncomingMessage, response: ServerResponse, mobile = false): Promise<void> {
+    response.setHeader("Cache-Control", "no-store");
     // The initial claim cannot have an Action Token yet; the one-time code is
     // its credential, but a browser must still claim it from the same origin.
     if (request.headers.origin && !(mobile && isNativeAppOrigin(request.headers.origin)) && !this.isSameOriginAction(request.headers.origin, request)) {

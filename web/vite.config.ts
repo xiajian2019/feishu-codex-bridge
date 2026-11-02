@@ -1,3 +1,5 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { defineConfig, normalizePath } from "vite";
@@ -10,6 +12,12 @@ const tmuxWebSocketTarget = tmuxApiTarget.replace(/^http/, "ws");
 
 export default defineConfig({
   root: webRoot,
+  // Separate Vite processes must not replace each other's optimized files while
+  // a long-lived browser still references them. The OS can clean up old caches.
+  cacheDir: join(tmpdir(), `feishu-codex-bridge-vite-${process.pid}`),
+  // These are loaded lazily by the photo/live scanner and must be available
+  // before a phone opens the pairing screen.
+  optimizeDeps: { include: ["jsqr", "qr-scanner"] },
   plugins: [react()],
   resolve: {
     alias: [

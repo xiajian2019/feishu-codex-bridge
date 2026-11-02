@@ -128,6 +128,7 @@ describe("Dashboard write and connection authorization", () => {
       ["POST", "/tmux-dashboard/api/attachments", "fixture"],
       ["PATCH", `/api/auth/devices/${device.id}`, { deviceName: "must-not-change" }],
       ["POST", `/api/auth/devices/${device.id}/extend`, undefined],
+      ["POST", `/api/auth/devices/${device.id}/pairing/start`, undefined],
       ["POST", `/api/auth/devices/${device.id}/revoke`, undefined],
       ["POST", "/api/auth/revoke-all", undefined],
       ["POST", "/api/auth/pairing/start", undefined],
@@ -163,6 +164,41 @@ describe("Dashboard write and connection authorization", () => {
     const upload = await fetch(f.url + "/tmux-dashboard/api/attachments", { method: "POST", headers: device.headers, body: "" });
     expect(upload.status).toBe(400);
     await upload.text();
+  });
+
+  it("reuses a device through the mobile endpoint and immediately closes only its old streams", async () => {
+    const f = await fixture();
+    const target = await f.pair();
+    const admin = await f.pair();
+    const socket = await f.connect(target.cookie);
+    const adminSocket = await f.connect(admin.cookie);
+    const stream = await fetch(f.url + "/api/events", { headers: { Cookie: target.cookie } });
+    const reader = stream.body!.getReader();
+    expect((await reader.read()).done).toBe(false);
+    const start = await fetch(`${f.url}/api/auth/devices/${target.id}/pairing/start`, { method: "POST", headers: admin.headers });
+    expect(start.status).toBe(200);
+    expect(start.headers.get("cache-control")).toBe("no-store");
+    const { pairingUrl } = await start.json() as { pairingUrl: string };
+    const code = new URLSearchParams(new URL(pairingUrl).hash.slice(1)).get("pair");
+    expect(code).toBeTruthy();
+    const closed = once(socket, "close");
+    const claim = await fetch(f.url + "/api/auth/mobile/pair", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }),
+    });
+    expect(claim.status).toBe(200);
+    expect(claim.headers.get("cache-control")).toBe("no-store");
+    const { token } = await claim.json() as { token: string };
+    expect((await closed)[0]).toBe(1008);
+    expect((await reader.read()).done).toBe(true);
+    reader.releaseLock();
+    expect(adminSocket.readyState).toBe(WebSocket.OPEN);
+    const old = await fetch(f.url + "/api/auth/status", { headers: { Cookie: target.cookie } });
+    expect((await old.json() as { authenticated: boolean }).authenticated).toBe(false);
+    const updated = await fetch(f.url + "/api/auth/devices", { headers: { Authorization: `Bearer ${token}` } });
+    const { devices } = await updated.json() as { devices: Array<{ sessionId: string; current: boolean }> };
+    expect(devices).toHaveLength(2);
+    expect(devices.find((device) => device.current)?.sessionId).toBe(target.id);
+    expect(f.calls.kills).toBe(0);
   });
 
   it("keeps initial pairing and same-origin read-only diagnostic form downloads usable", async () => {
