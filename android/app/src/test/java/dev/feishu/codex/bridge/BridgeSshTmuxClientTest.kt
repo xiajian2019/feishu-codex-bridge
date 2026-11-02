@@ -140,6 +140,18 @@ class BridgeSshTmuxClientTest {
         assertEquals(BridgeSshTmuxCommandBuilder.listSessions().command, calls.single().first)
     }
 
+    @Test
+    fun resumeDistinguishesAnAbsentTmuxServerFromOtherFailures() = runBlocking {
+        val missing = BridgeSshTmuxClient(BridgeSshTmuxExecutor { _, _ ->
+            BridgeCbSshExecResult(ByteArray(0), "no server running on /tmp/tmux-test/default".toByteArray(), SessionExit.Status(1))
+        })
+        assertEquals(null, missing.findResumeTarget(BridgeSshTmuxIdentity("\$1", 42)))
+        val broken = BridgeSshTmuxClient(BridgeSshTmuxExecutor { _, _ ->
+            BridgeCbSshExecResult(ByteArray(0), "permission denied".toByteArray(), SessionExit.Status(1))
+        })
+        assertTrue(runCatching { broken.findResumeTarget(BridgeSshTmuxIdentity("\$1", 42)) }.isFailure)
+    }
+
     private fun result(stdout: String): BridgeCbSshExecResult =
         BridgeCbSshExecResult(
             stdout = stdout.toByteArray(Charsets.UTF_8),

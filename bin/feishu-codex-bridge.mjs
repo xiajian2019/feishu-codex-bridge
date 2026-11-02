@@ -54,6 +54,9 @@ function forwardedArguments(args) {
 }
 
 export function resolveBuiltinInvocation(args, scriptNames) {
+  if (args[0] === "ssh-session" && scriptNames.includes("ssh:session")) {
+    return { kind: "run", script: "ssh:session", args: forwardedArguments(args.slice(1)) };
+  }
   if (scriptNames.includes("bridge:install") && args[0] === "install") {
     return { kind: "run", script: "bridge:install", args: forwardedArguments(args.slice(1)) };
   }

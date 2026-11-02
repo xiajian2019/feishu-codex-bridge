@@ -16,6 +16,7 @@ const DEFAULT_STATE_FILE = "runtime/codex-local-notifications.json";
 const MAX_THREADS = 500;
 const MAX_NOTIFICATION_BODY = 600;
 const CHATGPT_APP_BUNDLE_ID = "com.openai.codex";
+export const MAC_LOCAL_NOTIFICATION_TIMEOUT_MS = 5_000;
 const CODEX_SOURCE_KINDS = ["cli", "appServer"] as const;
 const TERMINAL_STATUSES = new Set(["idle", "systemError"]);
 
@@ -229,8 +230,8 @@ export function formatLocalCodexNotification(thread: WatchedThread): LocalCodexN
 
 export function buildMacNotificationScript(title: string, body: string): string {
   // Use JXA so AppleScript localization and tell-application terminology do
-  // not affect Notification Center delivery. This runs in the Bridge
-  // LaunchAgent, outside the Codex notify hook's sandbox.
+  // not affect Notification Center delivery. This can run from either the
+  // resident poller or the asynchronous official Codex notify hook.
   return [
     "const app = Application.currentApplication();",
     "app.includeStandardAdditions = true;",
@@ -258,9 +259,13 @@ export async function sendMacLocalNotification(
   }
 }
 
-function runMacCommand(command: string, args: string[]): Promise<void> {
+function runMacCommand(command: string, args: string[], timeoutMs = MAC_LOCAL_NOTIFICATION_TIMEOUT_MS): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    execFile(command, args, (error) => {
+    execFile(command, args, {
+      timeout: timeoutMs,
+      killSignal: "SIGKILL",
+      maxBuffer: 64 * 1024,
+    }, (error) => {
       if (error) reject(error);
       else resolve();
     });

@@ -20,7 +20,7 @@ import { discoverCodexHistoryHomes, type CodexHistoryHome } from "./codex-histor
 import { codexSkillScopeKeys, discoverCodexSkills, type CodexSkillScope } from "./codex-skills.js";
 import { GitWorkspaceError, inspectGitChanges, openGitChangeFile, previewGitChangeFile, inspectTaskSourceDirectory, resolveGitCommonDirectory, resolveGitRoot, verifyTaskWorkspace } from "./git-workspaces.js";
 import type { StateDatabase } from "./db.js";
-import type { Logger, StoredTask, StoredTmuxSessionAction, WebTaskSubmission } from "./types.js";
+import type { Logger, StoredTask, StoredTmuxSession, StoredTmuxSessionAction, WebTaskSubmission } from "./types.js";
 import {
   parseTmuxReviewAnchor,
   parseTmuxReviewTarget,
@@ -182,6 +182,23 @@ class DashboardBodyError extends Error {
   }
 }
 
+/** Optional optimistic identity guard for clients which retain a tmux Session ID. */
+function expectedSessionCreatedAt(request: IncomingMessage): number | undefined {
+  const raw = request.headers["x-bridge-session-created-at"];
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string" || !/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+    throw new DashboardBodyError("Invalid Session creation time.", 400);
+  }
+  return Number(raw);
+}
+
+function assertExpectedSessionCreatedAt(request: IncomingMessage, createdAt: number | undefined): void {
+  const expected = expectedSessionCreatedAt(request);
+  if (expected !== undefined && (createdAt === undefined || expected !== createdAt)) {
+    throw new DashboardBodyError("Session 已结束或重建，请刷新后重试。", 409);
+  }
+}
+
 interface TerminalData {
   sessionId: string;
   sessionRecordId: string;
@@ -215,10 +232,12 @@ export interface TmuxDashboardApiOptions {
   discoverCodexHomes?: () => CodexHistoryHome[];
   /** Absolute path or executable name used for the optional initial Session task. */
   codexWorktreeExecutable?: string;
-  /** Injectable for tests; production delegates complete Session snapshots to tmux-resurrect. */
+  /** Injectable for tests; production delegates explicit Session snapshots to tmux-resurrect. */
   resurrect?: TmuxResurrectController;
-  /** Isolated fixture servers must not restore the user's real tmux snapshots. */
+  /** @deprecated Session listing never restores snapshots; use the explicit CLI or resume action. */
   autoRestoreSessions?: boolean;
+  /** Allow explicit Session snapshot actions without automatic startup restoration. */
+  manageSessionSnapshots?: boolean;
 }
 
 export interface TerminalHeartbeatPeer {
@@ -287,13 +306,13 @@ export class TmuxDashboardApi {
   private readonly skillRefreshAttempts = new Map<string, number>();
   private codexHomeOptionsCache: { at: number; homes: CodexHistoryHome[] } | null = null;
   private sessionListRefresh: Promise<tmux.TmuxSession[]> | null = null;
+  private sessionLifecycleQueue: Promise<unknown> = Promise.resolve();
   private sessionListGeneration = 0;
   private sessionListController?: AbortController;
   private readonly sessionListTimeoutMs: number;
   private readonly logger?: Logger;
   private readonly codexWorktreeExecutable: string;
   private readonly resurrect: TmuxResurrectController;
-  private readonly autoRestoreSessions: boolean;
   private readonly manageSessionSnapshots: boolean;
   private stopped = false;
   private attachmentStorageReady: Promise<void> | null = null;
@@ -317,8 +336,7 @@ export class TmuxDashboardApi {
     this.discoverCodexHomes = options.discoverCodexHomes ?? (() => discoverCodexHistoryHomes());
     this.codexWorktreeExecutable = resolveCodexWorktreeExecutable(options.codexWorktreeExecutable);
     this.resurrect = options.resurrect ?? tmuxResurrectController;
-    this.autoRestoreSessions = options.autoRestoreSessions ?? !options.operations;
-    this.manageSessionSnapshots = options.autoRestoreSessions ?? (!options.operations || Boolean(options.resurrect));
+    this.manageSessionSnapshots = options.manageSessionSnapshots ?? options.autoRestoreSessions ?? (!options.operations || Boolean(options.resurrect));
     this.operations = { ...tmux, ...options.operations };
   }
 
@@ -699,18 +717,22 @@ export class TmuxDashboardApi {
       try { sessionId = decodeURIComponent(sessionResurrectMatch[1]!); }
       catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
       try {
-        const live = await this.operations.findSession(sessionId);
-        const saved = this.db.getLatestTmuxSession(sessionId);
-        const sessionName = live?.name ?? saved?.session_name;
-        if (!sessionName) throw new tmux.SessionNotFoundError("Session record no longer exists.");
-        if (!live) throw new tmux.SessionNotFoundError("Only a running Session can be saved.");
-        const result = await this.resurrect.saveSession(sessionName);
-        sendJson(response, 200, {
-          ok: true,
-          action: result.action,
-          sessionName: result.sessionName,
-          snapshot: result.snapshot,
-          output: result.output || null,
+        await this.withSessionLifecycleLock(async () => {
+          const live = await this.operations.findSession(sessionId);
+          const saved = this.db.getLatestTmuxSession(sessionId);
+          const sessionName = live?.name ?? saved?.session_name;
+          if (!sessionName) throw new tmux.SessionNotFoundError("Session record no longer exists.");
+          if (!live) throw new tmux.SessionNotFoundError("Only a running Session can be saved.");
+          assertExpectedSessionCreatedAt(request, live.createdAt);
+          this.assertNoSuspendedSnapshotConflict(live.name);
+          const result = await this.resurrect.saveSession(sessionName);
+          sendJson(response, 200, {
+            ok: true,
+            action: result.action,
+            sessionName: result.sessionName,
+            snapshot: result.snapshot,
+            output: result.output || null,
+          });
         });
       } catch (error) {
         sendDashboardError(response, error);
@@ -724,39 +746,55 @@ export class TmuxDashboardApi {
       catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
       const action = sessionLifecycleMatch[2] as "suspend" | "resume";
       try {
-        const saved = this.db.getLatestTmuxSession(sessionId);
-        if (action === "suspend") {
-          const live = await this.operations.findSession(sessionId);
-          if (!live) throw new tmux.SessionNotFoundError("Only a running Session can be suspended.");
-          const snapshot = await this.resurrect.saveSession(live.name);
-          await this.operations.killSession(sessionId);
-          const suspended = this.db.markTmuxSessionSuspended(sessionId);
-          if (!suspended) throw new tmux.SessionNotFoundError("Session record no longer exists.");
+        await this.withSessionLifecycleLock(async () => {
+          if (action === "suspend") {
+            const live = await this.operations.findSession(sessionId);
+            if (!live) throw new tmux.SessionNotFoundError("Only a running Session can be suspended.");
+            assertExpectedSessionCreatedAt(request, live.createdAt);
+            this.assertNoSuspendedSnapshotConflict(live.name);
+            const record = this.db.observeTmuxSession(live);
+            const snapshot = await this.resurrect.saveSession(live.name);
+            const current = await this.operations.findSession(sessionId);
+            if (!current || current.createdAt !== live.createdAt || current.name !== live.name) {
+              throw new DashboardBodyError("Session 已结束、重建或改名，请刷新后重试。", 409);
+            }
+            await this.operations.killSession(sessionId);
+            const suspended = this.db.markTmuxSessionRecordSuspended(record.record_id);
+            if (!suspended) throw new tmux.SessionNotFoundError("Session record no longer exists.");
+            this.invalidateSessionList();
+            sendJson(response, 200, {
+              ok: true,
+              action,
+              session: { id: sessionId, name: live.name, suspendedAt: suspended.suspended_at, snapshot: snapshot.snapshot },
+            });
+            return;
+          }
+          // tmux IDs restart at $0 after its server exits. An active Session
+          // may therefore have the same ID as an older suspended record.
+          const expected = expectedSessionCreatedAt(request);
+          const candidates = this.db.listTmuxSessionsForDashboard().filter((record) =>
+            record.tmux_session_id === sessionId && record.ended_at === null && record.suspended_at !== null
+              && (expected === undefined || record.tmux_created_at === expected));
+          if (candidates.length > 1) {
+            throw new DashboardBodyError("存在多个同 ID 的挂起 Session，请刷新后重试。", 409);
+          }
+          const saved = candidates[0];
+          if (!saved) throw new DashboardBodyError("只有匹配的已挂起 Session 可以恢复，请刷新后重试。", 409);
+          const liveSessions = await this.operations.listSessions();
+          if (liveSessions.some((session) => session.name === saved.session_name)) {
+            throw new DashboardBodyError("同名 Session 已在运行，请先刷新列表。", 409);
+          }
+          const snapshot = await this.resurrect.restoreSession(saved.session_name);
+          const restored = (await this.operations.listSessions()).find((session) => session.name === saved.session_name);
+          if (!restored) throw new tmux.SessionNotFoundError("快照已恢复，但没有找到新的 tmux Session。");
+          const resumed = this.db.resumeTmuxSession(saved.record_id, restored);
+          if (!resumed) throw new tmux.SessionNotFoundError("挂起的 Session 记录已变化，请刷新后重试。");
           this.invalidateSessionList();
           sendJson(response, 200, {
             ok: true,
             action,
-            session: { id: sessionId, name: live.name, suspendedAt: suspended.suspended_at, snapshot: snapshot.snapshot },
+            session: { id: restored.id, name: restored.name, suspendedAt: null, snapshot: snapshot.snapshot },
           });
-          return;
-        }
-        if (!saved || saved.ended_at !== null || saved.suspended_at === null) {
-          throw new DashboardBodyError("只有已挂起的 Session 可以恢复。", 409);
-        }
-        const liveSessions = await this.operations.listSessions();
-        if (liveSessions.some((session) => session.name === saved.session_name)) {
-          throw new DashboardBodyError("同名 Session 已在运行，请先刷新列表。", 409);
-        }
-        const snapshot = await this.resurrect.restoreSession(saved.session_name);
-        const restored = (await this.operations.listSessions()).find((session) => session.name === saved.session_name);
-        if (!restored) throw new tmux.SessionNotFoundError("快照已恢复，但没有找到新的 tmux Session。");
-        const resumed = this.db.resumeTmuxSession(saved.record_id, restored);
-        if (!resumed) throw new tmux.SessionNotFoundError("挂起的 Session 记录已变化，请刷新后重试。");
-        this.invalidateSessionList();
-        sendJson(response, 200, {
-          ok: true,
-          action,
-          session: { id: restored.id, name: restored.name, suspendedAt: null, snapshot: snapshot.snapshot },
         });
       } catch (error) {
         sendDashboardError(response, error);
@@ -772,7 +810,9 @@ export class TmuxDashboardApi {
         return;
       }
       try {
-        this.db.syncTmuxSessions(await this.operations.listSessions());
+        await this.withSessionLifecycleLock(async () => {
+          this.db.syncTmuxSessions(await this.operations.listSessions());
+        }, false);
       } catch {
         // Historical records remain readable while the tmux server is unavailable.
       }
@@ -810,33 +850,68 @@ export class TmuxDashboardApi {
       }
       return;
     }
+    if (request.method === "GET" && apiPath === "/sessions/suspended") {
+      const sessions = this.db.listTmuxSessionsForDashboard()
+        .filter((session) => session.suspended_at !== null && session.ended_at === null)
+        .map((session) => ({ id: session.tmux_session_id, name: session.session_name,
+          cwd: session.working_directory, createdAt: session.tmux_created_at }));
+      sendJson(response, 200, { sessions });
+      return;
+    }
+    const sessionIdentityMatch = /^\/sessions\/([^/]+)\/identity$/.exec(apiPath);
+    if (request.method === "GET" && sessionIdentityMatch) {
+      try {
+        const id = decodeURIComponent(sessionIdentityMatch[1]!);
+        const live = await this.operations.findSession(id);
+        if (!live) throw new tmux.SessionNotFoundError("tmux session not found.");
+        assertExpectedSessionCreatedAt(request, live.createdAt);
+        const record = this.db.observeTmuxSession(live);
+        sendJson(response, 200, { session: { ...live, codexHomeId: record.codex_home_id } });
+      } catch (error) { sendDashboardError(response, error); }
+      return;
+    }
     if (request.method === "GET" && apiPath === "/sessions") {
       try {
         const liveSessions = await this.listLiveSessions();
         const includeHomes = url.searchParams.get("includeHomes") !== "0";
         const liveByKey = new Map(liveSessions.map((session) => [`${session.id}\u0000${session.createdAt}`, session]));
-        const sessions = this.db.listTmuxSessionsForDashboard().map((saved) => {
-          const live = liveByKey.get(`${saved.tmux_session_id}\u0000${saved.tmux_created_at}`);
-          const workspace = saved.workspace_id ? this.db.getTaskWorkspaceById(saved.workspace_id) : null;
+        const savedSessions = this.db.listTmuxSessionsForDashboard();
+        const savedByKey = new Map(savedSessions.map((saved) => [
+          `${saved.tmux_session_id}\u0000${saved.tmux_created_at}`, saved,
+        ]));
+        const sessionView = (live: tmux.TmuxSession | undefined, saved: StoredTmuxSession | undefined) => {
+          if (!live && !saved) throw new Error("Session view requires a live or saved Session.");
+          const workspace = saved?.workspace_id ? this.db.getTaskWorkspaceById(saved.workspace_id) : null;
           return {
-            id: saved.tmux_session_id,
-            name: live?.name ?? saved.session_name,
+            id: live?.id ?? saved?.tmux_session_id,
+            name: live?.name ?? saved?.session_name,
             windows: live?.windows ?? 0,
             attachedClients: live?.attachedClients ?? 0,
-            cwd: saved.working_directory_override ? saved.working_directory : live?.cwd ?? saved.working_directory,
-            createdAt: live?.createdAt ?? saved.tmux_created_at,
-            endedAt: saved.ended_at,
-            suspendedAt: saved.suspended_at,
-            openCount: saved.open_count,
-            lastOpenedAt: saved.last_opened_at,
-            codexHomeId: saved.codex_home_id,
+            cwd: saved?.working_directory_override ? saved.working_directory : live?.cwd ?? saved?.working_directory ?? "",
+            createdAt: live?.createdAt ?? saved?.tmux_created_at,
+            endedAt: saved?.ended_at ?? null,
+            suspendedAt: saved?.suspended_at ?? null,
+            openCount: saved?.open_count ?? 0,
+            lastOpenedAt: saved?.last_opened_at ?? null,
+            codexHomeId: saved?.codex_home_id ?? null,
             workspaceId: workspace?.workspace_id ?? null,
             taskGuid: workspace?.task_guid ?? null,
             workspaceBranch: workspace?.branch ?? null,
             workspaceStatus: workspace?.status ?? null,
-            snapshot: this.resurrect.snapshotForSession(saved.session_name),
+            snapshot: this.resurrect.snapshotForSession(live?.name ?? saved?.session_name ?? ""),
           };
-        });
+        };
+        // Listing is intentionally read-only: enumerate tmux and overlay the
+        // last committed metadata. New externally-created Sessions are shown
+        // immediately but are persisted only by an explicit lifecycle action
+        // or the manual tmux restore/sync CLI.
+        const sessions = [
+          ...liveSessions.map((live) => sessionView(live, savedByKey.get(`${live.id}\u0000${live.createdAt}`))),
+          ...savedSessions
+            .filter((saved) => !liveByKey.has(`${saved.tmux_session_id}\u0000${saved.tmux_created_at}`)
+              && (saved.ended_at !== null || saved.suspended_at !== null))
+            .map((saved) => sessionView(undefined, saved)),
+        ];
         sendJson(response, 200, includeHomes
           ? {
             sessions,
@@ -941,6 +1016,7 @@ export class TmuxDashboardApi {
       try {
         const session = await this.operations.findSession(sessionId);
         if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        assertExpectedSessionCreatedAt(request, session.createdAt);
         const directory = await this.sessionDashboardWorkingDirectory(sessionId, session);
         const path = url.searchParams.get("path") ?? "";
         const expectedGitRoot = url.searchParams.get("expectedGitRoot") ?? undefined;
@@ -982,6 +1058,7 @@ export class TmuxDashboardApi {
       try {
         const session = await this.operations.findSession(sessionId);
         if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        assertExpectedSessionCreatedAt(request, session.createdAt);
         const directory = await this.sessionDashboardWorkingDirectory(sessionId, session);
         const inspection = await inspectGitChanges(directory);
         sendJson(response, 200, {
@@ -1007,6 +1084,7 @@ export class TmuxDashboardApi {
       try {
         const session = await this.operations.findSession(sessionId);
         if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        assertExpectedSessionCreatedAt(request, session.createdAt);
         const inspection = this.operations.inspectCodexHome
           ? await this.operations.inspectCodexHome(sessionId)
           : { status: "unavailable" as const };
@@ -1063,6 +1141,7 @@ export class TmuxDashboardApi {
       try {
         const session = await this.operations.findSession(sessionId);
         if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        assertExpectedSessionCreatedAt(request, session.createdAt);
         await this.operations.setCodexHomeForSession?.(sessionId, home?.path ?? null);
         this.db.recordTmuxSession(session);
         const saved = this.db.setTmuxSessionCodexHome(sessionId, homeId);
@@ -1355,17 +1434,37 @@ export class TmuxDashboardApi {
         return;
       }
       try {
-        const live = await this.operations.findSession(sessionId);
-        const saved = this.db.getLatestTmuxSession(sessionId);
-        const sessionName = live?.name ?? saved?.session_name;
-        if (live) await this.operations.killSession(sessionId);
-        else if (!saved || saved.ended_at !== null || saved.suspended_at === null) {
-          throw new tmux.SessionNotFoundError("Session no longer exists.");
-        }
-        this.invalidateSessionList();
-        this.db.markTmuxSessionEnded(sessionId);
-        if (sessionName && this.manageSessionSnapshots) this.resurrect.disableSession(sessionName);
-        sendEmpty(response, 204);
+        await this.withSessionLifecycleLock(async () => {
+          const live = await this.operations.findSession(sessionId);
+          const expected = expectedSessionCreatedAt(request);
+          const suspended = this.db.listTmuxSessionsForDashboard().filter((record) =>
+            record.tmux_session_id === sessionId && record.ended_at === null && record.suspended_at !== null
+              && (expected === undefined || record.tmux_created_at === expected));
+          const liveMatches = live && (expected === undefined || live.createdAt === expected);
+          if ((liveMatches && suspended.length > 0) || suspended.length > 1) {
+            throw new DashboardBodyError("Session ID 有多个匹配项，请刷新后重试。", 409);
+          }
+          let record: StoredTmuxSession;
+          if (liveMatches) {
+            this.assertNoSuspendedSnapshotConflict(live.name);
+            record = this.db.observeTmuxSession(live);
+            await this.operations.killSession(sessionId);
+          } else {
+            const candidate = suspended[0];
+            if (!candidate) {
+              assertExpectedSessionCreatedAt(request, live?.createdAt);
+              throw new tmux.SessionNotFoundError("Session no longer exists.");
+            }
+            record = candidate;
+            if ((await this.operations.listSessions()).some((session) => session.name === record.session_name)) {
+              throw new DashboardBodyError("同名 Session 正在运行，请先改名后再终结挂起记录。", 409);
+            }
+          }
+          this.invalidateSessionList();
+          this.db.markTmuxSessionRecordEnded(record.record_id);
+          if (this.manageSessionSnapshots) this.resurrect.disableSession(record.session_name);
+          sendEmpty(response, 204);
+        });
       } catch (error) {
         sendDashboardError(response, error);
       }
@@ -1602,6 +1701,22 @@ export class TmuxDashboardApi {
       : session.cwd;
   }
 
+  private assertNoSuspendedSnapshotConflict(sessionName: string): void {
+    if (this.db.listTmuxSessionsForDashboard().some((record) =>
+      record.session_name === sessionName && record.ended_at === null && record.suspended_at !== null)) {
+      throw new DashboardBodyError("存在同名的挂起 Session，请先恢复或改名以保护快照。", 409);
+    }
+  }
+
+  private withSessionLifecycleLock<T>(action: () => Promise<T>, invalidate = true): Promise<T> {
+    const next = this.sessionLifecycleQueue.then(async () => {
+      if (invalidate) this.invalidateSessionList();
+      return action();
+    });
+    this.sessionLifecycleQueue = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
   private invalidateSessionList(): void {
     this.sessionListGeneration += 1;
     const controller = this.sessionListController;
@@ -1629,31 +1744,18 @@ export class TmuxDashboardApi {
     });
     const refresh = (async () => {
       let sessions = await Promise.race([this.operations.listSessions({ signal: controller.signal }), timeout]);
-      if (controller.signal.aborted) throw controller.signal.reason;
-      if (generation !== this.sessionListGeneration) throw new DashboardBodyError("Session 列表已变化，请重新读取。", 503);
-      const enumerationMs = Math.round(performance.now() - started);
-      if (this.autoRestoreSessions) {
-        const activeSessionNames = this.db.listTmuxSessionsForDashboard()
-          .filter((saved) => saved.ended_at === null && saved.suspended_at === null)
-          .map((saved) => saved.session_name);
-        const restoreResult = await this.resurrect.restorePendingSessions(
-          activeSessionNames,
-          sessions.map((session) => session.name),
-        );
-        for (const failure of restoreResult.failures) {
-          this.logger?.warn("could not restore tmux Session snapshot", failure);
-        }
-        if (restoreResult.restored.length > 0) {
-          phase = "tmux-enumeration-after-restore";
-          sessions = await this.operations.listSessions({ signal: controller.signal });
-        }
-      }
-      phase = "database-sync";
-      this.db.syncTmuxSessions(sessions);
+      const assertCurrent = () => {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        if (generation !== this.sessionListGeneration) throw new DashboardBodyError("Session 列表已变化，请重新读取。", 503);
+      };
+      assertCurrent();
       const elapsedMs = Math.round(performance.now() - started);
       if (elapsedMs >= 1_000) this.logger?.warn("tmux session list query was slow", {
-        elapsedMs, enumerationMs, databaseMs: elapsedMs - enumerationMs,
+        elapsedMs, enumerationMs: elapsedMs,
       });
+      // Do not restore snapshots or reconcile SQLite from a page read. Both
+      // are explicit lifecycle operations and are intentionally moved out of
+      // the request path so a tmux-resurrect/plugin stall cannot block Web.
       return sessions;
     })();
     this.sessionListRefresh = refresh;

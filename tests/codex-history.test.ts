@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { DatabaseSync } from "../src/sqlite.js";
 import {
   CodexHistoryService,
   discoverCodexHomePaths,
@@ -18,6 +19,55 @@ import type {
 } from "../src/codex-interactive.js";
 
 describe("CodexHistoryService", () => {
+  it("reads the normal history list from Codex state SQLite without starting app-server", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bridge-codex-history-sqlite-"));
+    const databasePath = join(directory, "state_5.sqlite");
+    const database = new DatabaseSync(databasePath);
+    database.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        preview TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        recency_at INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        model_provider TEXT,
+        cwd TEXT,
+        archived INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO threads (id, name, preview, created_at, updated_at, recency_at, source, model_provider, cwd)
+      VALUES ('sqlite-new', 'SQLite thread', 'from state db', 100, 220, 220, 'cli', 'fixture', '/tmp');
+      INSERT INTO threads (id, name, preview, created_at, updated_at, recency_at, source, model_provider, cwd)
+      VALUES ('sqlite-old', 'Old thread', 'older', 90, 110, 110, 'appServer', 'fixture', '/tmp');
+    `);
+    database.close();
+    let appServerCalls = 0;
+    try {
+      const service = new CodexHistoryService({
+        executable: "unused-in-test",
+        environment: { CODEX_HOME: directory },
+        createClient: () => {
+          appServerCalls += 1;
+          throw new Error("history list must not start app-server for a valid state database");
+        },
+      });
+      const result = await service.listThreads({
+        sourceKinds: ["cli"],
+        archived: "active",
+        sortKey: "updated_at",
+        sortDirection: "desc",
+        limit: 10,
+        offset: 0,
+      });
+      expect(result.items.map((item) => item.thread.id)).toEqual(["sqlite-new"]);
+      expect(result.items[0]?.thread.preview).toBe("from state db");
+      expect(appServerCalls).toBe(0);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("discovers account homes and merges paginated read-only histories", async () => {
     const directory = await mkdtemp(join(tmpdir(), "bridge-codex-history-"));
     const secondHome = join(directory, "accounts", "second");

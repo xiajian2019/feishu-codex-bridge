@@ -7,6 +7,7 @@ import { Readable } from "node:stream";
 import { StateDatabase } from "../src/db.js";
 import { TmuxDashboardApi } from "../src/tmux-dashboard-api.js";
 import { listSessions } from "../src/tmux-dashboard.js";
+import type { TmuxResurrectController } from "../src/tmux-resurrect.js";
 
 function responseFixture() {
   return {
@@ -67,6 +68,33 @@ describe("bounded tmux Session enumeration", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
       expect(db.getLatestTmuxSession(ghost.id)).toBeNull();
       expect(db.getLatestTmuxSession(saved.id)?.ended_at).toBeNull();
+    } finally { await api.stop(); db.close(); }
+  });
+
+  it("keeps Session GET read-only and does not auto-restore or sync external Sessions", async () => {
+    const db = new StateDatabase(":memory:");
+    const saved = { id: "$1", name: "saved", cwd: "/tmp", createdAt: 1, windows: 1, attachedClients: 0 };
+    const external = { id: "$2", name: "external", cwd: "/tmp", createdAt: 2, windows: 1, attachedClients: 0 };
+    db.recordTmuxSession(saved);
+    let restores = 0;
+    const resurrect = {
+      restorePendingSessions: async () => {
+        restores += 1;
+        return { restored: [], failures: [] };
+      },
+      snapshotForSession: () => null,
+    } as unknown as TmuxResurrectController;
+    const api = new TmuxDashboardApi({ db, autoRestoreSessions: true, resurrect, operations: {
+      listSessions: async () => [external], findSession: async () => external,
+      createSession: async () => external, killSession: async () => {},
+    } });
+    try {
+      const result = await query(api);
+      expect(result.status).toBe(200);
+      expect(result.data.sessions).toEqual([expect.objectContaining({ id: "$2", name: "external", endedAt: null })]);
+      expect(restores).toBe(0);
+      expect(db.getLatestTmuxSession("$1")?.ended_at).toBeNull();
+      expect(db.getLatestTmuxSession("$2")).toBeNull();
     } finally { await api.stop(); db.close(); }
   });
 

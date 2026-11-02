@@ -34,6 +34,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 
 /**
@@ -151,6 +152,7 @@ class BridgeSshTerminalSession(
     }
     private val outputLock = Any()
     private val remoteCursor = BridgeSshCursorState()
+    private val outputCounter = AtomicLong()
     private var composerFocused = false
 
     private var statusState by mutableStateOf(
@@ -160,6 +162,10 @@ class BridgeSshTerminalSession(
     /** Compose observes this property when it is read from a composable. */
     val status: BridgeSshTerminalStatus
         get() = statusState
+
+    /** Changes whenever the remote PTY supplies output, even while history is visible. */
+    internal val outputRevision: Long
+        get() = outputCounter.get()
 
     /** The termlib emulator rendered by [BridgeSshTerminalView]. */
     val emulator: TerminalEmulator = TerminalEmulatorFactory.create(
@@ -199,6 +205,7 @@ class BridgeSshTerminalSession(
             val copy = bytes.copyOfRange(offset, end)
             try {
                 synchronized(outputLock) {
+                    outputCounter.incrementAndGet()
                     remoteCursor.accept(copy)
                     val implementation = emulator as? TerminalEmulatorImpl
                     if (composerFocused && implementation != null) {

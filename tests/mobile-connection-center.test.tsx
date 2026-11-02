@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
-import { MobileConnectionContent } from "../web/src/MobileConnectionGate.js";
+import { MobileConnectionContent, MobileEnvironmentDialog } from "../web/src/MobileConnectionGate.js";
 import {
   listNativeSshOptions as listBrowserSshOptions,
   onNativeSshReturnToWorkbench as onBrowserSshReturnToWorkbench,
@@ -30,6 +30,22 @@ describe("mobile connection center", () => {
     expect(html).toContain("登录并打开终端");
     expect(html).not.toContain("正在恢复连接");
     expect(html).not.toContain("已配对的 Bridge 内容");
+  });
+
+  it("keeps App version details expandable and exposes both update actions inside the environment dialog", () => {
+    const html = renderToStaticMarkup(createElement(MobileEnvironmentDialog, {
+      options: [], busy: null, message: null, currentServer: "https://bridge.fixture", appVersion: "0.5.0 (100)",
+      updateBanner: createElement("aside", { role: "status" }, "发现新的 Bridge App"),
+      appChecking: false, appDownloading: false, appActionsBusy: false, appMessage: null, appError: null,
+      onCheckUpdate: () => {}, onDownloadApp: () => {}, onSelect: () => {}, onOpenConnectionSettings: () => {}, onClose: () => {},
+    }));
+    expect(html).toContain('role="dialog"');
+    expect(html).toContain("0.5.0 (100)");
+    expect(html).toContain("检查更新");
+    expect(html).toContain("手动下载 App");
+    expect(html).toContain("<summary>版本详情</summary>");
+    expect(html).toContain("内置页面");
+    expect(html.indexOf("发现新的 Bridge App")).toBeLessThan(html.indexOf("切换 Bridge 环境"));
   });
 
   it("does not expose Android SSH metadata from a browser", async () => {

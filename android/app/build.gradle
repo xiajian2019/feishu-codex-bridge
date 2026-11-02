@@ -35,6 +35,9 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    buildFeatures {
+        aidl = true
+    }
     buildTypes {
         release {
             minifyEnabled false

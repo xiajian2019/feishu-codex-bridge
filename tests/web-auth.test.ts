@@ -59,6 +59,18 @@ describe("WebPairingAuth", () => {
     expect(auth.listDevices(request)?.[0]?.userAgent).toBe(ua);
   });
 
+  it("keeps a session authorized when the client IP changes", () => {
+    const db = new StateDatabase(":memory:");
+    const auth = new WebPairingAuth({ db });
+    const original = fakeRequest("10.0.0.55");
+    const token = auth.claimPairing(original, auth.startPairing().code);
+    const moved = fakeRequest("10.15.53.70", `bridge_session=${token}`);
+    try {
+      expect(auth.isAuthorized(moved)).toBe(true);
+      expect(db.listWebAuthSessions()[0]?.remoteAddress).toBe("10.15.53.70");
+    } finally { db.close(); }
+  });
+
   it("throttles last-seen writes while checking metadata changes and revocation on every request", () => {
     const db = new StateDatabase(":memory:");
     let now = Date.now();
@@ -108,6 +120,10 @@ describe("WebPairingAuth", () => {
     first.setSessionCookie(remote, response as unknown as ServerResponse, token);
     const cookie = response.headers["set-cookie"];
     expect(cookie).toContain("bridge_session=");
+    expect(cookie).toContain("Path=/");
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("SameSite=Strict");
+    expect(cookie).not.toContain("?");
 
     const authenticatedRequest = fakeRequest("203.0.113.20", cookie);
     expect(first.isAuthorized(authenticatedRequest)).toBe(true);

@@ -57,10 +57,10 @@ class BridgeSshLifecycleLiveTest {
                     activity.openEmbeddedSshWorkspace(request)
                 }
                 waitForTerminal()
-                assertTrue("connecting to the shell must not open tmux automatically",
-                    find(instrumentation.uiAutomation.rootInActiveWindow, "tmux 会话") == null)
-                click("tmux")
-                waitForNode("tmux 会话")
+                assertTrue("connecting to the shell must not open the tmux picker automatically",
+                    find(instrumentation.uiAutomation.rootInActiveWindow, "按名称、目录或 ID 筛选") == null)
+                click("tmux 会话")
+                waitForNode("按名称、目录或 ID 筛选")
                 click("关闭")
                 waitForTerminal()
                 instrumentation.runOnMainSync { original.set(BridgeSshAppState.find(connectionKey)) }
@@ -175,25 +175,33 @@ class BridgeSshLifecycleLiveTest {
                 assertTrue(instrumentation.uiAutomation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK))
                 waitForTerminal()
 
-                // Break the transport while backgrounded, then exercise the normal saved-key reconnect path.
+                // The app-owned logical session must recover its physical transport even while the Activity is stopped.
+                val oldTransport = AtomicReference<BridgeCbSshTransport>()
+                val oldGeneration = java.util.concurrent.atomic.AtomicLong()
+                instrumentation.runOnMainSync {
+                    oldTransport.set(original.get().transport)
+                    oldGeneration.set(original.get().bindingGeneration)
+                }
                 scenario.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)
-                runBlocking { original.get().transport.disconnect() }
-                waitForFailed(original.get())
-                scenario.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED)
+                runBlocking { oldTransport.get().disconnect() }
                 for (attempt in 0 until 200) {
                     instrumentation.runOnMainSync { recovered.set(BridgeSshAppState.find(connectionKey)) }
-                    if (recovered.get() != null && recovered.get() !== original.get() &&
+                    if (recovered.get() === original.get() && recovered.get().transport !== oldTransport.get() &&
+                        recovered.get().bindingGeneration > oldGeneration.get() &&
                         recovered.get().terminalSession.status.state == BridgeSshConnectionState.CONNECTED) break
                     Thread.sleep(50)
                 }
-                assertNotNull(recovered.get())
-                assertTrue("automatic reconnect should create a new SSH session", recovered.get() !== original.get())
-                waitForTerminal()
+                assertSame("recovery should preserve the app-owned session and terminal", original.get(), recovered.get())
+                assertTrue("automatic recovery should install a new transport", recovered.get().transport !== oldTransport.get())
+                assertTrue("automatic recovery should finish before returning to the Activity", recovered.get().bindingGeneration > oldGeneration.get())
                 assertAlive(recovered.get())
+                scenario.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED)
+                waitForTerminal()
                 instrumentation.runOnMainSync {
                     recovered.get().terminalSession.sendTerminalInput("printf diagnostic-secret-sentinel\r".toByteArray())
                 }
-                // A second drop leaves the terminal visibly disconnected; the stop/copy control must still work.
+                // Remove only this fixture key so a second drop stays in retry while diagnostics are copied.
+                BridgeSshKeyStore.delete(context, key.id)
                 runBlocking { recovered.get().transport.disconnect() }
                 waitForFailed(recovered.get())
                 click("停止并复制调试日志")
@@ -211,7 +219,7 @@ class BridgeSshLifecycleLiveTest {
                     .forEach { assertTrue("missing event: $it; got $names", it in names) }
                 assertTrue("automatic reconnect should be identified", (0 until events.length()).any {
                     val row = events.getJSONObject(it)
-                    row.optString("event") == "connection.started" && row.optString("detail") == "automatic"
+                    row.optString("event") == "reconnect.started" && row.optString("detail") == "automatic"
                 })
                 assertTrue("network state should be recorded", "network.available" in names || "network.changed" in names)
                 assertTrue("window focus changes should be recorded", "activity.focus.changed" in names)
@@ -223,7 +231,7 @@ class BridgeSshLifecycleLiveTest {
                     val row = events.getJSONObject(it)
                     if (row.has("session")) row.getInt("session") else null
                 }.toSet()
-                assertTrue("reconnected sessions should have distinct diagnostic ids", sessionIds.size >= 2)
+                assertTrue("recovery events should retain the logical session id", original.get().diagnosticId in sessionIds)
                 if (holdMs >= 32_000) assertTrue("background heartbeat should be recorded", "keepalive.result" in names)
                 assertFalse(copied.contains("diagnostic-secret-sentinel"))
                 assertFalse(copied.contains("10.0.2.2"))

@@ -308,7 +308,7 @@ class BridgeCbSshTransport(
         private val DOUBLE_QUOTE_INJECTION_CHARACTERS = setOf('$', '`', '\\')
 
         const val DEFAULT_MAX_OUTPUT_BYTES = 1 * 1024 * 1024
-        const val MAX_EXEC_COMMAND_BYTES = 8 * 1024
+        const val MAX_EXEC_COMMAND_BYTES = 32 * 1024
         const val MAX_EXEC_OUTPUT_BYTES = 1 * 1024 * 1024
     }
 }

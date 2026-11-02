@@ -20,6 +20,8 @@ const scenarios = [
   ["android-scan-failure", "reports native scanner failure without hiding other scanner choices"],
   ["android-motion-permission", "keeps the manual environment entry usable when motion permission is denied"],
   ["android-motion-detection", "only emits a shake while enabled and foregrounded after two strong movements"],
+  ["android-native-motion", "detects native sensor motion over the SSH workspace while respecting foreground and preference"],
+  ["android-native-motion-fallback", "falls back to Web motion when the native sensor listener fails"],
   ["android-apk-success", "verifies an APK before handing it to the installer and does not claim installation succeeded"],
   ["android-apk-invalid", "rejects a damaged APK before installation or saving and removes the failed download"],
   ["android-apk-cancel", "retains a verified APK after installer permission refusal so the user can retry"],

@@ -1393,7 +1393,7 @@ export class DashboardServer {
       });
       sendJson(response, 200, {
         generatedAt: new Date().toISOString(),
-        dataSource: "codex-app-server",
+        dataSource: "codex-sqlite",
         ...result,
       });
     } catch (error) {

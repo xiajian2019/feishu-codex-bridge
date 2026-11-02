@@ -1,10 +1,14 @@
 import { describe, expect, it } from "bun:test";
 
 import {
+  CODEX_NOTIFY_CHAIN_DEPTH_ENV,
   isCodexCompletionNotifyPayload,
+  isBridgeCommand,
   parseNotifyCommand,
   parseNotifyPayload,
   replaceNotifyCommand,
+  runCodexNotifyHook,
+  sanitizeLegacyNotifyCommand,
 } from "../src/codex-notify-hook.js";
 
 describe("Codex official notify hook", () => {
@@ -53,6 +57,36 @@ describe("Codex official notify hook", () => {
     })).toBe(false);
     expect(isCodexCompletionNotifyPayload({ "thread-id": "thr_1" })).toBe(false);
     expect(isCodexCompletionNotifyPayload({ type: "agent-turn-complete" })).toBe(false);
+  });
+
+  it("detects and removes a nested Bridge previous-notify command", () => {
+    const bridge = ["/tmp/bridge", "codex:notify-dispatch", "--config", "/tmp/config.json"];
+    const wrapped = ["/tmp/sky", "turn-ended", "--previous-notify", JSON.stringify(bridge)];
+
+    expect(isBridgeCommand(bridge)).toBe(true);
+    expect(isBridgeCommand(wrapped)).toBe(true);
+    expect(sanitizeLegacyNotifyCommand(wrapped)).toEqual(["/tmp/sky", "turn-ended"]);
+  });
+
+  it("preserves a non-Bridge previous-notify command", () => {
+    const previous = ["/tmp/other-hook", "--payload"];
+    const wrapped = ["/tmp/sky", "turn-ended", "--previous-notify", JSON.stringify(previous)];
+
+    expect(isBridgeCommand(wrapped)).toBe(false);
+    expect(sanitizeLegacyNotifyCommand(wrapped)).toEqual(wrapped);
+  });
+
+  it("removes the Sky legacy notification hook", () => {
+    expect(sanitizeLegacyNotifyCommand([
+      "/Users/me/Codex Computer Use.app/SkyComputerUseClient",
+      "turn-ended",
+    ])).toBeNull();
+  });
+
+  it("does not re-enter a nested Bridge notify chain", async () => {
+    await runCodexNotifyHook({} as never, [], {
+      [CODEX_NOTIFY_CHAIN_DEPTH_ENV]: "1",
+    });
   });
 
 });

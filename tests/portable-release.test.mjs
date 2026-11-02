@@ -61,6 +61,8 @@ describe("portable release", () => {
     expect(source).toContain("download_bun_runtime");
     expect(source).toContain("BUN_VERSION_REQUIRED=");
     expect(source).toContain("run_entry");
+    expect(source).toContain('ssh-session-cli) internal_command="--bridge-ssh-session"');
+    expect(source).toContain('run_entry ssh-session-cli "$@"');
     expect(source).not.toContain("node_is_supported");
     expect(source).not.toContain("pnpm run");
   });

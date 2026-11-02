@@ -190,6 +190,7 @@ run_entry() {
       codex-cli) internal_command="--bridge-codex" ;;
       install-cli) internal_command="--bridge-install" ;;
       web-pair-cli) internal_command="--bridge-web-pair" ;;
+      ssh-session-cli) internal_command="--bridge-ssh-session" ;;
       backup-cli) internal_command="--bridge-backup" ;;
       aamp-cli)
         echo "Direct 单二进制包不提供 AAMP 管理命令。" >&2
@@ -213,6 +214,7 @@ usage() {
   feishu-codex-bridge update [选项]
   feishu-codex-bridge service <install|start|stop|restart|status|logs|uninstall>
   feishu-codex-bridge web:pair
+  feishu-codex-bridge ssh-session --request <base64-json>
   feishu-codex-bridge aamp:<命令> [参数...]
   feishu-codex-bridge codex:<命令> [参数...]
   feishu-codex-bridge --version
@@ -238,7 +240,7 @@ case "$1" in
   list|scripts)
     printf '%s\n' \
       install init doctor start update service \
-      web:pair backup \
+      web:pair backup ssh-session \
       aamp aamp:install aamp:start aamp:stop aamp:restart aamp:status aamp:logs aamp:update aamp:add aamp:remove \
       aamp:recent aamp:task aamp:inspect aamp:worktrees \
       codex codex:install codex:setup codex:start codex:stop codex:restart codex:status codex:logs \
@@ -282,6 +284,10 @@ case "$1" in
   web:pair)
     shift
     run_entry web-pair-cli "$@"
+    ;;
+  ssh-session)
+    shift
+    run_entry ssh-session-cli "$@"
     ;;
   aamp)
     shift

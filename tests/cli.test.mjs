@@ -48,6 +48,12 @@ describe("global bridge CLI", () => {
     ]);
   });
 
+  it("routes the SSH Session entry to the Bridge CLI script", () => {
+    const invocation = resolveInvocation(["ssh-session", "--request", "e30="], ["ssh:session", ...scripts]);
+    expect(invocation).toEqual({ kind: "run", script: "ssh:session", args: ["--", "--request", "e30="] });
+    expect(buildBunArguments(invocation)).toEqual(["run", "ssh:session", "--", "--request", "e30="]);
+  });
+
   it("rejects unknown scripts instead of running from the caller directory", () => {
     expect(resolveInvocation(["missing"], scripts)).toMatchObject({
       kind: "error",

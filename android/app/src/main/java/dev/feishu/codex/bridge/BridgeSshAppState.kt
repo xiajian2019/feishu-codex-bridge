@@ -14,6 +14,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -21,6 +24,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import org.connectbot.sshlib.AuthResult
+import org.connectbot.sshlib.ConnectResult
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -32,31 +38,194 @@ internal data class BridgeSshAppConnectionKey(val host: String, val port: Int, v
     }
 }
 
-/** Owns a live SSH transport, terminal and jobs independently of native screens. */
+/** Owns one logical SSH session and recovers its physical transport independently of screens. */
 internal class BridgeSshAppSession(
+    context: Context,
     val key: BridgeSshAppConnectionKey,
-    val transport: BridgeCbSshTransport,
+    initialTransport: BridgeCbSshTransport,
     shell: BridgeCbSshShell,
+    private val credentials: BridgeSshReconnectCredentials,
 ) {
+    private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var closed = false
+    private var recoveryGeneration = 0L
+    private var recoveryJob: Job? = null
     val diagnostics = BridgeSshDiagnostics()
     val diagnosticId = BridgeSshActivityDiagnostics.nextSessionId()
     val uploadedPaths = mutableMapOf<String, String>()
     var selectedTmuxSession: BridgeSshTmuxSession? = null
-    val shellTransport = BridgeSshAppTerminalTransport(
-        transport, shell, scope, onFailure = { BridgeSshAppState.onSessionChanged() }, traceSessionId = diagnosticId,
-    ) { kind, count ->
-        diagnostics.record(kind, count)
-    }
-    val terminalSession = BridgeSshTerminalSession(shellTransport)
-    val tmuxClient = BridgeSshTmuxClient(transport)
+    var resumeTarget: BridgeSshTmuxIdentity? = null
+    var transport by mutableStateOf(initialTransport)
+        private set
+    var shellTransport by mutableStateOf(createShellTransport(initialTransport, shell))
+        private set
+    private val switchingTransport = BridgeSshSwitchingTerminalTransport(shellTransport)
+    val terminalSession = BridgeSshTerminalSession(switchingTransport)
+    var tmuxClient by mutableStateOf(BridgeSshTmuxClient(initialTransport))
+        private set
+    var bindingGeneration by mutableStateOf(0L)
+        private set
+    var reconnecting by mutableStateOf(false)
+        private set
+    var recoveryNotice by mutableStateOf<String?>(null)
+        private set
+    val isOpen: Boolean get() = !closed
 
     init {
         if (BridgeSshActivityDiagnostics.recording) diagnostics.start()
         shellTransport.startReaders()
     }
 
+    private fun createShellTransport(transport: BridgeCbSshTransport, shell: BridgeCbSshShell): BridgeSshAppTerminalTransport {
+        lateinit var channel: BridgeSshAppTerminalTransport
+        channel = BridgeSshAppTerminalTransport(transport, shell, scope, onFailure = {
+            mainHandler.post {
+                if (!closed && shellTransport === channel) requestReconnect()
+                BridgeSshAppState.onSessionChanged()
+            }
+        }, traceSessionId = diagnosticId) { kind, count -> diagnostics.record(kind, count) }
+        return channel
+    }
+
+    fun clearRecoveryNotice() { recoveryNotice = null }
+
+    /** Automatic retries use only a previously approved host key. Manual retry may prompt. */
+    fun requestReconnect(
+        force: Boolean = false,
+        requestHostKeyApproval: (suspend (BridgeCbSshHostKeyPrompt) -> Boolean)? = null,
+    ) {
+        if (closed || (!force && recoveryJob?.isActive == true)) return
+        recoveryGeneration += 1
+        val generation = recoveryGeneration
+        recoveryJob?.cancel()
+        reconnecting = true
+        recoveryNotice = null
+        switchingTransport.setState(BridgeSshConnectionState.CONNECTING, "SSH 连接中断，正在重连")
+        BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.RECONNECT_STARTED,
+            BridgeSshTraceField.SESSION to diagnosticId,
+            BridgeSshTraceField.DETAIL to if (force) BridgeSshTraceDetail.USER else BridgeSshTraceDetail.AUTOMATIC)
+        BridgeSshAppState.onSessionChanged()
+        recoveryJob = scope.launch {
+            var approval = requestHostKeyApproval
+            try {
+                val result = BridgeSshRecoveryLoop().run(
+                    attempt = {
+                        val attemptApproval = approval
+                        approval = null
+                        reconnectOnce(generation, attemptApproval)
+                    },
+                    onRetry = { message, wait ->
+                        if (!closed && generation == recoveryGeneration) {
+                            switchingTransport.setState(BridgeSshConnectionState.CONNECTING,
+                                "$message，${wait / 1_000} 秒后重试")
+                        }
+                    },
+                )
+                if (!closed && generation == recoveryGeneration) {
+                    when (result) {
+                        BridgeSshRecoveryResult.Connected -> switchingTransport.setState(BridgeSshConnectionState.CONNECTED, null)
+                        is BridgeSshRecoveryResult.Stop -> switchingTransport.setState(BridgeSshConnectionState.FAILED, result.message)
+                        is BridgeSshRecoveryResult.Retry -> Unit
+                    }
+                }
+            } finally {
+                if (generation == recoveryGeneration) {
+                    reconnecting = false
+                    recoveryJob = null
+                    BridgeSshAppState.onSessionChanged()
+                }
+            }
+        }
+    }
+
+    private suspend fun reconnectOnce(
+        generation: Long,
+        approval: (suspend (BridgeCbSshHostKeyPrompt) -> Boolean)?,
+    ): BridgeSshRecoveryResult {
+        var next: BridgeCbSshTransport? = null
+        var channel: BridgeSshAppTerminalTransport? = null
+        var adopted = false
+        try {
+            return withTimeout(if (approval == null) 20_000L else 60_000L) {
+                val verifier = BridgeCbSshHostKeyVerifier(
+                    appContext.getSharedPreferences(BRIDGE_SSH_KNOWN_HOSTS_PREFERENCES, Context.MODE_PRIVATE),
+                    key.host, key.port, approval ?: { false },
+                )
+                val candidate = BridgeCbSshTransport(key.host, key.port, verifier)
+                next = candidate
+                val connection = try { withContext(Dispatchers.IO) { candidate.connect() } }
+                    finally { verifier.clearApprovalHandler() }
+                when (connection) {
+                    is ConnectResult.Success -> Unit
+                    is ConnectResult.HostKeyRejected -> return@withTimeout BridgeSshRecoveryResult.Stop("SSH 主机指纹需要确认，请点击重连")
+                    is ConnectResult.AlgorithmMismatch -> return@withTimeout BridgeSshRecoveryResult.Stop("SSH 算法协商失败，请检查主机配置")
+                    else -> return@withTimeout BridgeSshRecoveryResult.Retry("SSH 暂时不可达")
+                }
+                when (withContext(Dispatchers.IO) { credentials.authenticate(appContext, key.username, candidate) }) {
+                    is AuthResult.Success -> Unit
+                    is AuthResult.Failure, is AuthResult.Error -> return@withTimeout BridgeSshRecoveryResult.Stop("SSH 认证失败，请检查密钥或密码")
+                }
+                // A new interactive login shell exists before tmux discovery or attach.
+                val nextShell = withContext(Dispatchers.IO) { candidate.openShell() }
+                val client = BridgeSshTmuxClient(candidate)
+                val target = selectedTmuxSession?.let(BridgeSshTmuxIdentity::of) ?: resumeTarget
+                val liveTarget = if (target == null) null else withContext(Dispatchers.IO) {
+                    client.findResumeTarget(target)
+                }
+                currentCoroutineContext().ensureActive()
+                check(!closed && generation == recoveryGeneration) { "SSH recovery superseded" }
+                val newChannel = createShellTransport(candidate, nextShell)
+                channel = newChannel
+                val previous = transport
+                transport = candidate
+                tmuxClient = client
+                shellTransport = newChannel
+                switchingTransport.replace(newChannel)
+                BridgeSshAppState.closeUnregistered(previous)
+                newChannel.startReaders()
+                if (liveTarget != null) {
+                    val result = newChannel.attachResumeTarget(liveTarget)
+                    check(result == BridgeSshCommandSendResult.Written) { "tmux attach was not confirmed sent" }
+                }
+                check(newChannel.isLive) { "SSH channel closed during recovery" }
+                selectedTmuxSession = liveTarget
+                resumeTarget = liveTarget?.let(BridgeSshTmuxIdentity::of)
+                if (target != null && liveTarget == null) {
+                    BridgeSshTmuxResumeStore(appContext).clear(key)
+                    recoveryNotice = "上次 tmux Session 已不存在，请重新选择。"
+                }
+                bindingGeneration += 1
+                adopted = true
+                BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.RECONNECT_TARGET,
+                    BridgeSshTraceField.SESSION to diagnosticId,
+                    BridgeSshTraceField.DETAIL to if (liveTarget != null) BridgeSshTraceDetail.TARGET_FOUND else BridgeSshTraceDetail.TARGET_MISSING)
+                BridgeSshRecoveryResult.Connected
+            }
+        } catch (timeout: TimeoutCancellationException) {
+            return BridgeSshRecoveryResult.Retry("SSH 重连超时")
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.CONNECTION_FAILED,
+                BridgeSshTraceField.SESSION to diagnosticId, BridgeSshTraceField.DETAIL to BridgeSshTraceDetail.AUTOMATIC,
+                BridgeSshTraceField.ERROR to error)
+            return BridgeSshRecoveryResult.Retry("SSH 重连失败")
+        } finally {
+            if (!adopted) {
+                channel?.close()
+                next?.let { BridgeSshAppState.closeUnregistered(it) }
+            }
+        }
+    }
+
     fun close() {
+        if (closed) return
+        closed = true
+        recoveryGeneration += 1
+        recoveryJob?.cancel()
+        credentials.close()
         try { terminalSession.close() } finally { scope.cancel() }
     }
 }
@@ -130,7 +299,7 @@ internal object BridgeSshAppState {
     }
 
     private fun needsBackgroundProtection(): Boolean =
-        pendingConnections > 0 || active.any { it.shellTransport.isLive }
+        pendingConnections > 0 || active.any { it.isOpen }
 
     private fun updateBackgroundProtection() {
         val context = applicationContext ?: return
@@ -164,15 +333,26 @@ internal object BridgeSshAppState {
     }
 
     /** A concurrent connection for the same identity reuses the existing session. */
-    fun register(key: BridgeSshAppConnectionKey, transport: BridgeCbSshTransport, shell: BridgeCbSshShell): Pair<BridgeSshAppSession, Boolean> {
+    fun register(
+        key: BridgeSshAppConnectionKey,
+        transport: BridgeCbSshTransport,
+        shell: BridgeCbSshShell,
+        credentials: BridgeSshReconnectCredentials,
+    ): Pair<BridgeSshAppSession, Boolean> {
         val existing = find(key)
         if (existing != null) {
+            credentials.close()
             closeUnregistered(transport)
             view(existing)
             BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.SESSION_REUSED, BridgeSshTraceField.SESSION to existing.diagnosticId)
             return existing to false
         }
-        val session = BridgeSshAppSession(key, transport, shell)
+        val session = try {
+            BridgeSshAppSession(checkNotNull(applicationContext), key, transport, shell, credentials)
+        } catch (error: Throwable) {
+            credentials.close()
+            throw error
+        }
         active.add(session)
         view(session)
         BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.SESSION_CREATED, BridgeSshTraceField.SESSION to session.diagnosticId)

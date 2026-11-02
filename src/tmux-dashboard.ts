@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { realpath, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
@@ -339,6 +339,16 @@ export async function setCodexHomeForSession(id: string, codexHomePath: string |
   }
 }
 
+/** Only infer the default Home when the OS actually exposed an environment. */
+export function parseCodexHomeEnvironment(value: string, homeDirectory = homedir()): string | undefined {
+  const environment = value.replaceAll("\0", " ");
+  if (!/(?:^|\s)(?:HOME|PATH|SHELL)=/.test(environment)) return undefined;
+  const match = /(?:^|\s)CODEX_HOME=(.*?)(?=\s[A-Za-z_][A-Za-z\d_]*=|$)/.exec(environment);
+  if (!match) return resolve(homeDirectory, ".codex");
+  const path = match[1]!.trim().replace(/^(['"])(.*)\1$/, "$2");
+  return path ? resolve(path.replace(/^~(?=\/|$)/, homeDirectory)) : undefined;
+}
+
 export async function inspectCodexHome(
   id: string,
   knownSession?: TmuxSession,
@@ -349,16 +359,18 @@ export async function inspectCodexHome(
   try {
     const panePid = Number(await runTmux(["display-message", "-p", "-t", id, "#{pane_pid}"]));
     if (!Number.isSafeInteger(panePid) || panePid < 1) return { status: "unavailable" };
-    const processRows = await runCommand("ps", ["-ww", "-axo", "pid=,ppid=,command="]);
-    const processInfo = processRows.split(/\r?\n/).flatMap((line) => {
-      const match = /^\s*(\d+)\s+(\d+)\s+(.+)$/.exec(line);
-      return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3]! }] : [];
+    // Avoid collecting command lines (which may be large or sensitive) for
+    // unrelated processes. Fetch them only for the selected pane's descendants.
+    const rows = await runCommand("ps", ["-axo", "pid=,ppid="]);
+    const processes = rows.split(/\r?\n/).flatMap((line) => {
+      const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+      return match ? [{ pid: Number(match[1]), ppid: Number(match[2]) }] : [];
     });
     const depths = new Map<number, number>([[panePid, 0]]);
     let changed = true;
     while (changed) {
       changed = false;
-      for (const process of processInfo) {
+      for (const process of processes) {
         const parentDepth = depths.get(process.ppid);
         if (parentDepth !== undefined && !depths.has(process.pid)) {
           depths.set(process.pid, parentDepth + 1);
@@ -366,23 +378,32 @@ export async function inspectCodexHome(
         }
       }
     }
-    const codexProcesses = processInfo
-      .filter((process) => depths.has(process.pid) && /(?:^|[\\/\s])codex(?:\.js)?(?:$|[\s/])/i.test(process.command))
-      .sort((left, right) => (depths.get(right.pid) ?? 0) - (depths.get(left.pid) ?? 0));
-    if (codexProcesses.length === 0) return { status: "not-running" };
-
-    for (const process of codexProcesses.slice(0, 24)) {
-      try {
-        const commandWithEnvironment = await runCommand("ps", ["eww", "-p", String(process.pid), "-o", "command="]);
-        const match = /(?:^|\s)CODEX_HOME=(.*?)(?=\s[A-Za-z_][A-Za-z\d_]*=|$)/.exec(commandWithEnvironment);
-        if (match) {
-          const value = match[1]!.trim().replace(/^(['"])(.*)\1$/, "$2");
-          if (value) return { status: "running", path: resolve(value.replace(/^~(?=\/|$)/, homedir())) };
-        }
-        return { status: "running", path: resolve(homedir(), ".codex") };
-      } catch {
-        // Try the next Codex process if the operating system denies this process listing.
+    const descendants = [...depths.entries()].sort((left, right) => right[1] - left[1]);
+    const codexProcesses: number[] = [];
+    for (let offset = 0; offset < Math.min(descendants.length, 128); offset += 8) {
+      const group = descendants.slice(offset, offset + 8);
+      const commands = await Promise.all(group.map(async ([pid]) => {
+        try { return { pid, command: await runCommand("ps", ["-ww", "-p", String(pid), "-o", "command="]) }; }
+        catch { return null; }
+      }));
+      for (const process of commands) {
+        if (process && /(?:^|[\\/\s])codex(?:\.js)?(?:$|[\s/])/i.test(process.command)) codexProcesses.push(process.pid);
       }
+    }
+    if (codexProcesses.length === 0) return { status: descendants.length > 128 ? "unavailable" : "not-running" };
+    for (const pid of codexProcesses.slice(0, 24)) {
+      if (process.platform === "linux") {
+        try {
+          const environment = await readFile(`/proc/${pid}/environ`, "utf8");
+          const path = parseCodexHomeEnvironment(environment);
+          if (path) return { status: "running", path };
+        } catch { /* Fall back to ps when /proc is unavailable or access is denied. */ }
+      }
+      try {
+        const environment = await runCommand("ps", ["eww", "-p", String(pid), "-o", "command="]);
+        const path = parseCodexHomeEnvironment(environment);
+        if (path) return { status: "running", path };
+      } catch { /* Try the next Codex process if this one became inaccessible. */ }
     }
     return { status: "unavailable" };
   } catch {

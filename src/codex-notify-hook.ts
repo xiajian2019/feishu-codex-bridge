@@ -9,7 +9,11 @@ import {
   CodexAppServerClient,
   codexThreadSourceLabel,
 } from "./codex-app-server.js";
-import { enqueueCodexNotification } from "./codex-notification-inbox.js";
+import {
+  NotificationSuppressionStore,
+  notificationSuppressionKey,
+} from "./notification-suppression.js";
+import { sendMacLocalNotification } from "./local-codex-notifications.js";
 import { resolveBridgeProjectRoot } from "./portable-runtime.js";
 import type { BridgeConfig } from "./types.js";
 
@@ -19,6 +23,7 @@ const CHAIN_STATE_FILE = "notify-chain.json";
 const DELIVERY_STATE_FILE = "notify-delivery.json";
 const CHAIN_VERSION = 1;
 const COMPLETION_EVENT_TYPE = "agent-turn-complete";
+export const CODEX_NOTIFY_CHAIN_DEPTH_ENV = "FEISHU_CODEX_BRIDGE_NOTIFY_CHAIN_DEPTH";
 
 export interface CodexNotifyInstallOptions {
   bridgeConfigPath: string;
@@ -57,9 +62,10 @@ export async function installCodexNotifyHook(options: CodexNotifyInstallOptions)
   const existingCommand = parseNotifyCommand(original);
   const statePath = join(codexHome, CHAIN_DIRECTORY, CHAIN_STATE_FILE);
   const previousState = await readJson<NotifyChainState>(statePath);
-  const legacyCommand = isBridgeCommand(existingCommand)
-    ? previousState?.legacyCommand ?? null
+  const rawLegacyCommand = isBridgeCommand(existingCommand)
+    ? previousState?.legacyCommand ?? existingCommand
     : existingCommand ?? null;
+  const legacyCommand = sanitizeLegacyNotifyCommand(rawLegacyCommand);
   const bridgeLauncherPath = options.bridgeLauncherPath || resolveBridgeLauncherPath();
   const bridgeCommand = [
     bridgeLauncherPath,
@@ -94,29 +100,32 @@ export async function installCodexNotifyHook(options: CodexNotifyInstallOptions)
 export async function runCodexNotifyHook(
   config: BridgeConfig,
   commandArgs: string[],
+  environment: NotifyEnvironment = process.env,
 ): Promise<void> {
+  // A legacy hook may itself invoke a previous-notify Bridge command. Mark the
+  // child invocation so an old/stale chain cannot recurse back into Bridge.
+  if (notifyChainDepth(environment) > 0) return;
   const payload = parseNotifyPayload(commandArgs);
   if (!payload) return;
 
   const chain = await readJson<NotifyChainState>(join(resolveCodexHome(), CHAIN_DIRECTORY, CHAIN_STATE_FILE));
   const payloadText = JSON.stringify(payload);
-  const legacyPromise = chain?.legacyCommand
-    ? runExternalHook(chain.legacyCommand, payloadText, payload.cwd)
-    : Promise.resolve();
-  // Preserve the pre-existing Computer Use hook for every payload. Only the
-  // Bridge's own delivery path is restricted to the official completion event;
-  // otherwise `/threads`/thread lifecycle payloads can become fake alerts.
-  const bridgePromise = config.localNotifications.enabled && isCodexCompletionNotifyPayload(payload)
-    ? deliverFeishuNotification(config, payload)
-    : Promise.resolve();
-  const results = await Promise.allSettled([legacyPromise, bridgePromise]);
-  const legacyResult = results[0];
-  if (legacyResult.status === "rejected") {
-    process.stderr.write(`原有 Codex notify hook 执行失败：${errorMessage(legacyResult.reason)}\n`);
+  const legacyCommand = sanitizeLegacyNotifyCommand(chain?.legacyCommand);
+  if (legacyCommand) {
+    await runExternalHook(legacyCommand, payloadText, payload.cwd, environment, {
+      [CODEX_NOTIFY_CHAIN_DEPTH_ENV]: "1",
+    }).catch((error) => {
+      process.stderr.write(`原有 Codex notify hook 执行失败：${errorMessage(error)}\n`);
+    });
   }
-  const bridgeResult = results[1];
-  if (bridgeResult.status === "rejected") {
-    process.stderr.write(`Feishu Codex notify hook 执行失败：${errorMessage(bridgeResult.reason)}\n`);
+
+  // Notification delivery is deliberately detached from the official Codex
+  // hook. A macOS permission/osascript/app-server failure must not make the
+  // completed Codex turn look like a failed hook invocation.
+  if (config.localNotifications.enabled
+    && config.localNotifications.mode === "hook"
+    && isCodexCompletionNotifyPayload(payload)) {
+    void deliverFeishuNotification(config, payload).catch(() => undefined);
   }
 }
 
@@ -153,6 +162,36 @@ export function parseNotifyCommand(text: string): string[] | undefined {
   return parseTomlStringArray(text.slice(located.valueStart, located.valueEnd));
 }
 
+export function isBridgeCommand(command: string[] | undefined): boolean {
+  if (!command || command.length === 0) return false;
+  if (isDirectBridgeCommand(command)) return true;
+  const previous = parsePreviousNotifyCommand(command);
+  return previous ? isBridgeCommand(previous) : false;
+}
+
+/**
+ * Retain an allowed legacy wrapper, but remove nested Bridge or Sky commands
+ * from its `--previous-notify` chain. Without this normalization reinstalling
+ * the hook can save a self-referential chain in notify-chain.json.
+ */
+export function sanitizeLegacyNotifyCommand(command: string[] | null | undefined): string[] | null {
+  if (!command || command.length === 0 || isDirectBridgeCommand(command) || isSkyHookCommand(command)) return null;
+  const previousIndex = command.indexOf("--previous-notify");
+  if (previousIndex < 0 || previousIndex + 1 >= command.length) return [...command];
+  const previous = parsePreviousNotifyCommand(command);
+  if (!previous) return [...command];
+  const sanitizedPrevious = sanitizeLegacyNotifyCommand(previous);
+  if (sanitizedPrevious === null) {
+    return [...command.slice(0, previousIndex), ...command.slice(previousIndex + 2)];
+  }
+  if (sameCommand(previous, sanitizedPrevious)) return [...command];
+  return [
+    ...command.slice(0, previousIndex),
+    JSON.stringify(sanitizedPrevious),
+    ...command.slice(previousIndex + 2),
+  ];
+}
+
 export function replaceNotifyCommand(text: string, command: string[]): string {
   const rendered = renderTomlStringArray(command);
   const located = locateRootNotifyValue(text);
@@ -171,6 +210,16 @@ async function deliverFeishuNotification(config: BridgeConfig, payload: NotifyPa
   if (!threadId) return;
   const turnId = stringValue(payload["turn-id"]);
   if (turnId && await wasDelivered(turnId)) return;
+
+  // Claim a typed turn before starting the one-shot app-server lookup. Hook
+  // delivery is detached from the main process, but duplicate hook processes
+  // can still otherwise all spawn a client before the one-minute suppression
+  // check runs. A turn id is already the stable notification identity.
+  const suppression = new NotificationSuppressionStore();
+  const claimedTurn = turnId
+    ? await suppression.claim(notificationSuppressionKey({ threadId, turnId, source: "turn", detail: "" }))
+    : false;
+  if (turnId && !claimedTurn) return;
 
   let source: "cli" | "appServer" = "cli";
   const client = new CodexAppServerClient({
@@ -203,17 +252,30 @@ async function deliverFeishuNotification(config: BridgeConfig, payload: NotifyPa
     ? payload["input-messages"].filter((value): value is string => typeof value === "string").join(" ")
     : "";
   const detail = truncate(assistantMessage || inputMessages || stringValue(payload.cwd) || "Codex turn 已结束。", 600);
-  await enqueueCodexNotification({
-    id: turnId || threadId,
-    title: `${sourceLabel}任务已完成`,
-    body: `${threadId}\n${detail}`,
+  const suppressionKey = notificationSuppressionKey({
+    threadId,
+    turnId,
     source,
-    createdAt: new Date().toISOString(),
+    detail,
   });
+  if (!turnId && !await suppression.claim(suppressionKey)) return;
+  await sendMacLocalNotification(
+    `${sourceLabel}任务已完成`,
+    `${threadId}\n${detail}`,
+    source,
+  );
   if (turnId) await markDelivered(turnId);
 }
 
-function runExternalHook(command: string[], payload: string, cwd?: string): Promise<void> {
+type NotifyEnvironment = Readonly<Record<string, string | undefined>>;
+
+function runExternalHook(
+  command: string[],
+  payload: string,
+  cwd: string | undefined,
+  environment: NotifyEnvironment,
+  environmentPatch: Record<string, string>,
+): Promise<void> {
   return new Promise<void>((resolvePromise, rejectPromise) => {
     if (command.length === 0) {
       resolvePromise();
@@ -221,7 +283,7 @@ function runExternalHook(command: string[], payload: string, cwd?: string): Prom
     }
     const child = spawn(command[0], [...command.slice(1), payload], {
       cwd: cwd && existsSync(cwd) ? cwd : process.cwd(),
-      env: process.env,
+      env: { ...environment, ...environmentPatch },
       stdio: "ignore",
     });
     child.once("error", rejectPromise);
@@ -248,8 +310,37 @@ function resolveCodexHome(): string {
   return resolve(process.env.CODEX_HOME?.trim() || join(homedir(), ".codex"));
 }
 
-function isBridgeCommand(command: string[] | undefined): boolean {
+function isDirectBridgeCommand(command: string[] | undefined): boolean {
   return Boolean(command?.some((value) => value === "codex:notify-hook" || value === "codex:notify-dispatch"));
+}
+
+function isSkyHookCommand(command: string[] | undefined): boolean {
+  const executable = command?.[0]?.toLowerCase() || "";
+  return executable.includes("skycomputeruseclient") || executable.includes("skycomputeruse");
+}
+
+function parsePreviousNotifyCommand(command: string[]): string[] | undefined {
+  const previousIndex = command.indexOf("--previous-notify");
+  const raw = previousIndex >= 0 ? command[previousIndex + 1] : undefined;
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) && parsed.every((value) => typeof value === "string")
+      ? parsed
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sameCommand(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function notifyChainDepth(environment: NotifyEnvironment): number {
+  const value = environment[CODEX_NOTIFY_CHAIN_DEPTH_ENV];
+  const depth = value === undefined ? 0 : Number(value);
+  return Number.isSafeInteger(depth) && depth >= 0 ? depth : 0;
 }
 
 async function enableHookNotifications(configPath: string): Promise<void> {

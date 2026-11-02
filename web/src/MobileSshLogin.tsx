@@ -3,6 +3,8 @@ import {
   listNativeSshOptions, onNativeSshWorkspaceClosed, openNativeSshWorkspace, openNativeTerminal,
   type SshOptions, type SshProfileOption,
 } from "./ssh-connectbot-native.js";
+import { getMobileConnection } from "./mobile-runtime.js";
+import { BRIDGE_GLOBAL_MAC_HOST } from "./bridge-global-config.js";
 
 const EMPTY_OPTIONS: SshOptions = { profiles: [], keys: [] };
 
@@ -16,7 +18,7 @@ function profileOptionLabel(profile: SshProfileOption): string {
 export default function MobileSshLogin(): ReactElement {
   const [options, setOptions] = useState<SshOptions>(EMPTY_OPTIONS);
   const [profileId, setProfileId] = useState("");
-  const [host, setHost] = useState("");
+  const [host, setHost] = useState(BRIDGE_GLOBAL_MAC_HOST);
   const [port, setPort] = useState("22");
   const [username, setUsername] = useState("");
   const [keyId, setKeyId] = useState("");
@@ -70,7 +72,13 @@ export default function MobileSshLogin(): ReactElement {
   const openWorkspace = async (mode?: "manage"): Promise<void> => {
     if (busy) return;
     setBusy(true); setError(null);
-    try { await openNativeSshWorkspace(mode); }
+    try {
+      await openNativeSshWorkspace({
+        defaultHost: BRIDGE_GLOBAL_MAC_HOST,
+        ...(getMobileConnection()?.server ? { bridgeServerOrigin: getMobileConnection()!.server } : {}),
+        ...(mode ? { mode } : {}),
+      });
+    }
     catch (cause) { setError(cause instanceof Error ? cause.message : "无法打开 SSH 工作区。"); }
     finally { setBusy(false); }
   };
@@ -89,6 +97,7 @@ export default function MobileSshLogin(): ReactElement {
     try {
       await openNativeTerminal({
         host: host.trim(), port: parsedPort, username: username.trim(),
+        ...(getMobileConnection()?.server ? { bridgeServerOrigin: getMobileConnection()!.server } : {}),
         ...(profileId ? { profileId } : {}), ...(keyId ? { keyId } : {}),
         ...(!keyId && password ? { password } : {}),
         ...(startupCommand.trim() ? { startupCommand: startupCommand.trim() } : {}),

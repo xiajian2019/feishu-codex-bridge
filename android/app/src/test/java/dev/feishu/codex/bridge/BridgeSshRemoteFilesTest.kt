@@ -39,6 +39,23 @@ class BridgeSshRemoteFilesTest {
     }
 
     @Test
+    fun listingIncludesOptionalUnsignedSftpModificationTimes() = runBlocking {
+        val fake = FakeSftp()
+        fake.directories.addAll(listOf("/repo", "/repo/sub"))
+        fake.files["/repo/readme.md"] = byteArrayOf()
+        fake.files["/repo/unknown.txt"] = byteArrayOf()
+        fake.modifiedTimes["/repo/sub"] = -1
+        fake.modifiedTimes["/repo/readme.md"] = 1_730_000_000
+        val browser = BridgeSshRemoteFiles({ "/repo" }, { fake })
+
+        val (_, entries) = browser.list("")
+        assertEquals(listOf("sub", "readme.md", "unknown.txt"), entries.map { it.name })
+        assertEquals(4_294_967_295L, entries[0].modifiedAtSeconds)
+        assertEquals(1_730_000_000L, entries[1].modifiedAtSeconds)
+        assertEquals(null, entries[2].modifiedAtSeconds)
+    }
+
+    @Test
     fun uploadsAreExclusiveAndFailedWritesCleanOnlyTheirOwnPartialFile() = runBlocking {
         val fake = FakeSftp()
         fake.directories.add("/repo")
@@ -59,6 +76,7 @@ class BridgeSshRemoteFilesTest {
         val directories = mutableSetOf<String>()
         val files = mutableMapOf<String, ByteArray>()
         val links = mutableMapOf<String, String>()
+        val modifiedTimes = mutableMapOf<String, Int>()
         private val handles = mutableMapOf<SftpFileHandle, String>()
         var failWrite = false
         override val protocolVersion: Int = 3
@@ -72,8 +90,8 @@ class BridgeSshRemoteFilesTest {
         override suspend fun stat(path: String): SftpResult<SftpAttributes> = SftpResult.Success(attributes(links[path] ?: path))
         private fun attributes(path: String): SftpAttributes = when {
             path in links -> SftpAttributes(permissions = 0xA000 or 511)
-            path in directories -> SftpAttributes(permissions = 0x4000 or 448)
-            path in files -> SftpAttributes(size = files[path]!!.size.toLong(), permissions = 0x8000 or 384)
+            path in directories -> SftpAttributes(permissions = 0x4000 or 448, mtime = modifiedTimes[path])
+            path in files -> SftpAttributes(size = files[path]!!.size.toLong(), permissions = 0x8000 or 384, mtime = modifiedTimes[path])
             else -> throw IOException("missing")
         }
         override suspend fun listdir(path: String): SftpResult<List<SftpDirectoryEntry>> {

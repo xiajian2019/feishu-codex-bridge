@@ -14,12 +14,17 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.unit.dp
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -33,6 +38,8 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 @RunWith(AndroidJUnit4::class)
 class BridgeSshCompactUiTest {
@@ -104,21 +111,25 @@ class BridgeSshCompactUiTest {
         val hosts = AtomicInteger()
         val tmux = AtomicInteger()
         val disconnected = AtomicInteger()
+        val reconnected = AtomicInteger()
+        val connected = mutableStateOf(true)
+        val reconnecting = mutableStateOf(false)
         ActivityScenario.launch(BridgeConnectBotSshActivity::class.java).use { scenario ->
             scenario.onActivity { activity -> activity.setContent {
                 BridgeSshTheme("dark") {
-                    BridgeSshTerminalHeader("user@host", connected = true, busy = false,
+                    BridgeSshTerminalHeader("user@host", connected = connected.value, reconnecting = reconnecting.value, busy = false,
                         onReturnToWorkbench = { returned.incrementAndGet() },
                         onHosts = { hosts.incrementAndGet() }, onTmux = { tmux.incrementAndGet() },
-                        onReconnect = {}, onDisconnect = { disconnected.incrementAndGet() })
+                        onReconnect = { reconnected.incrementAndGet() }, onDisconnect = { disconnected.incrementAndGet() })
                 }
             } }
             InstrumentationRegistry.getInstrumentation().waitForIdleSync()
-            assertNotNull(waitForNode("tmux"))
+            assertNotNull(waitForNode("tmux 会话"))
+            assertFalse("the tmux entry should be an icon", hasText("tmux"))
             assertNotNull(waitForNode("返回工作台"))
             assertFalse(hasText("主机"))
             assertFalse(hasText("断开"))
-            tap(waitForNode("tmux"))
+            tap(waitForNode("tmux 会话"))
             tap(waitForNode("返回工作台"))
             assertEquals(1, tmux.get())
             assertEquals(1, returned.get())
@@ -129,6 +140,144 @@ class BridgeSshCompactUiTest {
             tap(waitForNode("更多操作"))
             tap(waitForNode("断开"))
             assertEquals(1, disconnected.get())
+            scenario.onActivity { connected.value = false }
+            tap(waitForNode("重连"))
+            assertEquals(1, reconnected.get())
+            scenario.onActivity { reconnecting.value = true }
+            assertNotNull(waitForNode("重连中"))
+        }
+    }
+
+    @Test
+    fun compactHeaderKeepsActionBackgroundsAndTouchTargetsSeparate() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val density = instrumentation.targetContext.resources.displayMetrics.density
+        val usageClicks = AtomicInteger()
+        ActivityScenario.launch(BridgeConnectBotSshActivity::class.java).use { scenario ->
+            scenario.onActivity { activity -> activity.setContent {
+                BridgeSshTheme("dark") {
+                    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                        Column(Modifier.fillMaxSize().safeDrawingPadding()) {
+                            Box(Modifier.width(320.dp)) {
+                                BridgeSshTerminalHeader(
+                                    title = "codex-SDK", connected = true, reconnecting = false, busy = false,
+                                    hasTmuxSession = true, accountLabel = "默认", usageSummary = "57%·63%",
+                                    onReturnToWorkbench = {}, onHosts = {}, onTmux = {}, onReconnect = {},
+                                    onDisconnect = {}, onUsage = { usageClicks.incrementAndGet() },
+                                )
+                            }
+                        }
+                    }
+                }
+            } }
+            instrumentation.waitForIdleSync()
+            val actions = listOf(
+                waitForNode("tmux 会话"),
+                waitForClickableContaining("57%·63%"),
+                waitForNode("返回工作台"),
+                waitForNode("更多操作"),
+            )
+            val bounds = actions.map { Rect().also(it::getBoundsInScreen) }
+            bounds.forEach {
+                assertTrue("each action needs a full touch target", it.width() >= (48 * density).roundToInt() - 1)
+                assertTrue("each action needs a full touch target", it.height() >= (48 * density).roundToInt() - 1)
+            }
+            bounds.zipWithNext().forEach { (left, right) ->
+                assertTrue("neighboring touch targets must not overlap", left.right <= right.left)
+            }
+
+            val screenshot = instrumentation.uiAutomation.takeScreenshot()
+            assertNotNull(screenshot)
+            try {
+                val background = bridgeSshColorScheme("dark").surfaceVariant.toArgb()
+                val y = bounds.first().top + (8 * density).roundToInt()
+                val runs = mutableListOf<IntRange>()
+                var start = -1
+                for (x in bounds.first().left until bounds.last().right) {
+                    if (screenshot.getPixel(x, y) == background) {
+                        if (start < 0) start = x
+                    } else if (start >= 0) {
+                        runs.add(start until x)
+                        start = -1
+                    }
+                }
+                if (start >= 0) runs.add(start until bounds.last().right)
+                assertEquals("each action has its own background", 4, runs.size)
+                val gaps = runs.zipWithNext { left, right -> right.first - left.last - 1 }
+                assertTrue("backgrounds must remain separated", gaps.all { it > 0 })
+                assertTrue("background gaps should be equal", gaps.all { abs(it - gaps.first()) <= (2 * density).roundToInt() })
+            } finally {
+                screenshot.recycle()
+            }
+            tap(actions[1])
+            assertEquals(1, usageClicks.get())
+        }
+    }
+
+    @Test
+    fun sessionIconOpensUsageSortedPickerAndSelectedNameReplacesHost() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val preferences = instrumentation.targetContext.getSharedPreferences("bridge_ssh_usage_ui_test", 0)
+        preferences.edit().clear().commit()
+        val store = BridgeSshTmuxUsageStore(preferences)
+        val key = BridgeSshAppConnectionKey.of("host.test", 22, "user")
+        val zeta = BridgeSshTmuxSession("\$1", "zeta-session", 1, true, "/repo", 100)
+        val alpha = BridgeSshTmuxSession("\$2", "alpha-session", 1, false, "/repo", 200)
+        store.recordOpen(key, zeta, 1000)
+        store.recordOpen(key, zeta, 1010)
+        store.recordOpen(key, alpha, 1020)
+        try {
+            ActivityScenario.launch(BridgeConnectBotSshActivity::class.java).use { scenario ->
+                scenario.onActivity { activity -> activity.setContent {
+                    BridgeSshTheme("dark") {
+                        var selected by remember { mutableStateOf<BridgeSshTmuxSession?>(null) }
+                        var pickerOpen by remember { mutableStateOf(false) }
+                        var revision by remember { mutableStateOf(0) }
+                        val sessions = remember(revision) { store.sort(key, listOf(alpha, zeta)) }
+                        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                            Column(Modifier.fillMaxSize().safeDrawingPadding()) {
+                                BridgeSshTerminalHeader(
+                                    title = selected?.name ?: "user@host.test",
+                                    connected = true, reconnecting = false, busy = false,
+                                    onReturnToWorkbench = {}, onHosts = {}, onTmux = { pickerOpen = true },
+                                    onReconnect = {}, onDisconnect = {},
+                                )
+                            }
+                        }
+                        if (pickerOpen) BridgeSshTmuxPicker(
+                            target = "user@host.test:22", sessions = sessions, refreshing = false,
+                            canRefresh = true, message = null, errorDetails = null,
+                            onRefresh = {}, onDismiss = { pickerOpen = false }, onCopyError = {},
+                            onSelect = { chosen ->
+                                store.recordOpen(key, chosen)
+                                revision += 1
+                                selected = chosen
+                                pickerOpen = false
+                            },
+                        )
+                    }
+                } }
+                assertNotNull(waitForNode("user@host.test"))
+                tap(waitForNode("tmux 会话"))
+                val zetaBounds = Rect().also(waitForNode("zeta-session")::getBoundsInScreen)
+                val alphaBounds = Rect().also(waitForNode("alpha-session")::getBoundsInScreen)
+                assertTrue("the most used session should appear first", zetaBounds.top < alphaBounds.top)
+                tap(waitForNode("alpha-session"))
+                repeat(20) {
+                    if (hasText("tmux 会话")) Thread.sleep(100)
+                }
+                assertFalse("the picker should close after selection", hasText("tmux 会话"))
+                assertNotNull(waitForNode("alpha-session"))
+                assertFalse("the selected session name should replace the host title", hasText("user@host.test"))
+                Thread.sleep(350) // Let the dialog exit animation finish before capturing the header.
+                saveScreenshot("ssh-session-header.png")
+                tap(waitForNode("tmux 会话"))
+                val alphaAfter = Rect().also(waitForNode("alpha-session")::getBoundsInScreen)
+                val zetaAfter = Rect().also(waitForNode("zeta-session")::getBoundsInScreen)
+                assertTrue("the recent click breaks a usage-count tie", alphaAfter.top < zetaAfter.top)
+            }
+        } finally {
+            preferences.edit().clear().commit()
         }
     }
 
@@ -139,6 +288,26 @@ class BridgeSshCompactUiTest {
             Thread.sleep(100)
         }
         throw AssertionError("Missing accessibility target: $label")
+    }
+
+    private fun waitForClickableContaining(label: String): AccessibilityNodeInfo {
+        fun contains(node: AccessibilityNodeInfo?): Boolean {
+            if (node == null) return false
+            if (node.text?.toString()?.contains(label) == true || node.contentDescription?.toString()?.contains(label) == true) return true
+            return (0 until node.childCount).any { contains(node.getChild(it)) }
+        }
+        fun findClickable(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+            if (node == null) return null
+            if (node.isClickable && contains(node)) return node
+            for (index in 0 until node.childCount) findClickable(node.getChild(index))?.let { return it }
+            return null
+        }
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        repeat(80) {
+            findClickable(instrumentation.uiAutomation.rootInActiveWindow)?.let { return it }
+            Thread.sleep(100)
+        }
+        throw AssertionError("Missing clickable accessibility target containing: $label")
     }
 
     private fun find(node: AccessibilityNodeInfo?, label: String): AccessibilityNodeInfo? {

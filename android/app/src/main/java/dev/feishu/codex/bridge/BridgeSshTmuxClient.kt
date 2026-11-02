@@ -285,10 +285,15 @@ class BridgeSshTmuxClient(
     ): List<BridgeSshTmuxSession> {
         val result = execute(BridgeSshTmuxCommandBuilder.listSessions(), maxOutputBytes)
         when (val exit = result.exitInfo) {
-            is SessionExit.Status -> require(exit.code == 0L) {
-                result.stderr.toString(Charsets.UTF_8).ifBlank {
-                    "tmux list-sessions exited with code ${exit.code}"
+            is SessionExit.Status -> if (exit.code != 0L) {
+                val stderr = result.stderr.toString(Charsets.UTF_8)
+                val noServer = exit.code == 1L && stderr.lineSequence().any { line ->
+                    val text = line.trim().lowercase()
+                    text.startsWith("no server running") || text == "no sessions" ||
+                        (text.startsWith("error connecting to ") && text.contains("no such file or directory"))
                 }
+                if (noServer) return emptyList()
+                error(stderr.ifBlank { "tmux list-sessions exited with code ${exit.code}" })
             }
             is SessionExit.Signal -> error(
                 result.stderr.toString(Charsets.UTF_8).ifBlank {

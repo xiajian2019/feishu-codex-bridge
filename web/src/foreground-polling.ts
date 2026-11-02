@@ -4,6 +4,8 @@ export function setAppForeground(active: boolean): void {
   appActive = active;
   window.dispatchEvent(new Event(ACTIVITY_EVENT));
 }
+// Native overlays may cover the WebView while the Activity remains foregrounded.
+export function isAppActive(): boolean { return appActive; }
 export function isAppForeground(): boolean {
   return appActive && document.visibilityState !== "hidden";
 }

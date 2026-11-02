@@ -76,7 +76,7 @@ class BridgeSshWorkbenchLiveTest {
                 waitForJs(scenario, "!!document.querySelector('.mobile-ssh-login') && !!document.querySelector('.mobile-connect-return')")
                 evaluate(scenario, """
                     window.Capacitor.Plugins.BridgeConnectBotSSH.openTerminal({
-                      host:'10.0.2.2', port:$sshPort, username:'$username', profileId:'${profile.id}', keyId:'${key.id}'
+                      host:'10.0.2.2', port:$sshPort, username:'$username', bridgeServerOrigin:server, profileId:'${profile.id}', keyId:'${key.id}'
                     }); true
                 """.trimIndent())
                 waitForTerminal()
@@ -100,7 +100,7 @@ class BridgeSshWorkbenchLiveTest {
                 waitForJs(scenario, "!!document.querySelector('.mobile-ssh-login')")
                 evaluate(scenario, """
                     window.Capacitor.Plugins.BridgeConnectBotSSH.openTerminal({
-                      host:'10.0.2.2', port:$sshPort, username:'$username', profileId:'${profile.id}', keyId:'${key.id}'
+                      host:'10.0.2.2', port:$sshPort, username:'$username', bridgeServerOrigin:server, profileId:'${profile.id}', keyId:'${key.id}'
                     }); true
                 """.trimIndent())
                 waitForTerminal()

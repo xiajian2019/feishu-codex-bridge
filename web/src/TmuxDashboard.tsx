@@ -1937,7 +1937,7 @@ export function TmuxDashboard(): ReactElement {
             <span />
             <span>
               Connected to your local tmux
-              {resurrectStatus?.perSessionRestore ? " · 按 Session 自动恢复" : resurrectStatus?.installed ? " · 快照插件已安装" : " · 快照插件未配置"}
+              {resurrectStatus?.perSessionRestore ? " · 重启后可用 CLI 按 Session 恢复" : resurrectStatus?.installed ? " · 快照插件已安装" : " · 快照插件未配置"}
             </span>
           </div>
         </aside>

@@ -15,7 +15,13 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 
-internal data class BridgeSshRemoteFile(val name: String, val relativePath: String, val directory: Boolean, val size: Long?)
+internal data class BridgeSshRemoteFile(
+    val name: String,
+    val relativePath: String,
+    val directory: Boolean,
+    val size: Long?,
+    val modifiedAtSeconds: Long?,
+)
 
 /** A read/transfer boundary rooted at the current SSH host and tmux identity. */
 internal class BridgeSshRemoteFiles internal constructor(
@@ -49,7 +55,9 @@ internal class BridgeSshRemoteFiles internal constructor(
                 val type = (entry.attrs.permissions ?: return@mapNotNull null) and TYPE_MASK
                 if (type != DIRECTORY && type != REGULAR) return@mapNotNull null
                 val child = if (relative.isEmpty()) name else "$relative/$name"
-                BridgeSshRemoteFile(name, child, type == DIRECTORY, entry.attrs.size)
+                // SFTP v3 encodes timestamps as unsigned 32-bit seconds.
+                val modifiedAt = entry.attrs.mtime?.toLong()?.and(0xffff_ffffL)
+                BridgeSshRemoteFile(name, child, type == DIRECTORY, entry.attrs.size, modifiedAt)
             }.sortedWith(compareByDescending<BridgeSshRemoteFile> { it.directory }.thenBy { it.name.lowercase() })
             root to entries
         }

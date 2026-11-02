@@ -52,10 +52,18 @@ const ShareInbox = registerPlugin<{
   getFile(options: { shareId: string; fileId: string }): Promise<{ uri: string }>;
   addListener(event: "shareReceived", handler: (event: { id?: string; error?: string; state?: string }) => void): Promise<PluginListenerHandle>;
 }>("BridgeShareInbox");
+const Motion = registerPlugin<{
+  setEnabled(options: { enabled: boolean }): Promise<{ available: boolean }>;
+  addListener(event: "motion", handler: (sample: { x: number; y: number; z: number; timestampMs: number }) => void): Promise<PluginListenerHandle>;
+}>("BridgeMotion");
+const AutoVpn = registerPlugin<{
+  requestRecovery(options: { host: string; port: number }): Promise<{ accepted: boolean }>;
+}>("BridgeAutoVpn");
 // Browser preview uses memory only; tokens are never persisted in browser storage.
 const previewCredentials = new Map<string, string>();
 let lifecycle: Promise<void> | null = null;
 let shakeCleanup: (() => void) | null = null;
+let nativeMotionAvailable = false;
 
 export async function getCredential(server: string): Promise<string | null> {
   return Capacitor.isNativePlatform() ? (await Credentials.get({ server })).token : previewCredentials.get(server) ?? null;
@@ -71,6 +79,17 @@ export async function removeCredential(server: string): Promise<void> {
 
 export function isAndroidPlatform(): boolean {
   return Capacitor.getPlatform() === "android";
+}
+
+export async function requestMobileVpnRecovery(target: { host: string; port: number }): Promise<boolean> {
+  if (!isAndroidPlatform() || !Capacitor.isPluginAvailable("BridgeAutoVpn")) return false;
+  try {
+    const result = await AutoVpn.requestRecovery(target);
+    return result.accepted === true;
+  } catch {
+    // VPN installation, authorization and profile errors stay local to the native UI.
+    return false;
+  }
 }
 
 export async function nativeAppVersion(): Promise<string> {
@@ -109,7 +128,7 @@ export async function installNativeLifecycle(): Promise<void> {
       lifecycle = null;
       throw error;
     }
-    installShakeDetector();
+    await installShakeDetector();
     if (typeof App.getLaunchUrl === "function") {
       const opened = await App.getLaunchUrl().catch(() => undefined);
       if (opened?.url?.startsWith("bridgecodex:")) {
@@ -168,32 +187,53 @@ export async function showNativeNotification(options: { id: number; title: strin
 let shakeActive = true;
 const shakeDetector = createShakeDetector();
 
-function installShakeDetector(): void {
-  if (shakeCleanup || typeof window === "undefined" || !("DeviceMotionEvent" in window)) return;
+async function installShakeDetector(): Promise<void> {
+  if (shakeCleanup || typeof window === "undefined") return;
   let motionEnabled = readMobileShakeEnabled();
-  const onMotion = (event: DeviceMotionEvent): void => {
-    if (!motionEnabled || !shakeActive || document.visibilityState === "hidden") {
+  const sample = (acceleration: { x: number; y: number; z: number }, native: boolean, now = performance.now()): void => {
+    if (!motionEnabled || !shakeActive || (!native && document.visibilityState === "hidden")) {
       shakeDetector.reset();
       return;
     }
+    if (shakeDetector.sample(acceleration, now)) window.dispatchEvent(new Event(MOBILE_SHAKE_EVENT));
+  };
+  let nativeHandle: PluginListenerHandle | null = null;
+  if (isAndroidPlatform() && Capacitor.isPluginAvailable("BridgeMotion")) {
+    try {
+      nativeHandle = await Motion.addListener("motion", (reading) => sample(reading, true, reading.timestampMs));
+      nativeMotionAvailable = (await Motion.setEnabled({ enabled: motionEnabled })).available;
+      if (!nativeMotionAvailable) { await nativeHandle.remove(); nativeHandle = null; }
+    } catch {
+      await nativeHandle?.remove().catch(() => {});
+      void Motion.setEnabled({ enabled: false }).catch(() => {});
+      nativeHandle = null;
+      nativeMotionAvailable = false;
+    }
+  }
+  const onMotion = (event: DeviceMotionEvent): void => {
     const acceleration = [event.acceleration, event.accelerationIncludingGravity]
       .find((value) => value?.x != null && value.y != null && value.z != null);
     if (!acceleration || acceleration.x === null || acceleration.y === null || acceleration.z === null) {
       shakeDetector.reset();
       return;
     }
-    if (shakeDetector.sample({ x: acceleration.x, y: acceleration.y, z: acceleration.z }, performance.now())) {
-      window.dispatchEvent(new Event(MOBILE_SHAKE_EVENT));
-    }
+    sample({ x: acceleration.x, y: acceleration.y, z: acceleration.z }, false);
   };
-  const resetMotion = (): void => { motionEnabled = readMobileShakeEnabled(); shakeDetector.reset(); };
-  window.addEventListener("devicemotion", onMotion, { passive: true });
+  const resetMotion = (): void => {
+    motionEnabled = readMobileShakeEnabled();
+    shakeDetector.reset();
+    if (nativeMotionAvailable) void Motion.setEnabled({ enabled: motionEnabled }).catch(() => {});
+  };
+  if (!nativeMotionAvailable && "DeviceMotionEvent" in window) window.addEventListener("devicemotion", onMotion, { passive: true });
   document.addEventListener("visibilitychange", resetMotion);
   window.addEventListener(MOBILE_SHAKE_PREFERENCE_EVENT, resetMotion);
   shakeCleanup = () => {
     window.removeEventListener("devicemotion", onMotion);
     document.removeEventListener("visibilitychange", resetMotion);
     window.removeEventListener(MOBILE_SHAKE_PREFERENCE_EVENT, resetMotion);
+    if (nativeHandle) void nativeHandle.remove();
+    if (nativeMotionAvailable) void Motion.setEnabled({ enabled: false }).catch(() => {});
+    nativeMotionAvailable = false;
   };
 }
 
@@ -235,7 +275,10 @@ export async function scanPairingQr(): Promise<string | null> {
 }
 
 export async function setShakeEnabled(enabled: boolean): Promise<void> {
-  if (enabled) {
+  if (nativeMotionAvailable) {
+    const result = await Motion.setEnabled({ enabled });
+    if (enabled && !result.available) throw new Error("此设备未提供摇一摇能力，可从系统管理手动切换环境。");
+  } else if (enabled) {
     const motion = (window as typeof window & { DeviceMotionEvent?: { requestPermission?: () => Promise<string> } }).DeviceMotionEvent;
     if (!motion) throw new Error("此设备未提供摇一摇能力，可从系统管理手动切换环境。");
     if (motion.requestPermission && await motion.requestPermission() !== "granted") throw new Error("未获得运动传感器权限，可从系统管理手动切换环境。");

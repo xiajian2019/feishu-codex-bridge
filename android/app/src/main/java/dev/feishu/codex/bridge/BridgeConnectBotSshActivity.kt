@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Build
 import android.os.SystemClock
 import android.provider.OpenableColumns
+import android.view.View
 import android.view.ViewGroup
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
@@ -28,6 +29,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -45,6 +47,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -69,6 +72,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
@@ -80,11 +84,18 @@ import org.connectbot.sshlib.ConnectResult
 import org.json.JSONObject
 
 private enum class SshSetupPage { HOSTS, EDIT_HOST, KEYS }
+private data class SshGitDownloadRequest(
+    val owner: BridgeSshAppSession,
+    val target: BridgeSshTmuxSession,
+    val root: String,
+    val file: BridgeSshGitFile,
+)
 
 /** Native Android host for the ConnectBot cbssh + termlib workspace. */
 open class BridgeConnectBotSshActivity : BridgeActivity() {
     protected open fun isEmbeddedSshHost(): Boolean = false
     private var workspaceView: ComposeView? = null
+    private var appUpdateBanner by mutableStateOf<BridgeAppUpdateBannerState?>(null)
     private var previousStatusBarColor = 0
     private var previousNavigationBarColor = 0
     private var previousLightStatusBar = false
@@ -117,11 +128,14 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     private var editingProfileId by mutableStateOf<String?>(null)
     private var profileLabel by mutableStateOf("")
     private var hasIncomingConnection by mutableStateOf(false)
+    private var bridgeServerOrigin: String? = null
+    private var configuredDefaultHost = ""
     private var profileToDelete by mutableStateOf<BridgeSshProfile?>(null)
     private var keyToDelete by mutableStateOf<BridgeSshStoredKey?>(null)
-    private var tmuxSessions by mutableStateOf<List<BridgeSshTmuxSession>?>(null)
+    private val tmuxSessionCache = BridgeSshTmuxSessionCache()
+    private val tmuxUsageStore by lazy { BridgeSshTmuxUsageStore(applicationContext) }
+    private var tmuxUsageRevision by mutableStateOf(0L)
     private var tmuxClient: BridgeSshTmuxClient? = null
-    private var tmuxRefreshing by mutableStateOf(false)
     private var tmuxPickerOpen by mutableStateOf(false)
     private var connectionMessage by mutableStateOf<String?>(null)
     private var connectionErrorDetails by mutableStateOf<String?>(null)
@@ -134,11 +148,11 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     private var transport: BridgeCbSshTransport? = null
     private var shellTransport: BridgeSshAppTerminalTransport? = null
     private var managedSession: BridgeSshAppSession? = null
+    private var managedBindingGeneration = -1L
     private var provisionalTransport: BridgeCbSshTransport? = null
     private var connectJob: Job? = null
-    private var pendingReconnectTarget: BridgeSshTmuxSession? = null
+    private var pendingReconnectTarget: BridgeSshTmuxIdentity? = null
     private var pendingReconnectKey: BridgeSshAppConnectionKey? = null
-    private var lastAutoReconnectAt = 0L
     private var externalPickerOpen = false
     private var externalPickerReturnedAt = 0L
     private var keyGenerationJob: Job? = null
@@ -151,6 +165,26 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     private var composerSending by mutableStateOf(false)
     private var composerStaging by mutableStateOf(false)
     private var selectedTmuxSession by mutableStateOf<BridgeSshTmuxSession?>(null)
+    private var sshActionBusy by mutableStateOf(false)
+    private var sshCodexHomes by mutableStateOf<List<BridgeSshCodexHome>>(emptyList())
+    private var sshSelectedCodexHome by mutableStateOf("")
+    private var sshAccountOpen by mutableStateOf(false)
+    private var sshAccountError by mutableStateOf<String?>(null)
+    private var sshUsageSummary by mutableStateOf("-·-")
+    private var sshUsageJob: Job? = null
+    private var sshUsageOpen by mutableStateOf(false)
+    private var sshUsageResult by mutableStateOf<JSONObject?>(null)
+    private var sshUsageError by mutableStateOf<String?>(null)
+    private var sshGitOpen by mutableStateOf(false)
+    private var sshGitState by mutableStateOf<BridgeSshGitState?>(null)
+    private var sshGitSelected by mutableStateOf<BridgeSshGitFile?>(null)
+    private var sshGitDetail by mutableStateOf<String?>(null)
+    private var sshGitPreview by mutableStateOf(false)
+    private var sshGitTruncated by mutableStateOf(false)
+    private var sshGitError by mutableStateOf<String?>(null)
+    private var sshSuspended by mutableStateOf<List<BridgeSshSuspendedSession>>(emptyList())
+    private var sshSuspendedError by mutableStateOf<String?>(null)
+    private var sshConfirmAction by mutableStateOf<String?>(null)
     private var shortcutCatalog by mutableStateOf<BridgeSshShortcutCatalog?>(null)
     private var shortcutSourceScope: String? = null
     private var shortcutLoadGeneration = 0L
@@ -163,6 +197,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     private var skillPickerGeneration = 0L
     private var previewAttachmentId by mutableStateOf<String?>(null)
     private var terminalScrollController: BridgeSshScrollController? = null
+    private var terminalHistoryContext by mutableStateOf(0L)
     private var composerDiagnostics = BridgeSshDiagnostics()
     private val diagnosticsRecording: Boolean get() = BridgeSshActivityDiagnostics.recording
     private var diagnosticCopyRetry by mutableStateOf(false)
@@ -171,6 +206,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     private var remoteFilesOpen by mutableStateOf(false)
     private var remoteFilesRoot by mutableStateOf("")
     private var remoteFilesPath by mutableStateOf("")
+    private var remoteFilesRequestedPath: String? = null
     private var remoteFilesEntries by mutableStateOf<List<BridgeSshRemoteFile>>(emptyList())
     private var remoteFilesBusy by mutableStateOf(false)
     private var remoteFilesError by mutableStateOf<String?>(null)
@@ -180,6 +216,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     private var remotePreviewPdf by mutableStateOf(false)
     private var remotePreviewJob: Job? = null
     private var remoteDownload: BridgeSshRemoteFile? = null
+    private var sshGitDownload: SshGitDownloadRequest? = null
     private var attachmentPickerScope: String? = null
     private var composerAttachmentStates by mutableStateOf<Map<String, Pair<BridgeSshComposerAttachmentStatus, String?>>>(emptyMap())
     private var composerUploadedPaths = mutableMapOf<String, String>()
@@ -226,6 +263,12 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         remoteDownload = null
         if (uri != null && file != null) downloadRemoteFile(file, uri)
     }
+    private val sshGitDownloadPicker = registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        markExternalPickerReturned(uri != null)
+        val request = sshGitDownload
+        sshGitDownload = null
+        if (uri != null && request != null) downloadSshGitFile(request, uri)
+    }
     private val keyImportPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         markExternalPickerReturned(uri != null)
         if (uri != null) importPrivateKey(uri)
@@ -242,13 +285,19 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
             applyWindowTheme(nativeTheme)
             setContent { WorkspaceContent() }
         } else if (savedInstanceState?.getBoolean(STATE_WORKSPACE_VISIBLE) == true) {
-            openEmbeddedSshWorkspace(null)
+            val restoredRequest = Intent().putExtra(
+                EXTRA_BRIDGE_SERVER_ORIGIN,
+                savedInstanceState.getString(STATE_BRIDGE_SERVER_ORIGIN),
+            ).putExtra(EXTRA_DEFAULT_HOST, savedInstanceState.getString(STATE_DEFAULT_HOST))
+            openEmbeddedSshWorkspace(restoredRequest)
         }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         traceActivity(BridgeSshTraceEvent.ACTIVITY_SAVE_STATE)
         outState.putBoolean(STATE_WORKSPACE_VISIBLE, workspaceView != null)
+        bridgeServerOrigin?.let { outState.putString(STATE_BRIDGE_SERVER_ORIGIN, it) }
+        if (configuredDefaultHost.isNotBlank()) outState.putString(STATE_DEFAULT_HOST, configuredDefaultHost)
         super.onSaveInstanceState(outState)
     }
 
@@ -285,9 +334,28 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         }
     }
 
+    internal fun setAppUpdateBanner(state: BridgeAppUpdateBannerState?) {
+        appUpdateBanner = state
+    }
+
+    /** Temporarily reveal the connection center without detaching the SSH session. */
+    internal fun setEmbeddedSshWorkspaceVisible(visible: Boolean): Boolean {
+        val view = workspaceView ?: return false
+        view.visibility = if (visible) View.VISIBLE else View.INVISIBLE
+        return true
+    }
+
+    internal fun closeEmbeddedSshWorkspace() {
+        if (workspaceView != null) closeActivity()
+    }
+
     private fun prepareWorkspace(request: Intent?) {
         pendingReconnectTarget = null
         pendingReconnectKey = null
+        bridgeServerOrigin = request?.getStringExtra(EXTRA_BRIDGE_SERVER_ORIGIN)?.let { origin ->
+            runCatching { BridgeSecureCredentialStore.normalizeServerOrigin(origin) }.getOrNull()
+        }
+        configuredDefaultHost = request?.getStringExtra(EXTRA_DEFAULT_HOST).orEmpty().trim()
         startNewProfile()
         setupPage = SshSetupPage.HOSTS
         nativeTheme = BridgeNativeTheme.read(this)
@@ -304,7 +372,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         val profile = request?.getStringExtra(EXTRA_PROFILE_ID)?.let { id -> savedProfiles.firstOrNull { it.id == id } }
         if (profile != null) applyProfile(profile)
         if (incoming) {
-            host = request?.getStringExtra(EXTRA_HOST).orEmpty().ifBlank { BridgeSshProtocol.DEFAULT_HOST }
+            host = request?.getStringExtra(EXTRA_HOST).orEmpty().ifBlank { configuredDefaultHost }
             port = (request?.getIntExtra(EXTRA_PORT, BridgeSshProtocol.DEFAULT_PORT) ?: BridgeSshProtocol.DEFAULT_PORT).toString()
             username = incomingUsername
             password = request?.getStringExtra(EXTRA_PASSWORD).orEmpty()
@@ -328,7 +396,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         } else BridgeSshAppState.mostRecent()
         if (incoming && previous != null && previous.terminalSession.status.state != BridgeSshConnectionState.CONNECTED) {
             // An explicit login must not silently reopen a dead transport.
-            pendingReconnectTarget = previous.selectedTmuxSession
+            pendingReconnectTarget = previous.selectedTmuxSession?.let(BridgeSshTmuxIdentity::of) ?: previous.resumeTarget
             pendingReconnectKey = previous.key
             BridgeSshAppState.disconnect(previous)
             previous = null
@@ -338,6 +406,9 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
             savedProfiles.firstOrNull { candidate ->
                 candidate.keyId.isNotBlank() && savedKeys.any { it.id == candidate.keyId }
             }?.let { candidate ->
+                val key = BridgeSshAppConnectionKey.of(candidate.host, candidate.port, candidate.username)
+                pendingReconnectKey = key
+                pendingReconnectTarget = BridgeSshTmuxResumeStore(applicationContext).load(key)
                 connectionMessage = "正在恢复最近使用的 SSH 主机…"
                 BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.RECONNECT_STARTED,
                     BridgeSshTraceField.DETAIL to BridgeSshTraceDetail.RESTORED)
@@ -352,12 +423,26 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     private fun WorkspaceContent() {
         BridgeSshTheme(nativeTheme) {
             Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                val session = terminalSession
-                if (session != null) TerminalScreen(session)
-                else Box(Modifier.fillMaxSize().safeDrawingPadding()) { SetupScreen() }
-                pendingHostKey?.let { prompt -> HostKeyDialog(prompt) }
-                if (keyGenerationDialog) KeyGenerationDialog()
-                generatedPublicKeyDialog?.let { PublicKeyDialog(it) }
+                Box(Modifier.fillMaxSize()) {
+                    val session = terminalSession
+                    val appSession = managedSession
+                    val generation = appSession?.bindingGeneration
+                    LaunchedEffect(appSession, generation) {
+                        if (appSession != null && managedSession === appSession) refreshManagedSessionBindings(appSession)
+                    }
+                    if (session != null) TerminalScreen(session)
+                    else Box(Modifier.fillMaxSize().safeDrawingPadding()) { SetupScreen() }
+                    pendingHostKey?.let { prompt -> HostKeyDialog(prompt) }
+                    if (keyGenerationDialog) KeyGenerationDialog()
+                    generatedPublicKeyDialog?.let { PublicKeyDialog(it) }
+                    appUpdateBanner?.let { update ->
+                        Box(Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(horizontal = 12.dp, vertical = 8.dp)) {
+                            BridgeAppUpdateBanner(update) { action ->
+                                (bridge?.getPlugin("BridgeConnectBotSSH")?.instance as? BridgeConnectBotSSHPlugin)?.updateAction(action)
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -823,29 +908,51 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
 
     @Composable
     private fun TmuxSessionPickerDialog() {
+        val sessions = tmuxSessionCache.sessions
+        val connectionKey = managedSession?.key
+        val sortedSessions = remember(sessions, connectionKey, tmuxUsageRevision) {
+            if (sessions != null && connectionKey != null) {
+                runCatching { tmuxUsageStore.sort(connectionKey, sessions) }.getOrDefault(sessions)
+            } else sessions
+        }
+        LaunchedEffect(managedSession?.key, managedSession?.bindingGeneration) { refreshSshSuspended() }
         BridgeSshTmuxPicker(
             target = "$username@$host:$port",
-            sessions = tmuxSessions,
-            refreshing = tmuxRefreshing,
-            canRefresh = tmuxClient != null,
+            sessions = sortedSessions,
+            refreshing = tmuxSessionCache.refreshing || sshActionBusy,
+            canRefresh = tmuxClient != null && !sshActionBusy,
             message = connectionMessage,
             errorDetails = connectionErrorDetails,
-            onRefresh = { refreshTmuxSessions() },
+            onRefresh = { refreshTmuxSessions(); refreshSshSuspended() },
             onDismiss = { tmuxPickerOpen = false },
-            onSelect = { openTmuxSession(it) },
+            onSelect = { openTmuxSession(it, userInitiated = true) },
             onCopyError = { copyConnectionError(it) },
+            suspendedSessions = sshSuspended,
+            suspendedError = sshSuspendedError,
+            onRestore = { restoreSshSession(it) },
         )
     }
 
     @Composable
     private fun TerminalScreen(session: BridgeSshTerminalSession) {
         DisposableEffect(session) { onDispose { session.setComposerFocused(false) } }
+        LaunchedEffect(selectedTmuxSession?.id, selectedTmuxSession?.createdAt, managedSession?.bindingGeneration) {
+            sshCodexHomes = emptyList()
+            sshSelectedCodexHome = ""
+            sshUsageSummary = "-·-"
+            sshUsageJob?.cancel()
+            sshUsageJob = null
+            sshGitOpen = false
+            sshUsageOpen = false
+            sshAccountOpen = false
+            if (selectedTmuxSession != null) loadSshAccounts()
+        }
         BackHandler {
             when {
                 skillPickerOpen -> skillPickerOpen = false
                 shortcutPanelOpen -> shortcutPanelOpen = false
                 tmuxPickerOpen -> tmuxPickerOpen = false
-                remoteFilesOpen -> remoteFilesOpen = false
+                remoteFilesOpen -> closeRemoteFiles()
                 else -> closeActivity()
             }
         }
@@ -873,17 +980,24 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         // Applying safeDrawing's IME inset again would shrink the terminal twice.
         Column(modifier = Modifier.fillMaxSize().bridgeSshWorkspaceInsets()) {
             BridgeSshTerminalHeader(
-                title = "$username@$host${selectedTmuxSession?.let { " · ${it.name}" }.orEmpty()}",
+                title = selectedTmuxSession?.name ?: "$username@$host",
                 connected = session.status.state == BridgeSshConnectionState.CONNECTED,
-                busy = composerSending || composerStaging,
+                reconnecting = managedSession?.reconnecting == true,
+                busy = composerSending || composerStaging || sshActionBusy,
+                hasTmuxSession = selectedTmuxSession != null,
+                accountLabel = sshCodexHomes.firstOrNull { it.id == sshSelectedCodexHome }?.label,
+                usageSummary = sshUsageSummary,
+                onGitChanges = { sshGitState = null; sshGitSelected = null; loadSshGitChanges() },
+                onAccounts = { sshAccountOpen = true; loadSshAccounts() },
+                onUsage = { loadSshUsage() },
+                onSaveSnapshot = { runSshSessionAction("save") },
+                onSuspend = { sshConfirmAction = "suspend" },
+                onEnd = { sshConfirmAction = "end" },
                 onReturnToWorkbench = { closeActivity(returnToWorkbench = true) },
                 onHosts = { detachSession(); setupPage = SshSetupPage.HOSTS },
                 onTmux = { openTmuxPicker() },
                 onReconnect = {
-                    disconnectCurrentSession()
-                    setupPage = SshSetupPage.EDIT_HOST
-                    connectionState = "未连接"
-                    connectionMessage = "连接已中断，草稿已保存；请检查认证信息后重新连接。"
+                    managedSession?.requestReconnect(force = true) { prompt -> awaitHostKey(prompt) }
                 },
                 onDisconnect = { disconnectCurrentSession(); closeActivity() },
             )
@@ -895,7 +1009,9 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 val historyClient = tmuxClient
                 BridgeSshTerminalViewport(
                     session = session,
-                    historyKey = historyTarget?.let { it.id to it.createdAt },
+                    historyKey = historyTarget?.let {
+                        Triple(it.id, it.createdAt, managedSession?.bindingGeneration to terminalHistoryContext)
+                    },
                     captureHistory = if (historyTarget != null && historyClient != null) {
                         { historyClient.captureHistory(historyTarget.id) }
                     } else null,
@@ -937,7 +1053,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                         session.sendTerminalInput(it.toByteArray(Charsets.UTF_8)); true
                     } ?: false
                 },
-                connectionStatusMessage = session.status.message?.let { "$it，草稿已保留" },
+                connectionStatusMessage = session.status.message?.let { "$it，草稿已保留" } ?: managedSession?.recoveryNotice,
                 shortcuts = {
                     val enabled = !composerSending && !composerStaging && session.status.state == BridgeSshConnectionState.CONNECTED
                     BridgeSshComposerToolbar(shortcutCatalog, shortcutPanelOpen, shortcutCategory, enabled, diagnosticsRecording,
@@ -957,6 +1073,43 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 TextButton(onClick = { acknowledgeComposerUncertainty(scope, composerState) }) { Text("已检查终端，允许再次发送") }
             }
             if (tmuxPickerOpen) TmuxSessionPickerDialog()
+            if (sshGitOpen) BridgeSshGitChangesDialog(
+                sessionName = selectedTmuxSession?.name.orEmpty(), data = sshGitState, busy = sshActionBusy,
+                error = sshGitError, selected = sshGitSelected, detail = sshGitDetail,
+                preview = sshGitPreview, truncated = sshGitTruncated,
+                onDismiss = { sshGitOpen = false }, onRefresh = { loadSshGitChanges() },
+                onSelect = { file, preview -> loadSshGitDetail(file, preview) },
+                onDownload = { file ->
+                    val target = selectedTmuxSession
+                    val owner = managedSession
+                    val root = sshGitState?.root
+                    if (target != null && owner != null && root != null) {
+                        sshGitDownload = SshGitDownloadRequest(owner, target, root, file)
+                        markExternalPickerLaunched()
+                        sshGitDownloadPicker.launch(file.path.substringAfterLast('/'))
+                    }
+                },
+            )
+            if (sshAccountOpen) BridgeSshCodexHomesDialog(
+                homes = sshCodexHomes, selected = sshSelectedCodexHome, busy = sshActionBusy,
+                error = sshAccountError, onSelect = { changeSshAccount(it) },
+                onRefreshRunning = { changeSshAccount() }, onDismiss = { sshAccountOpen = false },
+            )
+            if (sshUsageOpen) BridgeSshCodexUsageDialog(
+                label = sshCodexHomes.firstOrNull { it.id == sshSelectedCodexHome }?.label.orEmpty(),
+                result = sshUsageResult, busy = sshActionBusy, error = sshUsageError,
+                onRefresh = { loadSshUsage() }, onDismiss = { sshUsageOpen = false },
+            )
+            sshConfirmAction?.let { action ->
+                val name = selectedTmuxSession?.name.orEmpty()
+                AlertDialog(onDismissRequest = { sshConfirmAction = null },
+                    title = { Text(if (action == "suspend") "挂起 Session？" else "终结 Session？") },
+                    text = { Text(if (action == "suspend")
+                        "将保存「$name」的独立快照并停止其中的进程，之后可从 SSH 或 Web 恢复。"
+                        else "将停止「$name」中的进程并结束其可恢复状态；历史记录仍可查看。") },
+                    confirmButton = { TextButton(onClick = { sshConfirmAction = null; runSshSessionAction(action) }) { Text("确认") } },
+                    dismissButton = { TextButton(onClick = { sshConfirmAction = null }) { Text("取消") } })
+            }
             if (skillPickerOpen) BridgeSshSkillPicker(skillPickerItems, skillPickerMessage,
                 onDismiss = { composerState.setSkillTrigger(null); skillPickerOpen = false },
                 onSelect = { composerState.insertSkill(it); skillPickerOpen = false })
@@ -969,7 +1122,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 root = remoteFilesRoot, relative = remoteFilesPath, files = remoteFilesEntries,
                 busy = remoteFilesBusy, error = remoteFilesError, previewName = remotePreviewName,
                 previewText = remotePreviewText, previewFile = remotePreviewFile, previewPdf = remotePreviewPdf,
-                onDismiss = { closeRemotePreview(); remoteFilesOpen = false; remoteFiles = null },
+                onDismiss = { closeRemoteFiles() },
                 onDirectory = { refreshRemoteFiles(it) }, onPreview = { previewRemoteFile(it) },
                 onDownload = { remoteDownload = it; markExternalPickerLaunched(); remoteDownloadPicker.launch(it.name) },
                 onCopyPath = { file ->
@@ -1201,7 +1354,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         identitySelection = identitySelection.withoutKey()
         editingProfileId = null
         profileLabel = ""
-        host = BridgeSshProtocol.DEFAULT_HOST
+        host = configuredDefaultHost
         port = BridgeSshProtocol.DEFAULT_PORT.toString()
         username = ""
         password = ""
@@ -1434,8 +1587,14 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 val sequence = forced ?: BridgeSshShortcutEncoding.resolve(shortcut, named)
                 if (sequence != null) {
                     if (session.status.state != BridgeSshConnectionState.CONNECTED || composerSending || composerStaging) return
+                    // A tmux shortcut can switch panes before new PTY output arrives.
+                    if (shortcut.groupId == "tmux") terminalHistoryContext += 1
                     session.sendTerminalInput(sequence.toByteArray(Charsets.UTF_8))
                     if (shortcut.value in setOf("tmux-detach", "tmux-detach-client", "tmux-next-session", "tmux-previous-session", "tmux-last-session", "tmux-choose-session", "tmux-choose-tree", "tmux-suspend")) {
+                        managedSession?.let { current ->
+                            current.resumeTarget = null
+                            runCatching { BridgeSshTmuxResumeStore(applicationContext).clear(current.key) }
+                        }
                         activateComposerScope(null)
                         composerNotice = "终端会话可能已切换；请通过 tmux 选择器重新定位 Session。"
                     }
@@ -1617,17 +1776,28 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         if (terminalSession?.status?.state != BridgeSshConnectionState.CONNECTED) return
         shortcutPanelOpen = false
         remoteFiles = BridgeSshRemoteFiles(ssh, selectedTmuxSession, tmuxClient)
+        remoteFilesBusy = false
         remoteFilesOpen = true
         remoteFilesRoot = ""
         remoteFilesPath = ""
+        remoteFilesRequestedPath = null
         remoteFilesEntries = emptyList()
         remoteFilesError = null
         refreshRemoteFiles("")
     }
 
+    private fun closeRemoteFiles() {
+        closeRemotePreview()
+        remoteFilesOpen = false
+        remoteFiles = null
+        remoteFilesBusy = false
+        remoteFilesRequestedPath = null
+    }
+
     private fun refreshRemoteFiles(path: String) {
         val browser = remoteFiles ?: return
         if (remoteFilesBusy) return
+        remoteFilesRequestedPath = path
         remoteFilesBusy = true
         remoteFilesError = null
         activityScope.launch {
@@ -1636,12 +1806,17 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 if (remoteFiles === browser && remoteFilesOpen) {
                     remoteFilesRoot = root
                     remoteFilesPath = path
+                    remoteFilesRequestedPath = null
                     remoteFilesEntries = entries
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
-                if (remoteFiles === browser && remoteFilesOpen) remoteFilesError = "无法读取 SSH 目录，请检查连接和 Session 状态。"
+                if (remoteFiles === browser && remoteFilesOpen) {
+                    remoteFilesError = "无法读取 SSH 目录，请检查连接和 Session 状态。"
+                    val current = managedSession
+                    if (current != null && (!current.transport.isAuthenticated || !current.shellTransport.isLive)) current.requestReconnect()
+                }
             } finally { if (remoteFiles === browser) remoteFilesBusy = false }
         }
     }
@@ -2159,49 +2334,14 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         externalPickerOpen || (externalPickerReturnedAt != 0L &&
             SystemClock.elapsedRealtime() - externalPickerReturnedAt < 1_500L)
 
-    /**
-     * A foreground transition is the reliable Android lifecycle point at which
-     * an interactive SSH session can be restored. Passwords are never retained,
-     * so automatic recovery is attempted only for a saved private-key profile.
-     * The last tmux target is restored when it still exists; otherwise the user
-     * remains in the shell and can open the picker manually.
-     */
+    /** The app-owned session also retries while its workspace is not visible. */
     private fun maybeReconnectOnResume() {
         val current = managedSession ?: return
-        if (connectJob != null || privateKeyReading) {
-            BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.RECONNECT_SKIPPED,
-                BridgeSshTraceField.SESSION to current.diagnosticId, BridgeSshTraceField.DETAIL to BridgeSshTraceDetail.CONNECTING)
-            return
-        }
-        if (current.terminalSession.status.state !in setOf(
+        if (current.terminalSession.status.state in setOf(
                 BridgeSshConnectionState.FAILED,
                 BridgeSshConnectionState.DISCONNECTED,
                 BridgeSshConnectionState.CLOSED,
-            )) return
-        val now = System.currentTimeMillis()
-        if (now - lastAutoReconnectAt < 5_000L) {
-            BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.RECONNECT_SKIPPED,
-                BridgeSshTraceField.SESSION to current.diagnosticId, BridgeSshTraceField.DETAIL to BridgeSshTraceDetail.THROTTLED)
-            return
-        }
-        val profile = savedProfiles.firstOrNull {
-            BridgeSshAppConnectionKey.of(it.host, it.port, it.username) == current.key && it.keyId.isNotBlank()
-        } ?: run {
-            BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.RECONNECT_SKIPPED,
-                BridgeSshTraceField.SESSION to current.diagnosticId, BridgeSshTraceField.DETAIL to BridgeSshTraceDetail.NO_SAVED_KEY)
-            connectionMessage = "SSH 已断开；当前主机没有可自动重连的已保存私钥。"
-            return
-        }
-        lastAutoReconnectAt = now
-        BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.RECONNECT_STARTED,
-            BridgeSshTraceField.SESSION to current.diagnosticId, BridgeSshTraceField.DETAIL to BridgeSshTraceDetail.AUTOMATIC)
-        pendingReconnectTarget = current.selectedTmuxSession ?: selectedTmuxSession
-        pendingReconnectKey = current.key
-        BridgeSshAppState.disconnect(current, BridgeSshTraceDetail.AUTOMATIC)
-        detachSession()
-        applyProfile(profile)
-        connectionMessage = "正在使用已保存私钥恢复 SSH；恢复后会重新读取 tmux Session。"
-        connectProfile(profile, automatic = true)
+            ) && !current.reconnecting) current.requestReconnect()
     }
 
     private fun decideHostKey(accepted: Boolean) {
@@ -2210,37 +2350,305 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         hostKeyDecision?.complete(accepted)
     }
 
-    private fun refreshTmuxSessions() {
+    private fun currentSessionTool(): BridgeSshRemoteSession? = managedSession
+        ?.takeIf { it.transport.isAuthenticated }
+        ?.let { session ->
+            val apiClient = bridgeServerOrigin?.let { origin ->
+                runCatching {
+                    BridgeSecureCredentialStore(applicationContext).get(origin)
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { token -> BridgeSshApiClient(origin, token) }
+                }.getOrNull()
+            }
+            BridgeSshRemoteSession(session.transport, apiClient)
+        }
+
+    private fun isCurrentTarget(target: BridgeSshTmuxSession): Boolean =
+        selectedTmuxSession?.let { it.id == target.id && it.createdAt == target.createdAt } == true
+
+    private fun loadSshAccounts() {
+        val target = selectedTmuxSession ?: return
+        val tool = currentSessionTool() ?: return
+        if (sshActionBusy) return
+        sshActionBusy = true
+        sshAccountError = null
+        activityScope.launch {
+            try {
+                val result = tool.call("accounts", target)
+                if (isCurrentTarget(target)) {
+                    val array = result.optJSONArray("homes")
+                    sshCodexHomes = (0 until (array?.length() ?: 0)).mapNotNull { index ->
+                        array?.optJSONObject(index)?.let { BridgeSshCodexHome(it.getString("id"), it.getString("path"), it.getString("label")) }
+                    }
+                    sshSelectedCodexHome = result.optString("selected")
+                    loadSshUsageSummary(target, sshSelectedCodexHome)
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { if (isCurrentTarget(target)) sshAccountError = error.message ?: "无法读取账号。" }
+            finally { sshActionBusy = false }
+        }
+    }
+
+    private fun changeSshAccount(home: BridgeSshCodexHome? = null) {
+        val target = selectedTmuxSession ?: return
+        val tool = currentSessionTool() ?: return
+        if (sshActionBusy) return
+        sshActionBusy = true
+        sshAccountError = null
+        activityScope.launch {
+            try {
+                val action = if (home == null) "refresh_account" else "mark_account"
+                val args = home?.let { mapOf("home" to it.id) } ?: emptyMap()
+                val result = tool.call(action, target, args)
+                if (isCurrentTarget(target)) {
+                    sshSelectedCodexHome = result.getString("selected")
+                    loadSshUsageSummary(target, sshSelectedCodexHome)
+                    composerNotice = "已更新账号标记；现有 shell 和正在运行的 Codex 不会切换。"
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { if (isCurrentTarget(target)) sshAccountError = error.message ?: "无法更新账号标记。" }
+            finally { sshActionBusy = false }
+        }
+    }
+
+    private fun loadSshUsageSummary(target: BridgeSshTmuxSession, home: String) {
+        sshUsageJob?.cancel()
+        sshUsageSummary = "-·-"
+        if (home.isBlank()) return
+        val tool = currentSessionTool() ?: return
+        sshUsageJob = activityScope.launch {
+            try {
+                val result = tool.call("usage", target, mapOf("home" to home))
+                if (isCurrentTarget(target) && sshSelectedCodexHome == home) {
+                    sshUsageSummary = codexUsageSummary(result)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                if (isCurrentTarget(target) && sshSelectedCodexHome == home) sshUsageSummary = "-·-"
+            }
+        }
+    }
+
+    private fun loadSshUsage() {
+        val target = selectedTmuxSession ?: return
+        val tool = currentSessionTool() ?: return
+        val home = sshSelectedCodexHome.takeIf { it.isNotBlank() } ?: return
+        if (sshActionBusy) return
+        sshUsageOpen = true
+        sshActionBusy = true
+        sshUsageError = null
+        sshUsageResult = null
+        activityScope.launch {
+            try {
+                val result = tool.call("usage", target, mapOf("home" to home))
+                if (isCurrentTarget(target) && sshSelectedCodexHome == home) {
+                    sshUsageResult = result
+                    sshUsageSummary = codexUsageSummary(result)
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { if (isCurrentTarget(target)) sshUsageError = error.message ?: "无法读取用量。" }
+            finally { sshActionBusy = false }
+        }
+    }
+
+    private fun loadSshGitChanges() {
+        val target = selectedTmuxSession ?: return
+        val tool = currentSessionTool() ?: return
+        if (sshActionBusy) return
+        sshGitOpen = true
+        sshActionBusy = true
+        sshGitError = null
+        activityScope.launch {
+            try {
+                val result = tool.call("git_list", target)
+                if (isCurrentTarget(target)) {
+                    val array = result.optJSONArray("files")
+                    val files = (0 until (array?.length() ?: 0)).mapNotNull { index ->
+                        array?.optJSONObject(index)?.let {
+                            val size = if (it.isNull("size")) null else it.optLong("size", -1).takeIf { value -> value >= 0 }
+                            BridgeSshGitFile(it.getString("path"), it.getString("status"), size)
+                        }
+                    }
+                    sshGitState = BridgeSshGitState(result.getString("root"), result.optString("branch"), files)
+                    sshGitSelected = null
+                    sshGitDetail = null
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { if (isCurrentTarget(target)) sshGitError = error.message ?: "无法读取 Git 变更。" }
+            finally { sshActionBusy = false }
+        }
+    }
+
+    private fun downloadSshGitFile(request: SshGitDownloadRequest, uri: Uri) {
+        if (managedSession !== request.owner || !isCurrentTarget(request.target) || sshActionBusy) {
+            sshGitError = "Session 已切换，请重新选择文件。"
+            return
+        }
+        val tool = BridgeSshRemoteSession(request.owner.transport)
+        val browser = BridgeSshRemoteFiles(
+            resolveCurrentRoot = {
+                val result = tool.call("git_list", request.target, mapOf("root" to request.root))
+                val files = result.getJSONArray("files")
+                check((0 until files.length()).any { index ->
+                    files.optJSONObject(index)?.optString("path") == request.file.path
+                }) { "文件已不在当前变更列表中。" }
+                result.getString("root")
+            },
+            openSftp = { request.owner.transport.openSftp() },
+        )
+        sshActionBusy = true
+        sshGitError = null
+        activityScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    checkNotNull(contentResolver.openOutputStream(uri)) { "无法打开下载目标。" }.use { output ->
+                        browser.download(request.file.path, output)
+                    }
+                }
+                sshGitError = null
+                composerNotice = "文件已下载。"
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { sshGitError = "下载失败：${error.message ?: "请检查连接和文件状态。"}" }
+            finally { sshActionBusy = false }
+        }
+    }
+
+    private fun loadSshGitDetail(file: BridgeSshGitFile, preview: Boolean) {
+        val target = selectedTmuxSession ?: return
+        val tool = currentSessionTool() ?: return
+        val root = sshGitState?.root ?: return
+        if (sshActionBusy) return
+        sshGitSelected = file
+        sshGitPreview = preview
+        sshGitDetail = null
+        sshGitTruncated = false
+        sshGitError = null
+        sshActionBusy = true
+        activityScope.launch {
+            try {
+                val result = tool.call(if (preview) "git_preview" else "git_diff", target, mapOf("root" to root, "path" to file.path))
+                if (isCurrentTarget(target) && sshGitSelected == file) {
+                    sshGitDetail = result.getString("text")
+                    sshGitTruncated = result.optBoolean("truncated")
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { if (isCurrentTarget(target)) sshGitError = error.message ?: "无法读取文件。" }
+            finally { sshActionBusy = false }
+        }
+    }
+
+    private fun runSshSessionAction(action: String) {
+        val target = selectedTmuxSession ?: return
+        val tool = currentSessionTool() ?: return
+        if (sshActionBusy) return
+        sshActionBusy = true
+        composerNotice = null
+        activityScope.launch {
+            try {
+                tool.call(action, target)
+                if (isCurrentTarget(target)) {
+                    if (action == "suspend" || action == "end") {
+                        managedSession?.let {
+                            it.resumeTarget = null
+                            runCatching { BridgeSshTmuxResumeStore(applicationContext).clear(it.key) }
+                        }
+                        activateComposerScope(null)
+                        sshCodexHomes = emptyList()
+                        sshSelectedCodexHome = ""
+                        tmuxSessionCache.reset()
+                    }
+                    composerNotice = when (action) {
+                        "save" -> "已保存「${target.name}」的独立快照。"
+                        "suspend" -> "已挂起「${target.name}」，可从 tmux 会话列表恢复。"
+                        else -> "已终结「${target.name}」。"
+                    }
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                if (isCurrentTarget(target)) composerNotice = "操作未确认：${error.message ?: "请刷新会话列表核对。"}"
+            } finally { sshActionBusy = false }
+        }
+    }
+
+    private fun refreshSshSuspended() {
+        val tool = currentSessionTool() ?: return
+        val owner = managedSession ?: return
+        activityScope.launch {
+            try {
+                val result = tool.call("list_suspended")
+                if (managedSession === owner) {
+                    val array = result.optJSONArray("sessions")
+                    sshSuspended = (0 until (array?.length() ?: 0)).mapNotNull { index ->
+                        array?.optJSONObject(index)?.let { BridgeSshSuspendedSession(it.getString("id"), it.getLong("createdAt"), it.getString("name"), it.optString("cwd")) }
+                    }
+                    sshSuspendedError = null
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { if (managedSession === owner) sshSuspendedError = error.message ?: "无法读取挂起的会话。" }
+        }
+    }
+
+    private fun restoreSshSession(session: BridgeSshSuspendedSession) {
+        val tool = currentSessionTool() ?: return
+        if (sshActionBusy) return
+        sshActionBusy = true
+        sshSuspendedError = null
+        activityScope.launch {
+            try {
+                tool.call("restore", identity = BridgeSshTmuxIdentity(session.id, session.createdAt))
+                connectionMessage = "已恢复「${session.name}」，请选择它进入。"
+                tmuxSessionCache.reset()
+                refreshTmuxSessions()
+                refreshSshSuspended()
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { sshSuspendedError = "恢复结果未确认：${error.message ?: "请刷新核对。"}" }
+            finally { sshActionBusy = false }
+        }
+    }
+
+    private fun refreshTmuxSessions(force: Boolean = true) {
         val client = tmuxClient ?: return
-        if (tmuxRefreshing) return
-        tmuxRefreshing = true
+        if (tmuxSessionCache.refreshing || (!force && tmuxSessionCache.sessions != null)) return
         connectionMessage = null
         connectionErrorDetails = null
         activityScope.launch {
-            try {
-                tmuxSessions = withContext(Dispatchers.IO) { client.listSessions() }
-                connectionState = "请选择 tmux Session"
-            } catch (error: Throwable) {
-                connectionMessage = "tmux Session 列表读取失败。"
-                connectionErrorDetails = formatConnectionError(
-                    error = error,
-                    phase = "list-tmux",
-                    usedPublicKey = false,
-                )
-            } finally {
-                tmuxRefreshing = false
+            when (val result = tmuxSessionCache.load(force) { withContext(Dispatchers.IO) { client.listSessions() } }) {
+                BridgeSshTmuxLoadResult.Loaded -> {
+                    connectionState = "请选择 tmux Session"
+                    val selected = selectedTmuxSession
+                    val updated = selected?.let { previous ->
+                        tmuxSessionCache.sessions?.firstOrNull { it.id == previous.id && it.createdAt == previous.createdAt }
+                    }
+                    if (updated != null) {
+                        selectedTmuxSession = updated
+                        managedSession?.selectedTmuxSession = updated
+                    }
+                }
+                is BridgeSshTmuxLoadResult.Failed -> {
+                    connectionMessage = "tmux Session 列表读取失败。"
+                    connectionErrorDetails = formatConnectionError(
+                        error = result.error,
+                        phase = "list-tmux",
+                        usedPublicKey = false,
+                    )
+                }
+                BridgeSshTmuxLoadResult.Skipped -> Unit
             }
         }
     }
 
     private fun openTmuxPicker() {
         tmuxPickerOpen = true
-        refreshTmuxSessions()
+        refreshTmuxSessions(force = false)
     }
 
-    private fun openTmuxSession(session: BridgeSshTmuxSession) {
+    private fun openTmuxSession(session: BridgeSshTmuxSession, userInitiated: Boolean = false) {
         val shell = shellTransport ?: return
         if (composerSending || composerStaging) return
+        if (userInitiated) managedSession?.key?.let { key ->
+            if (runCatching { tmuxUsageStore.recordOpen(key, session) }.isSuccess) tmuxUsageRevision += 1
+        }
         val current = selectedTmuxSession
         composerSending = true
         connectionMessage = if (current == null) "正在进入 tmux Session…" else "正在切换 tmux Session…"
@@ -2263,6 +2671,11 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 when (result) {
                     BridgeSshCommandSendResult.Written -> {
                         activateComposerScope(session)
+                        managedSession?.let { current ->
+                            current.resumeTarget = BridgeSshTmuxIdentity.of(session)
+                            current.clearRecoveryNotice()
+                            runCatching { BridgeSshTmuxResumeStore(applicationContext).save(current.key, session) }
+                        }
                         tmuxPickerOpen = false
                         connectionMessage = null
                     }
@@ -2289,11 +2702,18 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
             setupPage = SshSetupPage.EDIT_HOST
             return
         }
-        if (saveCurrentProfile() == null) return
+        if (!automatic && saveCurrentProfile() == null) return
         val connectionKey = BridgeSshAppConnectionKey.of(host, parsedPort, username)
         BridgeSshAppState.find(connectionKey)?.let { existing ->
-            attachSession(existing, restoreProfile = true)
-            return
+            if (existing.terminalSession.status.state == BridgeSshConnectionState.CONNECTED && !existing.reconnecting) {
+                attachSession(existing, restoreProfile = true)
+                return
+            }
+            // A user-supplied replacement credential must not reopen a failed session.
+            pendingReconnectKey = connectionKey
+            pendingReconnectTarget = existing.selectedTmuxSession?.let(BridgeSshTmuxIdentity::of) ?: existing.resumeTarget
+            if (managedSession === existing) detachSession()
+            BridgeSshAppState.disconnect(existing, BridgeSshTraceDetail.USER)
         }
         connectionMessage = null
         connectionErrorDetails = null
@@ -2322,7 +2742,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 }
                 keyPassphrase = passphrase.takeIf { key != null && it.isNotEmpty() }?.toCharArray()
                 val verifier = BridgeCbSshHostKeyVerifier(
-                    applicationContext.getSharedPreferences(KNOWN_HOSTS_PREFERENCES, Context.MODE_PRIVATE),
+                    applicationContext.getSharedPreferences(BRIDGE_SSH_KNOWN_HOSTS_PREFERENCES, Context.MODE_PRIVATE),
                     host,
                     parsedPort,
                 ) { prompt -> awaitHostKey(prompt) }
@@ -2387,11 +2807,18 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 phase = "open-shell"
                 traceConnectionPhase(attempt, phase)
                 val shell = withContext(Dispatchers.IO) { nextTransport.openShell() }
-                val (session, created) = BridgeSshAppState.register(connectionKey, nextTransport, shell)
+                val reconnectCredentials = when {
+                    selectedStoredKeyId != null -> BridgeSshReconnectCredentials.StoredKey(selectedStoredKeyId!!)
+                    key != null -> BridgeSshReconnectCredentials.TemporaryKey(key, keyPassphrase)
+                    else -> BridgeSshReconnectCredentials.Password(password.toCharArray())
+                }
+                val (session, created) = BridgeSshAppState.register(connectionKey, nextTransport, shell, reconnectCredentials)
+                password = ""
                 BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.CONNECTION_SUCCEEDED,
                     BridgeSshTraceField.ATTEMPT to attempt, BridgeSshTraceField.SESSION to session.diagnosticId,
                     BridgeSshTraceField.DETAIL to if (created) BridgeSshTraceDetail.REGISTERED else BridgeSshTraceDetail.RESTORED)
                 val reconnectTarget = pendingReconnectTarget.takeIf { pendingReconnectKey == connectionKey }
+                if (created && reconnectTarget != null) session.resumeTarget = reconnectTarget
                 pendingReconnectTarget = null
                 pendingReconnectKey = null
                 provisionalTransport = null
@@ -2400,9 +2827,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 if (created && reconnectTarget != null) {
                     val liveTarget = try {
                         withContext(Dispatchers.IO) {
-                            session.tmuxClient.listSessions().firstOrNull {
-                                it.id == reconnectTarget.id && it.createdAt == reconnectTarget.createdAt
-                            }
+                            session.tmuxClient.findResumeTarget(reconnectTarget)
                         }
                     } catch (cancelled: CancellationException) {
                         throw cancelled
@@ -2415,7 +2840,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                     if (liveTarget != null) {
                         openTmuxSession(liveTarget)
                     } else {
-                        connectionMessage = "上次 tmux Session 已不存在；请点击 tmux 选择其他会话。"
+                        connectionMessage = "无法恢复上次 tmux Session；请点击 tmux 重新选择。"
                         composerNotice = connectionMessage
                     }
                 } else if (created && startupCommand.isNotBlank()) {
@@ -2488,9 +2913,11 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         return try {
             decision.await()
         } finally {
-            withContext(Dispatchers.Main.immediate) {
-                if (hostKeyDecision === decision) hostKeyDecision = null
-                pendingHostKey = null
+            withContext(NonCancellable + Dispatchers.Main.immediate) {
+                if (hostKeyDecision === decision) {
+                    hostKeyDecision = null
+                    pendingHostKey = null
+                }
             }
         }
     }
@@ -2622,6 +3049,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         }
         BridgeSshAppState.view(session)
         managedSession = session
+        managedBindingGeneration = session.bindingGeneration
         transport = session.transport
         shellTransport = session.shellTransport
         tmuxClient = session.tmuxClient
@@ -2640,23 +3068,55 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         tmuxPickerOpen = false
     }
 
+    /** Rebind screen-owned helpers after the app replaces a broken SSH transport. */
+    private fun refreshManagedSessionBindings(session: BridgeSshAppSession) {
+        if (managedSession !== session || managedBindingGeneration == session.bindingGeneration) return
+        managedBindingGeneration = session.bindingGeneration
+        val reopenFiles = remoteFilesOpen
+        val requestedPath = remoteFilesRequestedPath ?: remoteFilesPath
+        if (remotePreviewJob != null) {
+            remotePreviewJob?.cancel()
+            remotePreviewJob = null
+            if (remotePreviewFile == null && remotePreviewText == null) remotePreviewText = "连接中断，请关闭后重新打开预览。"
+        }
+        transport = session.transport
+        shellTransport = session.shellTransport
+        tmuxClient = session.tmuxClient
+        tmuxSessionCache.reset()
+        val previous = selectedTmuxSession
+        val restored = session.selectedTmuxSession
+        val targetChanged = previous?.id != restored?.id || previous?.createdAt != restored?.createdAt
+        if (targetChanged) activateComposerScope(restored) else selectedTmuxSession = restored
+        if (reopenFiles && targetChanged) {
+            // Do not silently reinterpret the old relative directory under a different root.
+            closeRemoteFiles()
+        } else if (reopenFiles) {
+            remoteFiles = BridgeSshRemoteFiles(session.transport, session.selectedTmuxSession, session.tmuxClient)
+            remoteFilesBusy = false
+            remoteFilesError = null
+            refreshRemoteFiles(requestedPath)
+        }
+        session.recoveryNotice?.let { composerNotice = it }
+    }
+
     /** Release only screen-owned UI state; the app session keeps running. */
     private fun detachSession() {
         managedSession?.let { session ->
             BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.SESSION_DETACHED, BridgeSshTraceField.SESSION to session.diagnosticId)
         }
         managedSession = null
+        managedBindingGeneration = -1L
         terminalSession = null
         closeRemotePreview()
         remoteFiles = null
         remoteFilesOpen = false
         remoteFilesBusy = false
+        remoteFilesRequestedPath = null
         terminalScrollController = null
         shellTransport = null
         transport = null
         tmuxClient = null
-        tmuxSessions = null
-        tmuxRefreshing = false
+        tmuxSessionCache.reset()
         tmuxPickerOpen = false
         skillPickerOpen = false
         skillPickerGeneration += 1
@@ -2734,10 +3194,30 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         const val EXTRA_STARTUP_COMMAND = "bridge.ssh.startupCommand"
         const val EXTRA_PROFILE_ID = "bridge.ssh.profileId"
         const val EXTRA_KEY_ID = "bridge.ssh.keyId"
+        const val EXTRA_BRIDGE_SERVER_ORIGIN = "bridge.ssh.bridgeServerOrigin"
+        const val EXTRA_DEFAULT_HOST = "bridge.ssh.defaultHost"
         const val EXTRA_MANAGE = "bridge.ssh.manage"
         private const val STATE_WORKSPACE_VISIBLE = "bridge.ssh.workspaceVisible"
-        private const val KNOWN_HOSTS_PREFERENCES = "bridge_connectbot_known_hosts"
+        private const val STATE_BRIDGE_SERVER_ORIGIN = "bridge.ssh.bridgeServerOrigin.state"
+        private const val STATE_DEFAULT_HOST = "bridge.ssh.defaultHost.state"
     }
+}
+
+private fun codexUsageSummary(response: JSONObject): String {
+    val byId = response.optJSONObject("rateLimitsByLimitId")
+    val snapshot = byId?.optJSONObject("codex") ?: byId?.let { values ->
+        val keys = values.keys()
+        while (keys.hasNext()) {
+            values.optJSONObject(keys.next())?.let { return@let it }
+        }
+        null
+    } ?: response.optJSONObject("rateLimits")
+    fun remaining(window: JSONObject?): String {
+        val used = window?.optDouble("usedPercent", Double.NaN) ?: Double.NaN
+        if (!used.isFinite()) return "-"
+        return "${(100.0 - used).coerceIn(0.0, 100.0).toInt()}%"
+    }
+    return "${remaining(snapshot?.optJSONObject("primary"))}·${remaining(snapshot?.optJSONObject("secondary"))}"
 }
 
 private class BridgeSshConnectionFailure(

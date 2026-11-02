@@ -33,7 +33,7 @@ import {
   type BridgeSSHHostKeyEvent,
   type BridgeSSHPrivateKeyInfo,
 } from "./ssh-protocol.js";
-import { copyMobileText, isMobileApp } from "./mobile-runtime.js";
+import { copyMobileText, getMobileConnection, isMobileApp } from "./mobile-runtime.js";
 import { bindMobileTerminalTouch, type TerminalSelectionDisplay } from "./terminal-touch.js";
 import { getTmuxTerminalTheme } from "./tmux-terminal-theme.js";
 import { useTheme } from "./theme.js";
@@ -110,7 +110,10 @@ function MobileSshPage(): ReactElement {
     setBusy(true);
     setError(null);
     try {
-      await openNativeSshWorkspace();
+      await openNativeSshWorkspace({
+        defaultHost: SSH_DEFAULT_HOST,
+        ...(getMobileConnection()?.server ? { bridgeServerOrigin: getMobileConnection()!.server } : {}),
+      });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法打开 SSH 主机管理。请确认当前运行的是 Android App。");
     } finally {
@@ -128,6 +131,7 @@ function MobileSshPage(): ReactElement {
         host: host.trim(),
         port: Number(port),
         username: username.trim(),
+        ...(getMobileConnection()?.server ? { bridgeServerOrigin: getMobileConnection()!.server } : {}),
         ...(password ? { password } : {}),
         ...(startupCommand.trim() ? { startupCommand: startupCommand.trim() } : {}),
       });

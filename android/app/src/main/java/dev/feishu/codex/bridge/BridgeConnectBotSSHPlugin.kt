@@ -49,10 +49,21 @@ class BridgeConnectBotSSHPlugin : Plugin() {
     /** Open the existing native manager without leaving the current Activity. */
     @PluginMethod
     fun openWorkspace(call: PluginCall) {
-        val request = if (call.getString("mode") == "manage") {
-            Intent(activity, BridgeConnectBotSshActivity::class.java)
-                .putExtra(BridgeConnectBotSshActivity.EXTRA_MANAGE, true)
-        } else null
+        val serverOrigin = bridgeServerOrigin(call)
+        if (serverOrigin == null && !call.getString("bridgeServerOrigin").isNullOrBlank()) return
+        val defaultHost = call.getString("defaultHost")?.trim().orEmpty()
+        if (defaultHost.length > BridgeSshProtocol.MAX_HOST_LENGTH || containsControl(defaultHost)) {
+            call.reject("Invalid default SSH host.", "INVALID_ARGUMENTS")
+            return
+        }
+        val request = Intent(activity, BridgeConnectBotSshActivity::class.java)
+            .apply {
+                serverOrigin?.let { putExtra(BridgeConnectBotSshActivity.EXTRA_BRIDGE_SERVER_ORIGIN, it) }
+                if (defaultHost.isNotBlank()) putExtra(BridgeConnectBotSshActivity.EXTRA_DEFAULT_HOST, defaultHost)
+                if (call.getString("mode") == "manage") {
+                    putExtra(BridgeConnectBotSshActivity.EXTRA_MANAGE, true)
+                }
+            }
         openInHost(call, request)
     }
 
@@ -66,6 +77,45 @@ class BridgeConnectBotSSHPlugin : Plugin() {
     }
 
     @PluginMethod
+    fun setWorkspaceVisible(call: PluginCall) {
+        val visible = call.getBoolean("visible", true) ?: true
+        activity.runOnUiThread {
+            val changed = (activity as? MainActivity)?.setEmbeddedSshWorkspaceVisible(visible) == true
+            call.resolve(JSObject().put("workspaceOpen", changed))
+        }
+    }
+
+    @PluginMethod
+    fun closeWorkspace(call: PluginCall) {
+        activity.runOnUiThread {
+            (activity as? MainActivity)?.closeEmbeddedSshWorkspace()
+            call.resolve()
+        }
+    }
+
+    @PluginMethod
+    fun setUpdateBanner(call: PluginCall) {
+        val visible = call.getBoolean("visible", false) ?: false
+        val state = if (visible) BridgeAppUpdateBannerState(
+            detail = call.getString("detail").orEmpty().take(200),
+            status = call.getString("status").orEmpty().take(240),
+            error = call.getString("error").orEmpty().take(300),
+            busy = call.getBoolean("busy", false) ?: false,
+            downloaded = call.getBoolean("downloaded", false) ?: false,
+        ) else null
+        activity.runOnUiThread {
+            (activity as? MainActivity)?.setAppUpdateBanner(state)
+            call.resolve()
+        }
+    }
+
+    internal fun updateAction(action: String) {
+        if (action in setOf("install", "download", "dismiss")) {
+            notifyListeners("updateAction", JSObject().put("action", action))
+        }
+    }
+
+    @PluginMethod
     fun openTerminal(call: PluginCall) {
         val host = call.getString("host")?.trim()
         val username = call.getString("username")?.trim()
@@ -74,6 +124,8 @@ class BridgeConnectBotSSHPlugin : Plugin() {
         val startupCommand = call.getString("startupCommand")
         val profileId = call.getString("profileId")
         val keyId = call.getString("keyId")
+        val serverOrigin = bridgeServerOrigin(call)
+        if (serverOrigin == null && !call.getString("bridgeServerOrigin").isNullOrBlank()) return
 
         if (host.isNullOrEmpty() || host.length > BridgeSshProtocol.MAX_HOST_LENGTH || containsControl(host)) {
             call.reject("Invalid SSH host.", "INVALID_ARGUMENTS")
@@ -107,7 +159,19 @@ class BridgeConnectBotSSHPlugin : Plugin() {
             .putExtra(BridgeConnectBotSshActivity.EXTRA_STARTUP_COMMAND, startupCommand)
             .putExtra(BridgeConnectBotSshActivity.EXTRA_PROFILE_ID, profileId)
             .putExtra(BridgeConnectBotSshActivity.EXTRA_KEY_ID, keyId)
+            .apply { serverOrigin?.let { putExtra(BridgeConnectBotSshActivity.EXTRA_BRIDGE_SERVER_ORIGIN, it) } }
         openInHost(call, intent)
+    }
+
+    private fun bridgeServerOrigin(call: PluginCall): String? {
+        val value = call.getString("bridgeServerOrigin")
+        if (value.isNullOrBlank()) return null
+        return try {
+            BridgeSecureCredentialStore.normalizeServerOrigin(value)
+        } catch (_: Exception) {
+            call.reject("当前 Bridge 地址无效，请重新连接后再打开 SSH。", "BRIDGE_ORIGIN_REQUIRED")
+            null
+        }
     }
 
     private fun openInHost(call: PluginCall, request: Intent?) {

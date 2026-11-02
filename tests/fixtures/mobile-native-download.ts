@@ -42,6 +42,8 @@ const apkSaves: Array<Record<string, unknown>> = [];
 const clipboardWrites: Array<Record<string, unknown>> = [];
 const nativeScans: Array<Record<string, unknown>> = [];
 const appListeners = new Map<string, (event: any) => void>();
+let nativeMotionListener: ((event: { x: number; y: number; z: number; timestampMs: number }) => void) | undefined;
+const nativeMotionEnabled: boolean[] = [];
 let notificationAction: ((event: any) => void) | undefined;
 let shareReceived: ((event: { id?: string; error?: string }) => void) | undefined;
 let nativePermission = "granted";
@@ -69,8 +71,22 @@ Object.defineProperty(globalThis, "setTimeout", { value: (callback: () => void) 
 Object.defineProperty(globalThis, "clearTimeout", { value: (id: number) => { timers.delete(id); } });
 
 mock.module("@capacitor/core", () => ({
-  Capacitor: { isNativePlatform: () => true, getPlatform: () => android ? "android" : "ios", convertFileSrc: (uri: string) => "https://native.fixture/" + encodeURIComponent(uri) },
-  registerPlugin: (name: string) => name === "BridgeShareInbox" ? {
+  Capacitor: { isNativePlatform: () => true, getPlatform: () => android ? "android" : "ios",
+    isPluginAvailable: (name: string) => name === "BridgeMotion" && (scenario === "android-native-motion" || scenario === "android-native-motion-fallback"),
+    convertFileSrc: (uri: string) => "https://native.fixture/" + encodeURIComponent(uri) },
+  registerPlugin: (name: string) => name === "BridgeMotion" ? {
+    addListener: async (_event: string, callback: typeof nativeMotionListener) => {
+      nativeMotionListener = callback; return { remove: async () => {
+        nativeMotionListener = undefined;
+        if (scenario === "android-native-motion-fallback") throw new Error("fixture listener removal failed");
+      } };
+    },
+    setEnabled: async ({ enabled }: { enabled: boolean }) => {
+      nativeMotionEnabled.push(enabled);
+      if (scenario === "android-native-motion-fallback" && enabled) throw new Error("fixture sensor unavailable");
+      return { available: true };
+    },
+  } : name === "BridgeShareInbox" ? {
     addListener: async (_event: string, callback: typeof shareReceived) => { shareReceived = callback; return { remove: async () => {} }; },
     listShares: async () => ({ shares: [incomingShare] }),
     getFile: async () => ({ uri: scenario === "android-share-invalid-uri" ? "https://evil.fixture/private" : "file:///fixture-inbox/test" }),
@@ -280,6 +296,55 @@ if (scenario?.startsWith("android-scan-")) {
   else assert.equal(await native.scanPairingQr(), scenario === "android-scan-cancel" ? null : "bridgecodex://connect?fixture=pairing");
   assert.equal(nativeScans.length, 1);
   assert.equal(nativeScans[0]?.cameraDirection, 1);
+  process.exit(0);
+}
+if (scenario === "android-native-motion-fallback") {
+  let clock = 0;
+  let detected = 0;
+  Object.defineProperty(performance, "now", { configurable: true, value: () => clock });
+  Object.assign(windowEvents, { DeviceMotionEvent: {} });
+  windowEvents.addEventListener("bridge:mobile-shake", () => { detected++; });
+  await native.installNativeLifecycle();
+  for (clock = 0; clock <= 1_000; clock += 20) {
+    const x = [[120, 22], [240, 0], [520, -22], [640, 0]].findLast(([at]) => at! <= clock)?.[1] ?? 0;
+    windowEvents.dispatchEvent(Object.assign(new Event("devicemotion"), { acceleration: null,
+      accelerationIncludingGravity: { x, y: 0, z: 9.81 } }));
+  }
+  assert.equal(detected, 1);
+  assert.equal(nativeMotionEnabled.at(-1), false);
+  process.exit(0);
+}
+if (scenario === "android-native-motion") {
+  let clock = 0;
+  let detected = 0;
+  Object.defineProperty(performance, "now", { configurable: true, value: () => clock });
+  windowEvents.addEventListener("bridge:mobile-shake", () => { detected++; });
+  await native.installNativeLifecycle();
+  assert.equal(nativeMotionEnabled.at(-1), true);
+  assert.ok(nativeMotionListener);
+  const trace = (start: number, end: number, changes: Array<[number, number]>): void => {
+    for (clock = start; clock <= end; clock += 40) {
+      const x = changes.findLast(([at]) => at <= clock)?.[1] ?? 0;
+      nativeMotionListener!({ x, y: 0, z: 9.81, timestampMs: clock });
+    }
+  };
+  // The native workspace can cover the WebView while the Android activity stays foregrounded.
+  documentEvents.visibilityState = "hidden";
+  documentEvents.dispatchEvent(new Event("visibilitychange"));
+  trace(0, 1_000, [[120, 22], [240, 0], [520, -22], [640, 0]]);
+  assert.equal(detected, 1);
+  appListeners.get("appStateChange")!({ isActive: false });
+  trace(2_500, 3_500, [[2_620, 22], [2_740, 0], [3_020, -22], [3_140, 0]]);
+  assert.equal(detected, 1);
+  appListeners.get("appStateChange")!({ isActive: true });
+  await native.setShakeEnabled(false);
+  assert.equal(nativeMotionEnabled.at(-1), false);
+  trace(4_000, 5_000, [[4_120, 22], [4_240, 0], [4_520, -22], [4_640, 0]]);
+  assert.equal(detected, 1);
+  await native.setShakeEnabled(true);
+  assert.equal(nativeMotionEnabled.at(-1), true);
+  trace(5_500, 6_500, [[5_620, 22], [5_740, 0], [6_020, -22], [6_140, 0]]);
+  assert.equal(detected, 2);
   process.exit(0);
 }
 if (scenario === "android-motion-detection") {

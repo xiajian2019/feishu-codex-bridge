@@ -7,6 +7,8 @@ import kotlinx.coroutines.withContext
 import org.connectbot.sshlib.HostKeyVerifier
 import org.connectbot.sshlib.PublicKey
 
+internal const val BRIDGE_SSH_KNOWN_HOSTS_PREFERENCES = "bridge_connectbot_known_hosts"
+
 data class BridgeCbSshHostKeyPrompt(
     val fingerprint: String,
     val algorithm: String,

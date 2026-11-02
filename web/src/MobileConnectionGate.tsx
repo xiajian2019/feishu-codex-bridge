@@ -1,23 +1,30 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactElement, type ReactNode } from "react";
-import { parseMobilePairingInput } from "./mobile-connection.js";
+import { normalizeConfiguredBridgeServer, parseMobilePairingInput } from "./mobile-connection.js";
+import { bridgeOriginForPort } from "./bridge-global-config.js";
+import { createMobileVpnRetry } from "./mobile-vpn-retry.js";
 import {
   checkMobileApkUpdate, checkMobileConnection, disconnectMobileConnection, downloadMobileApkUpdate, getMobileConnection,
   initializeMobileRuntime, installMobileApkUpdate, MOBILE_CONNECTION_EVENT, MOBILE_RESUME_EVENT, MOBILE_SETTINGS_EVENT,
   MOBILE_SHAKE_EVENT, openMobileConnectionSettings, pairMobileConnection, switchMobileConnection,
-  getMobileAppVersion, getMobileAppBuild,
+  getMobileAppVersion, getMobileAppBuild, supportsMobileApkUpdates,
   type MobileApkUpdate,
 } from "./mobile-runtime.js";
 import MobileDownloadStatus from "./MobileDownloadStatus.js";
 import MobilePairingScanner from "./MobilePairingScanner.js";
-import { getBridgeCapabilities } from "./client-capabilities.js";
+import { bridgeFeatureUnavailable, getBridgeCapabilities } from "./client-capabilities.js";
 import { getLocalDraftScope } from "./local-draft-scope.js";
-import { apkUpdateStorageKey, readApkUpdateState, shouldOfferApkUpdate, type ApkUpdateState, type ApkUpdatePhase } from "./mobile-apk-update.js";
+import { apkUpdateStorageKey, decideApkUpdate, readApkUpdateState, type ApkUpdateState, type ApkUpdatePhase } from "./mobile-apk-update.js";
 import "./mobile-app.css";
 import { useMobileBack } from "./use-mobile-back.js";
 import { useLocation, useNavigate } from "react-router";
 import { isStandaloneSshPath } from "./ssh-route.js";
 import MobileSshLogin from "./MobileSshLogin.js";
-import { onNativeSshReturnToWorkbench } from "./ssh-connectbot-native.js";
+import {
+  closeNativeSshWorkspace, onNativeAppUpdateAction, onNativeSshReturnToWorkbench,
+  setNativeAppUpdateBanner, setNativeSshWorkspaceVisible, type AppUpdateAction,
+} from "./ssh-connectbot-native.js";
+import { isAppActive } from "./foreground-polling.js";
+import { createMobileWorkspaceOverlay } from "./mobile-workspace-overlay.js";
 import { MobileHandoffShell, MobileNavigationBridge } from "./MobileHandoff.js";
 
 type ConnectionState = "loading" | "setup" | "ready" | "unavailable";
@@ -49,13 +56,36 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
   const [apkState, setApkState] = useState<ApkUpdateState | null>(null);
   const apkStateRef = useRef<ApkUpdateState | null>(null);
   const apkBusyRef = useRef(false);
+  const apkLookupBusyRef = useRef(false);
+  const apkCheckSequence = useRef(0);
+  const [apkCheckBusy, setApkCheckBusy] = useState(false);
+  const [apkCheckMessage, setApkCheckMessage] = useState<string | null>(null);
+  const [apkCheckError, setApkCheckError] = useState<string | null>(null);
   const [apkUpdateBusy, setApkUpdateBusy] = useState(false);
   const [apkDownloadBusy, setApkDownloadBusy] = useState(false);
   const [apkUpdateError, setApkUpdateError] = useState<string | null>(null);
   const [apkDownloadMessage, setApkDownloadMessage] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [revision, setRevision] = useState(0);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const editingRef = useRef(editing);
+  editingRef.current = editing && mode !== "ssh";
+  const vpnRecoveryEventsToSkip = useRef(0);
+  const vpnRetry = useRef(createMobileVpnRetry(() => setRevision((value) => value + 1))).current;
   const [environmentDialogOpen, setEnvironmentDialogOpen] = useState(false);
+  const environmentOpening = useRef(false);
+  const workspaceOverlay = useRef(createMobileWorkspaceOverlay({
+    hide: () => setNativeSshWorkspaceVisible(false),
+    show: () => setNativeSshWorkspaceVisible(true),
+    close: closeNativeSshWorkspace,
+  })).current;
+  const closeEnvironmentDialog = (): void => {
+    environmentOpening.current = false;
+    setEnvironmentDialogOpen(false);
+    void workspaceOverlay.dismiss().catch(() => {});
+  };
+  const leaveSshWorkspace = (): Promise<void> => workspaceOverlay.leave();
   const [environmentBusy, setEnvironmentBusy] = useState<string | null>(null);
   const [environmentMessage, setEnvironmentMessage] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState("读取中…");
@@ -71,7 +101,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
   }, [location.pathname, navigate, state]);
   const returnToWorkbenchRef = useRef(returnToWorkbench);
   returnToWorkbenchRef.current = returnToWorkbench;
-  useMobileBack(environmentDialogOpen, () => { if (!environmentBusy) setEnvironmentDialogOpen(false); }, 220);
+  useMobileBack(environmentDialogOpen, () => { if (!environmentBusy) closeEnvironmentDialog(); }, 220);
   useMobileBack(editing || mode === "ssh", () => {
     if (!busy) returnToWorkbench();
   }, 50);
@@ -96,11 +126,19 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
 
   useEffect(() => {
     let active = true;
-    const changed = (): void => { setRevision((current) => current + 1); };
+    const changed = (): void => {
+      apkCheckSequence.current += 1;
+      setApkCheckMessage(null);
+      setApkCheckError(apkLookupBusyRef.current && !getMobileConnection()?.token ? "Bridge 配对已失效，请重新配对后再试。" : null);
+      setRevision((current) => current + 1);
+    };
     const settings = (event: Event): void => {
       const requestedServer = event instanceof CustomEvent && typeof event.detail?.server === "string" ? event.detail.server : null;
+      const requestedError = event instanceof CustomEvent && typeof event.detail?.error === "string" ? event.detail.error : null;
       setAddress(requestedServer ?? getMobileConnection()?.server ?? "");
-      setError(null); setPairingInput(""); setMode("bridge"); setEditing(true);
+      setError(requestedError); setPairingInput(""); setMode("bridge"); setEditing(true);
+      environmentOpening.current = false;
+      void leaveSshWorkspace().catch(() => {});
       try { window.localStorage.setItem("bridge.connection.mode", "bridge"); } catch { /* preference only */ }
       setEnvironmentDialogOpen(false);
     };
@@ -125,6 +163,27 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
   }, [revision]);
 
   useEffect(() => {
+    const onVpnReachable = (): void => {
+      if (document.visibilityState === "hidden") return;
+      if (vpnRetry.onReachable(stateRef.current, editingRef.current)) vpnRecoveryEventsToSkip.current = 2;
+    };
+    const onApiUnavailable = (): void => vpnRetry.onUnavailable(stateRef.current, editingRef.current);
+    const onApiReachable = (): void => vpnRetry.onReachableApi();
+    window.addEventListener("bridge:mobile-vpn-reachable", onVpnReachable);
+    window.addEventListener("bridge:api-network-unreachable", onApiUnavailable);
+    window.addEventListener("bridge:api-reachable", onApiReachable);
+    return () => {
+      window.removeEventListener("bridge:mobile-vpn-reachable", onVpnReachable);
+      window.removeEventListener("bridge:api-network-unreachable", onApiUnavailable);
+      window.removeEventListener("bridge:api-reachable", onApiReachable);
+    };
+  }, [vpnRetry]);
+
+  useEffect(() => {
+    vpnRetry.onState(state, editing && mode !== "ssh");
+  }, [state, editing, mode, vpnRetry]);
+
+  useEffect(() => {
     let disposed = false;
     let removeListener: (() => void) | undefined;
     void onNativeSshReturnToWorkbench(() => {
@@ -136,49 +195,68 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
   }, []);
 
   useEffect(() => {
+    let disposed = false;
     const openEnvironmentDialog = (): void => {
-      if (document.visibilityState === "hidden" || scannerOpen) return;
-      setEnvironmentMessage(null);
-      setEnvironmentDialogOpen(true);
+      if (!isAppActive() || scannerOpen || environmentOpening.current) return;
+      environmentOpening.current = true;
+      void workspaceOverlay.open().then((opened) => {
+        if (disposed) {
+          void workspaceOverlay.dismiss().catch(() => {});
+          environmentOpening.current = false;
+          return;
+        }
+        if (!opened) { environmentOpening.current = false; return; }
+        setEnvironmentMessage(null);
+        setEnvironmentDialogOpen(true);
+      }).catch(() => { environmentOpening.current = false; });
     };
     window.addEventListener(MOBILE_SHAKE_EVENT, openEnvironmentDialog);
-    return () => window.removeEventListener(MOBILE_SHAKE_EVENT, openEnvironmentDialog);
-  }, [scannerOpen]);
+    return () => { disposed = true; window.removeEventListener(MOBILE_SHAKE_EVENT, openEnvironmentDialog); };
+  }, [scannerOpen, workspaceOverlay]);
+
+  useEffect(() => () => { void workspaceOverlay.dismiss().catch(() => {}); }, [workspaceOverlay]);
 
   useEffect(() => {
-    if (state !== "unavailable" || editing) return;
+    if (state !== "unavailable" || (editing && mode !== "ssh")) return;
     const retry = (): void => {
-      if (navigator.onLine !== false && document.visibilityState !== "hidden") setRevision((value) => value + 1);
+      if (vpnRecoveryEventsToSkip.current > 0) {
+        vpnRecoveryEventsToSkip.current -= 1;
+        return;
+      }
+      if (navigator.onLine !== false && isAppActive()) setRevision((value) => value + 1);
     };
     window.addEventListener("online", retry);
     window.addEventListener(MOBILE_RESUME_EVENT, retry);
+    // SSH remains usable while Bridge is down; periodically recheck its update source.
+    const timer = mode === "ssh" ? window.setInterval(retry, 5 * 60 * 1_000) : null;
     return () => {
       window.removeEventListener("online", retry);
       window.removeEventListener(MOBILE_RESUME_EVENT, retry);
+      if (timer !== null) window.clearInterval(timer);
     };
-  }, [state, editing]);
+  }, [state, editing, mode]);
 
   useEffect(() => {
-    if (state !== "ready" || editing) return;
+    if (state !== "ready") { setApkUpdate(null); return; }
     let active = true;
     const checkForApkUpdate = async (): Promise<void> => {
-      if (apkBusyRef.current || document.visibilityState === "hidden") return;
+      if (apkBusyRef.current || apkLookupBusyRef.current || !isAppActive()) return;
+      const checkId = ++apkCheckSequence.current;
       try {
         const update = await checkMobileApkUpdate();
         const installed = await getMobileAppBuild();
-        if (!active || apkBusyRef.current) return;
+        if (!active || checkId !== apkCheckSequence.current || apkBusyRef.current || apkLookupBusyRef.current) return;
+        setApkUpdateError(null);
         if (!Number.isSafeInteger(installed) || installed < 1) throw new Error("无法读取已安装 App 版本，请稍后重试。");
         if (!update) { setApkUpdate(null); return; }
         let saved: ApkUpdateState;
         try { saved = readApkUpdateState(window.localStorage, update); }
         catch { saved = { revision: update.revision, phase: "available", snoozeUntil: 0 }; }
-        if (installed >= update.versionCode) {
-          saveApkState(update, { ...saved, phase: "installed" }); setApkUpdate(null); return;
-        }
-        saveApkState(update, saved);
-        setApkUpdate(shouldOfferApkUpdate(update, installed, saved) ? update : null);
+        const decision = decideApkUpdate(update, installed, saved);
+        saveApkState(update, decision.state);
+        setApkUpdate(decision.offer ? update : null);
       } catch (cause) {
-        if (active) setApkUpdateError(cause instanceof Error ? cause.message : "更新检查失败。");
+        if (active && checkId === apkCheckSequence.current) setApkUpdateError(cause instanceof Error ? cause.message : "更新检查失败。");
       }
     };
     void checkForApkUpdate();
@@ -189,7 +267,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
       window.clearInterval(timer);
       window.removeEventListener(MOBILE_RESUME_EVENT, checkForApkUpdate);
     };
-  }, [editing, state]);
+  }, [state]);
 
   const submit = async (event: FormEvent): Promise<void> => {
     event.preventDefault(); setBusy(true); setError(null);
@@ -236,22 +314,68 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
     }
   };
 
-  const downloadLatestApk = async (): Promise<void> => {
-    setApkDownloadBusy(true);
-    setApkUpdateError(null);
-    setApkDownloadMessage(null);
+  const requireApkUpdateSource = async (): Promise<void> => {
+    if (!getMobileConnection()?.token) throw new Error("请先配对 Bridge，再操作 App 更新。");
+    if (!(await supportsMobileApkUpdates())) throw new Error("App 更新和 APK 下载仅支持 Android App。");
+    const unavailable = bridgeFeatureUnavailable("mobile-apk-update");
+    if (unavailable) throw new Error(unavailable);
+  };
+
+  const checkForApkUpdateManually = async (): Promise<void> => {
+    if (apkLookupBusyRef.current || apkBusyRef.current) return;
+    apkLookupBusyRef.current = true;
+    const selected = getMobileConnection();
+    const checkId = ++apkCheckSequence.current;
+    const stillCurrent = (): boolean => checkId === apkCheckSequence.current && selected === getMobileConnection();
+    setApkCheckBusy(true);
+    setApkCheckMessage(null); setApkCheckError(null); setApkUpdateError(null); setApkDownloadMessage(null);
     try {
+      await requireApkUpdateSource();
       const update = await checkMobileApkUpdate();
-      if (!update) {
-        setApkDownloadMessage("当前 Bridge 没有可下载的 Android APK。");
-        return;
-      }
-      setApkUpdate(update);
+      if (!stillCurrent()) return;
+      if (!update) { setApkUpdate(null); setApkCheckMessage("当前 Bridge 没有可用的 Android APK。"); return; }
+      const installed = await getMobileAppBuild();
+      if (!stillCurrent()) return;
+      if (!Number.isSafeInteger(installed) || installed < 1) throw new Error("无法读取已安装 App 版本，请稍后重试。");
+      let saved: ApkUpdateState;
+      try { saved = readApkUpdateState(window.localStorage, update); }
+      catch { saved = { revision: update.revision, phase: "available", snoozeUntil: 0 }; }
+      const decision = decideApkUpdate(update, installed, saved, true);
+      saveApkState(update, decision.state);
+      setApkUpdate(decision.offer ? update : null);
+      setApkCheckMessage(decision.offer ? "发现新版本，请使用顶部提示更新或下载。"
+        : installed === update.versionCode ? "当前 App 已是最新版本。" : "当前 App 版本高于 Bridge 提供的版本。");
+    } catch (cause) {
+      if (stillCurrent()) setApkCheckError(cause instanceof Error ? cause.message : "更新检查失败。");
+    } finally {
+      apkLookupBusyRef.current = false;
+      setApkCheckBusy(false);
+    }
+  };
+
+  const downloadLatestApk = async (): Promise<void> => {
+    if (apkLookupBusyRef.current || apkBusyRef.current) return;
+    apkLookupBusyRef.current = true;
+    const selected = getMobileConnection();
+    const checkId = ++apkCheckSequence.current;
+    const stillCurrent = (): boolean => checkId === apkCheckSequence.current && selected === getMobileConnection();
+    setApkDownloadBusy(true);
+    setApkCheckMessage(null); setApkCheckError(null); setApkUpdateError(null); setApkDownloadMessage(null);
+    try {
+      await requireApkUpdateSource();
+      const update = await checkMobileApkUpdate();
+      if (!stillCurrent()) return;
+      if (!update) { setApkUpdate(null); setApkDownloadMessage("当前 Bridge 没有可下载的 Android APK。"); return; }
+      const installed = await getMobileAppBuild().catch(() => Number.NaN);
+      if (!stillCurrent()) return;
+      if (Number.isSafeInteger(installed) && installed > 0) setApkUpdate(update.versionCode > installed ? update : null);
+      apkLookupBusyRef.current = false;
       setApkDownloadBusy(false);
       await transferApk(update, false);
     } catch (cause) {
-      setApkUpdateError(cause instanceof Error ? cause.message : "APK 下载失败。");
+      if (stillCurrent()) setApkUpdateError(cause instanceof Error ? cause.message : "APK 下载失败。");
     } finally {
+      apkLookupBusyRef.current = false;
       setApkDownloadBusy(false);
     }
   };
@@ -261,22 +385,29 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
     saveApkState(apkUpdate, { ...(apkStateRef.current ?? { revision: apkUpdate.revision, phase: "available" }), snoozeUntil: Date.now() + 30 * 60_000 });
     setApkUpdate(null);
     setApkUpdateError(null);
+    setApkCheckMessage(null);
   };
 
   const environmentOptions = buildEnvironmentOptions(getMobileConnection()?.server ?? address);
   const selectEnvironment = async (option: EnvironmentOption): Promise<void> => {
     if (option.server === getMobileConnection()?.server) {
-      setEnvironmentDialogOpen(false);
+      closeEnvironmentDialog();
       return;
     }
     setEnvironmentBusy(option.id);
     setEnvironmentMessage(null);
     try {
       if (await switchMobileConnection(option.server)) {
+        await leaveSshWorkspace();
+        environmentOpening.current = false;
         setEnvironmentDialogOpen(false);
+        setMode("bridge");
+        try { window.localStorage.setItem("bridge.connection.mode", "bridge"); } catch { /* preference only */ }
         window.location.replace("/");
         return;
       }
+      await leaveSshWorkspace();
+      environmentOpening.current = false;
       setEnvironmentDialogOpen(false);
       openMobileConnectionSettings(option.server);
     } catch (cause) {
@@ -286,6 +417,44 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
     }
   };
 
+  const apkAction = useRef<(action: AppUpdateAction) => void>(() => {});
+  apkAction.current = (action): void => {
+    if (!apkUpdate) return;
+    if (action === "dismiss") dismissApkUpdate();
+    else if (action === "install" || action === "download") void transferApk(apkUpdate, action === "install");
+  };
+  useEffect(() => {
+    let disposed = false;
+    let remove: (() => void) | undefined;
+    void onNativeAppUpdateAction((action) => apkAction.current(action)).then((listener) => {
+      if (disposed) void listener.remove(); else remove = () => { void listener.remove(); };
+    }).catch(() => {});
+    return () => { disposed = true; remove?.(); };
+  }, []);
+  const apkStatus = apkDownloadMessage ?? (apkState?.phase === "installer-opened" ? "已打开安装器；若已取消，可再次安装。"
+    : apkState?.phase === "downloaded" ? "更新包已校验，可继续安装。" : "");
+  const apkDetail = apkUpdate ? `${apkUpdate.versionName} (${apkUpdate.versionCode}) · ${formatApkSize(apkUpdate.size)}` : "";
+  useEffect(() => {
+    void setNativeAppUpdateBanner({ visible: Boolean(apkUpdate), detail: apkDetail, status: apkStatus,
+      error: apkUpdateError ?? "", busy: apkUpdateBusy || apkDownloadBusy, downloaded: Boolean(apkState?.uri) }).catch(() => {});
+  }, [apkUpdate, apkDetail, apkStatus, apkUpdateError, apkUpdateBusy, apkDownloadBusy, apkState?.uri]);
+
+  const apkBanner = apkUpdate ? (
+    <aside className="mobile-update-banner" role="status">
+      <div>
+        <strong>发现新的 Bridge App</strong>
+        <span>{apkDetail}</span>
+        {apkStatus ? <span>{apkStatus}</span> : null}
+      </div>
+      <div className="mobile-update-actions">
+        <button type="button" onClick={() => void transferApk(apkUpdate, true)} disabled={apkUpdateBusy || apkDownloadBusy}>{apkUpdateBusy ? "处理中…" : apkState?.uri ? "继续安装" : "更新"}</button>
+        <button type="button" className="mobile-update-download" onClick={() => void transferApk(apkUpdate, false)} disabled={apkUpdateBusy || apkDownloadBusy}>{apkDownloadBusy ? "处理中…" : "下载 APK"}</button>
+        <button type="button" className="mobile-update-dismiss" onClick={dismissApkUpdate} disabled={apkUpdateBusy || apkDownloadBusy}>稍后</button>
+      </div>
+      {apkUpdateError ? <p role="alert">{apkUpdateError}</p> : null}
+    </aside>
+  ) : null;
+
   const environmentDialog = environmentDialogOpen ? (
     <MobileEnvironmentDialog
       options={environmentOptions}
@@ -293,36 +462,31 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
       message={environmentMessage}
       currentServer={getMobileConnection()?.server ?? ""}
       appVersion={appVersion}
+      updateBanner={apkBanner}
+      appChecking={apkCheckBusy}
+      appDownloading={apkDownloadBusy}
+      appActionsBusy={apkCheckBusy || apkDownloadBusy || apkUpdateBusy || Boolean(environmentBusy)}
+      appMessage={apkCheckMessage ?? apkDownloadMessage}
+      appError={apkCheckError ?? (!apkUpdate ? apkUpdateError : null)}
+      onCheckUpdate={() => { void checkForApkUpdateManually(); }}
+      onDownloadApp={() => { void downloadLatestApk(); }}
       onSelect={(option) => { void selectEnvironment(option); }}
       onOpenConnectionSettings={() => openMobileConnectionSettings()}
-      onClose={() => setEnvironmentDialogOpen(false)}
+      onClose={closeEnvironmentDialog}
     />
   ) : null;
 
-  if (scannerOpen) return <MobilePairingScanner onPair={scanAndPair} onClose={() => setScannerOpen(false)} />;
+  if (scannerOpen) return <>{apkBanner}<MobilePairingScanner onPair={scanAndPair} onClose={() => setScannerOpen(false)} /></>;
 
   if (state === "ready" && !editing && mode === "bridge") return <>
     <MobileNavigationBridge />
-    {apkUpdate ? (
-      <aside className="mobile-update-banner" role="status">
-        <div>
-          <strong>发现新的 Bridge App</strong>
-          <span>{apkUpdate.versionName} ({apkUpdate.versionCode}) · {formatApkSize(apkUpdate.size)}</span>
-          {apkState?.phase === "installer-opened" ? <span>已打开安装器；若已取消，可再次安装。</span> : apkState?.phase === "downloaded" ? <span>更新包已校验，可继续安装。</span> : null}
-        </div>
-        <div className="mobile-update-actions">
-          <button type="button" onClick={() => void transferApk(apkUpdate, true)} disabled={apkUpdateBusy || apkDownloadBusy}>{apkUpdateBusy ? "处理中…" : apkState?.uri ? "继续安装" : "更新"}</button>
-          <button type="button" className="mobile-update-download" onClick={() => void transferApk(apkUpdate, false)} disabled={apkUpdateBusy || apkDownloadBusy}>{apkDownloadBusy ? "处理中…" : "下载 APK"}</button>
-          <button type="button" className="mobile-update-dismiss" onClick={dismissApkUpdate} disabled={apkUpdateBusy || apkDownloadBusy}>稍后</button>
-        </div>
-        {apkUpdateError ? <p role="alert">{apkUpdateError}</p> : null}
-      </aside>
-    ) : null}
+    {!environmentDialogOpen && apkBanner}
     {children}
     {environmentDialog}
   </>;
 
   return <main className="mobile-connect-page mobile-connection-page">
+    {!environmentDialogOpen && apkBanner}
     <section className="mobile-connect-card mobile-connection-center" aria-labelledby="mobile-connect-title">
       <header className="mobile-connect-header">
         <div className="mobile-connect-brand-row">
@@ -413,7 +577,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
                 <p>从当前已配对的 Bridge 下载最新 APK，保存后再手动安装。</p>
               </div>
             </div>
-            <button type="button" className="mobile-connect-update-button" onClick={() => void downloadLatestApk()} disabled={busy || apkDownloadBusy || apkUpdateBusy}>
+            <button type="button" className="mobile-connect-update-button" onClick={() => void downloadLatestApk()} disabled={busy || apkCheckBusy || apkDownloadBusy || apkUpdateBusy}>
               {apkDownloadBusy ? "正在准备下载…" : "手动下载 APK"}
             </button>
             {apkDownloadMessage ? <p className="mobile-connect-update-message" role="status">{apkDownloadMessage}</p> : null}
@@ -436,9 +600,8 @@ interface EnvironmentOption {
 }
 
 function buildEnvironmentOptions(server: string): EnvironmentOption[] {
-  if (!server) return [];
   try {
-    const base = new URL(server);
+    const base = new URL(server ? normalizeConfiguredBridgeServer(server) : bridgeOriginForPort(7310));
     const targets: Array<Omit<EnvironmentOption, "server">> = [
       { id: "development", label: "开发环境", description: "连接开发 API，页面仍为内置版本", port: 5173 },
       { id: "stable", label: "稳定环境", description: "连接稳定 API，页面仍为内置版本", port: 7310 },
@@ -453,20 +616,31 @@ function buildEnvironmentOptions(server: string): EnvironmentOption[] {
   }
 }
 
-function MobileEnvironmentDialog({
-  options, busy, message, currentServer, appVersion, onSelect, onOpenConnectionSettings, onClose,
+export function MobileEnvironmentDialog({
+  options, busy, message, currentServer, appVersion, updateBanner, appChecking, appDownloading, appActionsBusy,
+  appMessage, appError, onCheckUpdate, onDownloadApp, onSelect, onOpenConnectionSettings, onClose,
 }: {
   options: EnvironmentOption[];
   busy: string | null;
   message: string | null;
   currentServer: string;
   appVersion: string;
+  updateBanner: ReactNode;
+  appChecking: boolean;
+  appDownloading: boolean;
+  appActionsBusy: boolean;
+  appMessage: string | null;
+  appError: string | null;
+  onCheckUpdate: () => void;
+  onDownloadApp: () => void;
   onSelect: (option: EnvironmentOption) => void;
   onOpenConnectionSettings: () => void;
   onClose: () => void;
 }): ReactElement {
   return <div className="mobile-environment-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <section className="mobile-environment-dialog" role="dialog" aria-modal="true" aria-labelledby="mobile-environment-title">
+    <div className={`mobile-environment-overlay${updateBanner ? " has-update-banner" : ""}`} role="dialog" aria-modal="true" aria-labelledby="mobile-environment-title">
+    {updateBanner ? <div className="mobile-environment-update">{updateBanner}</div> : null}
+    <section className="mobile-environment-dialog">
       <header className="mobile-environment-header">
         <div className="mobile-environment-icon" aria-hidden="true">⚙</div>
         <div>
@@ -476,10 +650,27 @@ function MobileEnvironmentDialog({
         <button type="button" className="mobile-environment-close" aria-label="关闭" onClick={onClose}>×</button>
       </header>
       <p className="mobile-environment-description">切换只更换后端 API，不会加载该环境的网页。当前配对和各环境草稿会保留；未配对的环境需先配对。</p>
-      <dl className="mobile-environment-versions">
-        <dt>App 安装版本</dt><dd>{appVersion}</dd>
-        <dt>内置页面</dt><dd>{import.meta.env.VITE_BRIDGE_FRONTEND_VERSION ?? "开发预览"} · {import.meta.env.VITE_BRIDGE_FRONTEND_BUILD ?? "未打包"}</dd>
-        <dt>后端版本</dt><dd>{getBridgeCapabilities()?.version ?? "旧版后端，未提供版本信息"}</dd>
+      <div className="mobile-environment-app" aria-label="App 版本与更新">
+        <div className="mobile-environment-app-version"><span>App 版本</span><strong>{appVersion}</strong></div>
+        <div className="mobile-environment-app-actions">
+          <button type="button" className="mobile-connect-secondary" disabled={appActionsBusy} onClick={onCheckUpdate}>
+            {appChecking ? "检查中…" : "检查更新"}
+          </button>
+          <button type="button" className="mobile-connect-secondary" disabled={appActionsBusy} onClick={onDownloadApp}>
+            {appDownloading ? "正在下载…" : "手动下载 App"}
+          </button>
+        </div>
+        {appMessage ? <p className="mobile-environment-app-message" role="status">{appMessage}</p> : null}
+        {appError ? <p className="mobile-connect-error" role="alert">{appError}</p> : null}
+        <details className="mobile-environment-version-details">
+          <summary>版本详情</summary>
+          <dl className="mobile-environment-versions">
+            <dt>内置页面</dt><dd>{import.meta.env.VITE_BRIDGE_FRONTEND_VERSION ?? "开发预览"} · {import.meta.env.VITE_BRIDGE_FRONTEND_BUILD ?? "未打包"}</dd>
+            <dt>后端版本</dt><dd>{getBridgeCapabilities()?.version ?? "旧版后端，未提供版本信息"}</dd>
+          </dl>
+        </details>
+      </div>
+      <dl className="mobile-environment-versions mobile-environment-current">
         <dt>当前地址</dt><dd>{currentServer || "未连接"}</dd>
       </dl>
       <CompatibilityNotice />
@@ -508,6 +699,7 @@ function MobileEnvironmentDialog({
         <button type="button" className="mobile-connect-primary" onClick={onOpenConnectionSettings}>打开连接管理<span aria-hidden="true">→</span></button>
       </div>
     </section>
+    </div>
   </div>;
 }
 

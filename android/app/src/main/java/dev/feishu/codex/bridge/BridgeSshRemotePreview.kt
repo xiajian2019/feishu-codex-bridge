@@ -9,8 +9,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
@@ -27,14 +27,13 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 
 @Composable
-internal fun BridgeSshRemotePreview(file: File?, pdf: Boolean, text: String?) {
+internal fun BridgeSshRemotePreview(file: File?, pdf: Boolean, text: String?, modifier: Modifier = Modifier) {
     var page by remember(file) { mutableIntStateOf(0) }
     var pageCount by remember(file) { mutableIntStateOf(0) }
     var image by remember(file, page) { mutableStateOf<ImageBitmap?>(null) }
@@ -72,14 +71,14 @@ internal fun BridgeSshRemotePreview(file: File?, pdf: Boolean, text: String?) {
         pageCount = result?.second ?: 0
         failed = result == null
     }
-    Column {
+    Column(modifier.fillMaxSize()) {
         val bitmap = image
         if (file == null) {
-            Text(text ?: "正在读取…", Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+            Text(text ?: "正在读取…", Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()),
                 fontFamily = FontFamily.Monospace, fontSize = 13.sp)
         } else if (bitmap != null) {
             Image(bitmap, contentDescription = if (pdf) "PDF 第 ${page + 1} 页" else "图片预览",
-                modifier = Modifier.fillMaxWidth().heightIn(max = 390.dp), contentScale = ContentScale.Fit)
+                modifier = Modifier.weight(1f).fillMaxWidth(), contentScale = ContentScale.Fit)
         } else Text(if (failed) "无法预览，请下载后打开。" else "正在读取…")
         if (pdf && pageCount > 1) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
             TextButton(onClick = { page -= 1 }, enabled = page > 0) { Text("上一页") }

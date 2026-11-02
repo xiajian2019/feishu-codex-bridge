@@ -1,6 +1,9 @@
 import {
+  chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -11,10 +14,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { getBunRuntime } from "./bun-runtime.js";
+import { findExecutableInPath } from "./runtime-env.js";
 
 export type TmuxResurrectAction = "save" | "restore";
 
@@ -190,8 +194,11 @@ function filterSnapshotForSession(sourcePath: string, sessionName: string): stri
   return selected.length > 0 ? `${selected.join("\n")}\n` : "";
 }
 
-function writeSessionSnapshot(saveDirectory: string, sessionName: string, sourcePath: string): TmuxResurrectSessionSnapshot | null {
-  if (existsSync(disabledFileForSession(saveDirectory, sessionName))) return null;
+function writeSessionSnapshot(
+  saveDirectory: string, sessionName: string, sourcePath: string, replaceDisabled = false,
+): TmuxResurrectSessionSnapshot | null {
+  const disabled = disabledFileForSession(saveDirectory, sessionName);
+  if (!replaceDisabled && existsSync(disabled)) return null;
   const content = filterSnapshotForSession(sourcePath, sessionName);
   if (!content) return null;
   const directory = snapshotDirectoryForSession(saveDirectory, sessionName);
@@ -202,21 +209,45 @@ function writeSessionSnapshot(saveDirectory: string, sessionName: string, source
   const lastPath = join(directory, "last");
   try { unlinkSync(lastPath); } catch { /* The first snapshot has no link yet. */ }
   symlinkSync("snapshot.txt", lastPath);
+  // A deliberate save of a running, newly created same-name Session replaces
+  // the termination marker only after its own snapshot is safely in place.
+  if (replaceDisabled && existsSync(disabled)) unlinkSync(disabled);
   return snapshotForSessionInDirectory(saveDirectory, sessionName);
 }
 
-async function runProcess(command: string[], env?: NodeJS.ProcessEnv): Promise<{ output: string; exitCode: number }> {
+const RESURRECT_COMMAND_TIMEOUT_MS = 30_000;
+
+async function runProcess(
+  command: string[],
+  env?: NodeJS.ProcessEnv,
+  timeoutMs = RESURRECT_COMMAND_TIMEOUT_MS,
+): Promise<{ output: string; exitCode: number }> {
   const child = getBunRuntime().spawn(command, {
     env: { ...process.env, TMUX: undefined, TMUX_PANE: undefined, ...env },
     stdout: "pipe",
     stderr: "pipe",
   });
-  const [stdout, stderr, exitCode] = await Promise.all([
+  const output = Promise.all([
     child.stdout?.text() ?? Promise.resolve(""),
     child.stderr?.text() ?? Promise.resolve(""),
     child.exited,
   ]);
-  return { output: `${stdout}\n${stderr}`.trim().slice(-4_000), exitCode };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      output,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          try { if (!child.killed) child.kill("SIGKILL"); } catch { /* process may have exited */ }
+          reject(new Error(`tmux-resurrect 命令执行超时（${timeoutMs}ms）：${command[0] ?? "command"}`));
+        }, timeoutMs);
+      }),
+    ]);
+    const [stdout, stderr, exitCode] = result;
+    return { output: `${stdout}\n${stderr}`.trim().slice(-4_000), exitCode };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function runTmux(args: string[], allowFailure = false): Promise<string> {
@@ -227,25 +258,86 @@ async function runTmux(args: string[], allowFailure = false): Promise<string> {
   return result.output;
 }
 
-async function tmuxOption(name: string): Promise<string> {
-  return runTmux(["show-option", "-gqv", name]);
-}
-
 async function tmuxSessionExists(sessionName: string): Promise<boolean> {
-  return (await runProcess(["tmux", "has-session", "-t", sessionName])).exitCode === 0;
+  return (await runProcess(["tmux", "has-session", "-t", `=${sessionName}`])).exitCode === 0;
 }
 
-async function runRestoreScript(pluginDirectory: string, saveDirectory: string): Promise<string> {
-  const previousDirectory = await tmuxOption("@resurrect-dir");
-  await runTmux(["set-option", "-g", "@resurrect-dir", saveDirectory]);
+// tmux-resurrect normally uses a global directory, enumerates every Session,
+// switches the current client, and may kill Session 0 when restoring. Keep the
+// plugin and its process strategies, while scoping those operations to the
+// selected Session and a private temporary directory.
+const SCOPED_TMUX_WRAPPER = `#!/bin/bash
+if [ "$1" = show-option ] && [ "$2" = -gqv ]; then
+  case "$3" in
+    @resurrect-dir) printf '%s\\n' "$BRIDGE_RESURRECT_DIR"; exit 0 ;;
+    @resurrect-never-overwrite) printf '%s\\n' on; exit 0 ;;
+  esac
+fi
+if [ -n "$BRIDGE_SAVE_TARGET" ] && [ "$2" = -a ]; then
+  case "$1" in
+    list-panes|list-windows) command="$1"; shift 2; exec "$BRIDGE_REAL_TMUX" "$command" -t "$BRIDGE_SAVE_TARGET" "$@" ;;
+  esac
+fi
+if [ "$BRIDGE_RESTORE" = 1 ]; then
+  if [ "$1" = switch-client ]; then exit 0; fi
+  if [ "$1" = select-pane ] && [ "$2" = -t ]; then
+    case "$3" in *[!0-9]*|'') ;; *) exit 0 ;; esac
+  fi
+fi
+if [ "$1" = -S ] && [ -z "$2" ]; then shift 2; fi
+exec "$BRIDGE_REAL_TMUX" "$@"
+`;
+
+function temporaryDirectory(prefix: string): string {
+  // Upstream restore.sh does not quote its snapshot path. Prefer /tmp so an
+  // install root or TMPDIR containing spaces cannot break its input handling.
+  const base = existsSync("/tmp") ? "/tmp" : tmpdir();
+  if (/\s/.test(base)) throw new Error("临时目录路径包含空格，无法安全调用 tmux-resurrect。 ");
+  return mkdtempSync(join(base, prefix));
+}
+
+async function withScopedTmux<T>(directory: string, target: string, restore: boolean, action: (env: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
+  const realTmux = findExecutableInPath("tmux", process.env.PATH);
+  if (!realTmux) throw new TmuxResurrectUnavailableError();
+  const wrapperDirectory = temporaryDirectory("bridge-tmux-wrapper-");
+  const wrapper = join(wrapperDirectory, "tmux");
+  writeFileSync(wrapper, SCOPED_TMUX_WRAPPER, { encoding: "utf8", mode: 0o700 });
   try {
-    const result = await runProcess(["bash", join(pluginDirectory, "scripts", "restore.sh")]);
+    return await action({
+      PATH: `${wrapperDirectory}:${process.env.PATH ?? ""}`,
+      BRIDGE_REAL_TMUX: resolve(realTmux), BRIDGE_RESURRECT_DIR: directory,
+      BRIDGE_SAVE_TARGET: target, BRIDGE_RESTORE: restore ? "1" : "0",
+    });
+  } finally { rmSync(wrapperDirectory, { recursive: true, force: true }); }
+}
+
+async function runRestoreScript(pluginDirectory: string, snapshotDirectory: string, sessionName: string): Promise<string> {
+  const temp = temporaryDirectory("bridge-tmux-restore-");
+  try {
+    const source = join(snapshotDirectory, "snapshot.txt");
+    const content = filterSnapshotForSession(source, sessionName);
+    if (!content || !content.split("\n").some((line) => line.startsWith(`pane\t${sessionName}\t`))) {
+      throw new Error(`Session「${sessionName}」的快照无效。`);
+    }
+    writeFileSync(join(temp, "snapshot.txt"), content, { encoding: "utf8", mode: 0o600 });
+    symlinkSync("snapshot.txt", join(temp, "last"));
+    const archive = join(snapshotDirectory, "pane_contents.tar.gz");
+    if (existsSync(archive)) copyFileSync(archive, join(temp, "pane_contents.tar.gz"));
+    const result = await withScopedTmux(temp, "", true, (env) => runProcess(["bash", join(pluginDirectory, "scripts", "restore.sh")], env));
     if (result.exitCode !== 0) throw new Error(result.output || `tmux-resurrect restore failed with exit code ${result.exitCode}.`);
+    if (!(await tmuxSessionExists(sessionName))) throw new Error(`快照已执行，但未找到 Session「${sessionName}」。`);
+    // Upstream changes the active client to select panes. Apply the saved
+    // selections with explicit targets so other attached clients stay put.
+    for (const line of content.split("\n")) {
+      const fields = line.split("\t");
+      if (fields[0] === "pane" && fields.length > 8 && fields[8] === "1") {
+        await runTmux(["select-pane", "-t", `${sessionName}:${fields[2]}.${fields[5]}`]);
+      } else if (fields[0] === "window" && fields.length > 4 && fields[4] === "1") {
+        await runTmux(["select-window", "-t", `${sessionName}:${fields[2]}`]);
+      }
+    }
     return result.output;
-  } finally {
-    if (previousDirectory) await runTmux(["set-option", "-g", "@resurrect-dir", previousDirectory], true);
-    else await runTmux(["set-option", "-gu", "@resurrect-dir"], true);
-  }
+  } finally { rmSync(temp, { recursive: true, force: true }); }
 }
 
 function configuredStatus(): { configPath: string | null; configText: string; saveDirectory: string } {
@@ -294,11 +386,32 @@ function ensureSnapshotFromGlobal(status: TmuxResurrectStatus, sessionName: stri
 async function saveSession(sessionName: string): Promise<TmuxResurrectSessionActionResult> {
   const status = getTmuxResurrectStatus();
   ensureInstalled(status);
-  const saveResult = await runProcess(["bash", join(status.pluginDirectory, "scripts", "save.sh")]);
-  if (saveResult.exitCode !== 0) throw new Error(saveResult.output || `tmux-resurrect save failed with exit code ${saveResult.exitCode}.`);
-  const snapshot = ensureSnapshotFromGlobal(status, sessionName);
-  if (!snapshot) throw new Error(`当前 Session「${sessionName}」没有可保存的 tmux 快照。`);
-  return { action: "save", sessionName, snapshot, output: saveResult.output };
+  const grouped = await runTmux(["display-message", "-p", "-t", `${sessionName}:`, "#{session_grouped}"]);
+  if (grouped === "1") throw new Error("暂不支持保存 tmux grouped Session。 ");
+  const temp = temporaryDirectory("bridge-tmux-save-");
+  try {
+    const saveResult = await withScopedTmux(temp, sessionName, false,
+      (env) => runProcess(["bash", join(status.pluginDirectory, "scripts", "save.sh"), "quiet"], env));
+    if (saveResult.exitCode !== 0) throw new Error(saveResult.output || `tmux-resurrect save failed with exit code ${saveResult.exitCode}.`);
+    const source = join(temp, "last");
+    if (!existsSync(source)) throw new Error("tmux-resurrect 没有生成快照。 ");
+    const filtered = filterSnapshotForSession(source, sessionName);
+    if (!filtered.split("\n").some((line) => line.startsWith(`pane\t${sessionName}\t`))) {
+      throw new Error(`当前 Session「${sessionName}」没有可保存的 tmux 快照。`);
+    }
+    const snapshot = writeSessionSnapshot(status.saveDirectory, sessionName, source, true);
+    if (!snapshot) throw new Error(`当前 Session「${sessionName}」没有可保存的 tmux 快照。`);
+    const directory = snapshotDirectoryForSession(status.saveDirectory, sessionName);
+    const archive = join(temp, "pane_contents.tar.gz");
+    const storedArchive = join(directory, "pane_contents.tar.gz");
+    if (existsSync(archive)) {
+      const temporaryArchive = `${storedArchive}.${process.pid}.tmp`;
+      copyFileSync(archive, temporaryArchive);
+      chmodSync(temporaryArchive, 0o600);
+      renameSync(temporaryArchive, storedArchive);
+    } else if (existsSync(storedArchive)) unlinkSync(storedArchive);
+    return { action: "save", sessionName, snapshot, output: saveResult.output };
+  } finally { rmSync(temp, { recursive: true, force: true }); }
 }
 
 async function restoreSession(sessionName: string): Promise<TmuxResurrectSessionActionResult> {
@@ -309,7 +422,7 @@ async function restoreSession(sessionName: string): Promise<TmuxResurrectSession
   }
   const snapshot = snapshotForSessionInDirectory(status.saveDirectory, sessionName) ?? ensureSnapshotFromGlobal(status, sessionName);
   if (!snapshot) throw new Error(`没有找到 Session「${sessionName}」的快照。`);
-  const output = await runRestoreScript(status.pluginDirectory, snapshotDirectoryForSession(status.saveDirectory, sessionName));
+  const output = await runRestoreScript(status.pluginDirectory, snapshotDirectoryForSession(status.saveDirectory, sessionName), sessionName);
   return { action: "restore", sessionName, snapshot, output };
 }
 

@@ -6,6 +6,7 @@ import java.util.Locale;
 
 /** Small, Android-independent validation and wire helpers for BridgeSSH. */
 final class BridgeSshProtocol {
+    /** The Web/App global config supplies the Mac host; native code has no IP fallback. */
     static final String DEFAULT_HOST = "";
     static final int DEFAULT_PORT = 22;
     static final int DEFAULT_COLS = 80;

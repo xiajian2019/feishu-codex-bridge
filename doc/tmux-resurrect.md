@@ -14,7 +14,7 @@ bun run tmux:setup
 
 - 安装 TPM、`tmux-resurrect` 和 `tmux-continuum` 到 `~/.tmux/plugins`；
 - 在现有 tmux 配置旁写入独立的 `feishu-codex-bridge-resurrect.conf`，只追加一个 `source-file` 入口，不覆盖现有快捷键；
-- 开启 15 分钟全局保存，以及 macOS 登录后的 tmux 自动启动；全局自动恢复关闭，由 Bridge 按活动 Session 恢复；
+- 开启 15 分钟全局保存，以及 macOS 登录后的 tmux 自动启动；全局自动恢复关闭，Bridge Web 请求不会触发恢复；
 - 默认把 `codex` 加入可恢复进程白名单。
 
 如果只想检查当前状态：
@@ -31,6 +31,12 @@ bun run tmux:setup:check
 
 窗口、Pane、布局和工作目录可以由快照恢复；进程恢复由 `@resurrect-processes` 白名单决定。当前只默认恢复 `codex`，其他开发服务器请确认启动命令和幂等性后再加入，不要直接启用 `:all:`，因为快照可能重新执行带有副作用的命令。
 
-macOS 自动启动依赖 tmux-continuum 的 Terminal 自动化能力，首次使用可能需要在“系统设置 → 隐私与安全性 → 辅助功能”允许对应脚本控制 Terminal。Bridge/Dashboard 首次读取 Session 列表时，会只恢复数据库中仍处于活动状态且没有正在运行实例的 Session；显式终结的 Session 会删除并禁用其快照。
+macOS 自动启动依赖 tmux-continuum 的 Terminal 自动化能力，首次使用可能需要在“系统设置 → 隐私与安全性 → 辅助功能”允许对应脚本控制 Terminal。Bridge/Dashboard 读取 Session 列表时只执行有超时的 `tmux list-sessions`，不会恢复快照或同步 SQLite。Mac 重启后需要显式执行：
+
+```sh
+bun run tmux:restore
+```
+
+该命令才会查找数据库中仍处于活动状态、但当前没有运行实例的 Session，按独立快照恢复，并将恢复后的 tmux 列表同步到 SQLite。显式终结的 Session 会删除并禁用其快照。
 
 全局快照文件由 tmux-resurrect 按其默认规则保存；Bridge 的独立 Session 快照位于其中的 `bridge-sessions/`。它们属于本机 tmux 状态，不写入 Bridge SQLite，也不会进入仓库提交或 Bridge 备份包。

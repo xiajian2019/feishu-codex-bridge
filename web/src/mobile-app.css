@@ -94,8 +94,23 @@ html.bridge-mobile-app .task-detail-composer { padding-bottom: 7px; }
 .mobile-connect-update-button { min-height: 42px; border: 1px solid var(--line); color: var(--ink); background: var(--card); font-size: 13px; }
 .mobile-connect-update-button:hover { border-color: var(--accent); background: var(--accent-soft); }
 .mobile-connect-update-message { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
-.mobile-environment-backdrop { position: fixed; inset: 0; z-index: 220; display: grid; place-items: center; padding: 20px; background: #081018a8; backdrop-filter: blur(8px); }
-.mobile-environment-dialog { box-sizing: border-box; width: min(100%, 430px); max-height: calc(100dvh - 40px - var(--bridge-safe-height, 0px)); overflow-y: auto; padding: 20px; border: 1px solid var(--line); border-radius: 22px; color: var(--ink); background: var(--card); box-shadow: 0 24px 80px #0008; }
+.mobile-environment-backdrop { position: fixed; inset: 0; z-index: 220; display: grid; place-items: center; padding: calc(20px + var(--bridge-safe-top, 0px)) calc(20px + var(--bridge-safe-right, 0px)) calc(20px + var(--bridge-safe-bottom, 0px)) calc(20px + var(--bridge-safe-left, 0px)); background: #081018a8; backdrop-filter: blur(8px); }
+.mobile-environment-overlay { box-sizing: border-box; display: flex; width: min(100%, 430px); max-height: calc(100dvh - 40px - var(--bridge-safe-height, 0px)); min-height: 0; flex-direction: column; gap: 10px; }
+.mobile-environment-overlay.has-update-banner { height: calc(100dvh - 40px - var(--bridge-safe-height, 0px)); }
+.mobile-environment-overlay.has-update-banner .mobile-environment-dialog { margin: auto 0; }
+.mobile-environment-update { width: 100%; flex: 0 0 auto; }
+.mobile-environment-update .mobile-update-banner { position: static; box-sizing: border-box; width: 100%; }
+.mobile-environment-dialog { box-sizing: border-box; width: 100%; max-height: 100%; min-height: 0; overflow-y: auto; padding: 20px; border: 1px solid var(--line); border-radius: 22px; color: var(--ink); background: var(--card); box-shadow: 0 24px 80px #0008; }
+.mobile-environment-app { margin: 0 0 12px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper); }
+.mobile-environment-app-version { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 12px; }
+.mobile-environment-app-version strong { min-width: 0; color: var(--ink); font-size: 12px; overflow-wrap: anywhere; text-align: right; }
+.mobile-environment-app-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+.mobile-environment-app-actions button { min-height: 40px; padding: 7px 6px; border-radius: 9px; font-size: 12px; font-weight: 700; }
+.mobile-environment-app-message { margin: 9px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.mobile-environment-app .mobile-connect-error { margin-top: 9px; }
+.mobile-environment-version-details { margin-top: 10px; color: var(--muted); font-size: 11px; }
+.mobile-environment-version-details summary { cursor: pointer; }
+.mobile-environment-version-details .mobile-environment-versions { margin: 8px 0 0; }
 .mobile-environment-versions { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 5px 10px; margin: 0 0 16px; font-size: 11px; line-height: 1.5; }
 .mobile-environment-versions dt { color: var(--muted); }
 .mobile-environment-versions dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
@@ -138,6 +153,9 @@ html[data-theme="dark"] .mobile-update-actions .mobile-update-dismiss { border-c
   .mobile-connect-card h1 { margin-top: 22px; }
   .mobile-update-banner { grid-template-columns: 1fr; }
   .mobile-update-actions { justify-content: flex-end; }
+}
+@media (max-width: 360px) {
+  .mobile-environment-header h2 { font-size: 17px; }
 }
 :root[data-theme="dark"] .mobile-connect-page { background: radial-gradient(circle at 15% 0, #1a2c3c 0, transparent 38%), var(--paper); }
 :root[data-theme="dark"] .mobile-connect-card { box-shadow: 0 24px 72px #00000040; }

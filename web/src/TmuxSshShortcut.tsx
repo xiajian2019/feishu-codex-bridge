@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
-import { isMobileApp } from "./mobile-runtime.js";
+import { getMobileConnection, isMobileApp } from "./mobile-runtime.js";
 import { isNativeSshWorkspaceAvailable, openNativeSshWorkspace } from "./ssh-connectbot-native.js";
+import { BRIDGE_GLOBAL_MAC_HOST } from "./bridge-global-config.js";
 
 /** Resume the native SSH workspace while leaving the current tmux page mounted. */
 export function TmuxSshShortcut({ onError }: { onError: (message: string) => void }): ReactElement | null {
@@ -17,7 +18,10 @@ export function TmuxSshShortcut({ onError }: { onError: (message: string) => voi
     openingRef.current = true;
     setOpening(true);
     try {
-      await openNativeSshWorkspace();
+      await openNativeSshWorkspace({
+        defaultHost: BRIDGE_GLOBAL_MAC_HOST,
+        ...(getMobileConnection()?.server ? { bridgeServerOrigin: getMobileConnection()!.server } : {}),
+      });
     } catch (error) {
       if (mountedRef.current) onError(error instanceof Error && error.message ? error.message : "无法打开 SSH 工作区，请重试。");
     } finally {

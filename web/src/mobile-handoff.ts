@@ -1,4 +1,4 @@
-import { normalizeBridgeServer, parseMobilePairingInput } from "./mobile-connection.js";
+import { normalizeConfiguredBridgeServer, parseMobilePairingInput } from "./mobile-connection.js";
 
 export type MobileOpenRequest =
   | { id: string; kind: "route"; server: string; route: string; scope?: string }
@@ -39,7 +39,7 @@ export function parseMobileOpenUrl(raw: string): MobileOpenRequest {
   }
   if (url.hostname !== "open" || url.pathname && url.pathname !== "/") throw new Error("不支持此 Bridge 链接。");
   for (const key of url.searchParams.keys()) if (!["server", "path"].includes(key) || url.searchParams.getAll(key).length !== 1) throw new Error("打开链接包含不支持的参数。");
-  const server = normalizeBridgeServer(url.searchParams.get("server") ?? "");
+  const server = normalizeConfiguredBridgeServer(url.searchParams.get("server") ?? "");
   const route = safeMobileRoute(url.searchParams.get("path"));
   if (!route) throw new Error("打开链接的目标页面无效。");
   return { id, kind: "route", server, route };
@@ -50,7 +50,7 @@ export function parseMobileNotificationTarget(value: unknown): MobileOpenRequest
   const target = value as Record<string, unknown>;
   const route = safeMobileRoute(target.route);
   if (!route || typeof target.server !== "string" || typeof target.scope !== "string" || !target.scope) throw new Error("通知缺少环境或设备上下文。");
-  return { id: crypto.randomUUID(), kind: "route", route, server: normalizeBridgeServer(target.server), scope: target.scope };
+  return { id: crypto.randomUUID(), kind: "route", route, server: normalizeConfiguredBridgeServer(target.server), scope: target.scope };
 }
 
 export function appendMobileShareText(current: string, incoming: string): string {
@@ -92,7 +92,7 @@ export function restoreMobileOpens(): void {
       const route = safeMobileRoute(row.route);
       if (!route || row.scope !== undefined && (typeof row.scope !== "string" || !row.scope)) continue;
       try {
-        const server = normalizeBridgeServer(row.server);
+        const server = normalizeConfiguredBridgeServer(row.server);
         if (!opens.some((item) => item.kind === "route" && item.server === server && item.route === route && item.scope === row.scope)) opens.push({ id: crypto.randomUUID(), kind: "route", server, route, ...(row.scope ? { scope: row.scope } : {}) });
       } catch { /* Ignore one invalid origin without discarding other pending navigation. */ }
     }

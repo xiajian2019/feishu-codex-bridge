@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.ui.Modifier
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.ComposeView
@@ -23,6 +24,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import kotlinx.coroutines.CompletableDeferred
 import org.connectbot.terminal.TerminalEmulatorImpl
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -31,6 +33,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
@@ -72,40 +75,203 @@ class BridgeSshTerminalInteractionUiTest {
                 terminal.acceptSshOutput("\u001b[?1049hLive TUI".toByteArray())
             }
             waitUntil { (terminal.emulator as TerminalEmulatorImpl).snapshot.value.alternateScreen }
+            waitUntil { captures.get() == 1 } // Background warm-up does not open history.
             instrumentation.waitForIdleSync()
             val bounds = Rect().also(waitForNode("测试终端")::getBoundsInScreen)
             longPress(bounds.centerX(), bounds.top + bounds.height() / 4)
-            assertEquals("long press must remain selection, not open history", 0, captures.get())
+            assertEquals("long press must remain selection, not request history", 1, captures.get())
             tap(bounds.centerX(), bounds.centerY()) // Clear the selection before scrolling.
             Thread.sleep(350)
             swipe(bounds.centerX(), bounds.top + bounds.height() / 4, bounds.top + bounds.height() * 3 / 4)
             try {
-                waitUntil { captures.get() == 1 && (controller.get()?.scrollbackPosition ?: 0) > 0 }
+                waitUntil { (controller.get()?.scrollbackPosition ?: 0) > 0 }
             } catch (failure: AssertionError) {
                 throw AssertionError("capture=${captures.get()} position=${controller.get()?.scrollbackPosition} error=${error.get()}", failure)
             }
+            assertEquals("warm snapshot should be reused on the first swipe", 1, captures.get())
             val firstPosition = controller.get().scrollbackPosition
             assertTrue(controller.get().maxScrollback > firstPosition)
+            if (firstPosition < terminal.emulator.dimensions.rows) {
+                assertEquals("a short scroll should not show an overlay button", null,
+                    find(instrumentation.uiAutomation.rootInActiveWindow, "返回实时"))
+            }
             swipe(bounds.centerX(), bounds.top + bounds.height() / 4, bounds.top + bounds.height() * 3 / 4)
             waitUntil { controller.get().scrollbackPosition > firstPosition }
-            scenario.onActivity { terminal.acceptSshOutput("\r\nlive output continues".toByteArray()) }
-            instrumentation.waitForIdleSync()
-            assertTrue("live output must not move the history view to the bottom", controller.get().scrollbackPosition > 0)
             assertEquals("history review must not send terminal keys or tmux scroll", 0, writes.get())
             assertEquals(null, error.get())
             repeat(8) {
-                if (find(instrumentation.uiAutomation.rootInActiveWindow, "返回实时") != null) {
+                if ((controller.get()?.scrollbackPosition ?: 0) > 0) {
                     swipe(bounds.centerX(), bounds.top + bounds.height() * 3 / 4, bounds.top + bounds.height() / 4)
                     Thread.sleep(150)
                 }
             }
-            waitUntil { find(instrumentation.uiAutomation.rootInActiveWindow, "返回实时") == null }
+            waitUntil { (controller.get()?.scrollbackPosition ?: 0) == 0 }
             scenario.onActivity { controller.get().scrollToTop() }
-            waitUntil { captures.get() == 2 && (controller.get()?.scrollbackPosition ?: 0) > 0 }
+            waitUntil { (controller.get()?.scrollbackPosition ?: 0) > 0 }
+            assertEquals("returning to the same unchanged history must not use SSH", 1, captures.get())
+            scenario.onActivity { terminal.acceptSshOutput("\r\nlive output continues".toByteArray()) }
+            instrumentation.waitForIdleSync()
+            assertTrue("live output must not move the history view to the bottom", controller.get().scrollbackPosition > 0)
             val returnButton = waitForNode("返回实时")
             Rect().also(returnButton::getBoundsInScreen).let { tap(it.centerX(), it.centerY()) }
             waitUntil { find(instrumentation.uiAutomation.rootInActiveWindow, "返回实时") == null }
+            waitUntil { captures.get() == 2 } // Refresh once in the background after new output.
+            scenario.onActivity { controller.get().scrollToTop() }
+            waitUntil { (controller.get()?.scrollbackPosition ?: 0) > 0 }
+            assertEquals("an in-flight refresh must not be duplicated", 2, captures.get())
             assertEquals(0, writes.get())
+            scenario.onActivity { controller.get().scrollToBottom() }
+            waitUntil { find(instrumentation.uiAutomation.rootInActiveWindow, "返回实时") == null }
+            scenario.onActivity { terminal.acceptSshOutput("\r\noutput while live".toByteArray()) }
+            scenario.onActivity { controller.get().scrollToTop() }
+            waitUntil { captures.get() == 3 && (controller.get()?.scrollbackPosition ?: 0) > 0 }
+            assertEquals("new live output requires a fresh snapshot", 3, captures.get())
+            assertEquals(0, writes.get())
+            scenario.onActivity { terminal.close() }
+        }
+    }
+
+    @Test
+    fun changingHistoryContextCancelsTheOldCaptureAndKeepsNewPaneIsolated() {
+        val controller = AtomicReference<BridgeSshScrollController>()
+        val target = mutableStateOf("old-pane")
+        val oldStarted = AtomicInteger()
+        val oldFinished = AtomicBoolean()
+        val newStarted = AtomicInteger()
+        val oldGate = CompletableDeferred<Unit>()
+        val transport = object : BridgeSshTerminalTransport {
+            override val initialState = BridgeSshConnectionState.CONNECTED
+            override fun attach(listener: BridgeSshTerminalTransport.Listener?) = Unit
+            override fun writeToSsh(bytes: ByteArray, offset: Int, length: Int) = Unit
+            override fun requestResize(size: BridgeSshTerminalSize) = Unit
+            override fun close() = Unit
+        }
+        ActivityScenario.launch(BridgeConnectBotSshActivity::class.java).use { scenario ->
+            lateinit var terminal: BridgeSshTerminalSession
+            scenario.onActivity { activity ->
+                terminal = BridgeSshTerminalSession(transport)
+                activity.setContent {
+                    val pane = target.value
+                    BridgeSshTerminalViewport(
+                        session = terminal,
+                        historyKey = pane,
+                        captureHistory = {
+                            if (pane == "old-pane") {
+                                oldStarted.incrementAndGet()
+                                try { oldGate.await() } finally { oldFinished.set(true) }
+                                (1..150).joinToString("\n") { "old pane $it" }.toByteArray()
+                            } else {
+                                newStarted.incrementAndGet()
+                                (1..400).joinToString("\n") { "new pane $it" }.toByteArray()
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                        backgroundColor = Color.Black,
+                        foregroundColor = Color.White,
+                        onScrollControllerAvailable = { controller.set(it) },
+                    )
+                }
+                terminal.acceptSshOutput("\u001b[?1049hLive TUI".toByteArray())
+            }
+            waitUntil { oldStarted.get() == 1 }
+            scenario.onActivity { target.value = "new-pane" }
+            waitUntil { oldFinished.get() && newStarted.get() == 1 }
+            scenario.onActivity { controller.get().scrollToTop() }
+            waitUntil { (controller.get()?.scrollbackPosition ?: 0) > 0 }
+            assertTrue("the selected pane must have its own 400-line snapshot", controller.get().maxScrollback > 250)
+            oldGate.complete(Unit)
+            Thread.sleep(300)
+            assertEquals("the abandoned capture must not replace or refetch the new pane", 1, newStarted.get())
+            assertTrue(controller.get().maxScrollback > 250)
+            scenario.onActivity { terminal.close() }
+        }
+    }
+
+    @Test
+    fun returningToLiveWhileCaptureIsPendingDoesNotOpenHistoryLater() {
+        val controller = AtomicReference<BridgeSshScrollController>()
+        val captures = AtomicInteger()
+        val gate = CompletableDeferred<Unit>()
+        val transport = object : BridgeSshTerminalTransport {
+            override val initialState = BridgeSshConnectionState.CONNECTED
+            override fun attach(listener: BridgeSshTerminalTransport.Listener?) = Unit
+            override fun writeToSsh(bytes: ByteArray, offset: Int, length: Int) = Unit
+            override fun requestResize(size: BridgeSshTerminalSize) = Unit
+            override fun close() = Unit
+        }
+        ActivityScenario.launch(BridgeConnectBotSshActivity::class.java).use { scenario ->
+            lateinit var terminal: BridgeSshTerminalSession
+            scenario.onActivity { activity ->
+                terminal = BridgeSshTerminalSession(transport)
+                activity.setContent {
+                    BridgeSshTerminalViewport(
+                        session = terminal,
+                        historyKey = "pending-pane",
+                        captureHistory = {
+                            captures.incrementAndGet()
+                            gate.await()
+                            (1..200).joinToString("\n") { "history $it" }.toByteArray()
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                        backgroundColor = Color.Black,
+                        foregroundColor = Color.White,
+                        onScrollControllerAvailable = { controller.set(it) },
+                    )
+                }
+                terminal.acceptSshOutput("\u001b[?1049hLive TUI".toByteArray())
+            }
+            waitUntil { captures.get() == 1 && controller.get() != null }
+            scenario.onActivity { controller.get().scrollToTop(); controller.get().scrollToBottom() }
+            gate.complete(Unit)
+            Thread.sleep(800)
+            assertEquals("a cancelled history request must leave the live terminal visible", null,
+                find(InstrumentationRegistry.getInstrumentation().uiAutomation.rootInActiveWindow, "返回实时"))
+            scenario.onActivity { controller.get().scrollToTop() }
+            waitUntil { (controller.get()?.scrollbackPosition ?: 0) > 0 }
+            assertEquals("the completed capture should still be reusable", 1, captures.get())
+            scenario.onActivity { terminal.close() }
+        }
+    }
+
+    @Test
+    fun failedBackgroundWarmupDoesNotBlockAManualRetry() {
+        val controller = AtomicReference<BridgeSshScrollController>()
+        val captures = AtomicInteger()
+        val error = AtomicReference<String>()
+        val transport = object : BridgeSshTerminalTransport {
+            override val initialState = BridgeSshConnectionState.CONNECTED
+            override fun attach(listener: BridgeSshTerminalTransport.Listener?) = Unit
+            override fun writeToSsh(bytes: ByteArray, offset: Int, length: Int) = Unit
+            override fun requestResize(size: BridgeSshTerminalSize) = Unit
+            override fun close() = Unit
+        }
+        ActivityScenario.launch(BridgeConnectBotSshActivity::class.java).use { scenario ->
+            lateinit var terminal: BridgeSshTerminalSession
+            scenario.onActivity { activity ->
+                terminal = BridgeSshTerminalSession(transport)
+                activity.setContent {
+                    BridgeSshTerminalViewport(
+                        session = terminal,
+                        historyKey = "retry-pane",
+                        captureHistory = {
+                            if (captures.incrementAndGet() == 1) throw IllegalStateException("background failure")
+                            (1..200).joinToString("\n") { "history $it" }.toByteArray()
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                        backgroundColor = Color.Black,
+                        foregroundColor = Color.White,
+                        onScrollControllerAvailable = { controller.set(it) },
+                        onHistoryError = { error.set(it) },
+                    )
+                }
+                terminal.acceptSshOutput("\u001b[?1049hLive TUI".toByteArray())
+            }
+            waitUntil { captures.get() == 1 }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            assertEquals("a silent warm-up failure should not interrupt the user", null, error.get())
+            scenario.onActivity { controller.get().scrollToTop() }
+            waitUntil { captures.get() == 2 && (controller.get()?.scrollbackPosition ?: 0) > 0 }
+            assertEquals(null, error.get())
             scenario.onActivity { terminal.close() }
         }
     }

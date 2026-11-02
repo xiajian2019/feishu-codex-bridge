@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it } from "bun:test";
-import { setAppForeground, startForegroundPolling } from "../web/src/foreground-polling.js";
+import { isAppActive, isAppForeground, setAppForeground, startForegroundPolling } from "../web/src/foreground-polling.js";
 
 const original = new Map(["window", "document", "navigator"].map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
 let win: EventTarget;
@@ -43,4 +43,12 @@ it("aborts a stale read and does not let an abort-ignoring read block or schedul
   win.dispatchEvent(new Event("online")); expect(calls).toHaveLength(2);
   stop(); expect(calls[1]!.signal.aborted).toBe(true);
   calls[1]!.resolve(); await settle();
+});
+
+it("distinguishes an obscured WebView from an Android Activity in the background", () => {
+  doc.visibilityState = "hidden";
+  expect(isAppActive()).toBe(true);
+  expect(isAppForeground()).toBe(false);
+  setAppForeground(false);
+  expect(isAppActive()).toBe(false);
 });

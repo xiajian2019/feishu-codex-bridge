@@ -34,6 +34,11 @@ try {
       await runBackupCli(args);
       break;
     }
+    case "--bridge-ssh-session": {
+      const { runBridgeSshSessionCli } = await import("../dist/ssh-session-cli.js");
+      await runBridgeSshSessionCli(args);
+      break;
+    }
     case "--bridge-web-pair": {
       const { runWebPair } = await import("../dist/web-pair-cli.js");
       await runWebPair(args);

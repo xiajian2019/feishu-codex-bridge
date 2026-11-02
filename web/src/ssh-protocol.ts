@@ -6,8 +6,10 @@
  * wrapper without introducing a browser-side fake connection.
  */
 
+import { BRIDGE_GLOBAL_MAC_HOST } from "./bridge-global-config.js";
+
 export const SSH_DEFAULT_PORT = 22;
-export const SSH_DEFAULT_HOST = "";
+export const SSH_DEFAULT_HOST = BRIDGE_GLOBAL_MAC_HOST;
 export const SSH_DEFAULT_COLS = 80;
 export const SSH_DEFAULT_ROWS = 24;
 export const SSH_MIN_COLS = 2;

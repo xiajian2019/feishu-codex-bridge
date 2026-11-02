@@ -1,7 +1,14 @@
 import { describe, expect, it } from "bun:test";
-import { createMobileFetch, normalizeBridgeServer, parseMobilePairingInput, type MobileConnection } from "../web/src/mobile-connection.js";
+import { createMobileFetch, normalizeBridgeServer, normalizeConfiguredBridgeServer, parseMobilePairingInput, type MobileConnection } from "../web/src/mobile-connection.js";
+import { BRIDGE_GLOBAL_MAC_HOST } from "../web/src/bridge-global-config.js";
 
 describe("mobile connection configuration", () => {
+  it("uses the global Mac host for private Bridge endpoints while preserving ports", () => {
+    expect(normalizeConfiguredBridgeServer("http://10.0.0.55:5173")).toBe(`http://${BRIDGE_GLOBAL_MAC_HOST}:5173`);
+    expect(normalizeConfiguredBridgeServer("http://mac.local:7310")).toBe(`http://${BRIDGE_GLOBAL_MAC_HOST}:7310`);
+    expect(normalizeConfiguredBridgeServer("http://127.0.0.1:17310")).toBe("http://127.0.0.1:17310");
+  });
+
   it("accepts HTTPS and LAN HTTP, rejects public cleartext, credentials and subpaths", () => {
     expect(normalizeBridgeServer(" https://bridge.example.com/ ")).toBe("https://bridge.example.com");
     for (const host of ["192.168.1.2", "10.1.2.3", "172.16.0.2", "mac.local", "100.100.1.2", "[fd12::1]"]) {
@@ -21,15 +28,15 @@ describe("mobile connection configuration", () => {
   });
 
   it("uses the code and server carried by a pasted link instead of stale manual values", () => {
-    expect(parseMobilePairingInput("http://10.15.55.17:7310/#pair=ABCD-EFGH-JKLM", "NPQRSTUVWXYZ", "http://192.168.1.2:17310"))
-      .toEqual({ server: "http://10.15.55.17:7310", code: "ABCDEFGHJKLM" });
+    expect(parseMobilePairingInput("http://10.0.0.55:7310/#pair=ABCD-EFGH-JKLM", "NPQRSTUVWXYZ", "http://192.168.1.2:17310"))
+      .toEqual({ server: "http://10.0.0.55:7310", code: "ABCDEFGHJKLM" });
     expect(parseMobilePairingInput("bridgecodex://connect?server=https%3A%2F%2Fbridge.example.com&code=ABCDEFGHJKLM", "NPQRSTUVWXYZ"))
       .toEqual({ server: "https://bridge.example.com", code: "ABCDEFGHJKLM" });
   });
 
   it("accepts a standalone code in the unified input with an explicitly selected Bridge", () => {
-    expect(parseMobilePairingInput(" abcd-efgh-jklm ", "", "http://10.15.55.17:7310"))
-      .toEqual({ server: "http://10.15.55.17:7310", code: "ABCDEFGHJKLM" });
+    expect(parseMobilePairingInput(" abcd-efgh-jklm ", "", "http://10.0.0.55:7310"))
+      .toEqual({ server: "http://10.0.0.55:7310", code: "ABCDEFGHJKLM" });
     expect(() => parseMobilePairingInput("ABCD-EFGH-JKLM")).toThrow("仅有配对码");
     for (const server of ["http://public.example.com", "https://user:secret@bridge.example.com", "file:///tmp", "https://bridge.example.com/api"]) {
       expect(() => parseMobilePairingInput("ABCD-EFGH-JKLM", "", server)).toThrow();
@@ -55,6 +62,7 @@ describe("mobile fetch credential boundaries", () => {
     expect(request.url).toBe("https://mac.example.com/api/tasks");
     expect(request.headers.get("Authorization")).toBe("Bearer private-token");
     expect(request.headers.get("X-Bridge-Action-Token")).toBe("action");
+    expect(request.headers.get("Cookie")).toBeNull();
     expect(await request.text()).toBe('{"text":"hello"}');
     expect(requestOptions?.credentials).toBe("omit");
     expect(requestOptions?.redirect).toBe("error");

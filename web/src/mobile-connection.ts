@@ -1,4 +1,6 @@
 /** Shared by the App runtime and tests; no native APIs or browser globals here. */
+import { BRIDGE_GLOBAL_MAC_HOST, bridgeOriginWithGlobalMacHost } from "./bridge-global-config.js";
+
 export interface MobileConnection {
   server: string;
   token: string | null;
@@ -32,6 +34,21 @@ export function normalizeBridgeServer(value: string): string {
   }
   return url.origin;
 }
+
+/**
+ * Resolve a user/App Bridge address against the global Mac target.
+ * Loopback remains useful for local browser fixtures; private remote hosts
+ * retain their protocol and port but use the configured Mac host.
+ */
+export function normalizeConfiguredBridgeServer(value: string): string {
+  const origin = normalizeBridgeServer(value);
+  const url = new URL(origin);
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const loopback = host === "localhost" || host === "127.0.0.1" || host === "::1";
+  return !loopback && isPrivateBridgeHost(host) ? bridgeOriginWithGlobalMacHost(origin) : origin;
+}
+
+export { BRIDGE_GLOBAL_MAC_HOST };
 
 export function parseMobilePairingInput(value: string, rawCode = "", defaultServer = ""): { server: string; code: string } {
   const text = value.trim();

@@ -3,7 +3,9 @@ package dev.feishu.codex.bridge
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -16,7 +18,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -47,128 +48,104 @@ internal fun BridgeSshTmuxPicker(
     onDismiss: () -> Unit,
     onSelect: (BridgeSshTmuxSession) -> Unit,
     onCopyError: (String) -> Unit,
+    suspendedSessions: List<BridgeSshSuspendedSession> = emptyList(),
+    suspendedError: String? = null,
+    onRestore: (BridgeSshSuspendedSession) -> Unit = {},
 ) {
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false),
-    ) {
-        Surface(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 16.dp),
-            shape = MaterialTheme.shapes.large,
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 3.dp,
-        ) {
-            var search by remember { mutableStateOf("") }
-            val normalizedSearch = search.trim()
-            val visibleSessions = sessions.orEmpty().filter { session ->
-                normalizedSearch.isBlank() ||
-                    session.name.contains(normalizedSearch, ignoreCase = true) ||
-                    session.cwd.contains(normalizedSearch, ignoreCase = true) ||
-                    session.id.contains(normalizedSearch, ignoreCase = true)
-            }
-            Column(modifier = Modifier.heightIn(max = 680.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "tmux 会话",
-                        modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.titleMedium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    TextButton(onClick = onRefresh, enabled = canRefresh && !refreshing) {
-                        Text("刷新")
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+            val dialogMaxHeight = maxHeight * 0.9f
+            Surface(
+                modifier = Modifier.fillMaxWidth().heightIn(max = dialogMaxHeight),
+                shape = MaterialTheme.shapes.medium,
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 3.dp,
+            ) {
+                var search by remember { mutableStateOf("") }
+                val normalizedSearch = search.trim()
+                val visibleSessions = remember(sessions, normalizedSearch) {
+                    sessions.orEmpty().filter { session ->
+                        normalizedSearch.isBlank() ||
+                            session.name.contains(normalizedSearch, ignoreCase = true) ||
+                            session.cwd.contains(normalizedSearch, ignoreCase = true) ||
+                            session.id.contains(normalizedSearch, ignoreCase = true)
                     }
-                    TextButton(onClick = onDismiss) { Text("关闭") }
                 }
-                Text(
-                    "当前 SSH 主机 · $target",
-                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 10.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                OutlinedTextField(
-                    value = search,
-                    onValueChange = { search = it },
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                    singleLine = true,
-                    label = { Text("筛选 Session") },
-                    placeholder = { Text("按名称、目录或 ID 搜索") },
-                )
-                HorizontalDivider()
-
-                LazyColumn(modifier = Modifier.weight(1f, fill = false)) {
-                    if (refreshing) {
-                        item {
-                            Row(
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                                Text("正在刷新会话…", style = MaterialTheme.typography.bodySmall)
-                            }
+                Column {
+                    Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("tmux 会话", style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                            Text(target, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
+                        TextButton(onClick = onRefresh, enabled = canRefresh && !refreshing,
+                            contentPadding = PaddingValues(horizontal = 8.dp)) { Text("刷新") }
+                        TextButton(onClick = onDismiss, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("关闭") }
                     }
-                    if (!message.isNullOrBlank()) {
-                        item {
-                            Text(
-                                message,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (errorDetails != null) MaterialTheme.colorScheme.error
-                                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                    BridgeSshCompactSearch(search, { search = it }, "按名称、目录或 ID 筛选",
+                        Modifier.padding(start = 12.dp, end = 12.dp, bottom = 8.dp))
+                    HorizontalDivider()
+                    LazyColumn(modifier = Modifier.weight(1f, fill = false)) {
+                        if (suspendedError != null) item {
+                            Text(suspendedError, Modifier.padding(12.dp), color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodySmall)
                         }
-                    }
-                    if (errorDetails != null) {
-                        item { BridgeSshTmuxErrorDetails(errorDetails, onCopyError) }
-                    }
-                    when {
-                        sessions == null && !refreshing && errorDetails == null -> item {
-                            Text(
-                                "尚未读取会话，请刷新。",
-                                modifier = Modifier.padding(16.dp),
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
+                        val visibleSuspended = suspendedSessions.filter {
+                            normalizedSearch.isBlank() || it.name.contains(normalizedSearch, true) || it.cwd.contains(normalizedSearch, true)
                         }
-                        sessions != null && sessions.isEmpty() && !refreshing && errorDetails == null -> item {
-                            Text(
-                                "没有发现 tmux 会话。可以在 Composer 执行 tmux new -s <name>。",
-                                modifier = Modifier.padding(16.dp),
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                        }
-                        sessions != null && sessions.isNotEmpty() && visibleSessions.isEmpty() && !refreshing -> item {
-                            Text(
-                                "没有匹配的 tmux 会话。",
-                                modifier = Modifier.padding(16.dp),
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                        }
-                        sessions != null && sessions.isNotEmpty() -> {
-                            if (errorDetails != null) {
-                                item {
-                                    Text(
-                                        "显示上次成功读取的会话。",
-                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
+                        if (visibleSuspended.isNotEmpty()) {
+                            item { Text("已挂起", Modifier.padding(start = 12.dp, top = 8.dp), style = MaterialTheme.typography.titleSmall) }
+                            itemsIndexed(visibleSuspended, key = { _, item -> "suspended:${item.id}:${item.createdAt}" }) { _, item ->
+                                Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(item.name, style = MaterialTheme.typography.titleSmall)
+                                        Text(item.cwd, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                    TextButton(onClick = { onRestore(item) }, enabled = !refreshing) { Text("恢复") }
                                 }
+                                HorizontalDivider()
                             }
-                            itemsIndexed(visibleSessions, key = { _, session -> session.id }) { index, session ->
-                                BridgeSshTmuxSessionRow(session = session, onSelect = { onSelect(session) })
-                                if (index != visibleSessions.lastIndex) {
-                                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+                        }
+                        if (refreshing) {
+                            item {
+                                Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                    Text("正在刷新会话…", style = MaterialTheme.typography.bodySmall)
                                 }
                             }
                         }
-                        else -> Unit
+                        if (!message.isNullOrBlank()) {
+                            item {
+                                Text(message, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (errorDetails != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        if (errorDetails != null) item { BridgeSshTmuxErrorDetails(errorDetails, onCopyError) }
+                        when {
+                            sessions == null && !refreshing && errorDetails == null -> item {
+                                Text("尚未读取会话，请刷新。", modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodyMedium)
+                            }
+                            sessions != null && sessions.isEmpty() && !refreshing && errorDetails == null -> item {
+                                Text("没有发现 tmux 会话。可以在 Composer 执行 tmux new -s <name>。",
+                                    modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodyMedium)
+                            }
+                            sessions != null && sessions.isNotEmpty() && visibleSessions.isEmpty() && !refreshing -> item {
+                                Text("没有匹配的 tmux 会话。", modifier = Modifier.padding(12.dp), style = MaterialTheme.typography.bodyMedium)
+                            }
+                            sessions != null && sessions.isNotEmpty() -> {
+                                if (errorDetails != null) item {
+                                    Text("显示上次成功读取的会话。", modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                itemsIndexed(visibleSessions, key = { _, session -> session.id }) { index, session ->
+                                    BridgeSshTmuxSessionRow(session = session, onSelect = { onSelect(session) })
+                                    if (index != visibleSessions.lastIndex) HorizontalDivider()
+                                }
+                            }
+                            else -> Unit
+                        }
                     }
                 }
             }
@@ -177,42 +154,23 @@ internal fun BridgeSshTmuxPicker(
 }
 
 @Composable
-private fun BridgeSshTmuxSessionRow(
-    session: BridgeSshTmuxSession,
-    onSelect: () -> Unit,
-) {
+private fun BridgeSshTmuxSessionRow(session: BridgeSshTmuxSession, onSelect: () -> Unit) {
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(min = 64.dp)
+        modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp)
             .clickable(onClickLabel = "进入会话 ${session.name}", role = Role.Button, onClick = onSelect)
-            .padding(horizontal = 16.dp, vertical = 9.dp),
+            .padding(horizontal = 12.dp, vertical = 5.dp),
         verticalArrangement = Arrangement.Center,
     ) {
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                session.name,
-                modifier = Modifier.weight(1f).padding(end = 8.dp),
-                style = MaterialTheme.typography.titleSmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                "${session.windows} 个窗口 · ${if (session.attached) "已附加" else "未附加"}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Text(session.name, modifier = Modifier.weight(1f).padding(end = 6.dp), style = MaterialTheme.typography.titleSmall,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text("${session.windows} 窗 · ${if (session.attached) "已附加" else "未附加"}",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        Text(
-            "${session.id} · ${session.cwd.ifBlank { "（未提供目录）" }}",
-            modifier = Modifier.fillMaxWidth().padding(top = 3.dp),
+        Text("${session.id} · ${session.cwd.ifBlank { "（未提供目录）" }}", modifier = Modifier.fillMaxWidth(),
             style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
 
@@ -233,17 +191,11 @@ private fun BridgeSshTmuxErrorDetails(details: String, onCopyError: (String) -> 
                 color = MaterialTheme.colorScheme.errorContainer,
             ) {
                 Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 160.dp)
-                        .verticalScroll(rememberScrollState())
-                        .padding(10.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 160.dp)
+                        .verticalScroll(rememberScrollState()).padding(10.dp),
                 ) {
-                    Text(
-                        details,
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                        color = MaterialTheme.colorScheme.onErrorContainer,
-                    )
+                    Text(details, style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        color = MaterialTheme.colorScheme.onErrorContainer)
                 }
             }
         }

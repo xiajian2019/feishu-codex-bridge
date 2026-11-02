@@ -7,6 +7,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -23,17 +25,23 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import org.connectbot.terminal.TerminalEmulatorImpl
 import java.io.ByteArrayOutputStream
 
 /** A read-only history overlay leaves the live PTY and its terminal intact. */
-
 @Composable
 internal fun BridgeSshTerminalViewport(
     session: BridgeSshTerminalSession,
@@ -54,18 +62,29 @@ internal fun BridgeSshTerminalViewport(
         var historyController by remember { mutableStateOf<BridgeSshScrollController?>(null) }
         var history by remember { mutableStateOf<BridgeSshTerminalSession?>(null) }
         var cachedHistory by remember { mutableStateOf<BridgeSshTerminalSession?>(null) }
+        var cachedStamp by remember { mutableStateOf<BridgeSshHistoryStamp?>(null) }
         var loading by remember { mutableStateOf(false) }
+        var waitingForHistory by remember { mutableStateOf(false) }
+        var showLoading by remember { mutableStateOf(false) }
         var openAtTop by remember { mutableStateOf(false) }
 
-        fun openHistory(top: Boolean) {
-            if (history != null || loading) return
-            val capture = currentCapture ?: return
+        fun stamp(): BridgeSshHistoryStamp {
+            val size = session.emulator.dimensions
+            return BridgeSshHistoryStamp(session.outputRevision, size.rows, size.columns)
+        }
+
+        fun cacheIsFresh() = cachedHistory != null && cachedStamp == stamp()
+
+        fun capture() {
+            if (loading) return
+            val fetch = currentCapture ?: return
+            val captureStamp = stamp()
             loading = true
             scope.launch {
                 try {
-                    val bytes = capture()
+                    val bytes = fetch()
                     if (bytes.isEmpty()) {
-                        currentError("当前 tmux 窗格没有可回看的历史。")
+                        if (waitingForHistory) currentError("当前 tmux 窗格没有可回看的历史。")
                     } else {
                         val size = session.emulator.dimensions
                         val review = cachedHistory ?: BridgeSshTerminalSession(
@@ -75,43 +94,65 @@ internal fun BridgeSshTerminalViewport(
                         val implementation = review.emulator as TerminalEmulatorImpl
                         val previousSnapshot = implementation.snapshot.value
                         review.resize(BridgeSshTerminalSize(size.rows, size.columns))
-                        // Reuse the emulator for this Session and replace its
-                        // old snapshot instead of accumulating native instances.
+                        // Update only while the live terminal is visible; never move
+                        // the user's position in an active history review.
                         val clear = "\u001b[3J\u001b[2J\u001b[H\u001b[?25l".toByteArray()
                         review.acceptSshOutput(clear + bridgeSshHistoryTerminalBytes(bytes))
                         check(withTimeoutOrNull(5_000) {
                             implementation.snapshot.first { it !== previousSnapshot }
                         } != null) { "History snapshot timed out" }
-                        openAtTop = top
-                        history = review
+                        // Output received during the request leaves this snapshot
+                        // conservatively stale for the next history visit.
+                        cachedStamp = captureStamp
+                        if (waitingForHistory) history = review
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (_: Exception) {
-                    currentError("无法读取 tmux 历史，请检查 SSH 连接后重试。")
+                    if (waitingForHistory) currentError("无法读取 tmux 历史，请检查 SSH 连接后重试。")
                 } finally {
                     loading = false
+                    waitingForHistory = false
                 }
             }
         }
 
+        fun openHistory(top: Boolean) {
+            if (history != null || currentCapture == null) return
+            openAtTop = top
+            if (!loading && cacheIsFresh()) {
+                history = cachedHistory
+            } else {
+                waitingForHistory = true
+                capture()
+            }
+        }
+
+        fun returnToLive() {
+            waitingForHistory = false
+            history = null
+            // One silent refresh covers output that arrived during review.
+            // Further refreshes happen on demand, not as a periodic poll.
+            if (!cacheIsFresh()) capture()
+        }
+
         val currentOpenHistory by rememberUpdatedState<(Boolean) -> Unit>({ openHistory(it) })
+        val currentReturnToLive by rememberUpdatedState<() -> Unit>({ returnToLive() })
         val exposedController = remember(session) {
             object : BridgeSshScrollController {
-                override val scrollbackPosition get() = (historyController ?: liveController)?.scrollbackPosition ?: 0
-                override val maxScrollback get() = (historyController ?: liveController)?.maxScrollback ?: 0
+                override val scrollbackPosition get() = (if (history != null) historyController else liveController)?.scrollbackPosition ?: 0
+                override val maxScrollback get() = (if (history != null) historyController else liveController)?.maxScrollback ?: 0
                 override fun scrollToTop() {
-                    val activeHistory = historyController
-                    if (activeHistory != null) activeHistory.scrollToTop()
+                    if (history != null) historyController?.scrollToTop()
                     else if ((session.emulator as? TerminalEmulatorImpl)?.snapshot?.value?.alternateScreen == true && currentCapture != null) {
                         currentOpenHistory(true)
                     } else liveController?.scrollToTop()
                 }
                 override fun scrollToBottom() {
-                    if (history != null) history = null else liveController?.scrollToBottom()
+                    if (history != null || waitingForHistory) currentReturnToLive() else liveController?.scrollToBottom()
                 }
                 override fun scrollBy(lines: Int) {
-                    (historyController ?: liveController)?.scrollBy(lines)
+                    (if (history != null) historyController else liveController)?.scrollBy(lines)
                 }
             }
         }
@@ -121,6 +162,23 @@ internal fun BridgeSshTerminalViewport(
         }
         DisposableEffect(session) {
             onDispose { cachedHistory?.close() }
+        }
+        LaunchedEffect(session, captureHistory != null) {
+            val implementation = session.emulator as? TerminalEmulatorImpl ?: return@LaunchedEffect
+            implementation.snapshot.map { it.alternateScreen }.distinctUntilChanged().collect { alternate ->
+                if (alternate && currentCapture != null && cachedHistory == null) {
+                    // Warm the first snapshot without blocking the live terminal.
+                    delay(350)
+                    if (implementation.snapshot.value.alternateScreen && cachedHistory == null) capture()
+                }
+            }
+        }
+        LaunchedEffect(loading, waitingForHistory) {
+            showLoading = false
+            if (loading && waitingForHistory) {
+                delay(300)
+                showLoading = true
+            }
         }
         LaunchedEffect(history, historyController) {
             val review = history ?: return@LaunchedEffect
@@ -137,7 +195,7 @@ internal fun BridgeSshTerminalViewport(
             }
             if (openAtTop) controller.scrollToTop() else controller.scrollBy(6)
             snapshotFlow { controller.scrollbackPosition }.first { it == 0 }
-            if (history === review) history = null
+            if (history === review) returnToLive()
         }
 
         Box(modifier) {
@@ -150,7 +208,7 @@ internal fun BridgeSshTerminalViewport(
                 foregroundColor = foregroundColor,
                 onTerminalTap = onTerminalTap,
                 onScrollControllerAvailable = { liveController = it },
-                onAlternateScrollBack = if (captureHistory != null && history == null && !loading) {
+                onAlternateScrollBack = if (captureHistory != null && history == null) {
                     { openHistory(false) }
                 } else null,
             )
@@ -164,19 +222,25 @@ internal fun BridgeSshTerminalViewport(
                     foregroundColor = foregroundColor,
                     onScrollControllerAvailable = { historyController = it },
                 )
-                Text(
-                    "返回实时",
-                    modifier = Modifier.align(Alignment.TopEnd)
-                        .background(MaterialTheme.colorScheme.surface.copy(alpha = .94f))
-                        .clickable { history = null }
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
+                if ((historyController?.scrollbackPosition ?: 0) >= session.emulator.dimensions.rows) {
+                    Box(
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp).size(36.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.surface.copy(alpha = .8f))
+                            .clickable { returnToLive() }
+                            .semantics { contentDescription = "返回实时" },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text("↓", color = MaterialTheme.colorScheme.onSurface, fontSize = 22.sp)
+                    }
+                }
             }
-            if (loading) CircularProgressIndicator(Modifier.align(Alignment.TopEnd).padding(8.dp))
+            if (showLoading) CircularProgressIndicator(Modifier.align(Alignment.TopEnd).padding(8.dp))
         }
     }
 }
+
+private data class BridgeSshHistoryStamp(val outputRevision: Long, val rows: Int, val columns: Int)
 
 /** Convert capture-pane's LF line endings to terminal CRLF without decoding UTF-8. */
 internal fun bridgeSshHistoryTerminalBytes(input: ByteArray): ByteArray {

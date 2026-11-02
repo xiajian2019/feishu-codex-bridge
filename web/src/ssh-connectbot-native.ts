@@ -4,10 +4,18 @@ export interface BridgeConnectBotSshOpenRequest {
   host: string;
   port: number;
   username: string;
+  /** Origin only; the native side reads the matching token from AndroidKeyStore. */
+  bridgeServerOrigin?: string;
   password?: string;
   startupCommand?: string;
   profileId?: string;
   keyId?: string;
+}
+
+export interface BridgeConnectBotSshWorkspaceRequest {
+  bridgeServerOrigin?: string;
+  defaultHost?: string;
+  mode?: "manage";
 }
 
 export interface SshProfileOption {
@@ -17,13 +25,26 @@ export interface SshKeyOption { id: string; nickname: string; algorithm: string 
 export interface SshOptions { profiles: SshProfileOption[]; keys: SshKeyOption[] }
 
 export interface SshWorkspaceClosedEvent { returnToWorkbench?: boolean }
+export type AppUpdateAction = "install" | "download" | "dismiss";
+export interface NativeAppUpdateBanner {
+  visible: boolean;
+  detail?: string;
+  status?: string;
+  error?: string;
+  busy?: boolean;
+  downloaded?: boolean;
+}
 
 interface BridgeConnectBotSSHPlugin {
   openTerminal(request: BridgeConnectBotSshOpenRequest): Promise<void>;
-  openWorkspace(options?: { mode?: "manage" }): Promise<void>;
+  openWorkspace(request: BridgeConnectBotSshWorkspaceRequest): Promise<void>;
   listOptions(): Promise<SshOptions>;
+  setWorkspaceVisible(options: { visible: boolean }): Promise<{ workspaceOpen: boolean }>;
+  closeWorkspace(): Promise<void>;
+  setUpdateBanner(options: NativeAppUpdateBanner): Promise<void>;
   addListener(event: "workspaceClosed", listener: (event: SshWorkspaceClosedEvent) => void): Promise<PluginListenerHandle>;
   addListener(event: "returnToWorkbench", listener: () => void): Promise<PluginListenerHandle>;
+  addListener(event: "updateAction", listener: (event: { action: AppUpdateAction }) => void): Promise<PluginListenerHandle>;
 }
 
 const NativeBridgeConnectBotSSH = registerPlugin<BridgeConnectBotSSHPlugin>("BridgeConnectBotSSH");
@@ -36,8 +57,8 @@ export function isNativeSshWorkspaceAvailable(): boolean {
   return Capacitor.getPlatform() === "android" && Capacitor.isPluginAvailable("BridgeConnectBotSSH");
 }
 
-export function openNativeSshWorkspace(mode?: "manage"): Promise<void> {
-  return NativeBridgeConnectBotSSH.openWorkspace(mode ? { mode } : {});
+export function openNativeSshWorkspace(request: BridgeConnectBotSshWorkspaceRequest): Promise<void> {
+  return NativeBridgeConnectBotSSH.openWorkspace(request);
 }
 
 export function listNativeSshOptions(): Promise<SshOptions> {
@@ -50,4 +71,21 @@ export function onNativeSshWorkspaceClosed(listener: (event: SshWorkspaceClosedE
 
 export function onNativeSshReturnToWorkbench(listener: () => void): Promise<PluginListenerHandle> {
   return NativeBridgeConnectBotSSH.addListener("returnToWorkbench", listener);
+}
+
+export async function setNativeSshWorkspaceVisible(visible: boolean): Promise<boolean> {
+  if (!isNativeSshWorkspaceAvailable()) return false;
+  return (await NativeBridgeConnectBotSSH.setWorkspaceVisible({ visible })).workspaceOpen;
+}
+
+export async function closeNativeSshWorkspace(): Promise<void> {
+  if (isNativeSshWorkspaceAvailable()) await NativeBridgeConnectBotSSH.closeWorkspace();
+}
+
+export async function setNativeAppUpdateBanner(banner: NativeAppUpdateBanner): Promise<void> {
+  if (isNativeSshWorkspaceAvailable()) await NativeBridgeConnectBotSSH.setUpdateBanner(banner);
+}
+
+export function onNativeAppUpdateAction(listener: (action: AppUpdateAction) => void): Promise<PluginListenerHandle> {
+  return NativeBridgeConnectBotSSH.addListener("updateAction", ({ action }) => listener(action));
 }
