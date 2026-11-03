@@ -18,33 +18,43 @@ import com.getcapacitor.BridgeActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -54,12 +64,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.core.content.FileProvider
@@ -573,67 +587,123 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         }
     }
 
+    @OptIn(ExperimentalMaterial3Api::class)
+    @Composable
+    private fun SshSetupTopBar(
+        title: String,
+        backDescription: String,
+        enabled: Boolean,
+        onBack: () -> Unit,
+        actions: @Composable RowScope.() -> Unit = {},
+    ) {
+        TopAppBar(
+            title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            navigationIcon = {
+                IconButton(
+                    onClick = onBack,
+                    enabled = enabled,
+                    modifier = Modifier.semantics { contentDescription = backDescription },
+                ) {
+                    BridgeBackIcon()
+                }
+            },
+            actions = actions,
+            colors = TopAppBarDefaults.topAppBarColors(
+                containerColor = MaterialTheme.colorScheme.background,
+            ),
+            // SetupScreen already applies safeDrawingPadding(). Avoid adding the
+            // status-bar inset a second time inside the top app bar.
+            windowInsets = WindowInsets(0, 0, 0, 0),
+        )
+    }
+
+    @Composable
+    private fun BridgeBackIcon() {
+        val color = MaterialTheme.colorScheme.onSurface
+        Canvas(Modifier.size(24.dp)) {
+            val left = 5.dp.toPx()
+            val centerY = 12.dp.toPx()
+            val shoulder = 11.dp.toPx()
+            val top = 6.dp.toPx()
+            val bottom = 18.dp.toPx()
+            val right = 19.dp.toPx()
+            val stroke = 2.1.dp.toPx()
+            drawLine(color, Offset(left, centerY), Offset(shoulder, top), strokeWidth = stroke, cap = StrokeCap.Square)
+            drawLine(color, Offset(left, centerY), Offset(shoulder, bottom), strokeWidth = stroke, cap = StrokeCap.Square)
+            drawLine(color, Offset(left, centerY), Offset(right, centerY), strokeWidth = stroke, cap = StrokeCap.Square)
+        }
+    }
+
     @Composable
     private fun HostListScreen() {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-        ) {
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("SSH 主机", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+        Column(modifier = Modifier.fillMaxSize()) {
+            SshSetupTopBar(
+                title = "SSH 主机",
+                backDescription = "返回工作台",
+                enabled = connectJob == null,
+                onBack = { closeActivity() },
+            ) {
                 TextButton(onClick = { openKeyList(SshSetupPage.HOSTS) }, enabled = connectJob == null) {
                     Text("密钥")
                 }
                 TextButton(onClick = { startNewProfile() }, enabled = connectJob == null) { Text("＋ 添加") }
             }
-            if (hasIncomingConnection) {
-                Row(
-                    modifier = Modifier.fillMaxWidth()
-                        .clickable(enabled = connectJob == null) { setupPage = SshSetupPage.EDIT_HOST }
-                        .padding(vertical = 12.dp, horizontal = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("继续本次连接", style = MaterialTheme.typography.titleSmall)
-                        Text("$username@$host:$port", style = MaterialTheme.typography.bodySmall)
-                    }
-                    Text("›", style = MaterialTheme.typography.titleLarge)
-                }
-                HorizontalDivider()
-            }
-            if (savedProfiles.isEmpty()) {
-                Text(
-                    "还没有保存的主机，点击“添加”创建连接。",
-                    modifier = Modifier.padding(vertical = 24.dp, horizontal = 8.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            } else {
-                savedProfiles.forEach { profile ->
-                    HostRow(profile)
-                    HorizontalDivider()
-                }
-            }
-            val unlisted = BridgeSshAppState.sessions.filter { session ->
-                savedProfiles.none { BridgeSshAppConnectionKey.of(it.host, it.port, it.username) == session.key }
-            }
-            if (unlisted.isNotEmpty()) {
-                Text("活动连接", modifier = Modifier.padding(start = 8.dp, top = 12.dp), style = MaterialTheme.typography.titleSmall)
-                unlisted.forEach { session ->
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            ) {
+                if (hasIncomingConnection) {
                     Row(
-                        modifier = Modifier.fillMaxWidth().clickable(enabled = connectJob == null) {
-                            attachSession(session, restoreProfile = true)
-                        }.padding(horizontal = 8.dp, vertical = 12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                            .clickable(enabled = connectJob == null) { setupPage = SshSetupPage.EDIT_HOST }
+                            .padding(vertical = 12.dp, horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text("${session.key.username}@${session.key.host}:${session.key.port}")
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("继续本次连接", style = MaterialTheme.typography.titleSmall)
+                            Text("$username@$host:$port", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Text("›", style = MaterialTheme.typography.titleLarge)
                     }
                     HorizontalDivider()
                 }
+
+                if (savedProfiles.isEmpty()) {
+                    Text(
+                        "还没有保存的主机，点击“添加”创建连接。",
+                        modifier = Modifier.padding(vertical = 24.dp, horizontal = 8.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    savedProfiles.forEach { profile ->
+                        HostRow(profile)
+                        HorizontalDivider()
+                    }
+                }
+
+                val unlisted = BridgeSshAppState.sessions.filter { session ->
+                    savedProfiles.none { BridgeSshAppConnectionKey.of(it.host, it.port, it.username) == session.key }
+                }
+                if (unlisted.isNotEmpty()) {
+                    Text("活动连接", modifier = Modifier.padding(start = 8.dp, top = 12.dp), style = MaterialTheme.typography.titleSmall)
+                    unlisted.forEach { session ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().clickable(enabled = connectJob == null) {
+                                attachSession(session, restoreProfile = true)
+                            }.padding(horizontal = 8.dp, vertical = 12.dp),
+                        ) {
+                            Text("${session.key.username}@${session.key.host}:${session.key.port}")
+                        }
+                        HorizontalDivider()
+                    }
+                }
+                SetupMessages()
             }
-            SetupMessages()
-            TextButton(onClick = { closeActivity() }, enabled = connectJob == null) { Text("关闭") }
         }
     }
 
@@ -680,17 +750,15 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
 
     @Composable
     private fun HostEditorScreen() {
-        Column(
-            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                TextButton(onClick = { setupPage = SshSetupPage.HOSTS }, enabled = connectJob == null) { Text("‹ 返回") }
-                Text(
-                    if (editingProfileId == null) "添加主机" else "编辑主机",
-                    modifier = Modifier.weight(1f),
-                    style = MaterialTheme.typography.titleLarge,
-                )
+        val hasSelectedIdentity = keyName != null || selectedStoredKeyId != null || identitySelection.profileKeyId != null
+
+        Column(modifier = Modifier.fillMaxSize()) {
+            SshSetupTopBar(
+                title = if (editingProfileId == null) "添加主机" else "编辑主机",
+                backDescription = "返回主机列表",
+                enabled = connectJob == null,
+                onBack = { setupPage = SshSetupPage.HOSTS },
+            ) {
                 TextButton(onClick = {
                     if (saveCurrentProfile() != null) {
                         setupPage = SshSetupPage.HOSTS
@@ -698,93 +766,137 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                     }
                 }, enabled = connectJob == null && !privateKeyReading) { Text("保存") }
             }
-            OutlinedTextField(profileLabel, { profileLabel = it }, label = { Text("名称（可选）") }, singleLine = true, enabled = connectJob == null, modifier = Modifier.fillMaxWidth())
-            OutlinedTextField(host, { host = it }, label = { Text("主机") }, singleLine = true, enabled = connectJob == null, modifier = Modifier.fillMaxWidth())
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                OutlinedTextField(port, { port = it }, label = { Text("端口") }, singleLine = true, enabled = connectJob == null, modifier = Modifier.weight(1f))
-                OutlinedTextField(username, { username = it }, label = { Text("用户名") }, singleLine = true, enabled = connectJob == null, modifier = Modifier.weight(2f))
-            }
-            OutlinedTextField(
-                password,
-                { password = it },
-                label = { Text("密码（仅当前连接）") },
-                singleLine = true,
-                enabled = connectJob == null,
-                visualTransformation = PasswordVisualTransformation(),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Text("身份验证", style = MaterialTheme.typography.titleSmall)
-            Text(
-                keyName?.let { "$it · ${keyFormat ?: "SSH"}${if (keyEncrypted) " · 已加密" else ""}" }
-                    ?: if (selectedStoredKeyId != null) "关联的密钥已不存在，请重新选择" else "未选择私钥",
-                style = MaterialTheme.typography.bodyMedium,
-                color = if (selectedStoredKeyId != null && keyName == null) {
-                    MaterialTheme.colorScheme.error
-                } else MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { openKeyList(SshSetupPage.EDIT_HOST) }, enabled = connectJob == null, modifier = Modifier.weight(1f)) {
-                    Text("选择密钥")
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedTextField(profileLabel, { profileLabel = it }, label = { Text("名称（可选）") }, singleLine = true, enabled = connectJob == null, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(host, { host = it }, label = { Text("主机") }, singleLine = true, enabled = connectJob == null, modifier = Modifier.fillMaxWidth())
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedTextField(port, { port = it }, label = { Text("端口") }, singleLine = true, enabled = connectJob == null, modifier = Modifier.weight(1f))
+                    OutlinedTextField(username, { username = it }, label = { Text("用户名") }, singleLine = true, enabled = connectJob == null, modifier = Modifier.weight(2f))
                 }
-                OutlinedButton(onClick = {
-                    keyPickerForNewHost = false
-                    markExternalPickerLaunched()
-                    privateKeyPicker.launch(arrayOf("*/*"))
-                }, enabled = connectJob == null, modifier = Modifier.weight(1f)) {
-                    Text("选择私钥文件")
-                }
-            }
-            Text("文件私钥仅用于当前连接，不会保存或关联到主机。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (privateKeyReading) {
-                Text("正在读取私钥文件…", style = MaterialTheme.typography.bodySmall)
-            } else if (privateKey != null && identitySelection.profileKeyId != null) {
-                val associated = savedKeys.firstOrNull { it.id == identitySelection.profileKeyId }
-                Text(
-                    "本次使用文件私钥；主机保存的密钥关联${associated?.let { "（${it.nickname}）" } ?: "（已不存在）"}保持不变。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            if (keyName != null || selectedStoredKeyId != null || identitySelection.profileKeyId != null) {
-                TextButton(onClick = {
-                    clearSelectedKey()
-                    identitySelection = identitySelection.withoutKey()
-                }, enabled = connectJob == null) { Text("不使用私钥") }
-            }
-            generatedPublicKey?.let { publicKey ->
-                TextButton(onClick = {
-                    publicKeyCopied = false
-                    generatedPublicKeyDialog = publicKey
-                }) {
-                    Text("查看/复制公钥")
-                }
-            }
-            if (keyEncrypted) {
                 OutlinedTextField(
-                    passphrase,
-                    { passphrase = it },
-                    label = { Text("私钥口令") },
+                    password,
+                    { password = it },
+                    label = { Text("密码（仅当前连接）") },
                     singleLine = true,
                     enabled = connectJob == null,
                     visualTransformation = PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth(),
                 )
+
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f),
+                    ),
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text("身份验证", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            keyName?.let { "$it · ${keyFormat ?: "SSH"}${if (keyEncrypted) " · 已加密" else ""}" }
+                                ?: if (selectedStoredKeyId != null) "关联的密钥已不存在，请重新选择" else "未选择私钥",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (selectedStoredKeyId != null && keyName == null) {
+                                MaterialTheme.colorScheme.error
+                            } else MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = { openKeyList(SshSetupPage.EDIT_HOST) },
+                                enabled = connectJob == null,
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            ) { Text("选择密钥", maxLines = 1) }
+                            OutlinedButton(
+                                onClick = {
+                                    keyPickerForNewHost = false
+                                    markExternalPickerLaunched()
+                                    privateKeyPicker.launch(arrayOf("*/*"))
+                                },
+                                enabled = connectJob == null,
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            ) { Text("选择私钥文件", maxLines = 1) }
+                        }
+                        Text(
+                            "文件私钥仅用于当前连接，不会保存或关联到主机。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        if (privateKeyReading) {
+                            Text("正在读取私钥文件…", style = MaterialTheme.typography.bodySmall)
+                        } else if (privateKey != null && identitySelection.profileKeyId != null) {
+                            val associated = savedKeys.firstOrNull { it.id == identitySelection.profileKeyId }
+                            Text(
+                                "本次使用文件私钥；主机保存的密钥关联${associated?.let { "（${it.nickname}）" } ?: "（已不存在）"}保持不变。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (hasSelectedIdentity || generatedPublicKey != null) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                if (hasSelectedIdentity) {
+                                    TextButton(
+                                        onClick = {
+                                            clearSelectedKey()
+                                            identitySelection = identitySelection.withoutKey()
+                                        },
+                                        enabled = connectJob == null,
+                                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                                    ) { Text("不使用私钥") }
+                                }
+                                generatedPublicKey?.let { publicKey ->
+                                    TextButton(
+                                        onClick = {
+                                            publicKeyCopied = false
+                                            generatedPublicKeyDialog = publicKey
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                                    ) { Text("查看/复制公钥") }
+                                }
+                            }
+                        }
+                        if (keyEncrypted) {
+                            OutlinedTextField(
+                                passphrase,
+                                { passphrase = it },
+                                label = { Text("私钥口令") },
+                                singleLine = true,
+                                enabled = connectJob == null,
+                                visualTransformation = PasswordVisualTransformation(),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
+                }
+
+                OutlinedTextField(
+                    startupCommand,
+                    { startupCommand = it },
+                    label = { Text("连接后命令（可选）") },
+                    placeholder = { Text("例如 tmux attach -t main") },
+                    singleLine = true,
+                    enabled = connectJob == null,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                SetupMessages()
+                Button(
+                    onClick = { connect() },
+                    enabled = connectJob == null && !privateKeyReading && host.isNotBlank() && username.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text(if (connectJob == null) "连接" else "连接中…") }
             }
-            OutlinedTextField(
-                startupCommand,
-                { startupCommand = it },
-                label = { Text("连接后命令（可选）") },
-                placeholder = { Text("例如 tmux attach -t main") },
-                singleLine = true,
-                enabled = connectJob == null,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            SetupMessages()
-            Button(
-                onClick = { connect() },
-                enabled = connectJob == null && !privateKeyReading && host.isNotBlank() && username.isNotBlank(),
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text(if (connectJob == null) "连接" else "连接中…") }
         }
     }
 
@@ -899,7 +1011,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
             }
         }
         if (connectJob != null || connectionState != "未连接") Text(connectionState, style = MaterialTheme.typography.bodySmall)
-        if (BridgeSshActivityDiagnostics.hasCapture) {
+        if ((connectionErrorDetails != null || diagnosticsRecording) && BridgeSshActivityDiagnostics.hasCapture) {
             TextButton(onClick = { if (diagnosticsRecording) stopAndCopyDiagnostics() else copyDiagnosticsReport() }) {
                 Text(if (diagnosticsRecording) "停止并复制诊断日志" else "复制诊断日志")
             }
