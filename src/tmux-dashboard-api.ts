@@ -8,6 +8,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { DownloadUploadError, DownloadUploadsService } from "./download-uploads.js";
+import { SshFallbackSnapshots } from "./ssh-session-fallback-snapshots.js";
 import {
   tmuxResurrectController,
   TmuxResurrectUnavailableError,
@@ -48,6 +49,12 @@ const MAX_TERMINAL_INPUT_BYTES = 32 * 1024;
 // Keep the synthetic submit outside that window so it is handled as submit.
 const TERMINAL_PASTE_SETTLE_MS = 180;
 const TERMINAL_HEARTBEAT_INTERVAL_MS = 30_000;
+const TERMINAL_HISTORY_ROWS = 2_000;
+const TERMINAL_HISTORY_INITIAL_DELAY_MS = 60;
+const TERMINAL_HISTORY_UPDATE_DELAY_MS = 800;
+const TERMINAL_HISTORY_MIN_INTERVAL_MS = 2_000;
+const TERMINAL_HISTORY_MAX_STALE_MS = 5_000;
+const TERMINAL_HISTORY_CAPTURE_TIMEOUT_MS = 5_000;
 const CODEX_WORKTREE_TASK_DIRECTORY = join(tmpdir(), "feishu-codex-bridge", "codex-worktree-tasks");
 const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.freeze({
   "codex-escape": "\u001b",
@@ -205,6 +212,7 @@ interface TerminalData {
   deviceId: string | null;
   cols: number;
   rows: number;
+  historyCache?: boolean;
   terminal?: BunTerminal;
   proc?: BunSubprocess;
   isAuthorized: () => boolean;
@@ -234,6 +242,8 @@ export interface TmuxDashboardApiOptions {
   codexWorktreeExecutable?: string;
   /** Injectable for tests; production delegates explicit Session snapshots to tmux-resurrect. */
   resurrect?: TmuxResurrectController;
+  /** Isolated SSH fallback snapshots; injectable for deterministic tests. */
+  sshFallbackSnapshots?: Pick<SshFallbackSnapshots, "list" | "restore" | "endSuspended"> | null;
   /** @deprecated Session listing never restores snapshots; use the explicit CLI or resume action. */
   autoRestoreSessions?: boolean;
   /** Allow explicit Session snapshot actions without automatic startup restoration. */
@@ -313,6 +323,7 @@ export class TmuxDashboardApi {
   private readonly logger?: Logger;
   private readonly codexWorktreeExecutable: string;
   private readonly resurrect: TmuxResurrectController;
+  private readonly sshFallbackSnapshots: Pick<SshFallbackSnapshots, "list" | "restore" | "endSuspended"> | null;
   private readonly manageSessionSnapshots: boolean;
   private stopped = false;
   private attachmentStorageReady: Promise<void> | null = null;
@@ -336,6 +347,10 @@ export class TmuxDashboardApi {
     this.discoverCodexHomes = options.discoverCodexHomes ?? (() => discoverCodexHistoryHomes());
     this.codexWorktreeExecutable = resolveCodexWorktreeExecutable(options.codexWorktreeExecutable);
     this.resurrect = options.resurrect ?? tmuxResurrectController;
+    // Tests supplying fake tmux operations must not inspect the user's real
+    // snapshot directory unless they explicitly inject a fixture store.
+    this.sshFallbackSnapshots = options.sshFallbackSnapshots !== undefined
+      ? options.sshFallbackSnapshots : options.operations ? null : new SshFallbackSnapshots();
     this.manageSessionSnapshots = options.manageSessionSnapshots ?? options.autoRestoreSessions ?? (!options.operations || Boolean(options.resurrect));
     this.operations = { ...tmux, ...options.operations };
   }
@@ -557,6 +572,7 @@ export class TmuxDashboardApi {
       try {
         const session = await this.operations.findSession(sessionId);
         if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+        assertExpectedSessionCreatedAt(request, session.createdAt);
         const [codexHomePath, projectCwd] = await Promise.all([
           this.codexHomePathForSession(sessionId, session),
           this.operations.getCurrentPanePath
@@ -619,7 +635,10 @@ export class TmuxDashboardApi {
         return;
       }
       try {
-        sendJson(response, 200, await this.listSessionFiles(sessionId, url.searchParams.get("path") ?? ""));
+        sendJson(response, 200, await this.listSessionFiles(
+          sessionId, url.searchParams.get("path") ?? "", expectedSessionCreatedAt(request),
+          url.searchParams.get("expectedRoot") ?? undefined,
+        ));
       } catch (error) {
         sendSessionFileError(response, error);
       }
@@ -650,7 +669,9 @@ export class TmuxDashboardApi {
         }
         const fileName = sanitizeSessionFileName(requestedFileName);
         const filePath = url.searchParams.get("path") ?? "";
-        const context = await this.getSessionFileContext(sessionId, filePath);
+        const context = await this.getSessionFileContext(
+          sessionId, filePath, expectedSessionCreatedAt(request), url.searchParams.get("expectedRoot") ?? undefined,
+        );
         if (!(await stat(context.absolutePath)).isDirectory()) {
           throw new DashboardBodyError("Choose a directory before uploading.", 400);
         }
@@ -678,7 +699,10 @@ export class TmuxDashboardApi {
         return;
       }
       try {
-        const context = await this.getSessionFileContext(sessionId, url.searchParams.get("path") ?? "");
+        const context = await this.getSessionFileContext(
+          sessionId, url.searchParams.get("path") ?? "", expectedSessionCreatedAt(request),
+          url.searchParams.get("expectedRoot") ?? undefined,
+        );
         const fileStat = await stat(context.absolutePath);
         if (!fileStat.isFile()) throw new DashboardBodyError("Select a file to download.", 400);
         const fileName = basename(context.absolutePath);
@@ -775,6 +799,35 @@ export class TmuxDashboardApi {
           const candidates = this.db.listTmuxSessionsForDashboard().filter((record) =>
             record.tmux_session_id === sessionId && record.ended_at === null && record.suspended_at !== null
               && (expected === undefined || record.tmux_created_at === expected));
+          const source = url.searchParams.get("source");
+          if (source !== null && source !== "ssh-fallback") throw new DashboardBodyError("不支持的快照来源。", 400);
+          const fallback = this.sshFallbackSnapshots
+            ? (source === "ssh-fallback" ? await this.sshFallbackSnapshots.list() : await this.listSshFallbackSnapshots())
+              .filter((record) => record.id === sessionId
+              && (expected === undefined || record.createdAt === expected)) : [];
+          if (fallback.length > 1 || (source === null && fallback.length > 0 && candidates.length > 0)) {
+            throw new DashboardBodyError("存在多个同 ID 的挂起快照，请在 SSH 列表选择对应来源。", 409);
+          }
+          if (source === "ssh-fallback" || (source === null && candidates.length === 0 && fallback.length === 1)) {
+            const item = fallback[0];
+            if (!item || !this.sshFallbackSnapshots) throw new DashboardBodyError("SSH 降级快照不存在或已变化。", 409);
+            if (item.uncertain) throw new DashboardBodyError("恢复结果未知，请先检查 tmux。", 409);
+            const originals = this.db.listTmuxSessionsForDashboard().filter((record) =>
+              record.tmux_session_id === item.id && record.tmux_created_at === item.createdAt);
+            if (originals.length > 1 || originals.some((record) => record.ended_at !== null || record.suspended_at !== null)) {
+              throw new DashboardBodyError("原 Session 的 Web 状态已变化，请先核对快照。", 409);
+            }
+            const restored = await this.sshFallbackSnapshots.restore(item.id, item.createdAt);
+            const previous = originals[0];
+            const rebound = previous
+              ? this.db.resumeSshFallbackTmuxSession(previous.record_id, item.createdAt, restored)
+              : this.db.recordTmuxSession(restored);
+            if (!rebound) throw new DashboardBodyError("Session 已恢复，但 Web 状态同步失败，请刷新核对。", 409);
+            this.invalidateSessionList();
+            sendJson(response, 200, { ok: true, action, session: { id: restored.id, name: restored.name,
+              suspendedAt: null, snapshot: { sessionName: item.name, savedAt: item.savedAt } } });
+            return;
+          }
           if (candidates.length > 1) {
             throw new DashboardBodyError("存在多个同 ID 的挂起 Session，请刷新后重试。", 409);
           }
@@ -855,7 +908,7 @@ export class TmuxDashboardApi {
         .filter((session) => session.suspended_at !== null && session.ended_at === null)
         .map((session) => ({ id: session.tmux_session_id, name: session.session_name,
           cwd: session.working_directory, createdAt: session.tmux_created_at }));
-      sendJson(response, 200, { sessions });
+      sendJson(response, 200, { sessions: [...sessions, ...await this.listSshFallbackSnapshots()] });
       return;
     }
     const sessionIdentityMatch = /^\/sessions\/([^/]+)\/identity$/.exec(apiPath);
@@ -905,13 +958,30 @@ export class TmuxDashboardApi {
         // last committed metadata. New externally-created Sessions are shown
         // immediately but are persisted only by an explicit lifecycle action
         // or the manual tmux restore/sync CLI.
-        const sessions = [
+        const sessions: Array<ReturnType<typeof sessionView> & { source?: string; uncertain?: boolean }> = [
           ...liveSessions.map((live) => sessionView(live, savedByKey.get(`${live.id}\u0000${live.createdAt}`))),
           ...savedSessions
             .filter((saved) => !liveByKey.has(`${saved.tmux_session_id}\u0000${saved.tmux_created_at}`)
               && (saved.ended_at !== null || saved.suspended_at !== null))
             .map((saved) => sessionView(undefined, saved)),
         ];
+        const fallbackSnapshots = await this.listSshFallbackSnapshots(liveSessions);
+        for (const fallback of fallbackSnapshots) {
+          const key = `${fallback.id}\u0000${fallback.createdAt}`;
+          const saved = savedByKey.get(key);
+          // A conflicting archived/suspended record belongs to a distinct Web
+          // snapshot; keep it intact and let the SSH picker disambiguate.
+          if (liveByKey.has(key) || (saved && (saved.ended_at !== null || saved.suspended_at !== null))) continue;
+          const base = saved ? sessionView(undefined, saved) : {
+            id: fallback.id, name: fallback.name, windows: 0, attachedClients: 0, cwd: fallback.cwd,
+            createdAt: fallback.createdAt, endedAt: null, suspendedAt: null, openCount: 0,
+            lastOpenedAt: null, codexHomeId: null, workspaceId: null, taskGuid: null,
+            workspaceBranch: null, workspaceStatus: null, snapshot: null,
+          };
+          sessions.push({ ...base, name: fallback.name, cwd: fallback.cwd, suspendedAt: fallback.savedAt,
+            snapshot: { sessionName: fallback.name, savedAt: fallback.savedAt }, source: "ssh-fallback",
+            ...(fallback.uncertain ? { uncertain: true } : {}) });
+        }
         sendJson(response, 200, includeHomes
           ? {
             sessions,
@@ -1441,6 +1511,29 @@ export class TmuxDashboardApi {
             record.tmux_session_id === sessionId && record.ended_at === null && record.suspended_at !== null
               && (expected === undefined || record.tmux_created_at === expected));
           const liveMatches = live && (expected === undefined || live.createdAt === expected);
+          const source = url.searchParams.get("source");
+          if (source !== null && source !== "ssh-fallback") throw new DashboardBodyError("不支持的快照来源。", 400);
+          const fallback = this.sshFallbackSnapshots
+            ? (source === "ssh-fallback" ? await this.sshFallbackSnapshots.list() : await this.listSshFallbackSnapshots())
+              .filter((record) => record.id === sessionId
+              && (expected === undefined || record.createdAt === expected)) : [];
+          if (fallback.length > 1 || (source === null && fallback.length > 0 && (liveMatches || suspended.length > 0))) {
+            throw new DashboardBodyError("Session ID 有多个匹配项，请先核对快照来源。", 409);
+          }
+          if (source === "ssh-fallback" || (source === null && !liveMatches && suspended.length === 0 && fallback.length === 1)) {
+            const item = fallback[0];
+            if (!item || !this.sshFallbackSnapshots) throw new DashboardBodyError("SSH 降级快照不存在或已变化。", 409);
+            const originals = this.db.listTmuxSessionsForDashboard().filter((record) =>
+              record.tmux_session_id === item.id && record.tmux_created_at === item.createdAt);
+            if (originals.length > 1 || originals.some((record) => record.ended_at !== null || record.suspended_at !== null)) {
+              throw new DashboardBodyError("原 Session 的 Web 状态已变化，请先核对快照。", 409);
+            }
+            await this.sshFallbackSnapshots.endSuspended(item.id, item.createdAt);
+            if (originals[0]) this.db.markTmuxSessionRecordEnded(originals[0].record_id);
+            this.invalidateSessionList();
+            sendEmpty(response, 204);
+            return;
+          }
           if ((liveMatches && suspended.length > 0) || suspended.length > 1) {
             throw new DashboardBodyError("Session ID 有多个匹配项，请刷新后重试。", 409);
           }
@@ -1512,6 +1605,11 @@ export class TmuxDashboardApi {
       rejectUpgrade(socket, 404, "tmux session not found.");
       return;
     }
+    const createdAt = url.searchParams.get("createdAt");
+    if (createdAt !== null && (!/^\d+$/.test(createdAt) || Number(createdAt) !== session.createdAt)) {
+      rejectUpgrade(socket, 409, "tmux session has changed.");
+      return;
+    }
     const storedSession = this.db.observeTmuxSession(session);
     const cols = clampDimension(Number(url.searchParams.get("cols")), 20, 400) || 80;
     const rows = clampDimension(Number(url.searchParams.get("rows")), 5, 200) || 24;
@@ -1523,6 +1621,7 @@ export class TmuxDashboardApi {
         deviceId,
         cols,
         rows,
+        historyCache: url.searchParams.get("history") === "local-cache-v1",
         isAuthorized,
       });
     });
@@ -1708,6 +1807,16 @@ export class TmuxDashboardApi {
     }
   }
 
+  private async listSshFallbackSnapshots(liveSessions?: tmux.TmuxSession[]) {
+    try { return await this.sshFallbackSnapshots?.list(liveSessions) ?? []; }
+    catch (error) {
+      this.logger?.warn("could not read SSH fallback snapshots", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+  }
+
   private withSessionLifecycleLock<T>(action: () => Promise<T>, invalidate = true): Promise<T> {
     const next = this.sessionLifecycleQueue.then(async () => {
       if (invalidate) this.invalidateSessionList();
@@ -1847,14 +1956,22 @@ export class TmuxDashboardApi {
     return { ...item, content, imageAttachments };
   }
 
-  private async getSessionFileContext(sessionId: string, requestedPath: string): Promise<SessionFileContext> {
+  private async getSessionFileContext(
+    sessionId: string, requestedPath: string, expectedCreatedAt?: number, expectedRoot?: string,
+  ): Promise<SessionFileContext> {
     if (!tmux.isSessionId(sessionId)) throw new DashboardBodyError("Invalid tmux session id.", 400);
     const session = await this.operations.findSession(sessionId);
     if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+    if (expectedCreatedAt !== undefined && session.createdAt !== expectedCreatedAt) {
+      throw new DashboardBodyError("Session 已结束或重建，请刷新后重试。", 409);
+    }
     const workingDirectory = await this.sessionDashboardWorkingDirectory(sessionId, session);
     const rootPath = await realpath(workingDirectory).catch(() => {
       throw new DashboardBodyError("The session working directory is unavailable.", 404);
     });
+    if (expectedRoot !== undefined && expectedRoot !== rootPath) {
+      throw new DashboardBodyError("Session 目录已变化，请重新打开文件页。", 409);
+    }
     const relativePath = normalizeSessionRelativePath(requestedPath);
     const candidatePath = resolve(rootPath, relativePath);
     if (!isPathInside(rootPath, candidatePath)) {
@@ -1872,13 +1989,14 @@ export class TmuxDashboardApi {
     };
   }
 
-  private async listSessionFiles(sessionId: string, requestedPath: string): Promise<{
+  private async listSessionFiles(sessionId: string, requestedPath: string, expectedCreatedAt?: number, expectedRoot?: string): Promise<{
     session: { id: string; name: string };
     root: string;
     path: string;
     entries: Array<{ name: string; type: "directory" | "file"; size: number; modifiedAt: number }>;
+    truncated: boolean;
   }> {
-    const context = await this.getSessionFileContext(sessionId, requestedPath);
+    const context = await this.getSessionFileContext(sessionId, requestedPath, expectedCreatedAt, expectedRoot);
     if (!(await stat(context.absolutePath)).isDirectory()) {
       throw new DashboardBodyError("The selected path is not a directory.", 400);
     }
@@ -1901,6 +2019,7 @@ export class TmuxDashboardApi {
       root: context.rootPath,
       path: context.path,
       entries,
+      truncated: names.length > 2_000,
     };
   }
 
@@ -1908,8 +2027,13 @@ export class TmuxDashboardApi {
     let cleanedUp = false;
     let stopHeartbeat: (() => void) | null = null;
     const capturePane = this.operations.capturePane ?? tmux.capturePane;
-    let initialScreenReady = false;
+    let initialScreenReady = data.historyCache === true;
     let outputFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    let historyTimer: ReturnType<typeof setTimeout> | null = null;
+    let historyCapturePending = false;
+    let historyDirty = false;
+    let historyDirtySince = 0;
+    let historyCapturedAt = 0;
     let outputBytes = 0;
     let immediateOutputFlushUntil = 0;
     const outputQueue: Array<string | Uint8Array> = [];
@@ -1939,6 +2063,49 @@ export class TmuxDashboardApi {
       }
       if (!outputFlushTimer) outputFlushTimer = setTimeout(flushOutput, 16);
     };
+    const scheduleHistory = (delayMs = TERMINAL_HISTORY_UPDATE_DELAY_MS): void => {
+      if (cleanedUp || client.readyState !== WebSocket.OPEN) return;
+      if (!historyDirty) historyDirtySince = Date.now();
+      historyDirty = true;
+      if (historyCapturePending) return;
+      if (historyTimer) {
+        // Preserve the first prefetch, then wait for output to settle before
+        // rebuilding history rather than repainting it throughout a burst.
+        if (!historyCapturedAt) return;
+        clearTimeout(historyTimer);
+      }
+      const minimumDelay = historyCapturedAt ? Math.max(0, TERMINAL_HISTORY_MIN_INTERVAL_MS - (Date.now() - historyCapturedAt)) : 0;
+      const maximumDelay = Math.max(0, TERMINAL_HISTORY_MAX_STALE_MS - (Date.now() - historyDirtySince));
+      historyTimer = setTimeout(() => {
+        historyTimer = null;
+        void captureHistory();
+      }, Math.min(Math.max(delayMs, minimumDelay), maximumDelay));
+    };
+    const captureHistory = async (): Promise<void> => {
+      if (!ensureAuthorized() || client.readyState !== WebSocket.OPEN || historyCapturePending) return;
+      historyDirty = false;
+      historyDirtySince = 0;
+      historyCapturePending = true;
+      try {
+        const content = await capturePane(data.sessionId, TERMINAL_HISTORY_ROWS, {
+          includeEscapeSequences: true,
+          preserveTrailingWhitespace: true,
+          timeoutMs: TERMINAL_HISTORY_CAPTURE_TIMEOUT_MS,
+        });
+        if (ensureAuthorized() && client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: "terminal-history", content }));
+        }
+      } catch {
+        // Live PTY output remains usable if the optional history capture fails.
+        if (ensureAuthorized() && client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify({ type: "terminal-history-error" }));
+        }
+      } finally {
+        historyCapturePending = false;
+        historyCapturedAt = Date.now();
+        if (historyDirty) scheduleHistory();
+      }
+    };
     const cleanup = (): void => {
       if (cleanedUp) return;
       cleanedUp = true;
@@ -1948,6 +2115,8 @@ export class TmuxDashboardApi {
       stopHeartbeat = null;
       if (outputFlushTimer) clearTimeout(outputFlushTimer);
       outputFlushTimer = null;
+      if (historyTimer) clearTimeout(historyTimer);
+      historyTimer = null;
       outputQueue.length = 0;
       try {
         if (data.proc && !data.proc.killed) data.proc.kill("SIGTERM");
@@ -1978,6 +2147,10 @@ export class TmuxDashboardApi {
       }
       if (typeof payload !== "object" || payload === null) return;
       const control = payload as { type?: unknown; data?: unknown; text?: unknown; key?: unknown; requestId?: unknown; cols?: unknown; rows?: unknown; review?: unknown };
+      if (control.type === "history-refresh") {
+        if (data.historyCache) scheduleHistory(0);
+        return;
+      }
       if (control.type === "input") {
         const input = validateTerminalInput(control.data);
         if (!input) {
@@ -2302,6 +2475,7 @@ export class TmuxDashboardApi {
         data.cols = cols;
         data.rows = rows;
         data.terminal?.resize(cols, rows);
+        if (data.historyCache) scheduleHistory(TERMINAL_HISTORY_INITIAL_DELAY_MS);
         if (data.proc && !data.proc.killed) {
           try {
             data.proc.kill("SIGWINCH");
@@ -2314,6 +2488,7 @@ export class TmuxDashboardApi {
 
     try {
       if (!ensureAuthorized()) return;
+      if (data.historyCache) client.send(JSON.stringify({ type: "terminal-history-ready" }));
       // LaunchAgents may omit locale variables even when the tmux server is UTF-8.
       // Give this attach client a UTF-8 locale so CJK text is emitted correctly.
       const inheritedUtf8Locale = [process.env.LC_ALL, process.env.LC_CTYPE, process.env.LANG]
@@ -2335,15 +2510,12 @@ export class TmuxDashboardApi {
           name: "xterm-256color",
           data: (_terminal, output) => {
             if (initialScreenReady) queueOutput(output);
+            if (data.historyCache) scheduleHistory();
           },
         },
       });
       data.proc = child;
       data.terminal = child.terminal;
-      const initialScreen = await captureInitialScreen(data.sessionId, data.rows, capturePane);
-      if (!ensureAuthorized() || client.readyState !== WebSocket.OPEN) return;
-      initialScreenReady = true;
-      client.send(Buffer.from(initialScreen));
       void child.exited.then((exitCode) => {
         if (ensureAuthorized() && client.readyState === WebSocket.OPEN) {
           flushOutput();
@@ -2351,6 +2523,15 @@ export class TmuxDashboardApi {
           client.close();
         }
       });
+      if (data.historyCache) {
+        scheduleHistory(TERMINAL_HISTORY_INITIAL_DELAY_MS);
+      } else {
+        // Older pages expect the original single-buffer snapshot protocol.
+        const initialScreen = await captureInitialScreen(data.sessionId, data.rows, capturePane);
+        if (!ensureAuthorized() || client.readyState !== WebSocket.OPEN) return;
+        initialScreenReady = true;
+        client.send(Buffer.from(initialScreen));
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not attach to tmux session.";
       if (ensureAuthorized() && client.readyState === WebSocket.OPEN) {
@@ -2361,28 +2542,22 @@ export class TmuxDashboardApi {
   }
 }
 
-function workspaceSessionName(branch: string, workspaceId: string): string {
-  const branchName = branch.split("/").at(-1)?.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "") || "task";
-  return `task-${branchName.slice(0, 46)}-${workspaceId.slice(0, 6)}`;
-}
-
 async function captureInitialScreen(sessionId: string, rows: number, capturePane = tmux.capturePane): Promise<string> {
-  // Let tmux finish attaching/resizing before taking the snapshot. PTY output
-  // during this settling window is intentionally not forwarded to the client.
   await new Promise<void>((resolve) => setTimeout(resolve, 60));
   const snapshotRows = Math.max(rows, 1_000);
   let captured: string;
   try {
-    captured = await capturePane(sessionId, snapshotRows, {
-      alternateScreen: true,
-      includeEscapeSequences: true,
-    });
+    captured = await capturePane(sessionId, snapshotRows, { alternateScreen: true, includeEscapeSequences: true });
   } catch {
     captured = await capturePane(sessionId, snapshotRows, { includeEscapeSequences: true });
   }
   const screen = captured.replace(/\r\n?/g, "\n").replace(/\n/g, "\r\n");
-  // Clear xterm's local history and paint only the current server-side screen.
   return "\u001b[3J\u001b[2J\u001b[H" + screen;
+}
+
+function workspaceSessionName(branch: string, workspaceId: string): string {
+  const branchName = branch.split("/").at(-1)?.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "") || "task";
+  return `task-${branchName.slice(0, 46)}-${workspaceId.slice(0, 6)}`;
 }
 
 async function waitForPaneChange(sessionId: string, before: string, submittedText: string, capturePane = tmux.capturePane, shouldContinue = () => true): Promise<boolean> {
@@ -2553,7 +2728,7 @@ function sendEmpty(response: ServerResponse, status: number): void {
 }
 
 function rejectUpgrade(socket: Duplex, status: number, message: string): void {
-  const reason = status === 403 ? "Forbidden" : "Not Found";
+  const reason = status === 409 ? "Conflict" : status === 403 ? "Forbidden" : "Not Found";
   socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(message)}\r\n\r\n${message}`);
 }
 

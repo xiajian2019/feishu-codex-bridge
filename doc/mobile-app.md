@@ -4,6 +4,10 @@
 
 App 与浏览器的功能差异、已发现风险和分批优化建议见 [App 与浏览器差异化适配评审（2026-10-27）](app-browser-adaptation-review-2026-10-27.md)。该评审针对源码工作区，不等同于已部署版本或真机验收结果。
 
+当前 Android App 的整体架构、风险分级和整改顺序见 [Android App 架构与风险评审（2026-11-02）](android-app-architecture-review-2026-11-02.md)。该文档是实施建议和验收门槛，不代表风险已经修复。
+
+Web 工作台和 Android 原生 SSH 是长期并存的使用路径，二者均可独立增加功能；Web 工作台也面向 iPhone。当前 Web tmux 经 Bridge WebSocket 访问 Bridge 主机，Android 原生 SSH 经手机直连 SSH 主机；不能把 iPhone 的 Web tmux 访问等同于当前已实现 iOS 原生直接 SSH。
+
 内置单配置 OpenVPN 的可行性、包体目标和实施计划见 [手机 App 内置 OpenVPN 评估](mobile-openvpn-feasibility-2026-11-01.md)；当前仅为方案，尚未实现。
 
 ## 构建与安装
@@ -20,7 +24,7 @@ bun run mobile:build
 
 Android App 在配对后及回前台时比较更新包与实际安装的 versionCode；首次连接旧版本也会提示，点击“稍后”暂缓 30 分钟。已下载、打开安装器和已安装分别记录，取消安装或拒绝安装权限后仍可重试。更新状态按服务器隔离。已配对且 Bridge 可访问时，即使停留在原生 SSH 工作区也会检查更新并在顶部提供更新、下载和稍后操作；未配对或 Bridge 不可访问时无法从该来源检查或下载。环境切换弹窗的 App 区域提供“检查更新”和“手动下载 App”；主动检查会重新显示已暂缓的新版本，手动下载也支持当前版本。原连接维护中的下载入口继续保留。
 
-服务端读取 `android/app/build/outputs/apk/debug/app-debug.apk` 及同目录 Gradle 生成的 `output-metadata.json`；可用 `FEISHU_CODEX_BRIDGE_ANDROID_APK` 指定其他构建输出。首次检查时流式复制为同目录 `.bridge-updates/<SHA-256>.apk` 快照，返回带摘要的下载路径，源 APK 的字节替换不会改变该快照。但当前目录仍属于构建输出，本轮观察到重打包回收旧快照，跨构建持久留存仍待迁至独立目录；不能承诺旧 revision 一直可用。自定义路径必须同时提供对应构建元数据。更新接口始终要求 App Bearer。安装和“手动下载 APK”均先下载至缓存，原生侧校验大小、SHA-256、包名及预期版本，拒绝降级后才打开安装器或流式写入系统 Downloads。安装器仍负责系统签名与安装确认。APK 下载需要保持 App 在前台，普通文件仍使用系统 DownloadManager。
+服务端读取 `android/app/build/outputs/apk/debug/app-debug.apk` 及同目录 Gradle 生成的 `output-metadata.json`；可用 `FEISHU_CODEX_BRIDGE_ANDROID_APK` 指定其他构建输出。首次检查时流式复制为同目录 `.bridge-updates/<SHA-256>.apk` 快照，返回带摘要的下载路径，源 APK 的字节替换不会改变该快照。但当前目录仍属于构建输出，本轮观察到重打包回收旧快照，跨构建持久留存仍待迁至独立目录；不能承诺旧 revision 一直可用。自定义路径必须同时提供对应构建元数据。更新接口始终要求 App Bearer。安装和“手动下载 APK”均先下载至缓存，原生侧校验大小、SHA-256、包名、预期版本和签名摘要交集，拒绝降级后才打开安装器或流式写入系统 Downloads；系统安装器仍负责最终签名兼容判断与安装确认。APK 传输禁用重定向并需要保持 App 在前台；普通文件仍使用系统 DownloadManager，入队前校验初始 URL、origin 与本机对应凭据，其重定向目标尚未完成专项验证。
 
 旧版本若在下载 100% 后提示“更新校验信息无效”，原因是原生桥接把 Integer 数值误读为 Long；本轮已统一读取正安全整数，不取消任何更新校验。旧二进制本身无法由下载的新 APK 自动修正，需手动覆盖安装本次修复包一次；不要先卸载或清空数据。
 
@@ -31,9 +35,9 @@ Android 构建通过 `scripts/mobile-version.mjs` 分配构建号，使用被忽
 | 平台 | 构建环境 | 打开工程 | 安装方式 |
 | --- | --- | --- | --- |
 | iOS 15+ | macOS、完整 Xcode 26+、Apple 签名账号；依赖使用 Swift Package Manager | `bun run mobile:open:ios` | 在 Xcode 选择 App target、Signing & Capabilities 中的 Team 和手机，执行 Run；分发需另行签名、Archive/TestFlight |
-| Android 8+（API 26） | JDK 21+、Android SDK Platform 36、platform-tools；建议 Android Studio Otter 2025.2.1+ | `bun run mobile:open:android` | 本地 debug APK 固定生成 `arm64-v8a`；Android Studio Run；或在 `android` 目录执行 `./gradlew assembleDebug`，安装 `app/build/outputs/apk/debug/app-debug.apk` |
+| Android 8+（API 26） | JDK 21+、Android SDK compile SDK 37.2、platform-tools；Android target SDK 为 36 | `bun run mobile:open:android` | 本地 debug APK 固定生成 `arm64-v8a`；Android Studio Run；或在 `android` 目录执行 `./gradlew assembleDebug`，安装 `app/build/outputs/apk/debug/app-debug.apk` |
 
-JDK 不在默认路径时设置 `JAVA_HOME`；SDK 不在默认目录时设置 `ANDROID_HOME`，或通过 Android Studio 生成被忽略的 `android/local.properties`。首次 Android 构建需要下载 Gradle 和 Maven 依赖，首次 iOS 构建需要解析 Swift packages。
+JDK 不在默认路径时设置 `JAVA_HOME`；SDK 不在默认目录时设置 `ANDROID_HOME`，或通过 Android Studio 生成被忽略的 `android/local.properties`。首次 Android 构建需要下载 Gradle 和 Maven 依赖，首次 iOS 构建需要解析 Swift packages。当前 `mobile:doctor` 仍检查 Platform 36，不会确认 compile SDK 37.2 已安装；以实际 Gradle 构建为准。
 
 App 名称为 `Bridge`，应用标识为 `dev.feishu.codex.bridge`。正式发布前确认应用标识归属、签名、图标、版本号和隐私披露；当前工程没有配置分发凭据或商店发布任务。`mobile:build` 不是 APK/IPA 构建，不产生已签名安装包。
 
@@ -50,21 +54,25 @@ App 名称为 `Bridge`，应用标识为 `dev.feishu.codex.bridge`。正式发�
 
 ## Android SSH 工作区
 
-App 连接中心可在 Bridge 配对和 SSH / Mac 登录之间切换。SSH 不依赖 Bridge 服务或配对；在已配对的工作台中可通过“系统管理 → App 连接”返回连接中心。旧 `/ssh` 地址在移动端仍进入 SSH 登录。SSH 登录表单可选择原生保存的主机和密钥；已保存私钥按需从设备密钥库读取。密码或临时私钥只在活动 App 会话内存中保留以便重连，显式断开时清空，不写入主机配置。主机、密钥的原有管理功能继续保留。App 鉴权失效时返回此连接中心，可直接选择 SSH；浏览器仍使用原有配对页面。Android 启用摇一摇后，在前台大幅摇晃两下可打开环境选择；在 SSH 工作区取消选择会恢复原界面，转到 Bridge 时只关闭 SSH 界面而不主动断开其 App 会话。
+App 连接中心可在 Bridge 配对和 SSH / Mac 登录之间切换。SSH 不依赖 Bridge 服务或配对；在已配对的工作台中可通过“系统管理 → App 连接”返回连接中心。SSH 登录表单可选择原生保存的主机和密钥；已保存私钥按需从设备密钥库读取。密码或临时私钥只在活动 App 会话内存中保留以便重连，显式断开时清空，不写入主机配置。主机、密钥的原有管理功能继续保留。App 鉴权失效时返回此连接中心，可直接选择 SSH；浏览器仍使用原有配对页面。Android 启用摇一摇后，在前台大幅摇晃两下可打开环境选择；在 SSH 工作区取消选择会恢复原界面，转到 Bridge 时只关闭 SSH 界面而不主动断开其 App 会话。
 
-Android App 打开或回到前台时，会检查当前源码配置的 SSH 默认主机；若存在同主机的已保存配置，使用最近的该配置端口，否则使用 SSH 默认端口。以 TCP 端口是否可连接作为可达性判断：目标不可达时，尝试通过已安装的 **OpenVPN for Android**（`de.blinkt.openvpn`）连接已有配置。SSH 服务未启动也可能使 TCP 探测失败，并不等于电脑一定离线。
+Android App 启动、回到前台和网络变化时会检查已安装的 **OpenVPN for Android**（`de.blinkt.openvpn`）；顶层 Activity 存活期间还会每 30 秒检查一次。免 VPN Wi-Fi 可在连接中心的网络设置中配置，未配对和 SSH 模式也可打开。配置的免 VPN Wi-Fi 上跳过自动启动；如果有免 VPN 列表但无法识别当前 Wi-Fi，会先请求位置权限，仍无法识别时跳过。其他可用网络上检查并启动或恢复所选 VPN，与 Bridge 是否配对、Bridge/SSH 的 IP 或端口是否可达无关。已有选中 VPN 正在连接或已连接时不重复启动，检测到其他活动 VPN 时不自动替换；认证失败时暂停自动重试，需检查 OpenVPN 配置后手动重试。免 VPN Wi-Fi 不会主动断开已连接的 VPN；在其他网络手动断开后，App 运行时会再次尝试连接。
 
-首次使用需要在 OpenVPN 客户端授权 Bridge 控制，并在系统要求时确认 VPN 权限；已有一个 VPN 配置时自动选用，存在多个配置时选择一次。配置、证书和密码继续由 OpenVPN 保管。目标本来可达时不启动 VPN；已有选中 VPN 正在连接或已连接时不重复启动，检测到其他活动 VPN 时不自动替换。关闭 Bridge 不会断开 VPN。连接请求发出后会短时重试目标端口；目标恢复后，如 Bridge 工作台之前连接失败，会重新检查连接。若 SSH 已先于 VPN 连接失败，可在 SSH 工作区重试；不会自动重放终端输入。此功能已在 Android 模拟器使用临时配置测试，华为真机和公司 VPN 仍需验收。
+摇一摇打开环境弹窗后，可点击当前地址旁的紧凑 VPN 按钮，主动检查并请求连接；结果在当前页面显示，不主动打开 OpenVPN 主界面。手动请求不受自动连接的免 VPN Wi-Fi 列表及重试间隔限制，可主动再试一次认证失败的配置，但仍不会自动替换其他 VPN。点击后先显示“正在发起 VPN 连接”，Bridge 会继续监听 OpenVPN 状态，确认收到连接成功状态后显示“VPN 连接成功”并自动清除；失败或超时则保留具体提示。
 
-认证成功后，App 进程内的全局 SSH 会话继续持有交互式 zsh、保活任务和当前 tmux 目标；原生终端嵌入 App 的现有 Activity，关闭终端界面只解除绑定，不会主动断开 SSH。Android 在连接建立及会话活动期间启动前台服务，并显示系统连接通知；所有连接和连接尝试均结束后停止服务。tmux 列表使用同一 SSH 连接上的临时命令通道，文件和附件按需使用同一连接上的 SFTP 通道。
+首次使用需要在 OpenVPN 客户端授权 Bridge 控制，并在系统要求时确认 VPN 权限；已有一个 VPN 配置时自动选用，存在多个配置时选择一次。若客户端需要输入密码，或系统需要授权，仍可能显示相应原生界面。配置、证书和密码继续由 OpenVPN 保管。关闭 Bridge 不会断开 VPN，但顶层 Activity 销毁或进程被系统终止后 Bridge 的定期检查也会停止，后台启动、系统省电策略及 VPN 自身重连仍受 Android 和客户端限制。Bridge API 网络不可达时另行探测当前 API 端口，最多重试 60 秒；端口恢复后通知工作台重试，端口不可达也可能只是 API 未启动。不会自动重放 SSH 终端输入。旧版目标不可达触发流程曾在模拟器使用临时配置测试；本次全局检查仍需华为真机和公司 VPN 验收。
 
-连接成功后先进入交互式 zsh，点击 tmux 打开 Session 列表；列表支持刷新、按名称/目录/ID 筛选和查看附着状态。第一次进入 Session 会在当前 zsh 中执行 attach；已经进入一个 Session 时，当前实现先发送 tmux detach 控制序列，再发送目标 attach。这个过程尚未确认 detach 已完成；如果 tmux 前缀被自定义或 detach 失败，attach 命令可能进入当前 Codex 输入区。修复前应避免在已 attach 的 Session 中使用列表直接切换。SSH 连接或终端中断后，App 级会话在前台和后台自动重试；工作区的重连按钮也直接重试当前连接。重连后按 Session ID 和创建时间核对并重新附加上次 tmux Session，不重放 Composer 或终端输入。目标不存在时提示重新选择；主机指纹变化时须手动确认。进程终止会清除内存凭据，重新打开时只有已保存私钥的主机可自动认证并恢复已记录的 tmux 目标。前台服务不能阻止系统强制停止进程、设备省电策略或网络切换造成断线，tmux 仍负责保留 Mac 上的 Codex 进程。
+认证成功后，App 进程内的全局 SSH 会话继续持有交互式 zsh、保活任务和当前 tmux 目标；原生终端嵌入 App 的现有 Activity，关闭终端界面只解除绑定，不会主动断开 SSH。Android 在连接建立及会话活动期间启动前台服务，并显示系统连接通知；所有连接和连接尝试均结束后停止服务。tmux 列表、Session 文件和 Composer 附件优先使用配对 Bridge API；符合回退条件时分别使用 SSH 临时命令或 SFTP。没有 tmux Session 身份的普通 SSH 文件、附件和技能发现继续使用 SSH/SFTP。
 
-原生 SSH 终端的“更多操作”提供当前 Session 的 Git 文件列表、搜索、Diff、文本预览和下载；操作通过 SSH 调用目标机的 Bridge `ssh-session` CLI，并复用 Web 的 Git、Codex 账号／用量和 Session 业务逻辑。Git 状态包含工作区、暂存区及未跟踪文件，Diff/文本预览沿用 Web 的大小限制；下载使用 SFTP。账号标记与 Web 共用，写入 tmux Session 的 `CODEX_HOME`，供用量查询和新建窗口、窗格继承，不会更改现有 shell 或已经运行的 Codex。检测当前账号需要系统允许读取目标 Codex 进程的环境；环境不可读时应手动选择。
+连接成功后先进入交互式 zsh，点击 tmux 打开 Session 列表；列表支持刷新、按名称/目录/ID 筛选和查看附着状态。第一次进入 Session 会在当前 zsh 中执行 attach；已进入一个 Session 时，当前实现发送 detach 控制序列并等待终端输出匹配 `detached`，超时不继续发送目标 attach。但该文本可能来自普通程序输出，匹配器也可能在 detach 发送前收到输出，因此并不能可靠证明 detach 完成；attach 的 `Written` 也不证明已经附着。切换结果不确定时，请先检查终端和 Session，再发送消息。SSH 连接或终端中断后，App 级会话在前台和后台自动重试；工作区的重连按钮也直接重试当前连接。重连后按 Session ID 和创建时间核对并重新附加上次 tmux Session，不重放 Composer 或终端输入。目标不存在时提示重新选择；主机指纹变化时须手动确认。进程终止会清除内存凭据，重新打开时只有已保存私钥的主机可自动认证并尝试恢复已记录的 tmux 目标。前台服务不能阻止系统强制停止进程、设备省电策略或网络切换造成断线，tmux 仍负责保留 Mac 上的 Codex 进程。
 
-目标机需要包含 `ssh-session` 命令的新版 Bridge，当前仅修改源码不会自动更新已安装版本。SSH 登录环境优先使用 `FEISHU_CODEX_BRIDGE_SSH_CLI` 指定的 Bridge 启动器，其次使用 PATH 中的 `feishu-codex-bridge`，最后查找默认便携安装位置。CLI 默认使用该 Bridge 安装根目录下的 `runtime/bridge.db`，源码运行时使用仓库的 `runtime/bridge.db`；自定义数据库或配置分别通过 `FEISHU_CODEX_BRIDGE_SSH_DB`、`FEISHU_CODEX_BRIDGE_SSH_CONFIG` 显式指定。在线调用会核对服务监听进程和数据库真实路径；默认检查开发端口 17310 和安装版端口 7310，自定义端口时使用 `FEISHU_CODEX_BRIDGE_SSH_PORT` 明确选择，不凭端口判定服务身份；若发现多个实例共用同一数据库，先停止其他实例以避免并发修改。
+原生 SSH 终端的“更多操作”提供当前 Session 的 Git 文件列表、搜索、Diff、文本预览和下载。账号列表、账号标记/检测、用量、Git 和 Session 快照/挂起/恢复/结束优先走配对 Bridge API，读取请求遇到网络或服务不可用等情况时回退目标 SSH 主机上的 `ssh-session` CLI；Session 文件及技能保留 SFTP/SSH 回退。文件列表不完整、旧版服务未提供截断标记或路径包含字面反斜杠时使用 SFTP。写入请求可能已执行但响应丢失时显示结果未知，先刷新核对，不自动重复写入。Composer 附件使用 API 分片上传并确认当前 SSH 主机可读，开始上传前 API 不可用时回退 SFTP；终端按键与 Composer 消息仍经 SSH PTY，不产生 Web Session 操作历史。Bridge 为原生 SSH API 请求记录脱敏路由、Session ID、状态和耗时，不记录令牌、文件内容或查询参数。
 
-挂起先保存所选 Session 的快照并停止其中的进程；SSH 和 Web 使用相同的数据库与快照记录，恢复入口位于 SSH 的 tmux 列表。恢复按 tmux-resurrect 的配置重建窗格和允许恢复的进程，不保证恢复进程的内存状态。目标机需要 tmux、tmux-resurrect、Git、Codex CLI 和 `lsof`。Bridge 服务未运行时，可在确认相关服务均已停止后显式设置 `FEISHU_CODEX_BRIDGE_SSH_OFFLINE=1`，CLI 会先检查数据库占用，再使用同一套逻辑离线操作；不会隐式创建新库。离线操作须串行执行，且操作期间不要启动 Bridge 服务：`lsof` 占用检查不是跨进程独占锁。存在同名挂起 Session 时，先恢复或改名，避免覆盖其快照。旧 Python 版本若曾在 `~/.feishu-codex-bridge/ssh-sessions/` 留下独立快照，这些文件不会被删除或自动并入 Web 数据库。手机界面、系统文件下载、实际 SSH 断线和真实主机恢复仍需设备验收。
+Git 状态包含工作区、暂存区及未跟踪文件，Diff/文本预览沿用 Web 的大小限制。账号标记写入所操作 tmux Session 的 `CODEX_HOME`，供用量查询和新建窗口、窗格继承，不会更改现有 shell 或已经运行的 Codex。默认 SSH 和私有 Bridge 目标复用同一个 Mac 主机配置，但已保存或手动选择的 SSH 主机、不同 Bridge 环境和不同数据库未自动绑定；切换目标后应核对当前环境和 Session。检测当前账号需要系统允许读取目标 Codex 进程的环境；环境不可读时应手动选择。
+
+目标机需要包含 `ssh-session` 命令的新版 Bridge，当前仅修改源码不会自动更新已安装版本。SSH 登录环境优先使用 `FEISHU_CODEX_BRIDGE_SSH_CLI` 指定的 Bridge 启动器，其次使用 PATH 中的 `feishu-codex-bridge`，最后查找默认便携安装位置。CLI 降级直接调用 tmux、Git 和 Codex app-server，不检查、打开或写入 Bridge SQLite；旧的 `--db`、`FEISHU_CODEX_BRIDGE_SSH_DB` 参数仍可传入但不再参与降级操作。`FEISHU_CODEX_BRIDGE_SSH_CONFIG` 仍可指定 Codex 配置。新 App 会传入 Session 的逻辑工作目录；旧 App 未提供时 Git 降级查看当前 tmux pane 目录。
+
+挂起先保存所选 Session 的快照并停止其中的进程。API 不可达时，CLI 在 tmux-resurrect 目录下的 `bridge-ssh-fallback` 中保存独立快照和身份元数据，不覆盖 Web 快照；恢复按 tmux-resurrect 的配置重建窗格和允许恢复的进程，不保证恢复进程的内存状态。Bridge API 恢复后，若两边配置同一快照目录，Web 和 Android 可看到降级快照，通过 API 恢复时重新关联已有 Session 记录。仅通过 CLI 恢复、终结或修改账号标记不会写入 Web 数据库，状态及账号可能需在 Web 重新核对；降级期间无法列出只存在于 Web 数据库中的旧挂起记录。目标机需要 tmux、tmux-resurrect、Git 和 Codex CLI；同一降级快照操作使用文件锁，异常退出留下锁时须先确认没有其他操作再处理。存在同名挂起快照时，先恢复或改名，避免覆盖。旧 Python 版本若曾在 `~/.feishu-codex-bridge/ssh-sessions/` 留下独立快照，这些文件不会被删除或自动并入 Web 数据库。手机界面、系统文件下载、实际 SSH 断线和真实主机恢复仍需设备验收。
 
 Android 原生 SSH Composer 的“调试日志”按钮首次点击开始记录，再次点击停止并直接复制 JSON；若断线后停在主机或连接设置页，可使用“停止并复制诊断日志”。原有“导出滚动日志”仍可保存文件。记录覆盖 Activity/工作区与系统文件选择器生命周期、SSH 连接与重连阶段、会话断开来源、心跳、前台服务及网络类型变化；进程重建后继续记录，并在系统提供时附上退出原因。报告包括设备型号、Android/App 版本和电池优化状态，不采集其他应用或系统全量 logcat、SSH 地址、用户名、命令、终端文本、密码或私钥，异常只保留类型和固定错误类别。Activity 事件最多保留最近 800 条，数据保存在 App 私有存储；开始新记录会覆盖上一次记录。
 
@@ -134,7 +142,7 @@ App 内置页面，不使用 Capacitor `server.url` 加载远端网页，也不�
 - [ ] 刘海/系统栏安全区、横竖屏、软键盘、系统返回键、后台返回和网络切换。
 - [ ] HTTPS 信任链与自用 LAN HTTP，iOS 首次局域网授权、拒绝权限后恢复。
 
-首版未接入 APNs/FCM 推送、后台常驻推送、应用商店分发或自动更新。Bridge WebSocket 进入后台后由系统管理；重新进入前台恢复工作台，不承诺后台 WebSocket 始终存活。Android SSH 的前台连接服务与 WebSocket 连接分别管理。
+首版未接入 APNs/FCM 推送、后台常驻推送、应用商店分发或静默安装更新；Android 已有检查、下载和手动打开系统安装器的更新流程。Bridge WebSocket 进入后台后由系统管理；重新进入前台恢复工作台，不承诺后台 WebSocket 始终存活。Android SSH 的前台连接服务与 WebSocket 连接分别管理。
 
 ## 官方资料
 

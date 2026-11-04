@@ -93,7 +93,9 @@ export function DeviceAuthorizations({ devices, loading, busy, onRefresh, onRena
               <strong>{profile.name}</strong>
               {device.current ? <span className="device-current-badge">当前授权</span> : null}
               <span className={`device-auth-state is-${state}`}>{state === "active" ? "有效" : state === "revoked" ? "已撤销" : "已过期"}</span>
-              <span className="device-auth-id" title="授权编号">#{profile.shortId}</span>
+              {state === "active" ? <button className="device-auth-edit" type="button" disabled={busy} aria-label={`修改 ${profile.name} 的备注`} title="修改备注" onClick={() => onRename(device)}>
+                <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15.5 5.5 3 3M4 20l4.2-.8L19 8.4a2.1 2.1 0 0 0-3-3L5.2 16.2 4 20Z" /></svg>
+              </button> : <span className="device-auth-id" title="授权编号">#{profile.shortId}</span>}
             </div>
             <p className="device-auth-environment"><b>{profile.browser}</b><span>{[profile.system, profile.app ? null : profile.model].filter(Boolean).join(" · ")}</span></p>
             <p className="device-auth-activity"><span>{deviceLastUsed(device.lastSeenAt, now)}</span><span className={soon ? "is-soon" : ""}>{state === "active" ? deviceExpiry(device.expiresAt, now) : state === "revoked" ? `撤销于 ${date(device.revokedAt)}` : `到期于 ${date(device.expiresAt)}`}</span><span className="device-auth-port" title={environment?.origin}>{environment ? `最近访问 :${environment.port}` : "访问入口未记录"}</span>{device.remoteAddress ? <span>IP {device.remoteAddress}</span> : null}</p>
@@ -109,7 +111,6 @@ export function DeviceAuthorizations({ devices, loading, busy, onRefresh, onRena
           {state !== "revoked" && !device.revokedAt ? <div className="device-auth-entry-actions">
             <button className="secondary" type="button" disabled={busy} aria-label={`为 ${profile.name} 授权 ${profile.shortId} 生成二维码`} onClick={() => onPair(device)}>生成二维码</button>
             {state === "active" ? <>
-              <button className="secondary" type="button" disabled={busy} onClick={() => onRename(device)}>名称 / 备注</button>
               <button className="secondary" type="button" disabled={busy} onClick={() => void onExtend(device)}>延期一年</button>
               <button className="device-revoke-button" type="button" disabled={busy} onClick={() => setPendingRevoke([device])}>撤销</button>
             </> : null}

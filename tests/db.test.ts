@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { StateDatabase } from "../src/db.js";
 import type { CodexHistoryUsageSnapshot } from "../src/codex-history.js";
@@ -23,6 +26,34 @@ const routedTask: RoutedTask = {
 };
 
 describe("StateDatabase", () => {
+  it("persists Codex history detail snapshots separately for summary and full views", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bridge-db-history-detail-"));
+    const databasePath = join(root, "bridge.db");
+    try {
+      const db = new StateDatabase(databasePath);
+      db.saveCodexHistoryDetailCache("home-a", "thread-a", "summary", 42, JSON.stringify({ view: "summary" }));
+      db.saveCodexHistoryDetailCache("home-a", "thread-a", "full", 42, JSON.stringify({ view: "full" }));
+      db.close();
+
+      const reopened = new StateDatabase(databasePath);
+      expect(reopened.getCodexHistoryDetailCache("home-a", "thread-a", "summary")).toMatchObject({
+        sourceUpdatedAt: 42,
+        payloadJson: JSON.stringify({ view: "summary" }),
+      });
+      expect(reopened.getCodexHistoryDetailCache("home-a", "thread-a", "full")).toMatchObject({
+        sourceUpdatedAt: 42,
+        payloadJson: JSON.stringify({ view: "full" }),
+      });
+
+      reopened.deleteCodexHistoryDetailCache("home-a", "thread-a");
+      expect(reopened.getCodexHistoryDetailCache("home-a", "thread-a", "summary")).toBeNull();
+      expect(reopened.getCodexHistoryDetailCache("home-a", "thread-a", "full")).toBeNull();
+      reopened.close();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("updates Codex usage buckets and snapshots when the server backfills a date", () => {
     const db = new StateDatabase(":memory:");
     const makeSnapshot = (capturedAt: string, tokens: number): CodexHistoryUsageSnapshot => ({

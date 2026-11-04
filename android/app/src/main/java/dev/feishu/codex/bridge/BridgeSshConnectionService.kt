@@ -12,7 +12,11 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 
-/** Keeps the app process hosting active SSH sessions important while their UI is away. */
+/**
+ * Foreground process-protection lease for the application-owned SSH registry.
+ * The service deliberately does not persist or recreate credentials: after
+ * process death, only a later UI open can recover a saved-key profile.
+ */
 internal class BridgeSshConnectionService : Service() {
     private var foregroundStarted = false
 

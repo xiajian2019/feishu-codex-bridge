@@ -64,7 +64,7 @@ export function parseSessions(output: string): TmuxSession[] {
   });
 }
 
-async function runTmux(args: string[], options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<string> {
+async function runTmux(args: string[], options: { timeoutMs?: number; signal?: AbortSignal; preserveOutput?: boolean } = {}): Promise<string> {
   if (options.signal?.aborted) throw options.signal.reason;
   const child = getBunRuntime().spawn(["tmux", ...args], {
     env: {
@@ -92,7 +92,7 @@ async function runTmux(args: string[], options: { timeoutMs?: number; signal?: A
       Promise.all([child.stdout!.text(), child.stderr!.text(), child.exited]), cancellation,
     ]);
     if (exitCode !== 0) throw new Error(stderr.trim() || `tmux ${args[0]} exited with code ${exitCode}`);
-    return stdout.trimEnd();
+    return options.preserveOutput ? stdout : stdout.trimEnd();
   } finally {
     if (timer) clearTimeout(timer);
     if (onAbort) options.signal?.removeEventListener("abort", onAbort);
@@ -339,6 +339,25 @@ export async function setCodexHomeForSession(id: string, codexHomePath: string |
   }
 }
 
+/** Read only the selected Session's account marker, without reading its full environment. */
+export async function getCodexHomeForSession(id: string, knownSession?: TmuxSession): Promise<string | null> {
+  if (!isSessionId(id)) throw new ValidationError("Invalid tmux session id.");
+  if (!knownSession && !(await findSession(id))) throw new SessionNotFoundError("Session no longer exists.");
+  let value: string;
+  try { value = await runTmux(["show-environment", "-t", id, "CODEX_HOME"]); }
+  catch (error) {
+    if (/unknown variable|no such variable/i.test(String(error))) return null;
+    throw error;
+  }
+  if (value === "-CODEX_HOME" || value === "CODEX_HOME=") return null;
+  if (!value.startsWith("CODEX_HOME=")) throw new ValidationError("The Session account marker is invalid.");
+  const path = value.slice("CODEX_HOME=".length);
+  if (!path.startsWith("/") || /[\u0000-\u001f\u007f]/.test(path)) {
+    throw new ValidationError("The Session account marker is invalid.");
+  }
+  return resolve(path);
+}
+
 /** Only infer the default Home when the OS actually exposed an environment. */
 export function parseCodexHomeEnvironment(value: string, homeDirectory = homedir()): string | undefined {
   const environment = value.replaceAll("\0", " ");
@@ -414,7 +433,7 @@ export async function inspectCodexHome(
 export async function capturePane(
   id: string,
   rows = 24,
-  options: { alternateScreen?: boolean; includeEscapeSequences?: boolean } = {},
+  options: { alternateScreen?: boolean; includeEscapeSequences?: boolean; preserveTrailingWhitespace?: boolean; timeoutMs?: number } = {},
 ): Promise<string> {
   if (!isSessionId(id)) throw new ValidationError("Invalid tmux session id.");
   const safeRows = Number.isSafeInteger(rows) ? Math.max(1, Math.min(2_000, rows)) : 24;
@@ -422,5 +441,5 @@ export async function capturePane(
   if (options.alternateScreen) args.push("-a");
   if (options.includeEscapeSequences) args.push("-e");
   args.push("-t", id, "-S", "-" + safeRows);
-  return runTmux(args);
+  return runTmux(args, { preserveOutput: options.preserveTrailingWhitespace, timeoutMs: options.timeoutMs });
 }

@@ -33,6 +33,8 @@ export interface NativeAppUpdateBanner {
   error?: string;
   busy?: boolean;
   downloaded?: boolean;
+  progressPercent?: number;
+  progressText?: string;
 }
 
 interface BridgeConnectBotSSHPlugin {

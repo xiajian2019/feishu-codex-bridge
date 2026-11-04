@@ -2,7 +2,7 @@
  * Thin native transport boundary around ConnectBot's cbssh library.
  *
  * This file deliberately does not know about Capacitor, React, or the current
- * sshj-based plugin. It is an adapter that can be wired into the native plugin
+ * Capacitor SSH plugin. It is an adapter that can be wired into the native plugin
  * after the cbssh capability probe is accepted.
  */
 package dev.feishu.codex.bridge
@@ -102,14 +102,29 @@ class BridgeCbSshTransport(
         username: String,
         privateKeyData: CharArray,
         passphrase: CharArray? = null,
+        publicKeyLine: String? = null,
     ): AuthResult {
         val keyBytes = privateKeyData.concatToString().toByteArray(Charsets.UTF_8)
         val passphraseValue = passphrase?.concatToString()
         return try {
-            client.authenticatePublicKey(username, keyBytes, passphraseValue)
+            if (
+                publicKeyLine?.startsWith("ssh-rsa ") == true &&
+                passphraseValue.isNullOrEmpty() &&
+                privateKeyData.isUnencryptedPkcs8Pem()
+            ) {
+                BridgeSshRsaAuth.authenticate(client, username, keyBytes, publicKeyLine)
+            } else {
+                client.authenticatePublicKey(username, keyBytes, passphraseValue)
+            }
         } finally {
             keyBytes.fill(0)
         }
+    }
+
+    private fun CharArray.isUnencryptedPkcs8Pem(): Boolean {
+        val header = "-----BEGIN PRIVATE KEY-----"
+        if (size < header.length) return false
+        return indices.take(header.length).all { this[it] == header[it] }
     }
 
     /**

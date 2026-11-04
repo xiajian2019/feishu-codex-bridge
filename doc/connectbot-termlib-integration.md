@@ -1,6 +1,6 @@
 # ConnectBot termlib 集成边界
 
-本文记录 Android 端接入 `org.connectbot:termlib:0.3.13` 的边界：终端适配层与 SSH 实现解耦，原生 Host 由 `BridgeConnectBotSshActivity` 承载。适配层本身不是 Activity，但已经由独立 Capacitor 插件和原生页面接入默认 `/ssh` 入口。
+本文记录 Android 端接入 `org.connectbot:termlib:0.3.13` 的边界：终端适配层与 SSH 实现解耦，原生 Host 由 `BridgeConnectBotSshActivity` 承载。适配层本身不是 Activity，由独立 Capacitor 插件和原生页面承载。
 
 ## 为什么只接入 termlib
 
@@ -78,9 +78,9 @@ BridgeConnectBotSSH plugin / BridgeConnectBotSshActivity
 
 ## 与当前项目的关系
 
-- 现有 `BridgeSSHPlugin.java`/sshj 路径仍保留为回退；默认 `/ssh` 入口已经改为调用 `BridgeConnectBotSSH` 原生页面。
+- 旧 `BridgeSSHPlugin.java`/sshj 传输路径及 SSHJ 依赖已移除；当前 SSH 入口统一调用 `BridgeConnectBotSSH` 原生页面，密钥格式解析和公钥编码使用 ConnectBot 与项目内原生实现。
 - `android/app/build.gradle`、Kotlin/Compose 配置和 `termlib`/`cbssh` 依赖已经接入；Android Debug APK 已成功构建。
-- React/Web 页面只负责 SSH Host 配置和打开原生页面；旧 React/xterm 实现保留为显式回退代码，不再是默认终端。
+- React/Web 页面只负责连接中心中的 SSH Host 配置和打开原生页面；终端输入、输出、滚动和选择由原生 termlib 处理。
 - `cbssh` 负责 SSH/PTY，原生 Host 负责私钥、Host Key、连接生命周期和快捷键；tmux session 管理面板仍需下一步接到 command channel。
 
 ## 当前编译边界

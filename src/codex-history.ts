@@ -21,8 +21,8 @@ import {
   type CodexAccountTokenUsageResponse,
   type CodexModelListResponse,
   type CodexResetCreditConsumeResponse,
-  type CodexThreadTokenUsageSnapshot,
   type CodexThread,
+  type CodexThreadTurnsListParams,
   type CodexThreadListParams,
   type CodexThreadSortDirection,
   type CodexThreadSortKey,
@@ -46,8 +46,11 @@ export const CODEX_HISTORY_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 export const CODEX_HISTORY_MAX_ATTACHMENTS = 10;
 const CODEX_HISTORY_LIST_CACHE_MAX_AGE_MS = 10 * 60 * 1_000;
 const CODEX_HISTORY_LIST_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const CODEX_HISTORY_DETAIL_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1_000;
+const CODEX_HISTORY_DETAIL_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const CODEX_HISTORY_RECOVERY_CHECK_INTERVAL_MS = 2_000;
 export type CodexHistoryReasoningEffort = string;
+export type CodexHistoryDetailView = "summary" | "full";
 
 export interface CodexHistoryListCacheStore {
   getCodexHistoryListCache(homeId: string, filterKey: string): {
@@ -56,6 +59,22 @@ export interface CodexHistoryListCacheStore {
     refreshedAt: string;
   } | null;
   saveCodexHistoryListCache(homeId: string, filterKey: string, sourceFingerprint: string, payloadJson: string): void;
+}
+
+export interface CodexHistoryDetailCacheStore {
+  getCodexHistoryDetailCache(homeId: string, threadId: string, view: CodexHistoryDetailView): {
+    sourceUpdatedAt: number | null;
+    payloadJson: string;
+    cachedAt: string;
+  } | null;
+  saveCodexHistoryDetailCache(
+    homeId: string,
+    threadId: string,
+    view: CodexHistoryDetailView,
+    sourceUpdatedAt: number | null,
+    payloadJson: string,
+  ): void;
+  deleteCodexHistoryDetailCache(homeId: string, threadId: string): void;
 }
 
 export interface CodexHistoryThreadHomePreferenceStore {
@@ -78,7 +97,6 @@ export interface CodexHistoryStoredRun {
   finishedAt?: number;
   state: CodexHistoryRunState;
   cursor: number;
-  usage?: CodexHistoryTurnUsage;
 }
 
 export interface CodexHistoryRunStore {
@@ -214,7 +232,7 @@ export interface CodexHistoryDetailResponse {
   thread: CodexThread;
   imageAttachments?: CodexHistoryTurnAttachments[];
   models?: CodexHistoryModelOption[];
-  turnUsages?: CodexHistoryTurnUsageRecord[];
+  view?: CodexHistoryDetailView;
 }
 
 export interface CodexHistoryModelOption {
@@ -227,18 +245,6 @@ export interface CodexHistoryModelOption {
     reasoningEffort: CodexHistoryReasoningEffort;
     description: string;
   }>;
-}
-
-export interface CodexHistoryTurnUsage {
-  inputTokens: number;
-  cachedInputTokens: number;
-  outputTokens: number;
-  reasoningOutputTokens?: number;
-}
-
-export interface CodexHistoryTurnUsageRecord {
-  turnIndex: number;
-  usage: CodexHistoryTurnUsage;
 }
 
 export interface CodexHistoryAttachment {
@@ -332,7 +338,6 @@ export interface CodexHistoryUpdateEvent {
   type: string;
   item?: unknown;
   message?: string;
-  usage?: CodexHistoryTurnUsage;
 }
 
 export interface CodexHistoryUpdatesResponse {
@@ -343,7 +348,6 @@ export interface CodexHistoryUpdatesResponse {
   cursor: number;
   events: CodexHistoryUpdateEvent[];
   attachments?: CodexHistoryAttachment[];
-  usage?: CodexHistoryTurnUsage;
   finalResponse?: string;
   error?: string;
   resetRequired?: boolean;
@@ -382,6 +386,8 @@ export interface CodexHistoryServiceOptions {
   stagedAttachmentRetentionMs?: number;
   /** Optional Bridge DB cache for per-home Codex thread list summaries. */
   listCacheStore?: CodexHistoryListCacheStore;
+  /** Optional Bridge DB storage for full and latest-conclusion thread details. */
+  detailCacheStore?: CodexHistoryDetailCacheStore;
   /** Optional Bridge DB preferences for the Home used to open each history thread. */
   threadHomePreferenceStore?: CodexHistoryThreadHomePreferenceStore;
   /** Optional Bridge DB receipts and metadata for recoverable history continuations. */
@@ -413,7 +419,6 @@ interface LiveCodexHistoryRun {
   reasoningEffort?: CodexHistoryReasoningEffort;
   interactive?: boolean;
   actions: Map<string, CodexHistoryPendingAction>;
-  usage?: CodexHistoryTurnUsage;
   createdAt: number;
   updatedAt: number;
   lastPersistedAt?: number;
@@ -465,11 +470,6 @@ export class CodexHistoryService {
   /** Set only after the directory is created; cleanup is limited to this physical root. */
   private attachmentRootRealPath?: string;
   private readonly modelCatalogCache = new Map<string, { expiresAt: number; models: CodexHistoryModelOption[] }>();
-  private readonly restoredThreadUsageCache = new Map<string, {
-    expiresAt: number;
-    updatedAt?: number;
-    record: CodexHistoryTurnUsageRecord | null;
-  }>();
   private readonly latestRunByThread = new Map<string, string>();
   private readonly pendingThreadKeys = new Set<string>();
   private readonly pendingIdempotentMessages = new Map<string, {
@@ -557,7 +557,6 @@ export class CodexHistoryService {
       ...(persisted.model ? { model: persisted.model } : {}),
       ...(persisted.reasoningEffort ? { reasoningEffort: persisted.reasoningEffort } : {}),
       actions: new Map(),
-      ...(persisted.usage ? { usage: persisted.usage } : {}),
       createdAt: persisted.createdAt,
       updatedAt: persisted.updatedAt,
       lastPersistedAt: persisted.updatedAt,
@@ -950,54 +949,166 @@ export class CodexHistoryService {
     homeId: string,
     threadId: string,
     includeTurns = true,
+    expectedUpdatedAt?: number,
   ): Promise<CodexHistoryDetailResponse> {
     const home = this.resolveHomes().find((candidate) => candidate.id === homeId);
     if (!home) throw new Error(`找不到 Codex home：${homeId}`);
     if (!home.available) throw new Error(`Codex home 不可用：${home.path}`);
+
+    if (includeTurns) {
+      const cached = this.readStoredDetail(homeId, threadId, "full", expectedUpdatedAt);
+      if (cached) return cached;
+    }
 
     const client = this.createClient(home);
     try {
       if (!client.readThread) throw new Error("当前 Codex 只读客户端不支持 thread/read");
       const result = await client.readThread(threadId, includeTurns);
       const models = includeTurns ? await this.readModelCatalog(home, client) : undefined;
-      let turnUsages = this.listTurnUsages(homeId, threadId, result.thread);
-      const threadTurns = Array.isArray(result.thread.turns) ? result.thread.turns : [];
-      const latestTurnIndex = threadTurns.length - 1;
-      const latestTurnHasUsage = turnUsages.some((item) => item.turnIndex === latestTurnIndex);
-      // CLI-originated histories lack SDK live events; restore the latest official app-server usage only for an idle, unlocked thread.
-      if (includeTurns
-        && latestTurnIndex >= 0
-        && !latestTurnHasUsage
-        && result.thread.status?.type !== "active"
-        && client.readThreadTokenUsage) {
-        const writerStatus = await this.getWriterStatus(homeId, threadId).catch(() => ({ state: "unknown" as const }));
-        if (writerStatus.state === "available") {
-          try {
-            const snapshot = await client.readThreadTokenUsage(threadId);
-            const usageRecord = snapshot
-              ? tokenUsageRecordForThreadTurn(snapshot, threadTurns, latestTurnIndex)
-              : null;
-            const threadKey = makeThreadKey(homeId, threadId);
-            this.restoredThreadUsageCache.set(threadKey, {
-              expiresAt: Date.now() + 5 * 60 * 1_000,
-              ...(typeof result.thread.updatedAt === "number" ? { updatedAt: result.thread.updatedAt } : {}),
-              record: usageRecord,
-            });
-            turnUsages = this.listTurnUsages(homeId, threadId, result.thread);
-          } catch {
-            // Token usage is optional detail data; keep the thread itself readable.
-          }
-        }
-      }
-      return {
+      const detail: CodexHistoryDetailResponse = {
         home: toPublicHome(home),
         thread: result.thread,
         imageAttachments: this.listTurnAttachments(homeId, threadId),
         ...(models ? { models } : {}),
-        ...(turnUsages.length > 0 ? { turnUsages } : {}),
+        ...(includeTurns ? { view: "full" as const } : {}),
       };
+      if (includeTurns) this.saveStoredDetail(detail, "full");
+      return detail;
     } finally {
       await client.close();
+    }
+  }
+
+  public async readThreadSummary(
+    homeId: string,
+    threadId: string,
+    expectedUpdatedAt?: number,
+  ): Promise<CodexHistoryDetailResponse> {
+    const home = this.resolveHomes().find((candidate) => candidate.id === homeId);
+    if (!home) throw new Error(`找不到 Codex home：${homeId}`);
+    if (!home.available) throw new Error(`Codex home 不可用：${home.path}`);
+
+    const cachedSummary = this.readStoredDetail(homeId, threadId, "summary", expectedUpdatedAt);
+    if (cachedSummary) return cachedSummary;
+    const cachedFull = this.readStoredDetail(homeId, threadId, "full", expectedUpdatedAt);
+    if (cachedFull) {
+      const summary = summarizeCodexHistoryDetail(cachedFull);
+      this.saveStoredDetail(summary, "summary");
+      return summary;
+    }
+
+    const client = this.createClient(home);
+    try {
+      if (!client.readThread) throw new Error("当前 Codex 只读客户端不支持 thread/read");
+      const metadata = await client.readThread(threadId, false);
+      const modelsPromise = this.readModelCatalog(home, client);
+      let summaryTurns: unknown[] | undefined;
+      if (client.listThreadTurns) {
+        try {
+          summaryTurns = [];
+          let cursor: string | null = null;
+          const seenCursors = new Set<string>();
+          while (true) {
+            const page = await client.listThreadTurns(threadId, {
+              cursor,
+              limit: CODEX_HISTORY_PAGE_SIZE,
+              sortDirection: "asc",
+              itemsView: "summary",
+            } satisfies CodexThreadTurnsListParams);
+            summaryTurns.push(...page.data);
+            if (summaryTurns.length > CODEX_HISTORY_MAX_SCAN) {
+              throw new Error(`本地历史最多读取 ${CODEX_HISTORY_MAX_SCAN} 轮结论，请先缩小范围`);
+            }
+            if (!page.nextCursor) break;
+            if (seenCursors.has(page.nextCursor)) throw new Error("Codex app-server 返回了重复的历史 cursor");
+            seenCursors.add(page.nextCursor);
+            cursor = page.nextCursor;
+          }
+          summaryTurns = summarizeCodexHistoryTurns(summaryTurns);
+        } catch (error) {
+          this.options.logger?.warn("failed to read Codex history conclusion pages", {
+            home: home.path,
+            threadId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          summaryTurns = undefined;
+        }
+      }
+      if (!summaryTurns) {
+        const full = await client.readThread(threadId, true);
+        summaryTurns = summarizeCodexHistoryTurns(Array.isArray(full.thread.turns) ? full.thread.turns : []);
+      }
+      const models = await modelsPromise;
+      const detail: CodexHistoryDetailResponse = {
+        home: toPublicHome(home),
+        thread: { ...metadata.thread, turns: summaryTurns },
+        imageAttachments: this.listTurnAttachments(homeId, threadId),
+        ...(models ? { models } : {}),
+        view: "summary",
+      };
+      this.saveStoredDetail(detail, "summary");
+      return detail;
+    } finally {
+      await client.close();
+    }
+  }
+
+  private readStoredDetail(
+    homeId: string,
+    threadId: string,
+    view: CodexHistoryDetailView,
+    expectedUpdatedAt?: number,
+  ): CodexHistoryDetailResponse | null {
+    const store = this.options.detailCacheStore;
+    if (!store) return null;
+    let cached: ReturnType<CodexHistoryDetailCacheStore["getCodexHistoryDetailCache"]>;
+    try {
+      cached = store.getCodexHistoryDetailCache(homeId, threadId, view);
+    } catch {
+      return null;
+    }
+    if (!cached) return null;
+    const cachedAt = Date.parse(cached.cachedAt);
+    if (!Number.isFinite(cachedAt) || Date.now() - cachedAt < 0 || Date.now() - cachedAt > CODEX_HISTORY_DETAIL_CACHE_MAX_AGE_MS) {
+      return null;
+    }
+    if (expectedUpdatedAt !== undefined && cached.sourceUpdatedAt !== expectedUpdatedAt) return null;
+    try {
+      const detail = JSON.parse(cached.payloadJson) as CodexHistoryDetailResponse;
+      if (detail.home?.id !== homeId || detail.thread?.id !== threadId) return null;
+      return {
+        ...detail,
+        view: detail.view ?? view,
+        imageAttachments: this.listTurnAttachments(homeId, threadId),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private saveStoredDetail(detail: CodexHistoryDetailResponse, view: CodexHistoryDetailView): void {
+    const store = this.options.detailCacheStore;
+    if (!store) return;
+    const payloadJson = JSON.stringify({ ...detail, view });
+    if (Buffer.byteLength(payloadJson) > CODEX_HISTORY_DETAIL_CACHE_MAX_BYTES) return;
+    try {
+      store.saveCodexHistoryDetailCache(
+        detail.home.id,
+        detail.thread.id,
+        view,
+        typeof detail.thread.updatedAt === "number" ? detail.thread.updatedAt : null,
+        payloadJson,
+      );
+    } catch {
+      // Persistent history is an optimization; a database failure must not hide a live read.
+    }
+  }
+
+  private invalidateStoredDetail(homeId: string, threadId: string): void {
+    try {
+      this.options.detailCacheStore?.deleteCodexHistoryDetailCache(homeId, threadId);
+    } catch {
+      // Cache invalidation is best effort.
     }
   }
 
@@ -1174,6 +1285,7 @@ export class CodexHistoryService {
     }
 
     this.pendingThreadKeys.add(threadKey);
+    this.invalidateStoredDetail(home.id, threadId);
     let resolvedAttachments: StagedCodexHistoryAttachment[] = [];
     let attachmentsReserved = false;
     let registered = false;
@@ -1302,7 +1414,6 @@ export class CodexHistoryService {
       state: run.state,
       cursor: run.cursor,
       events: resetRequired ? [] : run.events.filter((event) => event.cursor > afterCursor),
-      ...(run.usage ? { usage: run.usage } : {}),
       ...(run.finalResponse ? { finalResponse: run.finalResponse } : {}),
       ...(run.error ? { error: run.error } : {}),
       attachments: run.attachments.map(publicAttachment),
@@ -1502,26 +1613,6 @@ export class CodexHistoryService {
         turnIndex: run.turnIndex,
         attachments: run.attachments.map(publicAttachment),
       }));
-  }
-
-  private listTurnUsages(homeId: string, threadId: string, thread?: CodexThread): CodexHistoryTurnUsageRecord[] {
-    const threadKey = makeThreadKey(homeId, threadId);
-    const usages = new Map<number, CodexHistoryTurnUsage>();
-    const restored = this.restoredThreadUsageCache.get(threadKey);
-    if (restored
-      && restored.expiresAt > Date.now()
-      && restored.updatedAt === thread?.updatedAt
-      && restored.record) {
-      usages.set(restored.record.turnIndex, restored.record.usage);
-    } else if (restored && (restored.expiresAt <= Date.now() || restored.updatedAt !== thread?.updatedAt)) {
-      this.restoredThreadUsageCache.delete(threadKey);
-    }
-    for (const run of [...this.liveRuns.values()]
-      .filter((candidate) => candidate.threadKey === threadKey && candidate.usage)
-      .sort((left, right) => left.createdAt - right.createdAt)) {
-      usages.set(run.turnIndex, run.usage!);
-    }
-    return [...usages.entries()].map(([turnIndex, usage]) => ({ turnIndex, usage }));
   }
 
   private resolveHomes(): ResolvedCodexHistoryHome[] {
@@ -1934,14 +2025,11 @@ export class CodexHistoryService {
     const record = asRecord(event);
     const type = typeof record.type === "string" ? record.type : "codex.event";
     const item = record.item;
-    const usage = type === "turn.completed" ? parseSdkTurnUsage(record.usage) : undefined;
-    if (usage) run.usage = usage;
     const update: CodexHistoryUpdateEvent = {
       cursor: run.cursor + 1,
       type,
       ...(item !== undefined ? { item } : {}),
       ...(typeof record.message === "string" ? { message: record.message } : {}),
-      ...(usage ? { usage } : {}),
     };
     run.cursor = update.cursor;
     run.events.push(update);
@@ -2732,7 +2820,6 @@ function toStoredCodexHistoryRun(run: LiveCodexHistoryRun): CodexHistoryStoredRu
     ...(run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt }),
     state: run.state,
     cursor: run.cursor,
-    ...(run.usage ? { usage: run.usage } : {}),
   };
 }
 
@@ -2861,41 +2948,31 @@ function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
-function parseSdkTurnUsage(value: unknown): CodexHistoryTurnUsage | undefined {
-  const usage = asRecord(value);
-  const inputTokens = usage.input_tokens;
-  const cachedInputTokens = usage.cached_input_tokens;
-  const outputTokens = usage.output_tokens;
-  if (![inputTokens, cachedInputTokens, outputTokens].every((count) =>
-    typeof count === "number" && Number.isSafeInteger(count) && count >= 0)) return undefined;
+function summarizeCodexHistoryDetail(detail: CodexHistoryDetailResponse): CodexHistoryDetailResponse {
+  const turns = Array.isArray(detail.thread.turns) ? detail.thread.turns : [];
   return {
-    inputTokens: inputTokens as number,
-    cachedInputTokens: cachedInputTokens as number,
-    outputTokens: outputTokens as number,
-    ...(typeof usage.reasoning_output_tokens === "number"
-      && Number.isSafeInteger(usage.reasoning_output_tokens)
-      && usage.reasoning_output_tokens >= 0
-      ? { reasoningOutputTokens: usage.reasoning_output_tokens }
-      : {}),
+    ...detail,
+    view: "summary",
+    thread: { ...detail.thread, turns: summarizeCodexHistoryTurns(turns) },
   };
 }
 
-function tokenUsageRecordForThreadTurn(
-  snapshot: CodexThreadTokenUsageSnapshot,
-  turns: unknown[],
-  fallbackTurnIndex: number,
-): CodexHistoryTurnUsageRecord {
-  const matchedTurnIndex = turns.findIndex((turn) => asRecord(turn).id === snapshot.turnId);
-  const last = snapshot.last;
-  return {
-    turnIndex: matchedTurnIndex >= 0 ? matchedTurnIndex : fallbackTurnIndex,
-    usage: {
-      inputTokens: last.inputTokens,
-      cachedInputTokens: last.cachedInputTokens,
-      outputTokens: last.outputTokens,
-      ...(last.reasoningOutputTokens === undefined ? {} : { reasoningOutputTokens: last.reasoningOutputTokens }),
-    },
-  };
+function summarizeCodexHistoryTurns(turns: unknown[]): unknown[] {
+  return turns.map((turn) => {
+    const record = asRecord(turn);
+    const items = Array.isArray(record.items)
+      ? record.items.filter((item) => {
+          const type = asRecord(item).type;
+          return type === "userMessage"
+            || type === "user_message"
+            || type === "agentMessage"
+            || type === "agent_message"
+            || type === "assistantMessage"
+            || type === "assistant_message";
+        })
+      : [];
+    return { ...record, items };
+  });
 }
 
 function isFileOpenByAnotherProcess(filePath: string): Promise<boolean | null> {

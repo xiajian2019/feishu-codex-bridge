@@ -21,6 +21,17 @@ it("restores native IDs after process loss and obtains actual OS results without
   });
   expect(restarted.getSnapshot()[0]?.state).toBe("done");
 });
+it("does not restore a completed APK installer task after App restart", () => {
+  const disk = storage();
+  disk.rows.set("scope", JSON.stringify({ version: 1, tasks: [{
+    id: "apk", fileName: "bridge-update.apk", state: "done", destination: "installer",
+    downloadedBytes: 100, totalBytes: 100, updatedAt: Date.now(),
+  }] }));
+  const manager = createMobileDownloadManager();
+  manager.restore(disk, "scope");
+  expect(manager.getSnapshot()).toEqual([]);
+  expect(disk.getItem("scope")).toContain('"tasks":[]');
+});
 it("does not mix restored transfers or late callbacks across device scopes, and clears only the current scope", async () => {
   const disk = storage(); const manager = createMobileDownloadManager();
   manager.restore(disk, "A"); const id = manager.start("A.pdf", "downloads"); manager.trackAndroid(id, 1, "A.pdf");

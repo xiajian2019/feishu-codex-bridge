@@ -54,14 +54,12 @@ class BridgeSshWorkbenchLiveTest {
                         window.Capacitor.Plugins.BridgeCredentials.set({server, token:'fixture_test_token_012345678901234567890123456789'})
                           .then(() => {
                             localStorage.setItem('bridge.mobile.server', server);
-                            localStorage.setItem('bridge.connection.mode', 'ssh');
-                            window.location.replace('/ssh');
+                            localStorage.setItem('bridge.connection.mode', 'bridge');
+                            window.location.replace('/');
                           });
                         return true;
                     })()
                 """.trimIndent())
-                waitForJs(scenario, "location.pathname === '/ssh' && !!document.querySelector('.mobile-ssh-login') && !!document.querySelector('.mobile-connect-return')")
-                tap(waitForNode("返回工作台"))
                 waitForWorkbench(scenario)
                 assertEquals("/", evaluate(scenario, "location.pathname").trim('"'))
                 // Keep a non-root workbench route to ensure native return does

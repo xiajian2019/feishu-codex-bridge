@@ -16,7 +16,7 @@ import { setAppForeground } from "./foreground-polling.js";
 import { MOBILE_SHAKE_PREFERENCE_EVENT, readMobileShakeEnabled, writeMobileShakeEnabled } from "./app-settings.js";
 import {
   failMobileDownload, hasAndroidMobileDownloads, refreshAndroidMobileDownloads, startMobileDownload,
-  trackAndroidMobileDownload, updateMobileDownload, subscribeMobileDownloads, getMobileDownloads, cancelAndroidMobileDownload, type NativeDownloadStatus,
+  trackAndroidMobileDownload, updateMobileDownload, subscribeMobileDownloads, getMobileDownloads, cancelAndroidMobileDownload, dismissMobileDownload, type NativeDownloadStatus,
 } from "./mobile-download-manager.js";
 
 interface TransferProgress {
@@ -40,7 +40,7 @@ interface UpdaterPlugin {
   openDownloads(): Promise<void>;
   cancelDownload(options: { id: number }): Promise<{ cancelled: boolean }>;
   openDownloadedFile(options: { id: number }): Promise<void>;
-  download(options: { url: string; token: string; fileName: string; mimeType?: string; userAgent: string }): Promise<{ id: number; fileName: string }>;
+  download(options: { url: string; serverOrigin: string; token: string; fileName: string; mimeType?: string; userAgent: string }): Promise<{ id: number; fileName: string }>;
   save(options: { data: string; fileName: string; mimeType?: string }): Promise<{ fileName: string; size: number }>;
   saveFile(options: { uri: string; fileName: string; mimeType?: string }): Promise<{ fileName: string; size: number }>;
   copyImage(options: { uri: string }): Promise<void>;
@@ -57,7 +57,10 @@ const Motion = registerPlugin<{
   addListener(event: "motion", handler: (sample: { x: number; y: number; z: number; timestampMs: number }) => void): Promise<PluginListenerHandle>;
 }>("BridgeMotion");
 const AutoVpn = registerPlugin<{
-  requestRecovery(options: { host: string; port: number }): Promise<{ accepted: boolean }>;
+  configure(options: { bypassWifiSsids: string[] }): Promise<{ accepted: boolean }>;
+  requestRecovery(options: { host: string; port: number; bypassWifiSsids?: string[] }): Promise<{ accepted: boolean }>;
+  checkAndConnect(options: { bypassWifiSsids: string[] }): Promise<{ message: string }>;
+  getCurrentWifi(): Promise<{ ssid?: string | null }>;
 }>("BridgeAutoVpn");
 // Browser preview uses memory only; tokens are never persisted in browser storage.
 const previewCredentials = new Map<string, string>();
@@ -81,7 +84,18 @@ export function isAndroidPlatform(): boolean {
   return Capacitor.getPlatform() === "android";
 }
 
-export async function requestMobileVpnRecovery(target: { host: string; port: number }): Promise<boolean> {
+/** Sync the Wi-Fi exceptions even when no Bridge connection is paired. */
+export async function configureMobileAutoVpn(bypassWifiSsids: string[]): Promise<boolean> {
+  if (!isAndroidPlatform()) return true;
+  if (!Capacitor.isPluginAvailable("BridgeAutoVpn")) return false;
+  try {
+    return (await AutoVpn.configure({ bypassWifiSsids })).accepted === true;
+  } catch {
+    return false;
+  }
+}
+
+export async function requestMobileVpnRecovery(target: { host: string; port: number; bypassWifiSsids?: string[] }): Promise<boolean> {
   if (!isAndroidPlatform() || !Capacitor.isPluginAvailable("BridgeAutoVpn")) return false;
   try {
     const result = await AutoVpn.requestRecovery(target);
@@ -89,6 +103,27 @@ export async function requestMobileVpnRecovery(target: { host: string; port: num
   } catch {
     // VPN installation, authorization and profile errors stay local to the native UI.
     return false;
+  }
+}
+
+export async function checkAndConnectMobileVpn(bypassWifiSsids: string[]): Promise<string> {
+  if (!isAndroidPlatform() || !Capacitor.isPluginAvailable("BridgeAutoVpn")) {
+    throw new Error("手动连接 VPN 仅支持带自动 VPN 功能的 Android App。");
+  }
+  const result = await AutoVpn.checkAndConnect({ bypassWifiSsids });
+  return result.message || "VPN 检查已完成。";
+}
+
+export async function readCurrentWifiSsid(): Promise<string | null> {
+  if (!isAndroidPlatform() || !Capacitor.isPluginAvailable("BridgeAutoVpn")) {
+    throw new Error("读取当前 Wi-Fi 仅支持 Android App。");
+  }
+  try {
+    const result = await AutoVpn.getCurrentWifi();
+    const ssid = result.ssid?.trim();
+    return ssid || null;
+  } catch {
+    throw new Error("无法读取当前 Wi-Fi，请确认已连接 Wi-Fi 并允许位置权限。");
   }
 }
 
@@ -311,7 +346,10 @@ export async function prepareApkUpdate(update: MobileApkUpdate, token: string, i
     if (install) {
       await Updater.install(options);
       onPhase?.("installer-opened", uri);
+      // The system installer now owns the flow. Keeping this row would show a
+      // misleading 100% download panel after the user has installed the App.
       updateMobileDownload(task, { state: "done", message: "已校验并打开 Android 安装器；请按系统提示完成安装。" });
+      dismissMobileDownload(task);
     } else {
       const saved = await Updater.saveApk(options);
       updateMobileDownload(task, { state: "done", savedName: saved.fileName, message: "更新包已校验并保存到 Downloads，可手动安装。" });
@@ -326,11 +364,11 @@ export async function prepareApkUpdate(update: MobileApkUpdate, token: string, i
   }
 }
 
-export async function downloadFile(url: string, fileName: string, token: string): Promise<void> {
+export async function downloadFile(url: string, fileName: string, token: string, serverOrigin = new URL(url).origin): Promise<void> {
   if (!isAndroidPlatform()) throw new Error("系统下载仅支持 Android App。");
   const task = startMobileDownload(fileName, "downloads");
   try {
-    const result = await Updater.download({ url, token, fileName, mimeType: mimeTypeForFileName(fileName), userAgent: navigator.userAgent });
+    const result = await Updater.download({ url, serverOrigin, token, fileName, mimeType: mimeTypeForFileName(fileName), userAgent: navigator.userAgent });
     if (!Number.isSafeInteger(result.id) || result.id <= 0) throw new Error("系统未返回有效的下载任务，请重试。");
     trackAndroidMobileDownload(task, result.id, result.fileName);
     watchAndroidDownloads();
@@ -429,11 +467,11 @@ function downloadName(suppliedName: string): string {
   return suppliedName.replace(/[/\\\u0000-\u001f\u007f]/g, "_").slice(0, 160) || "bridge-file";
 }
 
-export async function shareFile(url: string, suppliedName: string, token: string | null): Promise<void> {
+export async function shareFile(url: string, suppliedName: string, token: string | null, serverOrigin = new URL(url).origin): Promise<void> {
   const name = downloadName(suppliedName);
   if (Capacitor.isNativePlatform() && isAndroidPlatform()) {
     if (!token) throw new Error("请先配对 Bridge。");
-    await downloadFile(url, name, token);
+    await downloadFile(url, name, token, serverOrigin);
     return;
   }
   const native = Capacitor.isNativePlatform();
@@ -477,8 +515,8 @@ export async function shareFile(url: string, suppliedName: string, token: string
 }
 
 // Every authenticated download from the App uses the same global status store.
-export async function downloadBridgeFile(url: string, suppliedName: string, token: string | null): Promise<void> {
-  await shareFile(url, suppliedName, token);
+export async function downloadBridgeFile(url: string, suppliedName: string, token: string | null, serverOrigin = new URL(url).origin): Promise<void> {
+  await shareFile(url, suppliedName, token, serverOrigin);
 }
 
 function mimeTypeForFileName(fileName: string): string {

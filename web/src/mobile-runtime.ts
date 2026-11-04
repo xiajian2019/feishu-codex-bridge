@@ -1,4 +1,6 @@
 import { createMobileFetch, isBridgeApiPath, normalizeBridgeServer, normalizeConfiguredBridgeServer, parseMobilePairingInput, type MobileConnection } from "./mobile-connection.js";
+import { BRIDGE_NETWORK_SETTINGS_EVENT, readBridgeNetworkSettings } from "./bridge-global-config.js";
+import { createMobileVpnSettingsSync } from "./mobile-vpn-settings-sync.js";
 import { createMobileConnectionSwitch } from "./mobile-connection-switch.js";
 import { readBridgeJson } from "./bridge-json.js";
 import { assertBridgeApiSupported, bridgeFeatureUnavailable, parseBridgeCapabilities, setBridgeCapabilities } from "./client-capabilities.js";
@@ -25,6 +27,8 @@ let initialization: Promise<void> | null = null;
 let downloadTrackingInstalled = false;
 let credentialQueue = Promise.resolve();
 let removeGlobalVpnRecovery: (() => void) | null = null;
+let autoVpnSettingsSyncInstalled = false;
+let autoVpnSettingsSync: Promise<boolean> | null = null;
 let migratedCredentialServer: string | null = null;
 const connectionSwitch = createMobileConnectionSwitch();
 
@@ -55,6 +59,16 @@ function persistCredential(action: () => Promise<void>): Promise<void> {
   return pending;
 }
 
+const syncAutoVpnSettings = createMobileVpnSettingsSync(
+  () => readBridgeNetworkSettings().vpnBypassWifiSsids,
+  async (bypassWifiSsids) => (await import("./mobile-native.js")).configureMobileAutoVpn(bypassWifiSsids),
+);
+
+function queueAutoVpnSettingsSync(): Promise<boolean> {
+  autoVpnSettingsSync = syncAutoVpnSettings();
+  return autoVpnSettingsSync;
+}
+
 export async function initializeMobileRuntime(): Promise<void> {
   if (!isMobileApp()) return;
   if (initialization) return initialization;
@@ -73,6 +87,12 @@ async function initialize(): Promise<void> {
   }
   originalFetch ??= window.fetch.bind(window);
   const native = await import("./mobile-native.js");
+  if (!autoVpnSettingsSyncInstalled) {
+    window.addEventListener(BRIDGE_NETWORK_SETTINGS_EVENT, () => { void queueAutoVpnSettingsSync(); });
+    autoVpnSettingsSyncInstalled = true;
+  }
+  // Native checks are independent of pairing and SSH/Bridge target reachability.
+  await queueAutoVpnSettingsSync();
   let savedServer: string | null = null;
   try {
     const saved = window.localStorage.getItem(SERVER_KEY);
@@ -114,7 +134,6 @@ async function initialize(): Promise<void> {
     },
   });
   removeGlobalVpnRecovery ??= subscribeBridgeApiUnreachable(() => {
-    if (typeof navigator !== "undefined" && navigator.onLine === false) return;
     void requestMobileVpnRecovery().catch(() => {});
   });
   await native.installNativeLifecycle();
@@ -167,18 +186,51 @@ export async function checkMobileConnection(): Promise<boolean> {
   }
 }
 
-/** Ask the Android side to probe the actual Bridge API origin before starting VPN. */
+/** Probe the Bridge API origin to retry after the network becomes reachable. */
 export async function requestMobileVpnRecovery(): Promise<boolean> {
   const selected = connection;
   if (!selected?.token) return false;
   let url: URL;
-  try { url = new URL(selected.server); }
+  try { url = new URL(normalizeConfiguredBridgeServer(selected.server)); }
   catch { return false; }
   const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : url.protocol === "http:" ? 80 : Number.NaN;
   if (!url.hostname || !Number.isInteger(port) || port < 1 || port > 65535) return false;
   const native = await import("./mobile-native.js");
   if (selected !== connection) return false;
-  return native.requestMobileVpnRecovery({ host: url.hostname, port });
+  return native.requestMobileVpnRecovery({
+    host: url.hostname,
+    port,
+    bypassWifiSsids: readBridgeNetworkSettings().vpnBypassWifiSsids,
+  });
+}
+
+/** Explicitly check and start the selected Android VPN without leaving Bridge. */
+export async function checkAndConnectMobileVpn(): Promise<string> {
+  await (autoVpnSettingsSync ?? queueAutoVpnSettingsSync());
+  return (await import("./mobile-native.js")).checkAndConnectMobileVpn(readBridgeNetworkSettings().vpnBypassWifiSsids);
+}
+
+export async function readCurrentWifiSsid(): Promise<string | null> {
+  return (await import("./mobile-native.js")).readCurrentWifiSsid();
+}
+
+/** Apply a changed global private-host setting to the live App connection. */
+export async function applyConfiguredBridgeNetworkSettings(): Promise<void> {
+  if (!isMobileApp()) return;
+  if (!await (autoVpnSettingsSync ?? queueAutoVpnSettingsSync())) {
+    throw new Error("自动 VPN 网络设置尚未同步到 Android，请重新打开 App 后重试。");
+  }
+  if (!connection) return;
+  const selected = connection;
+  const server = normalizeConfiguredBridgeServer(selected.server);
+  if (server === selected.server) return;
+  const native = await import("./mobile-native.js");
+  const token = selected.token ?? await native.getCredential(selected.server);
+  if (connection !== selected) throw new DOMException("Bridge connection changed", "AbortError");
+  if (token) await persistCredential(() => native.setCredential(server, token));
+  if (connection !== selected) throw new DOMException("Bridge connection changed", "AbortError");
+  commitMobileConnection({ server, token });
+  if (token) void persistCredential(() => native.removeCredential(selected.server)).catch(() => {});
 }
 
 export async function pairMobileConnection(address: string, code: string): Promise<void> {
@@ -295,7 +347,7 @@ export async function downloadBridgeFile(path: string, fileName = "bridge-file")
   if (url.origin !== getBridgeOrigin() || !isBridgeApiPath(url.pathname)) throw new Error("该文件不属于当前 Bridge。");
   const native = await import("./mobile-native.js");
   if (connection !== selected) throw new DOMException("Bridge connection changed", "AbortError");
-  await native.downloadBridgeFile(url.toString(), fileName, selected?.token ?? null);
+  await native.downloadBridgeFile(url.toString(), fileName, selected?.token ?? null, selected?.server);
 }
 
 /** @deprecated Use downloadBridgeFile for authenticated Bridge files. */

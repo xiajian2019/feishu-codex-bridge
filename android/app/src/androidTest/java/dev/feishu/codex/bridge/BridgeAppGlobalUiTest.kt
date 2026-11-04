@@ -68,6 +68,19 @@ class BridgeAppGlobalUiTest {
         }
     }
 
+    @Test
+    fun nativeUpdateBannerIsMountedAboveTheWebView() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                activity.setAppUpdateBanner(BridgeAppUpdateBannerState("0.5.0 (200) · 50 MB", "", "", false, false))
+                val root = activity.findViewById<ViewGroup>(android.R.id.content)
+                assertTrue(root.getChildAt(root.childCount - 1) is ComposeView)
+            }
+            waitForNode("发现新的 Bridge App")
+            scenario.onActivity { it.setAppUpdateBanner(null) }
+        }
+    }
+
     private fun waitForNode(label: String): AccessibilityNodeInfo {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         repeat(80) {

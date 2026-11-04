@@ -95,6 +95,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.connectbot.sshlib.AuthResult
 import org.connectbot.sshlib.ConnectResult
+import org.connectbot.sshlib.SessionExit
 import org.json.JSONObject
 
 private enum class SshSetupPage { HOSTS, EDIT_HOST, KEYS }
@@ -110,6 +111,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     protected open fun isEmbeddedSshHost(): Boolean = false
     private var workspaceView: ComposeView? = null
     private var appUpdateBanner by mutableStateOf<BridgeAppUpdateBannerState?>(null)
+    private var appUpdateOverlayView: ComposeView? = null
     private var previousStatusBarColor = 0
     private var previousNavigationBarColor = 0
     private var previousLightStatusBar = false
@@ -294,6 +296,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
             BridgeSshTraceField.SAVED_STATE to (savedInstanceState != null),
             BridgeSshTraceField.EMBEDDED to isEmbeddedSshHost())
         super.onCreate(savedInstanceState)
+        nativeTheme = BridgeNativeTheme.read(this)
         if (!isEmbeddedSshHost()) {
             prepareWorkspace(intent)
             applyWindowTheme(nativeTheme)
@@ -338,6 +341,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         }
         workspaceView = view
         addContentView(view, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        appUpdateOverlayView?.bringToFront()
         loadComposerShortcuts()
         if (hasIncomingConnection && terminalSession == null) {
             setupPage = SshSetupPage.EDIT_HOST
@@ -349,13 +353,38 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     }
 
     internal fun setAppUpdateBanner(state: BridgeAppUpdateBannerState?) {
-        appUpdateBanner = state
+        runOnUiThread {
+            nativeTheme = BridgeNativeTheme.read(this)
+            appUpdateBanner = state
+            if (state == null) {
+                appUpdateOverlayView?.let { (it.parent as? ViewGroup)?.removeView(it) }
+                appUpdateOverlayView = null
+                return@runOnUiThread
+            }
+            val overlay = appUpdateOverlayView ?: ComposeView(this).apply {
+                isClickable = false
+                isFocusable = false
+                setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
+                setContent {
+                    BridgeSshTheme(nativeTheme) {
+                        BridgeAppUpdateOverlay(appUpdateBanner) { action ->
+                            (bridge?.getPlugin("BridgeConnectBotSSH")?.instance as? BridgeConnectBotSSHPlugin)?.updateAction(action)
+                        }
+                    }
+                }
+            }.also { created ->
+                appUpdateOverlayView = created
+                addContentView(created, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            }
+            overlay.bringToFront()
+        }
     }
 
     /** Temporarily reveal the connection center without detaching the SSH session. */
     internal fun setEmbeddedSshWorkspaceVisible(visible: Boolean): Boolean {
         val view = workspaceView ?: return false
         view.visibility = if (visible) View.VISIBLE else View.INVISIBLE
+        if (visible) appUpdateOverlayView?.bringToFront()
         return true
     }
 
@@ -449,13 +478,6 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                     pendingHostKey?.let { prompt -> HostKeyDialog(prompt) }
                     if (keyGenerationDialog) KeyGenerationDialog()
                     generatedPublicKeyDialog?.let { PublicKeyDialog(it) }
-                    appUpdateBanner?.let { update ->
-                        Box(Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(horizontal = 12.dp, vertical = 8.dp)) {
-                            BridgeAppUpdateBanner(update) { action ->
-                                (bridge?.getPlugin("BridgeConnectBotSSH")?.instance as? BridgeConnectBotSSHPlugin)?.updateAction(action)
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -654,13 +676,13 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                     .fillMaxWidth()
                     .weight(1f)
                     .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
             ) {
                 if (hasIncomingConnection) {
                     Row(
                         modifier = Modifier.fillMaxWidth()
                             .clickable(enabled = connectJob == null) { setupPage = SshSetupPage.EDIT_HOST }
-                            .padding(vertical = 12.dp, horizontal = 8.dp),
+                            .padding(vertical = 6.dp, horizontal = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
@@ -675,7 +697,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 if (savedProfiles.isEmpty()) {
                     Text(
                         "还没有保存的主机，点击“添加”创建连接。",
-                        modifier = Modifier.padding(vertical = 24.dp, horizontal = 8.dp),
+                        modifier = Modifier.padding(vertical = 12.dp, horizontal = 8.dp),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -690,12 +712,13 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                     savedProfiles.none { BridgeSshAppConnectionKey.of(it.host, it.port, it.username) == session.key }
                 }
                 if (unlisted.isNotEmpty()) {
-                    Text("活动连接", modifier = Modifier.padding(start = 8.dp, top = 12.dp), style = MaterialTheme.typography.titleSmall)
+                    Text("活动连接", modifier = Modifier.padding(start = 8.dp, top = 6.dp), style = MaterialTheme.typography.titleSmall)
                     unlisted.forEach { session ->
                         Row(
-                            modifier = Modifier.fillMaxWidth().clickable(enabled = connectJob == null) {
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(enabled = connectJob == null) {
                                 attachSession(session, restoreProfile = true)
-                            }.padding(horizontal = 8.dp, vertical = 12.dp),
+                            }.padding(horizontal = 8.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text("${session.key.username}@${session.key.host}:${session.key.port}")
                         }
@@ -716,7 +739,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 .clickable(enabled = connectJob == null) {
                     if (active != null) attachSession(active, restoreProfile = true) else connectProfile(profile)
                 }
-                .padding(start = 8.dp, top = 8.dp, bottom = 8.dp),
+                .padding(start = 8.dp, top = 4.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text("⌘", modifier = Modifier.padding(end = 16.dp), color = MaterialTheme.colorScheme.primary)
@@ -771,8 +794,8 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                     .fillMaxWidth()
                     .weight(1f)
                     .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 OutlinedTextField(profileLabel, { profileLabel = it }, label = { Text("名称（可选）") }, singleLine = true, enabled = connectJob == null, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(host, { host = it }, label = { Text("主机") }, singleLine = true, enabled = connectJob == null, modifier = Modifier.fillMaxWidth())
@@ -797,8 +820,8 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                     ),
                 ) {
                     Column(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
                         Text("身份验证", style = MaterialTheme.typography.titleSmall)
                         Text(
@@ -890,7 +913,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                     enabled = connectJob == null,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                SetupMessages()
+                SetupMessages(showPreviousDiagnostics = false)
                 Button(
                     onClick = { connect() },
                     enabled = connectJob == null && !privateKeyReading && host.isNotBlank() && username.isNotBlank(),
@@ -991,27 +1014,28 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     }
 
     @Composable
-    private fun SetupMessages() {
+    private fun SetupMessages(showPreviousDiagnostics: Boolean = true) {
         keyStoreError?.let {
-            Text(it, modifier = Modifier.padding(vertical = 8.dp), color = MaterialTheme.colorScheme.error)
+            Text(it, modifier = Modifier.padding(vertical = 2.dp), color = MaterialTheme.colorScheme.error)
         }
         connectionMessage?.let {
             Text(
                 it,
-                modifier = Modifier.padding(vertical = 8.dp),
+                modifier = Modifier.padding(vertical = 2.dp),
                 color = if (connectionErrorDetails != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
         connectionErrorDetails?.let { details -> ConnectionErrorCard(details) }
         keyGenerationErrorDetails?.let { details ->
-            Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("生成错误详情", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.titleSmall)
                 Text(details, color = MaterialTheme.colorScheme.onSurfaceVariant, style = TextStyle(fontFamily = FontFamily.Monospace))
                 OutlinedButton(onClick = { copyKeyGenerationError(details) }) { Text("复制错误详情") }
             }
         }
         if (connectJob != null || connectionState != "未连接") Text(connectionState, style = MaterialTheme.typography.bodySmall)
-        if ((connectionErrorDetails != null || diagnosticsRecording) && BridgeSshActivityDiagnostics.hasCapture) {
+        if ((diagnosticsRecording || diagnosticCopyRetry || (showPreviousDiagnostics && connectionErrorDetails != null)) &&
+            BridgeSshActivityDiagnostics.hasCapture) {
             TextButton(onClick = { if (diagnosticsRecording) stopAndCopyDiagnostics() else copyDiagnosticsReport() }) {
                 Text(if (diagnosticsRecording) "停止并复制诊断日志" else "复制诊断日志")
             }
@@ -1404,8 +1428,8 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
             tonalElevation = 2.dp,
         ) {
             Column(
-                modifier = Modifier.padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1430,7 +1454,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                         modifier = Modifier
                             .fillMaxWidth()
                             .verticalScroll(rememberScrollState())
-                            .padding(10.dp),
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
                     ) {
                         Text(
                             details,
@@ -1763,10 +1787,14 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         val target = selectedTmuxSession
         val sourceHost = host.trim().lowercase()
         val sourceScope = composerScope
+        val tool = currentSessionTool()
         activityScope.launch {
             val cached = withContext(Dispatchers.IO) {
                 try {
-                    val sameSession = target != null && tmuxClient?.listSessions()?.any { it.id == target.id && it.createdAt == target.createdAt } == true
+                    val sameSession = target != null && tmuxClient?.let { client ->
+                        val sessions = tool?.listSessions { client.listSessions() } ?: client.listSessions()
+                        sessions.any { it.id == target.id && it.createdAt == target.createdAt }
+                    } == true
                     BridgeComposerDatabase(this@BridgeConnectBotSshActivity).use { database ->
                         if (database.activeSourceHost() != sourceHost) return@use emptyList<BridgeSshSkill>() to false
                         val key = target?.let { URLEncoder.encode(it.id, "UTF-8").replace("+", "%20") + ":" + it.createdAt }
@@ -1792,7 +1820,8 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
             skillPickerItems = cached.first
             if (cached.first.isNotEmpty()) skillPickerMessage = "正在读取 SSH 主机技能；已显示可用缓存。"
             val remote = try {
-                transport?.let { BridgeSshRemoteSkills(it, target, tmuxClient).discover() }.orEmpty()
+                val discover = suspend { transport?.let { BridgeSshRemoteSkills(it, target, tmuxClient).discover() }.orEmpty() }
+                tool?.listSkills(target, discover) ?: discover()
             } catch (_: TimeoutCancellationException) {
                 emptyList()
             } catch (cancelled: CancellationException) {
@@ -1811,9 +1840,9 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
             ) else cached.first
             skillPickerItems = loaded
             skillPickerMessage = when {
-                remote.isNotEmpty() && cached.second -> "技能来自 SSH 主机与同一 Session 的缓存；缓存随 Web 同步更新。"
-                remote.isNotEmpty() && target != null -> "技能来自当前 SSH 主机和 Session 目录。"
-                remote.isNotEmpty() -> "显示 SSH 主机的全局技能；可手动输入项目技能。"
+                remote.isNotEmpty() && cached.second -> "技能来自当前 Session 和同一 Session 的缓存。"
+                remote.isNotEmpty() && target != null -> "显示当前 Session 的技能。"
+                remote.isNotEmpty() -> "显示当前环境的全局技能；可手动输入项目技能。"
                 cached.second -> "显示已缓存的 Session 技能。"
                 loaded.isNotEmpty() -> "显示同一 Bridge 的全局技能；可手动输入当前项目技能名。"
                 else -> "没有匹配当前 SSH 主机的技能缓存，可手动输入技能名。"
@@ -1887,7 +1916,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         val ssh = transport ?: return
         if (terminalSession?.status?.state != BridgeSshConnectionState.CONNECTED) return
         shortcutPanelOpen = false
-        remoteFiles = BridgeSshRemoteFiles(ssh, selectedTmuxSession, tmuxClient)
+        remoteFiles = BridgeSshRemoteFiles(ssh, selectedTmuxSession, tmuxClient, currentSessionTool()?.apiClient)
         remoteFilesBusy = false
         remoteFilesOpen = true
         remoteFilesRoot = ""
@@ -2052,8 +2081,9 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (_: Exception) {
-                if (remoteFiles === browser) remoteFilesError = "文件已失效或无法访问，请刷新后重试。"
+            } catch (error: Exception) {
+                if (remoteFiles === browser) remoteFilesError = (error as? BridgeSshApiRequestException)?.message
+                    ?: "文件已失效或无法访问，请刷新后重试。"
             } finally { if (remoteFiles === browser) remoteFilesBusy = false }
         }
     }
@@ -2097,8 +2127,9 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (_: Exception) {
-                if (remoteFiles === browser) remoteFilesError = "上传失败：请检查连接、文件大小或同名文件。"
+            } catch (error: Exception) {
+                if (remoteFiles === browser) remoteFilesError = if (error is BridgeSshApiRequestException) error.message
+                    else "上传失败：请检查连接、文件大小或同名文件。"
             } finally { if (remoteFiles === browser && !refreshing) remoteFilesBusy = false }
         }
     }
@@ -2181,6 +2212,8 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
             return
         }
         val attachments = composerDraft.attachments.toList()
+        val attachmentTarget = selectedTmuxSession
+        val sessionTool = currentSessionTool()
         composerSending = true
         composerNotice = null
         activityScope.launch {
@@ -2194,7 +2227,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                         composerAttachmentStates = composerAttachmentStates +
                             (attachment.id to (BridgeSshComposerAttachmentStatus.Uploading to "正在上传"))
                         val file = composerDraftStore.fileFor(scope, attachment.id)
-                        val result = BridgeSshAttachmentTransfer(ssh).upload(attachment.name, FileInputStream(file)) { bytes ->
+                        val progress: (Long) -> Unit = { bytes ->
                             activityScope.launch {
                                 if (composerSending && composerScope == scope &&
                                     composerAttachmentStates[attachment.id]?.first == BridgeSshComposerAttachmentStatus.Uploading) {
@@ -2203,6 +2236,17 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                                 }
                             }
                         }
+                        val fallback: suspend () -> BridgeSshUploadedAttachment = {
+                            BridgeSshAttachmentTransfer(ssh).upload(attachment.name, FileInputStream(file), progress)
+                        }
+                        val result = sessionTool?.uploadComposerAttachment(
+                            attachmentTarget, attachment.name, attachment.mimeType, file, progress,
+                            canReadRemote = { path ->
+                                val check = ssh.exec(BridgeSshAttachmentTransfer.remoteReadCheckCommand(path), maxOutputBytes = 16 * 1024)
+                                (check.exitInfo as? SessionExit.Status)?.code == 0L
+                            },
+                            fallback = fallback,
+                        ) ?: fallback()
                         remotePath = result.remotePath
                         composerUploadedPaths[attachment.id] = remotePath
                         composerAttachmentStates = composerAttachmentStates +
@@ -2221,10 +2265,12 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (_: Throwable) {
+            } catch (error: Throwable) {
                 outcome = if (pendingMarked) BridgeSshCommandSendResult.Unknown else BridgeSshCommandSendResult.NotSent
                 if (composerScope == scope) {
-                    composerNotice = if (pendingMarked) "SSH 写入结果未知，请检查终端。" else "附件或草稿准备失败，请检查连接、SFTP 和手机存储后重试。"
+                    composerNotice = if (pendingMarked) "SSH 写入结果未知，请检查终端。"
+                    else (error as? BridgeSshApiRequestException)?.message
+                        ?: "附件或草稿准备失败，请检查连接、SFTP 和手机存储后重试。"
                     composerAttachmentStates = composerAttachmentStates.mapValues { (_, value) ->
                         if (value.first == BridgeSshComposerAttachmentStatus.Uploading)
                             BridgeSshComposerAttachmentStatus.Failed to "上传失败，可重试" else value
@@ -2515,7 +2561,9 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 if (isCurrentTarget(target)) {
                     sshSelectedCodexHome = result.getString("selected")
                     loadSshUsageSummary(target, sshSelectedCodexHome)
-                    composerNotice = "已更新账号标记；现有 shell 和正在运行的 Codex 不会切换。"
+                    composerNotice = if (result.optString("source") == "ssh-fallback")
+                        "已通过 SSH 更新账号标记；Web 记录尚未同步，现有 shell 和 Codex 不会切换。"
+                    else "已更新账号标记；现有 shell 和正在运行的 Codex 不会切换。"
                 }
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) { if (isCurrentTarget(target)) sshAccountError = error.message ?: "无法更新账号标记。" }
@@ -2597,7 +2645,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
             sshGitError = "Session 已切换，请重新选择文件。"
             return
         }
-        val tool = BridgeSshRemoteSession(request.owner.transport)
+        val tool = currentSessionTool() ?: return
         val browser = BridgeSshRemoteFiles(
             resolveCurrentRoot = {
                 val result = tool.call("git_list", request.target, mapOf("root" to request.root))
@@ -2615,7 +2663,9 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
             try {
                 withContext(Dispatchers.IO) {
                     checkNotNull(contentResolver.openOutputStream(uri)) { "无法打开下载目标。" }.use { output ->
-                        browser.download(request.file.path, output)
+                        tool.downloadGitFile(request.target, request.root, request.file.path, output) {
+                            browser.download(request.file.path, output)
+                        }
                     }
                 }
                 sshGitError = null
@@ -2658,7 +2708,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         composerNotice = null
         activityScope.launch {
             try {
-                tool.call(action, target)
+                val result = tool.call(action, target)
                 if (isCurrentTarget(target)) {
                     if (action == "suspend" || action == "end") {
                         managedSession?.let {
@@ -2670,7 +2720,11 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                         sshSelectedCodexHome = ""
                         tmuxSessionCache.reset()
                     }
-                    composerNotice = when (action) {
+                    composerNotice = if (result.optString("source") == "ssh-fallback") when (action) {
+                        "save" -> "已保存「${target.name}」的 SSH 降级快照；它与 Web 快照分开。"
+                        "suspend" -> "已挂起「${target.name}」；请在 SSH 会话列表中恢复，Web 状态尚未同步。"
+                        else -> "已通过 SSH 终结「${target.name}」；Web 状态尚未同步。"
+                    } else when (action) {
                         "save" -> "已保存「${target.name}」的独立快照。"
                         "suspend" -> "已挂起「${target.name}」，可从 tmux 会话列表恢复。"
                         else -> "已终结「${target.name}」。"
@@ -2692,7 +2746,10 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 if (managedSession === owner) {
                     val array = result.optJSONArray("sessions")
                     sshSuspended = (0 until (array?.length() ?: 0)).mapNotNull { index ->
-                        array?.optJSONObject(index)?.let { BridgeSshSuspendedSession(it.getString("id"), it.getLong("createdAt"), it.getString("name"), it.optString("cwd")) }
+                        array?.optJSONObject(index)?.let {
+                            BridgeSshSuspendedSession(it.getString("id"), it.getLong("createdAt"), it.getString("name"),
+                                it.optString("cwd"), it.optString("source"), it.optBoolean("uncertain"))
+                        }
                     }
                     sshSuspendedError = null
                 }
@@ -2708,8 +2765,10 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         sshSuspendedError = null
         activityScope.launch {
             try {
-                tool.call("restore", identity = BridgeSshTmuxIdentity(session.id, session.createdAt))
-                connectionMessage = "已恢复「${session.name}」，请选择它进入。"
+                val result = tool.call("restore", arguments = mapOf("source" to session.source).filterValues { it.isNotBlank() },
+                    identity = BridgeSshTmuxIdentity(session.id, session.createdAt))
+                connectionMessage = if (result.optString("source") == "ssh-fallback")
+                    "已通过 SSH 恢复「${session.name}」；Web 状态尚未同步。" else "已恢复「${session.name}」，请选择它进入。"
                 tmuxSessionCache.reset()
                 refreshTmuxSessions()
                 refreshSshSuspended()
@@ -2721,11 +2780,14 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
 
     private fun refreshTmuxSessions(force: Boolean = true) {
         val client = tmuxClient ?: return
+        val tool = currentSessionTool()
         if (tmuxSessionCache.refreshing || (!force && tmuxSessionCache.sessions != null)) return
         connectionMessage = null
         connectionErrorDetails = null
         activityScope.launch {
-            when (val result = tmuxSessionCache.load(force) { withContext(Dispatchers.IO) { client.listSessions() } }) {
+            when (val result = tmuxSessionCache.load(force) {
+                withContext(Dispatchers.IO) { tool?.listSessions { client.listSessions() } ?: client.listSessions() }
+            }) {
                 BridgeSshTmuxLoadResult.Loaded -> {
                     connectionState = "请选择 tmux Session"
                     val selected = selectedTmuxSession
@@ -2852,14 +2914,18 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                         )
                     }
                 }
-                keyPassphrase = passphrase.takeIf { key != null && it.isNotEmpty() }?.toCharArray()
+                val selectedPublicKeyLine = selectedStoredKeyId
+                    ?.let { id -> savedKeys.firstOrNull { it.id == id }?.publicKeyLine }
+                keyPassphrase = passphrase.takeIf {
+                    key != null && selectedPublicKeyLine == null && it.isNotEmpty()
+                }?.toCharArray()
                 val verifier = BridgeCbSshHostKeyVerifier(
                     applicationContext.getSharedPreferences(BRIDGE_SSH_KNOWN_HOSTS_PREFERENCES, Context.MODE_PRIVATE),
                     host,
                     parsedPort,
                 ) { prompt -> awaitHostKey(prompt) }
                 traceConnectionPhase(attempt, "connect")
-                val nextTransport = BridgeCbSshTransport(host, parsedPort, verifier)
+                val nextTransport = withContext(Dispatchers.IO) { BridgeCbSshTransport(host, parsedPort, verifier) }
                 provisionalTransport = nextTransport
                 val result = try {
                     withContext(Dispatchers.IO) { nextTransport.connect() }
@@ -2881,11 +2947,14 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                         summary = result.message,
                         cause = result.cause,
                     )
-                    is ConnectResult.TransportError -> throw BridgeSshConnectionFailure(
-                        category = BridgeSshTraceDetail.TRANSPORT_ERROR, phase = "connect",
-                        summary = "传输层错误",
-                        cause = result.cause,
-                    )
+                    is ConnectResult.TransportError -> {
+                        BridgeAutoVpnRecoverySignal.request()
+                        throw BridgeSshConnectionFailure(
+                            category = BridgeSshTraceDetail.TRANSPORT_ERROR, phase = "connect",
+                            summary = "传输层错误",
+                            cause = result.cause,
+                        )
+                    }
                     else -> throw BridgeSshConnectionFailure(
                         phase = "connect",
                         summary = "未处理的连接结果：${result::class.java.name}",
@@ -2897,7 +2966,14 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                     BridgeSshTraceField.AUTH_METHOD to if (key != null) BridgeSshTraceDetail.PUBLIC_KEY else BridgeSshTraceDetail.PASSWORD)
                 connectionState = "认证中"
                 val auth = withContext(Dispatchers.IO) {
-                    if (key != null) nextTransport.authenticatePublicKey(username, key, keyPassphrase)
+                    if (key != null) {
+                        nextTransport.authenticatePublicKey(
+                            username,
+                            key,
+                            keyPassphrase,
+                            selectedPublicKeyLine,
+                        )
+                    }
                     else nextTransport.authenticatePassword(username, password)
                 }
                 when (auth) {
@@ -3203,7 +3279,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
             // Do not silently reinterpret the old relative directory under a different root.
             closeRemoteFiles()
         } else if (reopenFiles) {
-            remoteFiles = BridgeSshRemoteFiles(session.transport, session.selectedTmuxSession, session.tmuxClient)
+            remoteFiles = BridgeSshRemoteFiles(session.transport, session.selectedTmuxSession, session.tmuxClient, currentSessionTool()?.apiClient)
             remoteFilesBusy = false
             remoteFilesError = null
             refreshRemoteFiles(requestedPath)
@@ -3285,6 +3361,8 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
 
     override fun onDestroy() {
         traceActivity(BridgeSshTraceEvent.ACTIVITY_DESTROYED)
+        appUpdateOverlayView?.let { (it.parent as? ViewGroup)?.removeView(it) }
+        appUpdateOverlayView = null
         connectJob?.cancel()
         keyGenerationJob?.cancel()
         privateKey?.let { BridgeSshKeySupport.clear(it) }

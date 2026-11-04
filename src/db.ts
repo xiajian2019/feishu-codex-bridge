@@ -24,6 +24,7 @@ import type { PairingClaimResult, WebAuthPairingRecord, WebAuthSessionRecord } f
 import type { GitWorkspaceSnapshot } from "./run-artifacts.js";
 import type { PreparedTaskWorkspace } from "./git-workspaces.js";
 import type {
+  CodexHistoryDetailCacheStore,
   CodexHistoryStoredRun,
   CodexHistoryUsageDailyBucket,
   CodexHistoryUsageSnapshot,
@@ -321,6 +322,19 @@ CREATE TABLE IF NOT EXISTS codex_history_list_cache (
 
 CREATE INDEX IF NOT EXISTS idx_codex_history_list_cache_refreshed
   ON codex_history_list_cache(home_id, refreshed_at DESC);
+
+CREATE TABLE IF NOT EXISTS codex_history_detail_cache (
+    home_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    view TEXT NOT NULL CHECK (view IN ('summary', 'full')),
+    source_updated_at REAL,
+    payload_json TEXT NOT NULL,
+    cached_at TEXT NOT NULL,
+    PRIMARY KEY(home_id, thread_id, view)
+);
+
+CREATE INDEX IF NOT EXISTS idx_codex_history_detail_cache_cached
+  ON codex_history_detail_cache(cached_at DESC);
 
 CREATE TABLE IF NOT EXISTS codex_account_usage_snapshots (
     home_id TEXT NOT NULL,
@@ -751,7 +765,7 @@ export interface TaskPanelQuery {
   offset?: number;
 }
 
-export class StateDatabase {
+export class StateDatabase implements CodexHistoryDetailCacheStore {
   private readonly db: SqliteDatabase;
   public readonly workbench: WorkbenchStore;
   private readonly now: () => Date;
@@ -1256,6 +1270,51 @@ export class StateDatabase {
       payloadJson: String(row.payload_json),
       refreshedAt: String(row.refreshed_at),
     } : null;
+  }
+
+  public getCodexHistoryDetailCache(homeId: string, threadId: string, view: "summary" | "full"): {
+    sourceUpdatedAt: number | null;
+    payloadJson: string;
+    cachedAt: string;
+  } | null {
+    const row = this.db.prepare(
+      `SELECT source_updated_at, payload_json, cached_at
+       FROM codex_history_detail_cache
+       WHERE home_id = ? AND thread_id = ? AND view = ?`,
+    ).get(homeId, threadId, view) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    const sourceUpdatedAt = row.source_updated_at === null || row.source_updated_at === undefined
+      ? null
+      : Number(row.source_updated_at);
+    return {
+      sourceUpdatedAt: sourceUpdatedAt !== null && Number.isFinite(sourceUpdatedAt) ? sourceUpdatedAt : null,
+      payloadJson: String(row.payload_json),
+      cachedAt: String(row.cached_at),
+    };
+  }
+
+  public saveCodexHistoryDetailCache(
+    homeId: string,
+    threadId: string,
+    view: "summary" | "full",
+    sourceUpdatedAt: number | null,
+    payloadJson: string,
+  ): void {
+    this.db.prepare(
+      `INSERT INTO codex_history_detail_cache
+         (home_id, thread_id, view, source_updated_at, payload_json, cached_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(home_id, thread_id, view) DO UPDATE SET
+         source_updated_at = excluded.source_updated_at,
+         payload_json = excluded.payload_json,
+         cached_at = excluded.cached_at`,
+    ).run(homeId, threadId, view, sourceUpdatedAt, payloadJson, this.timestamp());
+  }
+
+  public deleteCodexHistoryDetailCache(homeId: string, threadId: string): void {
+    this.db.prepare(
+      "DELETE FROM codex_history_detail_cache WHERE home_id = ? AND thread_id = ?",
+    ).run(homeId, threadId);
   }
 
   public getCodexUsageSnapshot(homeId: string): CodexHistoryUsageSnapshot | null {
@@ -4331,6 +4390,19 @@ export class StateDatabase {
         session.createdAt,
         this.timestamp(),
         recordId,
+      );
+    return result.changes > 0 ? this.getTmuxSession(recordId) : null;
+  }
+
+  /** Rebind an active record after restoring a snapshot made by the SSH fallback. */
+  public resumeSshFallbackTmuxSession(
+    recordId: string, previousCreatedAt: number, session: { id: string; name: string; cwd: string; createdAt: number },
+  ): StoredTmuxSession | null {
+    const result = this.db.prepare(`UPDATE tmux_sessions SET
+      tmux_session_id = ?, session_name = ?, working_directory = COALESCE(working_directory_override, ?), tmux_created_at = ?,
+      last_seen_at = ?, suspended_at = NULL, ended_at = NULL
+      WHERE record_id = ? AND tmux_created_at = ? AND ended_at IS NULL AND suspended_at IS NULL`).run(
+        session.id, session.name, session.cwd, session.createdAt, this.timestamp(), recordId, previousCreatedAt,
       );
     return result.changes > 0 ? this.getTmuxSession(recordId) : null;
   }
