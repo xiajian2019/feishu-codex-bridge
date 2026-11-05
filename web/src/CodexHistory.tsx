@@ -72,7 +72,6 @@ import {
   type CodexHistoryHome,
   type CodexHistoryItem,
   type CodexHistoryListResponse,
-  type CodexHistoryTurnUsage,
   type CodexHistoryRunState,
   type CodexHistoryTurnAttachments,
   type CodexHistoryUpdateEvent,
@@ -108,8 +107,8 @@ const EMPTY_FILTERS: HistoryFilters = {
   status: "",
 };
 
-// Version 2 discards details cached before SQLite Home selection was fixed.
-const CODEX_HISTORY_DETAIL_CACHE_VERSION = 2;
+// Version 3 stores summary/full detail views after the SQLite Home selection fix.
+const CODEX_HISTORY_DETAIL_CACHE_VERSION = 3;
 const CODEX_HISTORY_DETAIL_CACHE_TTL_MS = 60 * 60 * 1_000;
 const CODEX_HISTORY_LIST_VERSION_MAX_AGE_MS = 30 * 1_000;
 const CODEX_HISTORY_DETAIL_CACHE_MAX_CHARS = 600_000;
@@ -119,6 +118,12 @@ interface CodexHistoryDetailCacheEntry {
   version: number;
   cachedAt: number;
   detail: CodexHistoryDetailResponse;
+}
+
+interface CodexHistoryRouteState {
+  historyListThread?: CodexThread;
+  historyListHome?: CodexHistoryHome;
+  historyDraftInsertion?: unknown;
 }
 
 function readStoredCodexHistoryHome(): string {
@@ -391,7 +396,12 @@ export function CodexHistory(): ReactElement {
       if (result?.generatedAt) params.set("listCheckedAt", result.generatedAt);
     }
     const query = params.toString();
-    navigate(query ? `${path}?${query}` : path);
+    navigate(query ? `${path}?${query}` : path, {
+      state: {
+        historyListThread: item.thread,
+        historyListHome: item.home,
+      } satisfies CodexHistoryRouteState,
+    });
   }, [navigate, result?.generatedAt]);
 
   const saveListItemHome = useCallback(async (item: CodexHistoryItem, nextHomeId: string): Promise<void> => {
@@ -697,11 +707,22 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
   const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(() => new Set());
   const [bookmarks, setBookmarks] = useState<Set<string>>(() => new Set());
   const [draftInsertion, setDraftInsertion] = useState<HistoryDraftInsertion | null>(null);
+  const [loadingFullHistory, setLoadingFullHistory] = useState(false);
   const liveCursorRef = useRef(0);
   const target = useMemo(() => historyTarget(homeId, threadId), [homeId, threadId]);
   const targetKey = historyPreferenceKey(target);
   const draftScope = getLocalDraftScope();
   const routeDraftInsertion = useMemo(() => readHistoryDraftInsertion(asRecord(location.state).historyDraftInsertion), [location.state]);
+  const routeThreadHint = useMemo(() => {
+    const candidate = asRecord(asRecord(location.state).historyListThread);
+    return candidate.id === threadId ? candidate as CodexThread : null;
+  }, [location.state, threadId]);
+  const routeHomeHint = useMemo(() => {
+    const candidate = asRecord(asRecord(location.state).historyListHome);
+    return candidate.id === homeId && typeof candidate.label === "string" && typeof candidate.path === "string" && typeof candidate.available === "boolean"
+      ? candidate as unknown as CodexHistoryHome
+      : null;
+  }, [location.state, homeId]);
 
   useEffect(() => {
     setSelectedMessageIds(new Set());
@@ -759,6 +780,11 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
   useEffect(() => {
     const controller = new AbortController();
     const cachedDetail = readCodexHistoryDetailCache(homeId, threadId);
+    const hintedDetail = routeThreadHint ? {
+      home: routeHomeHint ?? { id: homeId, label: "Codex home", path: "", available: true },
+      thread: routeThreadHint,
+      view: "summary" as const,
+    } : null;
     const listUpdatedAt = expectedUpdatedAt === null ? Number.NaN : Number(expectedUpdatedAt);
     const listCheckedAtMs = listCheckedAt === null ? Number.NaN : Date.parse(listCheckedAt);
     const cacheMatchesFreshList = Boolean(cachedDetail)
@@ -769,13 +795,16 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
       && Date.now() - listCheckedAtMs <= CODEX_HISTORY_LIST_VERSION_MAX_AGE_MS;
     setLoading(!cachedDetail);
     setError(null);
-    setDetail(cachedDetail);
+    setDetail(cachedDetail ?? hintedDetail);
     setImagePreviews(buildTurnImagePreviews(homeId, threadId, cachedDetail?.imageAttachments ?? []));
     setFilePreviewTarget(null);
     if (cacheMatchesFreshList) {
       return () => controller.abort();
     }
-    void fetchCodexThreadDetail(homeId, threadId, controller.signal)
+    void fetchCodexThreadDetail(homeId, threadId, controller.signal, {
+      view: "summary",
+      ...(Number.isFinite(listUpdatedAt) ? { updatedAt: listUpdatedAt } : {}),
+    })
       .then((next) => {
         if (!controller.signal.aborted) {
           const cachedTurns = cachedDetail?.thread.turns;
@@ -783,9 +812,18 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
           const sameVersion = typeof cachedDetail?.thread.updatedAt === "number"
             && cachedDetail.thread.updatedAt === next.thread.updatedAt
             && (Array.isArray(cachedTurns) ? cachedTurns.length : 0) === (Array.isArray(nextTurns) ? nextTurns.length : 0);
-          setDetail(sameVersion && cachedDetail ? { ...next, thread: cachedDetail.thread } : next);
+          const hintedNext = routeThreadHint ? {
+            ...next,
+            thread: {
+              ...routeThreadHint,
+              ...next.thread,
+              ...(next.thread.name?.trim() ? {} : routeThreadHint.name ? { name: routeThreadHint.name } : {}),
+              ...(next.thread.preview?.trim() ? {} : routeThreadHint.preview ? { preview: routeThreadHint.preview } : {}),
+            },
+          } : next;
+          setDetail(sameVersion && cachedDetail ? { ...hintedNext, thread: cachedDetail.thread } : hintedNext);
           setImagePreviews(buildTurnImagePreviews(homeId, threadId, next.imageAttachments ?? []));
-          writeCodexHistoryDetailCache(next, draftScope);
+          writeCodexHistoryDetailCache(hintedNext, draftScope);
         }
       })
       .catch((nextError: unknown) => {
@@ -795,7 +833,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
         if (!controller.signal.aborted) setLoading(false);
     });
     return () => controller.abort();
-  }, [homeId, threadId, expectedUpdatedAt, listCheckedAt]);
+  }, [homeId, threadId, expectedUpdatedAt, listCheckedAt, routeThreadHint, routeHomeHint, draftScope]);
 
   useEffect(() => {
     setWriterStatus(null);
@@ -852,7 +890,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
         if (next.resetRequired) {
           liveCursorRef.current = 0;
           setLiveRun((current) => current?.runId === next.runId
-            ? { ...current, state: next.state, cursor: next.cursor, items: [], ...(next.usage ? { usage: next.usage } : {}) }
+            ? { ...current, state: next.state, cursor: next.cursor, items: [] }
             : current);
         } else {
           setLiveRun((current) => current?.runId === next.runId
@@ -861,7 +899,6 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
                 state: next.state,
                 cursor: next.cursor,
                 items: mergeLiveItems(current.items, next.events),
-                ...(next.usage ? { usage: next.usage } : {}),
               }
             : current);
         }
@@ -873,7 +910,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
             setRunNotice(next.recovery?.error
               ?? "Bridge 已重启，无法继续跟踪上一轮；请核对 Codex 历史后再提交。");
           }
-          const refreshed = await fetchCodexThreadDetail(homeId, threadId, signal);
+          const refreshed = await fetchCodexThreadDetail(homeId, threadId, signal, { view: "summary" });
           if (signal.aborted) return;
           setDetail(refreshed);
           setImagePreviews(buildTurnImagePreviews(homeId, threadId, refreshed.imageAttachments ?? []));
@@ -900,19 +937,41 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
       { type: "userMessage", text: liveRun.userText || "（已发送附件）" },
       ...liveRun.items,
     ],
-    ...(liveRun.usage ? { usage: liveRun.usage } : {}),
   }] : [], [liveRun]);
   const selectableMessages = useMemo(() => extractHistoryMessages(thread, liveTurns), [thread, liveTurns]);
   const selectableMessageIds = useMemo(() => new Set(selectableMessages.map((message) => message.id)), [selectableMessages]);
-  const turnUsages = useMemo<Record<number, CodexHistoryTurnUsage>>(() => {
-    const result: Record<number, CodexHistoryTurnUsage> = {};
-    for (const { turnIndex, usage } of detail?.turnUsages ?? []) result[turnIndex] = usage;
-    return result;
-  }, [detail?.turnUsages]);
   const displayedTurnCount = turns.length + (liveRun ? 1 : 0);
+  const isSummaryDetail = detail?.view === "summary";
   const busyInOtherLocation = writerStatus?.state === "busy"
     && !writerStatus.localRun
     && !isLiveRunActive(liveRun?.state);
+  const loadFullHistory = useCallback(async (): Promise<void> => {
+    if (loadingFullHistory || !isSummaryDetail) return;
+    setLoadingFullHistory(true);
+    setError(null);
+    try {
+      const full = await fetchCodexThreadDetail(homeId, threadId, undefined, {
+        view: "full",
+        ...(typeof thread.updatedAt === "number" ? { updatedAt: thread.updatedAt } : {}),
+      });
+      const hintedFull = routeThreadHint ? {
+        ...full,
+        thread: {
+          ...routeThreadHint,
+          ...full.thread,
+          ...(full.thread.name?.trim() ? {} : routeThreadHint.name ? { name: routeThreadHint.name } : {}),
+          ...(full.thread.preview?.trim() ? {} : routeThreadHint.preview ? { preview: routeThreadHint.preview } : {}),
+        },
+      } : full;
+      setDetail(hintedFull);
+      setImagePreviews(buildTurnImagePreviews(homeId, threadId, full.imageAttachments ?? []));
+      writeCodexHistoryDetailCache(hintedFull, draftScope);
+    } catch (historyError: unknown) {
+      setError(historyError instanceof Error ? historyError.message : String(historyError));
+    } finally {
+      setLoadingFullHistory(false);
+    }
+  }, [loadingFullHistory, isSummaryDetail, homeId, threadId, thread.updatedAt, routeThreadHint, draftScope]);
   const openFilePreview = useCallback((target: CodexFileLinkTarget): void => {
     if ("outside" in target) {
       setError("此文件链接不在当前 Codex session 的工作目录内，无法在此预览。");
@@ -958,7 +1017,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
         setImagePreviews((current) => ({ ...current, [result.turnIndex]: previews }));
       }
       if (!isLiveRunActive(result.state)) {
-        const refreshed = await fetchCodexThreadDetail(homeId, threadId);
+        const refreshed = await fetchCodexThreadDetail(homeId, threadId, undefined, { view: "summary" });
         setDetail(refreshed);
         setImagePreviews(buildTurnImagePreviews(homeId, threadId, refreshed.imageAttachments ?? []));
         writeCodexHistoryDetailCache(refreshed, draftScope);
@@ -1035,7 +1094,7 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
         <div className="codex-thread-view-content">
           <div className="codex-thread-view-heading">
             <strong id="codex-thread-title" title={title}>{title}</strong>
-            <span className="codex-thread-turn-count">{loading ? "" : `${displayedTurnCount} 轮${liveRun?.state === "running" ? " · 运行中" : liveRun?.state === "cancelling" ? " · 中断中" : ""}`}</span>
+            <span className="codex-thread-turn-count">{loading ? "" : isSummaryDetail ? `${displayedTurnCount} 轮 · 文字结论` : `${displayedTurnCount} 轮${liveRun?.state === "running" ? " · 运行中" : liveRun?.state === "cancelling" ? " · 中断中" : ""}`}</span>
             <HistoryWorkbench
               homeId={homeId}
               thread={thread}
@@ -1091,6 +1150,14 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
       </div>
       <div className="codex-thread-view-body">
         <div className="codex-thread-transcript">
+          {isSummaryDetail && !loading ? (
+            <div className="codex-history-transcript-toolbar">
+              <span>当前显示全部文字结论和耗时，过程回放未加载。</span>
+              <button type="button" className="secondary" onClick={() => void loadFullHistory()} disabled={loadingFullHistory}>
+                {loadingFullHistory ? "正在加载过程…" : "查看过程回放（可选）"}
+              </button>
+            </div>
+          ) : null}
           {loading ? <div className="empty">正在读取会话详情…</div> : null}
           {!loading && !error && detail !== null && turns.length === 0 && !liveRun ? <div className="empty">该会话没有可展示的轮次。</div> : null}
           {!loading && (turns.length > 0 || liveRun) ? (
@@ -1098,7 +1165,6 @@ function CodexThreadDetail({ homeId, threadId, expectedUpdatedAt, listCheckedAt,
               thread={thread}
               extraTurns={liveTurns}
               imagePreviews={imagePreviews}
-              turnUsages={turnUsages}
               selectableMessageIds={selectableMessageIds}
               selectedMessageIds={selectedMessageIds}
               bookmarks={bookmarks}
@@ -1175,7 +1241,6 @@ interface LiveThreadRun {
   turnIndex: number;
   items: unknown[];
   interactive?: boolean;
-  usage?: CodexHistoryTurnUsage;
 }
 
 function isLiveRunActive(state: CodexHistoryRunState | undefined): state is "running" | "cancelling" {
@@ -1247,7 +1312,6 @@ interface CodexProcessGroup {
 interface CodexProcessPayload {
   groups: CodexProcessGroup[];
   durationMs?: number;
-  usage?: CodexHistoryTurnUsage;
 }
 
 type CodexMessagePart = Exclude<ThreadMessageLike["content"], string>[number];
@@ -1256,7 +1320,6 @@ function CodexAssistantTranscript({
   thread,
   extraTurns = [],
   imagePreviews = {},
-  turnUsages = {},
   selectableMessageIds,
   selectedMessageIds,
   bookmarks,
@@ -1266,7 +1329,6 @@ function CodexAssistantTranscript({
   thread: CodexThread;
   extraTurns?: unknown[];
   imagePreviews?: Record<number, CodexImagePreview[]>;
-  turnUsages?: Record<number, CodexHistoryTurnUsage>;
   selectableMessageIds: ReadonlySet<string>;
   selectedMessageIds: ReadonlySet<string>;
   bookmarks: ReadonlySet<string>;
@@ -1274,8 +1336,8 @@ function CodexAssistantTranscript({
   onToggleBookmark: (messageId: string) => void;
 }): ReactElement {
   const messages = useMemo(
-    () => buildCodexMessages(thread, extraTurns, imagePreviews, turnUsages),
-    [thread, extraTurns, imagePreviews, turnUsages],
+    () => buildCodexMessages(thread, extraTurns, imagePreviews),
+    [thread, extraTurns, imagePreviews],
   );
   const runtime = useExternalStoreRuntime({
     messages,
@@ -1641,7 +1703,6 @@ function CodexProcessPart({ data }: { data: CodexProcessPayload }): ReactElement
           {groups.map((group, index) => <CodexProcessGroupView key={`process-group-${index}`} group={group} />)}
         </div>
       ) : null}
-      {data.usage ? <div className="codex-assistant-usage" title="本轮 Codex Token 用量">{formatTokenUsage(data.usage)}</div> : null}
     </>
   );
 }
@@ -1667,7 +1728,6 @@ function buildCodexMessages(
   thread: CodexThread,
   extraTurns: unknown[] = [],
   imagePreviews: Record<number, CodexImagePreview[]> = {},
-  turnUsages: Record<number, CodexHistoryTurnUsage> = {},
 ): ThreadMessageLike[] {
   const turns = [
     ...(Array.isArray(thread.turns) ? thread.turns : []),
@@ -1701,16 +1761,12 @@ function buildCodexMessages(
     const content: CodexMessagePart[] = assistantItems
       .map((item) => ({ type: "text" as const, text: formatCodexItem(item, itemType(item) || "agentMessage") }));
     const durationMs = finiteNumber(record.durationMs);
-    const usage = parseTurnUsage(record.usage)
-      ?? parseTurnUsage(record.tokenUsage)
-      ?? turnUsages[turnIndex];
-    if (processItems.length > 0 || durationMs !== null || usage) {
+    if (processItems.length > 0 || durationMs !== null) {
       content.push({
         type: "data-codex-process",
         data: {
           groups: buildCodexProcessGroups(processItems),
           ...(durationMs === null ? {} : { durationMs }),
-          ...(usage ? { usage } : {}),
         } satisfies CodexProcessPayload,
       });
     }
@@ -1733,37 +1789,6 @@ function finiteNumber(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
   return null;
-}
-
-function parseTurnUsage(value: unknown): CodexHistoryTurnUsage | null {
-  const record = asRecord(value);
-  const usage = Object.keys(asRecord(record.last)).length > 0 ? asRecord(record.last) : record;
-  const inputTokens = finiteNumber(usage.inputTokens ?? usage.input_tokens);
-  const cachedInputTokens = finiteNumber(usage.cachedInputTokens ?? usage.cached_input_tokens);
-  const outputTokens = finiteNumber(usage.outputTokens ?? usage.output_tokens);
-  if (inputTokens === null || cachedInputTokens === null || outputTokens === null
-    || inputTokens < 0 || cachedInputTokens < 0 || outputTokens < 0) return null;
-  const reasoningOutputTokens = finiteNumber(usage.reasoningOutputTokens ?? usage.reasoning_output_tokens);
-  return {
-    inputTokens,
-    cachedInputTokens,
-    outputTokens,
-    ...(reasoningOutputTokens === null ? {} : { reasoningOutputTokens }),
-  };
-}
-
-function formatTokenCount(value: number): string {
-  return Math.round(value).toLocaleString("zh-CN");
-}
-
-function formatTokenUsage(usage: CodexHistoryTurnUsage): string {
-  // Match Codex CLI's blended total: uncached input plus output, with cached input shown separately.
-  const freshInputTokens = Math.max(0, usage.inputTokens - usage.cachedInputTokens);
-  const totalTokens = freshInputTokens + usage.outputTokens;
-  const reasoning = usage.reasoningOutputTokens === undefined
-    ? "未知"
-    : formatTokenCount(usage.reasoningOutputTokens);
-  return `总计=${formatTokenCount(totalTokens)} 输入=${formatTokenCount(freshInputTokens)}（+ ${formatTokenCount(usage.cachedInputTokens)} 缓存） 输出=${formatTokenCount(usage.outputTokens)}（推理 ${reasoning}）`;
 }
 
 function formatDuration(milliseconds: number): string {

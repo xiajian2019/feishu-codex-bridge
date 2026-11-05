@@ -105,6 +105,20 @@ describe("Bridge connection state cache", () => {
       markBridgeRequestSuccess();
       expect(getBridgeConnectionSnapshot()).toMatchObject({ failureKind: null, api: "connected", target: "reachable", browserOnline: true });
       expect(bridgeTransportMayBeReachable()).toBe(true);
+
+      // A stale offline hint must not suppress a real transport failure.
+      markBridgeRequestFailure(new TypeError("Failed to fetch"));
+      expect(getBridgeConnectionSnapshot()).toMatchObject({ failureKind: "browser-offline", browserOnline: false });
+      expect(vpnRequests).toBe(2);
+      markBridgeRequestFailure(new TypeError("Failed to fetch"));
+      expect(vpnRequests).toBe(2);
+      markBridgeRequestSuccess();
+      markBridgeRequestFailure(new DOMException("cancelled", "AbortError"));
+      expect(vpnRequests).toBe(2);
+      markBridgeRequestFailure(new Error("unauthorized"), 401);
+      expect(vpnRequests).toBe(2);
+      markBridgeRequestFailure(new TypeError("Failed to fetch"));
+      expect(vpnRequests).toBe(3);
     } finally {
       if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
       else Reflect.deleteProperty(globalThis, "window");

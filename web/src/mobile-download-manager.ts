@@ -73,6 +73,10 @@ export function createMobileDownloadManager() {
             || !["downloads", "share", "browser", "installer"].includes(row.destination ?? "")
             || !["preparing", "queued", "downloading", "paused", "saving", "sharing", "done", "error", "cancelled"].includes(row.state ?? "")
             || !Number.isFinite(row.updatedAt) || row.updatedAt! > Date.now() || Date.now() - row.updatedAt! > 7 * 86_400_000) continue;
+          // Opening the Android installer is the end of the App-update task.
+          // The package installer owns the next step, so do not resurrect a
+          // stale 100% bridge-update.apk row on the next App launch.
+          if (row.destination === "installer" && row.state === "done") continue;
           const nativeId = Number.isSafeInteger(row.nativeId) && row.nativeId! > 0 ? row.nativeId : undefined;
           const active = isMobileDownloadActive(row as MobileDownloadTask);
           const task: MobileDownloadTask = {

@@ -5,7 +5,7 @@
 
 ## 结论
 
-可以复用手机上已经建立的 VPN 网络，Bridge 的工作台和原生 SSH 在路由允许时都能使用它。根据用户确认的需求，当前实现通过现有 OpenVPN for Android 在默认 SSH 主机端口不可达时自动连接；其他可选路线如下：
+可以复用手机上已经建立的 VPN 网络，Bridge 的工作台和原生 SSH 在路由允许时都能使用它。当前实现由 Android 顶层 Activity 全局检查 OpenVPN 状态，在非例外网络尝试连接或恢复；Bridge API 端口探测只用于恢复工作台连接。其他可选路线如下：
 
 1. **先确认手机系统 VPN 是否原生支持这份 OpenVPN 配置**；若支持，在系统中配置连接后，Bridge 直接使用，不需要打包 VPN 内核。
 2. 若系统不支持，但保留截图中的 OpenVPN for Android：先评估通过其外部 API 操作已有的单个配置，在 Bridge 显示状态并由用户点击连接；不需要把 OpenVPN 内核打包进 Bridge。
@@ -39,15 +39,15 @@
 
 当前实现流程：
 
-1. App 启动或回前台后，读取 SSH 默认主机，并使用同主机最近保存的端口或默认端口进行短超时 TCP 探测。默认主机为空或端口可达时不启动 VPN；端口不可达也可能是 SSH 服务未启动。
-2. 只有目标不可达且网络可用时，绑定指定客户端并调用外部 API 的 `prepare`；首次控制授权和系统 VPN 授权由用户在各自界面确认。客户端未安装、无配置或授权失败时显示提示，现有 Bridge/SSH 功能仍可使用。[Android 包可见性](https://developer.android.com/training/package-visibility)
-3. 一个 profile 时自动选择，多个 profile 时由用户选择一次并保存标识。Bridge 不读取或复制 `.ovpn`、证书、私钥、账号密码。检查客户端最近状态：选中的 VPN 已连接或正在连接则等待；其他 VPN 活跃时不自动替换；暂停的选中 VPN 在没有其他活动 VPN 时恢复。
-4. 调用 `startProfile` 或 `resume`，由现有客户端处理认证、LZO、协议和隧道；需要密码或授权时允许其显示原生界面。Bridge 轮询目标端口最多 60 秒，端口可达后通知工作台重试此前失败的连接；没有按下发重放 SSH 输入。自动检查在一次进行中不会重复，前台重试间隔至少 30 秒。
-5. Bridge 不调用外部客户端的 `disconnect()`，页面关闭和 App 退出也不会主动断开 VPN；若要停止 VPN，继续在 OpenVPN 或系统设置中操作。
+1. Android 顶层 Activity 同步连接中心的免 VPN Wi-Fi 列表，启动、前台恢复及网络变化时检查 VPN；顶层 Activity 存活期间每 30 秒复查。自动及摇一摇手动检查均遵守免 VPN Wi-Fi 列表；列表非空而 Wi-Fi 无法识别时先请求精确位置权限，并依赖系统位置服务读取 SSID，仍无法识别则跳过。Bridge 只读取 SSID，不读取 GPS 坐标。Bridge 是否配对、目标 IP 和端口是否可达不决定 VPN 启动。
+2. 绑定指定客户端并调用外部 API 的 `prepare`；首次控制授权和系统 VPN 授权由用户在前台确认。客户端未安装、无配置或授权失败时显示提示，现有 Bridge/SSH 功能仍可使用。[Android 包可见性](https://developer.android.com/training/package-visibility)
+3. 一个 profile 时自动选择，多个 profile 时由用户选择一次并保存标识。Bridge 不读取或复制 `.ovpn`、证书、私钥、账号密码。选中的 VPN 已连接或正在连接则等待；其他 VPN 活跃时不自动替换；暂停的选中 VPN 在没有其他活动 VPN 时恢复；认证失败时停止自动重试并提示用户。
+4. 调用 `startProfile` 或 `resume`，由现有客户端处理认证、协议和隧道；需要密码或授权时允许其显示原生界面。Bridge API 不可达时另外轮询当前 API 端口最多 60 秒，端口可达后通知工作台重试；不会自动重放 SSH 输入。
+5. Bridge 不调用外部客户端的 `disconnect()`；免 VPN Wi-Fi、页面关闭和 App 退出也不会主动断开 VPN。在非例外网络手动断开后，App 运行时会再次尝试连接。顶层 Activity 销毁或 App 进程停止后不再运行检查，后台启动和保活受 Android 系统及 VPN 客户端限制。
 
 用户已有这一客户端，因此不必新增 VPN 应用或重新导入证书；但卸载它后这种方式不能工作，且其维护、后台运行和兼容性仍依赖该客户端。`0.7.64` 的许可文件将用于外部控制的 `remoteExample` 代码标为 Apache 2.0；这不同于把其 VPN 核心移植进 Bridge。实际使用时仍需核对具体复制文件、许可声明及应用分发条件。[该版本许可](https://github.com/schwabe/ics-openvpn/blob/v0.7.64/doc/LICENSE.txt)
 
-外部 API 自动连接已实现，并在 Mac 的 Android 36 ARM64 模拟器中配合官方 OpenVPN for Android 0.7.64 和临时本机测试服务完成授权、自动连接和 TLS 握手；还验证了重开 Bridge 不会断开已有 VPN。测试使用临时证书和模拟目标，不证明公司路由或华为系统行为。下方 8.5–15 人日仅适用于完全内嵌 OpenVPN 的另一条路线。
+此前按目标不可达触发的外部 API 自动连接曾在 Mac 的 Android 36 ARM64 模拟器中配合官方 OpenVPN for Android 0.7.64 和临时本机测试服务完成授权、自动连接和 TLS 握手；还验证了重开 Bridge 不会断开已有 VPN。测试使用临时证书和模拟目标，不证明公司路由或华为系统行为。下方 8.5–15 人日仅适用于完全内嵌 OpenVPN 的另一条路线。
 
 ## 结合当前手机配置的判断
 
@@ -80,7 +80,7 @@
 | 检查项 | 当前情况 | 对方案的影响 |
 | --- | --- | --- |
 | App 外壳 | Capacitor 8.5.3；Android `minSdk=26`、`targetSdk=36`；开发 APK 仅 `arm64-v8a` | 可加原生插件，但必须保留 Android 8+ 兼容性并实际验证其他计划分发的 ABI。 |
-| 现有 SSH | `sshlib:0.5.0`、`termlib:0.3.13`，另保留 sshj 和 Bouncy Castle 路径 | 现有 SSH 连接、原生终端和回退都保留；VPN 是网络层新能力，不替换 SSH。 |
+| 现有 SSH | `sshlib:0.5.0`、`termlib:0.3.13`；Bouncy Castle 用于原生密钥生成 | 当前 SSH 连接和原生终端统一走 ConnectBot；VPN 是网络层新能力，不替换 SSH。 |
 | 现有 VPN | Manifest 没有 VPN service；iOS App entitlements 没有 Network Extension | 若 Bridge 自持 VPN 协议和隧道，需要原生实现；复用手机已建立的 VPN 则不需要新增隧道。 |
 | 现有入口 | 连接中心区分 Bridge 和 SSH / Mac；已配对工作台可返回连接中心 | VPN 应作为这两种连接方式共同使用的独立状态和操作，在 Bridge 不可达时也能打开。 |
 | 外部网络消费者 | Demo 通过系统浏览器打开；Android 普通文件下载使用系统 `DownloadManager` | 如果只允许 Bridge 应用进 VPN，外部浏览器肯定不属于 Bridge 应用，系统下载也需实测其路由；不能只验证 App 内请求。 |

@@ -94,12 +94,8 @@ html.bridge-mobile-app .task-detail-composer { padding-bottom: 7px; }
 .mobile-connect-update-button { min-height: 42px; border: 1px solid var(--line); color: var(--ink); background: var(--card); font-size: 13px; }
 .mobile-connect-update-button:hover { border-color: var(--accent); background: var(--accent-soft); }
 .mobile-connect-update-message { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
-.mobile-environment-backdrop { position: fixed; inset: 0; z-index: 220; display: grid; place-items: center; padding: calc(20px + var(--bridge-safe-top, 0px)) calc(20px + var(--bridge-safe-right, 0px)) calc(20px + var(--bridge-safe-bottom, 0px)) calc(20px + var(--bridge-safe-left, 0px)); background: #081018a8; backdrop-filter: blur(8px); }
+.mobile-environment-backdrop { position: fixed; inset: 0; z-index: 2200; display: grid; place-items: center; padding: calc(20px + var(--bridge-safe-top, 0px)) calc(20px + var(--bridge-safe-right, 0px)) calc(20px + var(--bridge-safe-bottom, 0px)) calc(20px + var(--bridge-safe-left, 0px)); background: #081018a8; backdrop-filter: blur(8px); }
 .mobile-environment-overlay { box-sizing: border-box; display: flex; width: min(100%, 430px); max-height: calc(100dvh - 40px - var(--bridge-safe-height, 0px)); min-height: 0; flex-direction: column; gap: 10px; }
-.mobile-environment-overlay.has-update-banner { height: calc(100dvh - 40px - var(--bridge-safe-height, 0px)); }
-.mobile-environment-overlay.has-update-banner .mobile-environment-dialog { margin: auto 0; }
-.mobile-environment-update { width: 100%; flex: 0 0 auto; }
-.mobile-environment-update .mobile-update-banner { position: static; box-sizing: border-box; width: 100%; }
 .mobile-environment-dialog { box-sizing: border-box; width: 100%; max-height: 100%; min-height: 0; overflow-y: auto; padding: 20px; border: 1px solid var(--line); border-radius: 22px; color: var(--ink); background: var(--card); box-shadow: 0 24px 80px #0008; }
 .mobile-environment-app { margin: 0 0 12px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper); }
 .mobile-environment-app-version { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 12px; }
@@ -114,6 +110,15 @@ html.bridge-mobile-app .task-detail-composer { padding-bottom: 7px; }
 .mobile-environment-versions { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 5px 10px; margin: 0 0 16px; font-size: 11px; line-height: 1.5; }
 .mobile-environment-versions dt { color: var(--muted); }
 .mobile-environment-versions dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.mobile-environment-current { align-items: center; margin-bottom: 6px; }
+.mobile-environment-current dd { display: flex; align-items: center; gap: 6px; line-height: 1.3; }
+.mobile-environment-current dd > span { min-width: 0; overflow-wrap: anywhere; }
+.mobile-environment-vpn-check { display: inline-flex; flex: 0 0 auto; width: auto; min-width: 38px; height: 25px; min-height: 25px; align-items: center; justify-content: center; padding: 2px 8px; border: 1px solid var(--line); border-radius: 7px; color: var(--accent); background: var(--paper); font-size: 11px; font-weight: 750; line-height: 1; }
+.mobile-environment-vpn-check:hover, .mobile-environment-vpn-check:focus-visible { border-color: var(--accent); background: var(--accent-soft); }
+.mobile-environment-vpn-check:disabled { opacity: .6; }
+.mobile-environment-vpn-check[data-loading="true"]::before { width: 10px; height: 10px; margin-right: 5px; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; content: ""; animation: mobile-environment-vpn-spin .7s linear infinite; }
+@keyframes mobile-environment-vpn-spin { to { transform: rotate(360deg); } }
+.mobile-environment-vpn-message { margin: -1px 0 8px; color: var(--muted); font-size: 12px; line-height: 1.35; }
 .mobile-compatibility-notice { padding: 8px 12px; border-bottom: 1px solid var(--line); color: var(--muted); background: var(--paper); font-size: 12px; line-height: 1.5; }
 .mobile-environment-header { display: grid; grid-template-columns: 42px minmax(0, 1fr) 34px; align-items: center; gap: 11px; }
 .mobile-environment-icon { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 13px; color: #c5f3d8; background: #1e4432; font-size: 22px; }
@@ -135,24 +140,10 @@ html.bridge-mobile-app .task-detail-composer { padding-bottom: 7px; }
 .mobile-environment-empty { margin: 0; padding: 16px; border: 1px dashed var(--line); border-radius: 13px; color: var(--muted); font-size: 13px; text-align: center; }
 .mobile-environment-actions { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: 9px; margin-top: 18px; }
 .mobile-environment-actions button { min-height: 46px; }
-.mobile-update-banner { position: fixed; top: calc(var(--bridge-safe-top, 0px) + 10px); right: 12px; left: 12px; z-index: 120; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; align-items: center; padding: 11px 12px; border: 1px solid #6e9bdc; border-radius: 12px; color: #17345e; background: #eaf2ff; box-shadow: 0 8px 24px #0003; }
-.mobile-update-banner > div:first-child { display: grid; min-width: 0; gap: 2px; }
-.mobile-update-banner strong { font-size: 13px; }
-.mobile-update-banner span { overflow: hidden; color: #496889; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.mobile-update-actions { display: flex; gap: 6px; }
-.mobile-update-actions button { min-height: 34px; padding: 5px 10px; border: 1px solid #3775c5; border-radius: 7px; color: #fff; background: #3775c5; font-size: 12px; font-weight: 700; }
-.mobile-update-actions .mobile-update-download { border-color: #9db8dc; color: #27517f; background: transparent; }
-.mobile-update-actions .mobile-update-dismiss { border-color: #9db8dc; color: #27517f; background: transparent; }
-.mobile-update-banner > p { grid-column: 1 / -1; margin: 0; color: #a12935; font-size: 11px; }
-html[data-theme="dark"] .mobile-update-banner { border-color: #5277a8; color: #dceaff; background: #1d2d44; }
-html[data-theme="dark"] .mobile-update-banner span { color: #a9c3e5; }
-html[data-theme="dark"] .mobile-update-actions .mobile-update-dismiss { border-color: #5277a8; color: #c5dcfa; }
 @media (max-width: 480px) {
   .mobile-connect-page { padding-right: 12px; padding-left: 12px; }
   .mobile-connect-card { padding: 22px 18px; border-radius: 21px; }
   .mobile-connect-card h1 { margin-top: 22px; }
-  .mobile-update-banner { grid-template-columns: 1fr; }
-  .mobile-update-actions { justify-content: flex-end; }
 }
 @media (max-width: 360px) {
   .mobile-environment-header h2 { font-size: 17px; }
@@ -164,7 +155,6 @@ html[data-theme="dark"] .mobile-update-actions .mobile-update-dismiss { border-c
 :root[data-theme="dark"] .mobile-connect-scan-copy small { color: #a9c3e5; }
 :root[data-theme="dark"] .mobile-connect-scan-arrow { color: #9fc5f7; }
 :root[data-theme="dark"] .mobile-connect-update-icon { color: #c5f3d8; background: #1e4432; }
-:root[data-theme="dark"] .mobile-update-actions .mobile-update-download { border-color: #5277a8; color: #c5dcfa; background: transparent; }
 :root[data-theme="dark"] .mobile-environment-option.is-active .mobile-environment-option-mark { color: #102319; }
 :root[data-theme="light"] .mobile-connect-error { border-color: #e4a2a9; background: #fff0f1; color: #9c2635; }
 
@@ -221,10 +211,32 @@ html[data-theme="dark"] .mobile-update-actions .mobile-update-dismiss { border-c
 .mobile-connection-center .mobile-connect-code-only[open] summary { margin-bottom: 3px; }
 .mobile-connect-maintenance { margin-top: 10px; border-top: 1px solid var(--line); }
 .mobile-connect-maintenance > summary, .mobile-ssh-advanced > summary { min-height: 36px; padding: 8px 0; color: var(--muted); cursor: pointer; font-size: 12px; font-weight: 600; }
-.mobile-connect-maintenance .mobile-connect-existing-actions { margin: 0; padding: 0; border: 0; }
+.mobile-connect-maintenance .mobile-connect-existing-actions { margin: 8px 0 0; padding: 0; border: 0; }
+.mobile-connection-center .mobile-connect-maintenance .mobile-connect-danger { width: 100%; border: 1px solid #b83f50; border-radius: 9px; color: #fff; background: #c74758; font-size: 13px !important; }
+.mobile-connection-center .mobile-connect-maintenance .mobile-connect-danger:hover:not(:disabled) { border-color: #d75a68; color: #fff; background: #d04d5e; }
 .mobile-connect-maintenance .mobile-connect-update { margin-top: 6px; padding: 10px; border-radius: 10px; }
 .mobile-connect-maintenance .mobile-connect-update-button { width: 100%; margin-top: 10px; }
 .mobile-connect-maintenance .mobile-connect-update-message { margin-top: 8px; }
+.mobile-connect-network-settings { display: grid; box-sizing: border-box; width: 100%; min-width: 0; gap: 9px; margin-top: 8px; padding: 10px; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: color-mix(in srgb, var(--paper) 82%, var(--card)); }
+.mobile-connect-network-heading { display: grid; gap: 2px; }
+.mobile-connect-network-heading strong { font-size: 13px; }
+.mobile-connect-network-heading span, .mobile-connect-network-field small { color: var(--muted); font-size: 11px; line-height: 1.45; }
+.mobile-connect-network-settings form { display: grid; min-width: 0; gap: 8px; }
+.mobile-connect-card .mobile-connect-network-field { display: grid; min-width: 0; align-items: stretch; justify-content: initial; gap: 4px; }
+.mobile-connect-card .mobile-connect-network-field small { overflow: visible; overflow-wrap: anywhere; text-overflow: clip; white-space: normal; }
+.mobile-connect-network-field > span { font-size: 12px; font-weight: 650; }
+.mobile-connect-network-field input { width: 100%; min-width: 0; min-height: 40px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--paper); font: inherit; font-size: 16px; line-height: 1.4; }
+.mobile-connect-network-input-row { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) 34px; gap: 6px; align-items: center; }
+.mobile-connect-network-input-row input { box-sizing: border-box; min-width: 0; height: 40px; min-height: 40px; }
+.mobile-connect-network-read { display: grid; box-sizing: border-box; width: 40px; height: 40px; min-height: 40px; place-items: center; padding: 0; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--paper); }
+.mobile-connect-network-read svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.mobile-connect-network-read:hover:not(:disabled), .mobile-connect-network-read:focus-visible { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.mobile-connect-network-list { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.mobile-connect-network-list li { display: flex; min-height: 34px; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: var(--paper); font-size: 12px; }
+.mobile-connect-network-list li > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-connect-network-list li button { min-height: 26px; padding: 3px 6px; border: 0; color: var(--danger); background: transparent; font-size: 11px; }
+.mobile-connect-network-save { width: 100%; min-height: 40px; padding: 7px 10px; border-radius: 9px; font-size: 13px; }
+.mobile-connect-network-message { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.45; white-space: pre-line; }
 .mobile-ssh-login { margin-top: 0; }
 .mobile-ssh-continue { width: 100%; min-height: 40px; padding: 7px 10px; border-radius: 9px; font-size: 13px; }
 .mobile-ssh-login form { gap: 8px; margin-top: 10px; }

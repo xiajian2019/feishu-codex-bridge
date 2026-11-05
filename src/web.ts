@@ -310,6 +310,7 @@ export class DashboardServer {
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", "http://localhost");
+    this.trackNativeSshApiRequest(request, response, url.pathname);
     if (!this.allowMobileRequest(request, response, url)) return;
     // EventSource cannot set Authorization. Exchange a credential for a short-lived,
     // path-bound ticket instead of putting the device token in the URL.
@@ -1205,6 +1206,30 @@ export class DashboardServer {
     sendJson(response, 404, { error: "not found" });
   }
 
+  private trackNativeSshApiRequest(request: IncomingMessage, response: ServerResponse, pathname: string): void {
+    const logger = this.options.logger;
+    if (!logger || request.headers["x-bridge-client"] !== "android-native-ssh") return;
+    const route = nativeSshLogRoute(pathname);
+    if (!route) return;
+    const started = Date.now();
+    let logged = false;
+    const log = (completed: boolean) => {
+      if (logged) return;
+      logged = true;
+      try {
+        logger.info("android native ssh api", {
+          ...route,
+          method: ["GET", "POST", "PUT", "DELETE"].includes(request.method ?? "") ? request.method : "OTHER",
+          status: response.headersSent ? response.statusCode : null,
+          completed,
+          durationMs: Date.now() - started,
+        });
+      } catch { /* Diagnostics must not disrupt a request. */ }
+    };
+    response.once("finish", () => log(true));
+    response.once("close", () => log(response.writableFinished));
+  }
+
   private async claimPairing(request: IncomingMessage, response: ServerResponse, mobile = false): Promise<void> {
     response.setHeader("Cache-Control", "no-store");
     // The initial claim cannot have an Action Token yet; the one-time code is
@@ -1445,7 +1470,14 @@ export class DashboardServer {
       return;
     }
     try {
-      const result = await history.readThread(homeId, threadId, url.searchParams.get("turns") !== "0");
+      const includeTurns = url.searchParams.get("turns") !== "0";
+      const updatedAtValue = url.searchParams.get("updatedAt");
+      const updatedAt = updatedAtValue !== null && Number.isFinite(Number(updatedAtValue))
+        ? Number(updatedAtValue)
+        : undefined;
+      const result = includeTurns && url.searchParams.get("view") === "summary"
+        ? await history.readThreadSummary(homeId, threadId, updatedAt)
+        : await history.readThread(homeId, threadId, includeTurns, updatedAt);
       sendJson(response, 200, result);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -3738,6 +3770,23 @@ function buildPairingUrl(request: IncomingMessage, code: string): string {
   const url = new URL(`${protocol}://${configuredHost}/`);
   url.hash = "pair=" + encodeURIComponent(code);
   return url.toString();
+}
+
+function nativeSshLogRoute(pathname: string): { route: string; sessionId?: string } | null {
+  const plain = new Set([
+    "/api/codex/homes", "/api/codex/usage", "/api/skills",
+    "/tmux-dashboard/api/codex-homes", "/tmux-dashboard/api/sessions",
+    "/tmux-dashboard/api/sessions/suspended", "/tmux-dashboard/api/attachments/uploads",
+  ]);
+  if (plain.has(pathname)) return { route: pathname };
+  const session = /^\/tmux-dashboard\/api\/sessions\/(?:%24|\$)(\d{1,16})(?:\/(identity|skills|codex-account(?:\/check)?|git-changes(?:\/(?:content|download))?|files(?:\/(?:upload|download))?|resurrect\/save|suspend|resume))?$/i.exec(pathname);
+  if (session) return { route: `/tmux-dashboard/api/sessions/:session${session[2] ? `/${session[2]}` : ""}`, sessionId: `$${session[1]}` };
+  if (/^\/tmux-dashboard\/api\/attachments\/uploads\/[a-f0-9-]{1,64}(?:\/complete)?$/i.test(pathname)) {
+    return { route: pathname.endsWith("/complete")
+      ? "/tmux-dashboard/api/attachments/uploads/:upload/complete"
+      : "/tmux-dashboard/api/attachments/uploads/:upload" };
+  }
+  return null;
 }
 
 function firstHeaderValue(value: string | string[] | undefined): string | undefined {

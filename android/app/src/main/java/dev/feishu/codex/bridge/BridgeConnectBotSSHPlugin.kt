@@ -96,15 +96,20 @@ class BridgeConnectBotSSHPlugin : Plugin() {
     @PluginMethod
     fun setUpdateBanner(call: PluginCall) {
         val visible = call.getBoolean("visible", false) ?: false
+        val progressPercent = call.getDouble("progressPercent")?.let { value ->
+            if (value >= 0.0 && value <= 100.0) value else null
+        }
         val state = if (visible) BridgeAppUpdateBannerState(
             detail = call.getString("detail").orEmpty().take(200),
             status = call.getString("status").orEmpty().take(240),
             error = call.getString("error").orEmpty().take(300),
             busy = call.getBoolean("busy", false) ?: false,
             downloaded = call.getBoolean("downloaded", false) ?: false,
+            progress = progressPercent?.div(100.0)?.toFloat(),
+            progressText = call.getString("progressText").orEmpty().take(120),
         ) else null
         activity.runOnUiThread {
-            (activity as? MainActivity)?.setAppUpdateBanner(state)
+            (activity as? BridgeConnectBotSshActivity)?.setAppUpdateBanner(state)
             call.resolve()
         }
     }

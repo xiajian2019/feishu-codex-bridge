@@ -95,13 +95,15 @@ internal fun BridgeSshTmuxPicker(
                         }
                         if (visibleSuspended.isNotEmpty()) {
                             item { Text("已挂起", Modifier.padding(start = 12.dp, top = 8.dp), style = MaterialTheme.typography.titleSmall) }
-                            itemsIndexed(visibleSuspended, key = { _, item -> "suspended:${item.id}:${item.createdAt}" }) { _, item ->
+                            itemsIndexed(visibleSuspended, key = { _, item -> "suspended:${item.id}:${item.createdAt}:${item.source}" }) { _, item ->
                                 Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
                                     Column(Modifier.weight(1f)) {
-                                        Text(item.name, style = MaterialTheme.typography.titleSmall)
+                                        Text(item.name + if (item.source == "ssh-fallback") " · SSH 降级快照" else "", style = MaterialTheme.typography.titleSmall)
                                         Text(item.cwd, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        if (item.uncertain) Text("恢复结果未知，请先检查 tmux。", color = MaterialTheme.colorScheme.error,
+                                            style = MaterialTheme.typography.bodySmall)
                                     }
-                                    TextButton(onClick = { onRestore(item) }, enabled = !refreshing) { Text("恢复") }
+                                    TextButton(onClick = { onRestore(item) }, enabled = !refreshing && !item.uncertain) { Text("恢复") }
                                 }
                                 HorizontalDivider()
                             }

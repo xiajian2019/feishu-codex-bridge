@@ -22,7 +22,6 @@ export default defineConfig({
   resolve: {
     alias: [
       { find: /^\.\/mobile-runtime\.js$/, replacement: fileURLToPath(new URL("./src/mobile-runtime.browser.ts", import.meta.url)) },
-      { find: /^\.\/ssh-native\.js$/, replacement: fileURLToPath(new URL("./src/ssh-native.browser.ts", import.meta.url)) },
       { find: /^\.\/ssh-connectbot-native\.js$/, replacement: fileURLToPath(new URL("./src/ssh-connectbot-native.browser.ts", import.meta.url)) },
       { find: /^\.\/native-theme\.js$/, replacement: fileURLToPath(new URL("./src/native-theme.browser.ts", import.meta.url)) },
     ],

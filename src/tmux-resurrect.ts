@@ -383,8 +383,13 @@ function ensureSnapshotFromGlobal(status: TmuxResurrectStatus, sessionName: stri
   return writeSessionSnapshot(status.saveDirectory, sessionName, globalSnapshot.path);
 }
 
-async function saveSession(sessionName: string): Promise<TmuxResurrectSessionActionResult> {
+function statusForDirectory(saveDirectory?: string): TmuxResurrectStatus {
   const status = getTmuxResurrectStatus();
+  return saveDirectory ? { ...status, saveDirectory, sessionSnapshotDirectory: join(saveDirectory, SESSION_SNAPSHOT_DIRECTORY_NAME) } : status;
+}
+
+async function saveSession(sessionName: string, saveDirectory?: string): Promise<TmuxResurrectSessionActionResult> {
+  const status = statusForDirectory(saveDirectory);
   ensureInstalled(status);
   const grouped = await runTmux(["display-message", "-p", "-t", `${sessionName}:`, "#{session_grouped}"]);
   if (grouped === "1") throw new Error("暂不支持保存 tmux grouped Session。 ");
@@ -414,8 +419,8 @@ async function saveSession(sessionName: string): Promise<TmuxResurrectSessionAct
   } finally { rmSync(temp, { recursive: true, force: true }); }
 }
 
-async function restoreSession(sessionName: string): Promise<TmuxResurrectSessionActionResult> {
-  const status = getTmuxResurrectStatus();
+async function restoreSession(sessionName: string, saveDirectory?: string): Promise<TmuxResurrectSessionActionResult> {
+  const status = statusForDirectory(saveDirectory);
   ensureInstalled(status);
   if (await tmuxSessionExists(sessionName)) {
     throw new Error(`Session「${sessionName}」仍在运行，请直接打开它；恢复只针对不存在的 Session。`);
@@ -426,8 +431,8 @@ async function restoreSession(sessionName: string): Promise<TmuxResurrectSession
   return { action: "restore", sessionName, snapshot, output };
 }
 
-async function restorePendingSessions(activeSessionNames: string[], liveSessionNames: string[]): Promise<TmuxResurrectPendingRestoreResult> {
-  const status = getTmuxResurrectStatus();
+async function restorePendingSessions(activeSessionNames: string[], liveSessionNames: string[], saveDirectory?: string): Promise<TmuxResurrectPendingRestoreResult> {
+  const status = statusForDirectory(saveDirectory);
   if (!status.installed) return { restored: [], failures: [] };
   const live = new Set(liveSessionNames);
   const restored: string[] = [];
@@ -437,7 +442,7 @@ async function restorePendingSessions(activeSessionNames: string[], liveSessionN
     const snapshot = ensureSnapshotFromGlobal(status, sessionName);
     if (!snapshot) continue;
     try {
-      await restoreSession(sessionName);
+      await restoreSession(sessionName, saveDirectory);
       restored.push(sessionName);
     } catch (error) {
       failures.push({ sessionName, error: error instanceof Error ? error.message : String(error) });
@@ -446,24 +451,30 @@ async function restorePendingSessions(activeSessionNames: string[], liveSessionN
   return { restored, failures };
 }
 
-function snapshotForSession(sessionName: string): TmuxResurrectSessionSnapshot | null {
-  const status = getTmuxResurrectStatus();
+function snapshotForSession(sessionName: string, saveDirectory?: string): TmuxResurrectSessionSnapshot | null {
+  const status = statusForDirectory(saveDirectory);
   return snapshotForSessionInDirectory(status.saveDirectory, sessionName);
 }
 
-function disableSession(sessionName: string): void {
-  const status = getTmuxResurrectStatus();
+function disableSession(sessionName: string, saveDirectory?: string): void {
+  const status = statusForDirectory(saveDirectory);
   const directory = snapshotDirectoryForSession(status.saveDirectory, sessionName);
   rmSync(directory, { recursive: true, force: true });
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   writeFileSync(disabledFileForSession(status.saveDirectory, sessionName), "disabled\n", { encoding: "utf8", mode: 0o600 });
 }
 
-export const tmuxResurrectController: TmuxResurrectController = {
-  status: getTmuxResurrectStatus,
-  saveSession: (sessionName) => withSessionActionLock(() => saveSession(sessionName)),
-  restoreSession: (sessionName) => withSessionActionLock(() => restoreSession(sessionName)),
-  restorePendingSessions: (activeSessionNames, liveSessionNames) => withSessionActionLock(() => restorePendingSessions(activeSessionNames, liveSessionNames)),
-  snapshotForSession,
-  disableSession,
-};
+/** Use a separate snapshot root for SSH fallback, without changing Web snapshots. */
+export function createTmuxResurrectController(saveDirectory?: string): TmuxResurrectController {
+  return {
+    status: () => statusForDirectory(saveDirectory),
+    saveSession: (sessionName) => withSessionActionLock(() => saveSession(sessionName, saveDirectory)),
+    restoreSession: (sessionName) => withSessionActionLock(() => restoreSession(sessionName, saveDirectory)),
+    restorePendingSessions: (activeSessionNames, liveSessionNames) =>
+      withSessionActionLock(() => restorePendingSessions(activeSessionNames, liveSessionNames, saveDirectory)),
+    snapshotForSession: (sessionName) => snapshotForSession(sessionName, saveDirectory),
+    disableSession: (sessionName) => disableSession(sessionName, saveDirectory),
+  };
+}
+
+export const tmuxResurrectController: TmuxResurrectController = createTmuxResurrectController();

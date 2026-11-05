@@ -99,6 +99,25 @@ async function fixture(options: { allowLocalRequests?: boolean; now?: () => numb
 }
 
 describe("Dashboard write and connection authorization", () => {
+  it("rejects a terminal connection for an older Session incarnation", async () => {
+    const f = await fixture();
+    const device = await f.pair();
+    const status = await new Promise<number>((resolve, reject) => {
+      const socket = new WebSocket(f.url.replace("http:", "ws:") + "/tmux-dashboard/terminal?session=%2441&createdAt=999", {
+        headers: { Cookie: device.cookie, Origin: f.url },
+      });
+      socket.on("error", reject);
+      socket.once("open", () => { socket.terminate(); resolve(101); });
+      socket.once("unexpected-response", (_request, response) => {
+        const code = response.statusCode ?? 0;
+        response.resume();
+        response.once("end", () => { socket.terminate(); resolve(code); });
+      });
+    });
+    expect(status).toBe(409);
+    expect(f.terminals).toHaveLength(0);
+  });
+
   it("delivers the answer, prompt-back and warning keys directly to the attached terminal", async () => {
     const f = await fixture();
     const device = await f.pair();

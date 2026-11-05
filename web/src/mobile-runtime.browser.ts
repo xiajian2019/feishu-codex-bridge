@@ -14,6 +14,9 @@ export function openMobileConnectionSettings(_server?: string, _error?: string):
 export async function initializeMobileRuntime(): Promise<void> {}
 export async function checkMobileConnection(): Promise<boolean> { return false; }
 export async function requestMobileVpnRecovery(): Promise<boolean> { return false; }
+export async function readCurrentWifiSsid(): Promise<string | null> { return null; }
+export async function checkAndConnectMobileVpn(): Promise<string> { throw new Error("手动连接 VPN 仅支持 Android App。"); }
+export async function applyConfiguredBridgeNetworkSettings(): Promise<void> {}
 export async function mobileStreamUrl(path: string): Promise<string> { return new URL(path, window.location.origin).toString(); }
 async function appOnly(): Promise<never> { throw new Error("此功能仅在手机 App 中可用。"); }
 export const pairMobileConnection = appOnly;

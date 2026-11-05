@@ -378,6 +378,9 @@ pre {
 .codex-history-composer-slot { flex: 0 0 auto; }
 .codex-history-composer-slot[hidden] { display: none; }
 .codex-thread-transcript { display: flex; min-height: 0; flex: 1; flex-direction: column; overflow: hidden; }
+.codex-history-transcript-toolbar { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 2px; color: var(--muted); font-size: 11px; line-height: 1.35; }
+.codex-history-transcript-toolbar > span { min-width: 0; flex: 1; }
+.codex-history-transcript-toolbar > button { flex: 0 0 auto; padding: 5px 8px; font-size: 11px; }
 .codex-thread-transcript > .empty { padding: 30px 18px; }
 .codex-thread-error { display: flex; min-width: 0; align-items: flex-start; gap: 8px; margin: 0; padding: 8px 10px; border: 1px solid #6b4144; border-radius: 9px; color: #f0c9c9; background: #2a1d20; font-size: 12px; line-height: 1.45; }
 .codex-thread-error > span { min-width: 0; flex: 1; overflow-wrap: anywhere; }
@@ -898,6 +901,10 @@ pre {
 .dashboard-terminal-frame { position: relative; display: flex; flex: 1; min-height: 0; background: #10141a; }
 .dashboard-terminal-copy-selection { position: absolute; z-index: 9; min-height: 36px; padding: 0 11px; border: 1px solid #4e806b; border-radius: 8px; color: #e0f5e9; background: #24533f; box-shadow: 0 4px 14px #0005; font-size: 12px; touch-action: manipulation; }
 .dashboard-terminal-host { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
+.dashboard-terminal-layer { position: absolute; inset: 0; min-width: 0; min-height: 0; overflow: hidden; }
+.dashboard-terminal-layer.is-history { opacity: 0; pointer-events: none; background: var(--tmux-terminal-render-background, #10141a); }
+.dashboard-terminal-layer.is-history[data-active="true"] { opacity: 1; pointer-events: auto; }
+.dashboard-terminal-return-live { position: absolute; z-index: 8; right: 8px; top: 6px; min-height: 32px; padding: 0 9px; border: 1px solid #4e806b; border-radius: 7px; color: #e0f5e9; background: #24533f; font-size: 12px; cursor: pointer; }
 .dashboard-terminal-selection-handle { position: absolute; z-index: 10; width: 28px; height: 28px; padding: 0; transform: translate(-50%, -50%); border: 0; border-radius: 50%; background: transparent; touch-action: none; -webkit-tap-highlight-color: transparent; }
 .dashboard-terminal-selection-handle[hidden] { display: none; }
 .dashboard-terminal-selection-handle::before { position: absolute; top: 50%; left: 50%; width: 13px; height: 13px; transform: translate(-50%, -50%); border: 2px solid #10141a; border-radius: 50%; background: #79dca9; box-shadow: 0 1px 5px #0008; content: ""; }
@@ -1061,6 +1068,10 @@ pre {
 .dashboard-image-lightbox-content { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; touch-action: pan-y pinch-zoom; -webkit-overflow-scrolling: touch; }
 .dashboard-image-lightbox-content img { display: block; flex: 0 0 auto; width: auto; height: auto; max-width: 100%; max-height: none; margin: auto; object-fit: contain; border-radius: 8px; box-shadow: 0 18px 60px #000b; }
 .dashboard-image-lightbox-content > span { margin: auto; color: #fff; }
+.dashboard-image-lightbox-navigation { position: absolute; z-index: 1; top: max(14px, var(--bridge-safe-top, env(safe-area-inset-top, 0px))); left: max(14px, env(safe-area-inset-left, 0px)); display: flex; height: 42px; align-items: center; gap: 8px; color: #fff; }
+.dashboard-image-lightbox-navigation button { display: grid; width: 42px; min-width: 42px; height: 42px; min-height: 42px; place-items: center; padding: 0; border: 1px solid #fff6; border-radius: 50%; color: #fff; background: #202124e8; font-size: 27px; line-height: 1; }
+.dashboard-image-lightbox-navigation button:hover:not(:disabled) { background: #3b414a; }
+.dashboard-image-lightbox-navigation button:disabled { opacity: .4; }
 .dashboard-image-lightbox-close { position: absolute; z-index: 1; top: max(14px, var(--bridge-safe-top, env(safe-area-inset-top, 0px))); right: max(14px, env(safe-area-inset-right)); display: grid; width: 42px; min-width: 42px; height: 42px; min-height: 42px; place-items: center; padding: 0; border: 1px solid #fff6; border-radius: 50%; color: #fff; background: #202124e8; font-size: 27px; line-height: 1; }
 .dashboard-image-lightbox-close:hover { background: #3b414a; }
 .dashboard-modal-backdrop { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; padding: 14px; background: #070a0dcc; backdrop-filter: blur(4px); }

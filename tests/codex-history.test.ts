@@ -8,6 +8,7 @@ import { DatabaseSync } from "../src/sqlite.js";
 import {
   CodexHistoryService,
   discoverCodexHomePaths,
+  type CodexHistoryDetailCacheStore,
   type CodexHistoryHome,
   type CodexHistoryUsageSnapshotStore,
 } from "../src/codex-history.js";
@@ -19,6 +20,86 @@ import type {
 } from "../src/codex-interactive.js";
 
 describe("CodexHistoryService", () => {
+  it("reads all text conclusions without process replay and reuses the persisted snapshot", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bridge-codex-history-summary-"));
+    await writeFile(join(directory, "state_5.sqlite"), "");
+    const cache = new Map<string, { sourceUpdatedAt: number | null; payloadJson: string; cachedAt: string }>();
+    const detailCacheStore: CodexHistoryDetailCacheStore = {
+      getCodexHistoryDetailCache: (homeId, threadId, view) => cache.get(`${homeId}:${threadId}:${view}`) ?? null,
+      saveCodexHistoryDetailCache: (homeId, threadId, view, sourceUpdatedAt, payloadJson) => {
+        cache.set(`${homeId}:${threadId}:${view}`, { sourceUpdatedAt, payloadJson, cachedAt: new Date().toISOString() });
+      },
+      deleteCodexHistoryDetailCache: (homeId, threadId) => {
+        for (const key of cache.keys()) if (key.startsWith(`${homeId}:${threadId}:`)) cache.delete(key);
+      },
+    };
+    let metadataReads = 0;
+    let latestTurnReads = 0;
+    try {
+      const service = new CodexHistoryService({
+        executable: "unused-in-test",
+        environment: { CODEX_HOME: directory },
+        detailCacheStore,
+        createClient: () => ({
+          listThreads: async () => ({ data: [], nextCursor: null, backwardsCursor: null }),
+          readThread: async (threadId, includeTurns) => {
+            metadataReads += 1;
+            return {
+              thread: {
+                id: threadId,
+                name: "摘要标题",
+                updatedAt: 42,
+                turns: includeTurns ? [
+                  { id: "old-turn", items: [{ type: "agentMessage", text: "旧回放" }] },
+                  { id: "latest-turn", items: [{ type: "agentMessage", text: "最新结论" }] },
+                ] : [],
+              },
+            };
+          },
+          listThreadTurns: async (_threadId, params) => {
+            expect(params).toMatchObject({ limit: 200, sortDirection: "asc", itemsView: "summary" });
+            latestTurnReads += 1;
+            return {
+              data: params?.cursor
+                ? [{ id: "latest-turn", items: [{ type: "agentMessage", text: "最新结论" }], durationMs: 2_000 }]
+                : [{ id: "old-turn", items: [{ type: "agentMessage", text: "旧结论" }], durationMs: 1_000 }],
+              nextCursor: params?.cursor ? null : "page-2",
+              backwardsCursor: null,
+            };
+          },
+          close: async () => undefined,
+        }),
+      });
+      const homeId = service.listHomes()[0]!.id;
+      const first = await service.readThreadSummary(homeId, "thread-1", 42);
+      expect(first.view).toBe("summary");
+      expect(first.thread.turns).toHaveLength(2);
+      expect(first.thread.turns).toEqual([
+        { id: "old-turn", items: [{ type: "agentMessage", text: "旧结论" }], durationMs: 1_000 },
+        { id: "latest-turn", items: [{ type: "agentMessage", text: "最新结论" }], durationMs: 2_000 },
+      ]);
+      expect(metadataReads).toBe(1);
+      expect(latestTurnReads).toBe(2);
+
+      const second = await service.readThreadSummary(homeId, "thread-1", 42);
+      expect(second.thread.turns).toHaveLength(2);
+      expect(metadataReads).toBe(1);
+      expect(latestTurnReads).toBe(2);
+
+      const full = await service.readThread(homeId, "thread-1", true, 42);
+      expect(full.view).toBe("full");
+      expect(full.thread.turns).toHaveLength(2);
+      expect(metadataReads).toBe(2);
+
+      await service.readThread(homeId, "thread-1", false);
+      const cachedFull = await service.readThread(homeId, "thread-1", true, 42);
+      expect(cachedFull.thread.turns).toHaveLength(2);
+      expect(metadataReads).toBe(3);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("reads the normal history list from Codex state SQLite without starting app-server", async () => {
     const directory = await mkdtemp(join(tmpdir(), "bridge-codex-history-sqlite-"));
     const databasePath = join(directory, "state_5.sqlite");

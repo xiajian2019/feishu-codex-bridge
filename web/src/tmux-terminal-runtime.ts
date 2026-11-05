@@ -16,6 +16,9 @@ export type TmuxTerminalControlMessage = {
 
 export type TmuxTerminalTransportEvent =
   | { type: "output"; data: string | Uint8Array; connectionId: number }
+  | { type: "history"; data: string; connectionId: number }
+  | { type: "history-error"; connectionId: number }
+  | { type: "history-ready"; connectionId: number }
   | { type: "control"; message: TmuxTerminalControlMessage; everAttached: boolean }
   | { type: "status"; status: TmuxTerminalTransportStatus }
   | { type: "closed" };
@@ -32,11 +35,12 @@ const runtimeGlobal = globalThis as RuntimeGlobal;
 const transports = runtimeGlobal.__feishuCodexBridgeTmuxTerminalTransports
   ?? (runtimeGlobal.__feishuCodexBridgeTmuxTerminalTransports = new Map());
 
-export function getTmuxTerminalTransport(sessionId: string): TmuxTerminalTransport {
-  const existing = transports.get(sessionId);
+export function getTmuxTerminalTransport(sessionId: string, createdAt?: number): TmuxTerminalTransport {
+  const sessionKey = `${sessionId}\u0000${createdAt ?? ""}`;
+  const existing = transports.get(sessionKey);
   if (existing && !existing.isDisposed()) return existing;
-  const transport = new TmuxTerminalTransport(sessionId);
-  transports.set(sessionId, transport);
+  const transport = new TmuxTerminalTransport(sessionKey);
+  transports.set(sessionKey, transport);
   return transport;
 }
 
@@ -55,8 +59,10 @@ export class TmuxTerminalTransport {
   private replayChunks: Array<string | Uint8Array> = [];
   private replayBytes = 0;
   private replayComplete = true;
+  private history: string | null = null;
+  private historyProtocol = false;
 
-  public constructor(private readonly sessionId: string) {
+  public constructor(private readonly sessionKey: string) {
     window.addEventListener("online", this.reconnectNow);
     window.addEventListener("offline", this.markOffline);
     window.addEventListener("bridge:api-reachable", this.reconnectNow);
@@ -80,7 +86,9 @@ export class TmuxTerminalTransport {
     if (!this.replayComplete) {
       this.forceReconnect();
     } else {
+      if (this.historyProtocol) listener({ type: "history-ready", connectionId: this.connectionId });
       for (const chunk of this.replayChunks) listener({ type: "output", data: chunk, connectionId: this.connectionId });
+      if (this.history !== null) listener({ type: "history", data: this.history, connectionId: this.connectionId });
     }
     this.connect();
     return () => {
@@ -142,6 +150,8 @@ export class TmuxTerminalTransport {
     this.replayChunks = [];
     this.replayBytes = 0;
     this.replayComplete = true;
+    this.history = null;
+    this.historyProtocol = false;
     this.emit({ type: "status", status: this.everAttached ? "RECONNECTING" : "CONNECTING" });
     const openSocket = (value: string): void => {
       if (this.disposed || requestGeneration !== this.connectionGeneration) return;
@@ -199,7 +209,23 @@ export class TmuxTerminalTransport {
 
   private handleTextMessage(data: string): void {
     try {
-      const message = JSON.parse(data) as TmuxTerminalControlMessage;
+      const message = JSON.parse(data) as TmuxTerminalControlMessage & { content?: unknown };
+      if (message.type === "terminal-history-ready") {
+        this.historyProtocol = true;
+        this.emit({ type: "history-ready", connectionId: this.connectionId });
+        return;
+      }
+      if (message.type === "terminal-history") {
+        if (typeof message.content === "string") {
+          this.history = message.content;
+          this.emit({ type: "history", data: message.content, connectionId: this.connectionId });
+        }
+        return;
+      }
+      if (message.type === "terminal-history-error") {
+        this.emit({ type: "history-error", connectionId: this.connectionId });
+        return;
+      }
       if (message.type === "submission-result" || message.type === "error" || message.type === "input-error" || message.type === "exit") {
         this.emit({ type: "control", message, everAttached: this.everAttached });
         return;
@@ -285,6 +311,6 @@ export class TmuxTerminalTransport {
     const previousSocket = this.socket;
     this.socket = null;
     if (previousSocket && previousSocket.readyState < WebSocket.CLOSING) previousSocket.close(1000, "client released");
-    if (transports.get(this.sessionId) === this) transports.delete(this.sessionId);
+    if (transports.get(this.sessionKey) === this) transports.delete(this.sessionKey);
   }
 }

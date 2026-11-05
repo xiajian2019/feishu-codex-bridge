@@ -168,7 +168,7 @@ export interface CodexHistoryDetailResponse {
   thread: CodexThread;
   imageAttachments?: CodexHistoryTurnAttachments[];
   models?: CodexHistoryModelOption[];
-  turnUsages?: CodexHistoryTurnUsageRecord[];
+  view?: "summary" | "full";
 }
 
 export type CodexHistoryReasoningEffort = string;
@@ -183,18 +183,6 @@ export interface CodexHistoryModelOption {
     reasoningEffort: CodexHistoryReasoningEffort;
     description: string;
   }>;
-}
-
-export interface CodexHistoryTurnUsage {
-  inputTokens: number;
-  cachedInputTokens: number;
-  outputTokens: number;
-  reasoningOutputTokens?: number;
-}
-
-export interface CodexHistoryTurnUsageRecord {
-  turnIndex: number;
-  usage: CodexHistoryTurnUsage;
 }
 
 export interface CodexHistoryAttachment {
@@ -245,7 +233,6 @@ export interface CodexHistoryUpdateEvent {
   type: string;
   item?: unknown;
   message?: string;
-  usage?: CodexHistoryTurnUsage;
 }
 
 export interface CodexHistoryUpdatesResponse {
@@ -255,7 +242,6 @@ export interface CodexHistoryUpdatesResponse {
   state: CodexHistoryRunState;
   cursor: number;
   events: CodexHistoryUpdateEvent[];
-  usage?: CodexHistoryTurnUsage;
   finalResponse?: string;
   error?: string;
   attachments?: CodexHistoryAttachment[];

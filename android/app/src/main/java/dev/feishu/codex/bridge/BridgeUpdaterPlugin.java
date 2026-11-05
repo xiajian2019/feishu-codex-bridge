@@ -10,6 +10,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.Signature;
 import android.database.Cursor;
 import android.net.Uri;
 import android.media.MediaScannerConnection;
@@ -37,9 +38,13 @@ import java.io.FileOutputStream;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 import java.security.MessageDigest;
+import java.util.HashSet;
+import java.util.Set;
 
 /** Downloads authenticated files and opens downloaded APKs in Android's package installer. */
 @CapacitorPlugin(
@@ -348,7 +353,8 @@ public class BridgeUpdaterPlugin extends Plugin {
         String rawUrl = call.getString("url");
         String token = call.getString("token");
         String suppliedName = call.getString("fileName");
-        if (rawUrl == null || token == null || suppliedName == null) {
+        String serverOrigin = call.getString("serverOrigin");
+        if (rawUrl == null || token == null || suppliedName == null || serverOrigin == null) {
             call.reject("下载参数不完整。", "INVALID_DOWNLOAD_REQUEST");
             return;
         }
@@ -356,6 +362,12 @@ public class BridgeUpdaterPlugin extends Plugin {
         if (!("http".equals(url.getScheme()) || "https".equals(url.getScheme())) || url.getUserInfo() != null
             || !token.matches("[A-Za-z0-9_-]{40,128}")) {
             call.reject("下载地址或授权信息无效。", "INVALID_DOWNLOAD_REQUEST");
+            return;
+        }
+        try {
+            requireAuthorizedDownloadOrigin(serverOrigin, rawUrl, token);
+        } catch (Exception error) {
+            call.reject("下载地址必须属于当前已配对的 Bridge。", "INVALID_DOWNLOAD_REQUEST");
             return;
         }
         String safeName = sanitizeFileName(suppliedName);
@@ -464,6 +476,29 @@ public class BridgeUpdaterPlugin extends Plugin {
         return mimeType == null ? "application/octet-stream" : mimeType;
     }
 
+    /**
+     * Bind a DownloadManager request to the currently paired Bridge origin.
+     * The URL and origin both come from JavaScript, so the stored native token
+     * is also compared before an Authorization header is accepted.
+     * HTTP remains valid for trusted LAN deployments; this check is about
+     * authority and token routing, not a blanket HTTPS requirement.
+     */
+    private void requireAuthorizedDownloadOrigin(String rawOrigin, String rawUrl, String token) throws Exception {
+        String origin = BridgeSecureCredentialStore.normalizeServerOrigin(rawOrigin);
+        URI url = new URI(rawUrl);
+        if (url.getUserInfo() != null || url.getFragment() != null || url.getHost() == null
+            || url.getRawAuthority() == null) throw new IOException("invalid download URL");
+        String actualOrigin = BridgeSecureCredentialStore.normalizeServerOrigin(
+            url.getScheme() + "://" + url.getRawAuthority());
+        if (!origin.equals(actualOrigin)) throw new IOException("download origin mismatch");
+
+        String stored = new BridgeSecureCredentialStore(getContext()).get(origin);
+        if (stored == null || !MessageDigest.isEqual(
+            stored.getBytes(StandardCharsets.UTF_8), token.getBytes(StandardCharsets.UTF_8))) {
+            throw new IOException("download credential mismatch");
+        }
+    }
+
     @PluginMethod
     public void verifyApk(PluginCall call) {
         getBridge().execute(() -> {
@@ -497,14 +532,44 @@ public class BridgeUpdaterPlugin extends Plugin {
         for (byte value : digest.digest()) actual.append(String.format(java.util.Locale.ROOT, "%02x", value & 0xff));
         if (!hash.equals(actual.toString())) throw new IOException("更新包摘要不符，请重新下载。");
         PackageManager manager = getContext().getPackageManager();
-        PackageInfo archive = manager.getPackageArchiveInfo(file.getPath(), 0);
-        PackageInfo installed = manager.getPackageInfo(getContext().getPackageName(), 0);
+        int signingFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+            ? PackageManager.GET_SIGNING_CERTIFICATES : PackageManager.GET_SIGNATURES;
+        PackageInfo archive = manager.getPackageArchiveInfo(file.getPath(), signingFlags);
+        PackageInfo installed = manager.getPackageInfo(getContext().getPackageName(), signingFlags);
         long archiveCode = archive == null ? -1 : Build.VERSION.SDK_INT >= 28 ? archive.getLongVersionCode() : archive.versionCode;
         long installedCode = Build.VERSION.SDK_INT >= 28 ? installed.getLongVersionCode() : installed.versionCode;
         if (archive == null || !getContext().getPackageName().equals(archive.packageName) || archiveCode != version
             || !java.util.Objects.equals(archive.versionName, call.getString("versionName"))) throw new IOException("更新包的包名或版本不符，请重新检查更新。");
+        if (!hasMatchingSigner(archive, installed)) throw new IOException("更新包签名与当前 App 不一致，已停止安装。");
         if (archiveCode < installedCode) throw new IOException("该更新包版本低于已安装版本，已停止安装。");
         return file;
+    }
+
+    private boolean hasMatchingSigner(PackageInfo archive, PackageInfo installed) throws Exception {
+        Set<String> archiveSigners = signerDigests(archive);
+        Set<String> installedSigners = signerDigests(installed);
+        for (String signer : archiveSigners) if (installedSigners.contains(signer)) return true;
+        return false;
+    }
+
+    private Set<String> signerDigests(PackageInfo info) throws Exception {
+        Signature[] signatures;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && info.signingInfo != null) {
+            signatures = info.signingInfo.hasMultipleSigners()
+                ? info.signingInfo.getApkContentsSigners()
+                : info.signingInfo.getSigningCertificateHistory();
+        } else {
+            signatures = info.signatures;
+        }
+        if (signatures == null || signatures.length == 0) throw new IOException("missing APK signer");
+        Set<String> result = new HashSet<>();
+        for (Signature signature : signatures) {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(signature.toByteArray());
+            StringBuilder hex = new StringBuilder(digest.length * 2);
+            for (byte value : digest) hex.append(String.format(java.util.Locale.ROOT, "%02x", value & 0xff));
+            result.add(hex.toString());
+        }
+        return result;
     }
 
     @PluginMethod

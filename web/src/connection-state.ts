@@ -30,6 +30,7 @@ let snapshot: BridgeConnectionSnapshot = {
 };
 let installed = false;
 const apiUnreachableListeners = new Set<(snapshot: BridgeConnectionSnapshot) => void>();
+let transportFailureNotified = false;
 
 function publish(next: BridgeConnectionSnapshot): void {
   snapshot = next;
@@ -43,11 +44,12 @@ function installBrowserListeners(): void {
     publish({ ...snapshot, browserOnline: false, api: "unreachable", failureKind: "browser-offline", target: "unknown", lastError: "当前设备已离线。页面会保留最近数据。" });
   });
   window.addEventListener("online", () => {
+    transportFailureNotified = false;
     publish({ ...snapshot, browserOnline: true, api: "checking", failureKind: null, target: "unknown", lastError: null });
   });
   window.addEventListener("bridge:mobile-vpn-target-unreachable", () => {
     if (!snapshot.browserOnline) return;
-    publish({ ...snapshot, api: "unreachable", failureKind: "target-unreachable", target: "unreachable", lastError: "目标主机端口不可达，正在尝试 VPN。" });
+    publish({ ...snapshot, api: "unreachable", failureKind: "target-unreachable", target: "unreachable", lastError: "目标主机端口不可达，请检查网络和 VPN。" });
   });
   window.addEventListener("bridge:mobile-vpn-reachable", () => {
     publish({ ...snapshot, browserOnline: true, api: "checking", failureKind: null, target: "reachable", lastError: null });
@@ -91,6 +93,7 @@ export function markBridgeRequestStart(): void {
 }
 
 export function markBridgeRequestSuccess(): void {
+  transportFailureNotified = false;
   publish({
     ...snapshot,
     // The request itself reached Bridge. This corrects stale WebView online hints.
@@ -127,7 +130,13 @@ export function markBridgeRequestFailure(error: unknown, status?: number): void 
     lastFailureAt: Date.now(),
     lastError: error instanceof Error ? error.message : String(error),
   } satisfies BridgeConnectionSnapshot;
-  const notifyVpn = failureKind === "api-network-unreachable" && snapshot.failureKind !== failureKind;
+  // WebView's online hint can be stale even with a usable underlying network.
+  // Leave that hint in the UI state, but send transport failures to Android,
+  // which checks the real network and Wi-Fi policy before starting a VPN.
+  const cancelled = error instanceof DOMException && error.name === "AbortError";
+  if (status !== undefined) transportFailureNotified = false;
+  const notifyVpn = status === undefined && !cancelled && !transportFailureNotified;
+  if (notifyVpn) transportFailureNotified = true;
   publish(next);
   if (notifyVpn) {
     for (const listener of apiUnreachableListeners) listener(next);
