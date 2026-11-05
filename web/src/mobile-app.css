@@ -94,7 +94,7 @@ html.bridge-mobile-app .task-detail-composer { padding-bottom: 7px; }
 .mobile-connect-update-button { min-height: 42px; border: 1px solid var(--line); color: var(--ink); background: var(--card); font-size: 13px; }
 .mobile-connect-update-button:hover { border-color: var(--accent); background: var(--accent-soft); }
 .mobile-connect-update-message { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
-.mobile-environment-backdrop { position: fixed; inset: 0; z-index: 220; display: grid; place-items: center; padding: calc(20px + var(--bridge-safe-top, 0px)) calc(20px + var(--bridge-safe-right, 0px)) calc(20px + var(--bridge-safe-bottom, 0px)) calc(20px + var(--bridge-safe-left, 0px)); background: #081018a8; backdrop-filter: blur(8px); }
+.mobile-environment-backdrop { position: fixed; inset: 0; z-index: 2200; display: grid; place-items: center; padding: calc(20px + var(--bridge-safe-top, 0px)) calc(20px + var(--bridge-safe-right, 0px)) calc(20px + var(--bridge-safe-bottom, 0px)) calc(20px + var(--bridge-safe-left, 0px)); background: #081018a8; backdrop-filter: blur(8px); }
 .mobile-environment-overlay { box-sizing: border-box; display: flex; width: min(100%, 430px); max-height: calc(100dvh - 40px - var(--bridge-safe-height, 0px)); min-height: 0; flex-direction: column; gap: 10px; }
 .mobile-environment-dialog { box-sizing: border-box; width: 100%; max-height: 100%; min-height: 0; overflow-y: auto; padding: 20px; border: 1px solid var(--line); border-radius: 22px; color: var(--ink); background: var(--card); box-shadow: 0 24px 80px #0008; }
 .mobile-environment-app { margin: 0 0 12px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper); }

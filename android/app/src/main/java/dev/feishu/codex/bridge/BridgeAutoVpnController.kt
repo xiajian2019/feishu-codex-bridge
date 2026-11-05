@@ -82,8 +82,8 @@ internal class BridgeAutoVpnController(
     private val authorization = activity.registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         pendingAuthorization?.complete(result.resultCode == Activity.RESULT_OK)
     }
-    private val locationAuthorization = activity.registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        pendingLocationAuthorization?.complete(granted)
+    private val locationAuthorization = activity.registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+        pendingLocationAuthorization?.complete(grants[Manifest.permission.ACCESS_FINE_LOCATION] == true)
     }
     private fun networkCallback() = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) = scheduleNetworkCheck()
@@ -221,7 +221,7 @@ internal class BridgeAutoVpnController(
         scope.launch {
             try {
                 var state = currentWifiState()
-                if (state.connected && state.ssid == null && !hasLocationPermission() && requestLocationPermission()) {
+                if (state.connected && state.ssid == null && !hasWifiIdentityPermission() && requestWifiIdentityPermission()) {
                     state = currentWifiState()
                 }
                 result.complete(state.ssid)
@@ -252,8 +252,8 @@ internal class BridgeAutoVpnController(
             Log.i(TAG, "VPN check skipped: no active network")
             return report("当前没有可用网络，暂时无法连接 VPN。")
         }
-        // The exemption controls automatic connection, not an explicit user request.
-        if (!manual && !mayStartForCurrentWifi(bypass)) return "当前网络已跳过自动 VPN。"
+        // Both automatic and user-initiated checks must honor Wi-Fi exemptions.
+        wifiStartBlockReason(bypass, manual)?.let { return it }
 
         val bound = bindProvider() ?: run {
             Log.i(TAG, "VPN check skipped: OpenVPN provider unavailable")
@@ -300,6 +300,8 @@ internal class BridgeAutoVpnController(
             }
             val (decision, initialStatus) = startDecision()
             Log.i(TAG, "VPN provider decision: $decision")
+            if (!hasNetwork()) return report("当前没有可用网络，暂时无法连接 VPN。")
+            wifiStartBlockReason(bypassWifiSsids ?: return "VPN 网络设置尚未同步。", manual)?.let { return it }
             when (decision) {
                 BridgeVpnStartDecision.OTHER_VPN -> return report("其他 VPN 正在使用中，未自动切换。")
                 BridgeVpnStartDecision.WAIT -> {
@@ -323,10 +325,9 @@ internal class BridgeAutoVpnController(
             // OpenVPN may need to display its own credential prompt when starting.
             if (authorizationCompleted) awaitResume()
             if (!hasNetwork()) return report("当前没有可用网络，暂时无法连接 VPN。")
-            if (!manual && !mayStartForCurrentWifi(bypassWifiSsids ?: return "VPN 网络设置尚未同步。")) {
-                return "当前网络已跳过自动 VPN。"
-            }
             val (finalDecision, finalStatus) = startDecision()
+            // Authorization and provider status checks can outlive a network change.
+            wifiStartBlockReason(bypassWifiSsids ?: return "VPN 网络设置尚未同步。", manual)?.let { return it }
             return when (finalDecision) {
                 BridgeVpnStartDecision.OTHER_VPN -> report("其他 VPN 正在使用中，未自动切换。")
                 BridgeVpnStartDecision.WAIT -> {
@@ -388,47 +389,54 @@ internal class BridgeAutoVpnController(
         return connectivity.getNetworkCapabilities(network) != null
     }
 
-    /** Do not start on a possibly exempt Wi-Fi when Android cannot identify its SSID. */
-    private suspend fun mayStartForCurrentWifi(bypass: List<String>): Boolean {
+    /** Return why a connection is blocked, including when the current SSID is unknown. */
+    private suspend fun wifiStartBlockReason(bypass: List<String>, manual: Boolean): String? {
+        fun blocked(message: String, notify: Boolean = true): String {
+            if (!manual && notify) showMessageOnce(message)
+            return message
+        }
         var state = if (bypass.isEmpty()) BridgeCurrentWifi(false, null) else currentWifiState()
-        var decision = BridgeAutoVpnPolicy.networkDecision(true, state.connected, state.ssid, bypass, hasLocationPermission())
+        Log.i(TAG, "Wi-Fi policy input: connected=${state.connected}, ssidKnown=${state.ssid != null}, exemptions=${bypass.size}")
+        var decision = BridgeAutoVpnPolicy.networkDecision(true, state.connected, state.ssid, bypass, hasWifiIdentityPermission())
         if (decision == BridgeVpnNetworkDecision.REQUEST_LOCATION) {
-            if (!resumed.value || userDeclinedPrompt) return false
-            if (!requestLocationPermission()) {
+            if (!resumed.value || userDeclinedPrompt) {
+                return blocked("无法确认当前 Wi‑Fi，已跳过 VPN 连接。请允许精确位置权限后重试。", notify = false)
+            }
+            if (!requestWifiIdentityPermission()) {
                 userDeclinedPrompt = true
-                showMessageOnce("无法读取当前 Wi-Fi，已跳过自动 VPN。请允许位置权限后重试。")
-                return false
+                return blocked("无法识别当前 Wi‑Fi，已跳过 VPN 连接。请允许精确位置权限后重试。")
             }
             state = currentWifiState()
-            decision = BridgeAutoVpnPolicy.networkDecision(true, state.connected, state.ssid, bypass, hasLocationPermission())
+            decision = BridgeAutoVpnPolicy.networkDecision(true, state.connected, state.ssid, bypass, hasWifiIdentityPermission())
         }
         return when (decision) {
-            BridgeVpnNetworkDecision.CHECK -> true
+            BridgeVpnNetworkDecision.CHECK -> null
             BridgeVpnNetworkDecision.SKIP_WIFI -> {
                 Log.i(TAG, "VPN check skipped: Wi-Fi is exempt")
-                false
+                blocked("当前 Wi‑Fi 已在免 VPN 列表，已跳过 VPN 连接。", notify = false)
             }
             BridgeVpnNetworkDecision.UNKNOWN_WIFI, BridgeVpnNetworkDecision.REQUEST_LOCATION -> {
                 Log.i(TAG, "VPN check skipped: Wi-Fi identity unavailable")
-                showMessageOnce("无法识别当前 Wi-Fi，已跳过自动 VPN。")
-                false
+                blocked("无法识别当前 Wi‑Fi，已跳过 VPN 连接。请确认系统位置服务已开启。")
             }
-            BridgeVpnNetworkDecision.NO_NETWORK -> false
+            BridgeVpnNetworkDecision.NO_NETWORK -> blocked("当前没有可用网络，暂时无法连接 VPN。")
         }
     }
 
-    private fun hasLocationPermission(): Boolean = ContextCompat.checkSelfPermission(
+    private fun hasWifiIdentityPermission(): Boolean = ContextCompat.checkSelfPermission(
         activity,
         Manifest.permission.ACCESS_FINE_LOCATION,
     ) == PackageManager.PERMISSION_GRANTED
 
-    private suspend fun requestLocationPermission(): Boolean {
+    private suspend fun requestWifiIdentityPermission(): Boolean {
         pendingLocationAuthorization?.let { return it.await() }
         awaitResume()
         val result = CompletableDeferred<Boolean>()
         pendingLocationAuthorization = result
         return try {
-            locationAuthorization.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+            // Android 12+ requires coarse and fine together to present the
+            // precise-location choice. Only the SSID is read afterwards.
+            locationAuthorization.launch(arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION))
             result.await()
         } finally {
             if (pendingLocationAuthorization === result) pendingLocationAuthorization = null
@@ -510,6 +518,7 @@ internal class BridgeAutoVpnController(
 
         val result = CompletableDeferred<String>()
         var requestIssued = start == null
+        var startSucceeded = start == null
         val callback = object : IOpenVPNStatusCallback.Stub() {
             override fun newStatus(uuid: String?, state: String?, message: String?, level: String?) {
                 if (!uuid.isNullOrBlank() && uuid != profileId) return
@@ -526,7 +535,10 @@ internal class BridgeAutoVpnController(
             withContext(Dispatchers.IO) { service.registerStatusCallback(callback) }
             registered = true
             if (start != null) {
+                if (!hasNetwork()) return "当前没有可用网络，暂时无法连接 VPN。"
+                wifiStartBlockReason(bypassWifiSsids ?: return "VPN 网络设置尚未同步。", manual = true)?.let { return it }
                 withContext(Dispatchers.IO) { start() }
+                startSucceeded = true
                 // Ignore a stale status callback delivered while OpenVPN handled the start request.
                 requestIssued = true
             }
@@ -535,7 +547,8 @@ internal class BridgeAutoVpnController(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
-            "VPN 已发起，但暂时无法确认连接状态。"
+            if (startSucceeded) "VPN 已发起，但暂时无法确认连接状态。"
+            else "VPN 启动失败，请检查网络和 OpenVPN 配置后重试。"
         } finally {
             if (registered) withContext(NonCancellable + Dispatchers.IO) {
                 runCatching { service.unregisterStatusCallback(callback) }

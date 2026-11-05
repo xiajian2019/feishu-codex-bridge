@@ -31,6 +31,14 @@ class BridgeAutoVpnPolicyTest {
     }
 
     @Test
+    fun skipsMintTechnologyWifiWhenItIsConfiguredAsAnExemption() {
+        assertEquals(
+            BridgeVpnNetworkDecision.SKIP_WIFI,
+            BridgeAutoVpnPolicy.networkDecision(true, true, "\"薄荷科技\"", listOf("薄荷科技"), true),
+        )
+    }
+
+    @Test
     fun globalChecksUseNetworkAndWifiExemptionsRatherThanTargetReachability() {
         val decide = BridgeAutoVpnPolicy::networkDecision
         val bypass = listOf("Office WiFi")

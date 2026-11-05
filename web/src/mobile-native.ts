@@ -123,7 +123,7 @@ export async function readCurrentWifiSsid(): Promise<string | null> {
     const ssid = result.ssid?.trim();
     return ssid || null;
   } catch {
-    throw new Error("无法读取当前 Wi-Fi，请确认已连接 Wi-Fi 并允许位置权限。");
+    throw new Error("无法读取当前 Wi‑Fi 名称，请确认已连接 Wi‑Fi、开启系统位置服务，并允许应用使用精确位置。");
   }
 }
 

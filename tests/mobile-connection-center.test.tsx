@@ -20,7 +20,7 @@ describe("mobile connection center", () => {
     expect(html).toContain("SSH / Mac");
     expect(html).toContain("正在恢复连接");
     expect(html).toContain("<summary>网络设置</summary>");
-    expect(html).toContain("免自动 VPN 的 Wi‑Fi");
+    expect(html).toContain("免 VPN 的 Wi‑Fi");
     expect(html).not.toContain('aria-label="SSH 登录"');
   });
 
@@ -45,21 +45,22 @@ describe("mobile connection center", () => {
 
     const loadingHtml = renderToStaticMarkup(createElement(MobileEnvironmentDialog, {
       options: [], busy: null, message: null, currentServer: "https://bridge.fixture", appVersion: "浏览器预览",
-      vpnChecking: true, vpnMessage: "正在发起 VPN 连接…", onCheckVpn: () => {},
+      vpnChecking: true, vpnMessage: "正在检查 VPN 和当前网络…", onCheckVpn: () => {},
       appChecking: false, appDownloading: false, appActionsBusy: false, appMessage: null, appError: null,
       onCheckUpdate: () => {}, onDownloadApp: () => {}, onSelect: () => {}, onOpenConnectionSettings: () => {}, onClose: () => {},
     }));
-    expect(loadingHtml).toContain('aria-label="正在连接 VPN"');
+    expect(loadingHtml).toContain('aria-label="正在检查 VPN"');
     expect(loadingHtml).toContain('aria-busy="true"');
-    expect(loadingHtml).toContain("正在发起 VPN 连接…");
+    expect(loadingHtml).toContain("正在检查 VPN 和当前网络…");
   });
 
   it("places the global target and Wi-Fi VPN exemption settings in connection management", () => {
     const html = renderToStaticMarkup(createElement(MobileAutoVpnSettings));
     expect(html).toContain("自动 VPN 网络设置");
     expect(html).toContain("全局 IP");
-    expect(html).toContain("免自动 VPN 的 Wi‑Fi");
+    expect(html).toContain("免 VPN 的 Wi‑Fi");
     expect(html).toContain('aria-label="读取当前 Wi‑Fi"');
+    expect(html).toContain("Bridge 只读取 SSID，不读取 GPS 坐标");
     expect(html).toContain("保存网络配置");
   });
 

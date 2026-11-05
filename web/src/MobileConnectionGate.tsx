@@ -203,6 +203,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
     const openEnvironmentDialog = (): void => {
       if (!isAppActive() || scannerOpen || environmentOpening.current) return;
       environmentOpening.current = true;
+      window.dispatchEvent(new Event("bridge:mobile-environment-open"));
       void workspaceOverlay.open().then((opened) => {
         if (disposed) {
           void workspaceOverlay.dismiss().catch(() => {});
@@ -399,7 +400,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
       window.clearTimeout(vpnMessageTimerRef.current);
       vpnMessageTimerRef.current = null;
     }
-    setVpnChecking(true); setVpnMessage("正在发起 VPN 连接…");
+    setVpnChecking(true); setVpnMessage("正在检查 VPN 和当前网络…");
     try {
       const message = await checkAndConnectMobileVpn();
       setVpnMessage(message);
@@ -668,7 +669,7 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
     setWifiReadBusy(true); setError(null); setMessage(null);
     try {
       const ssid = await readCurrentWifiSsid();
-      if (!ssid) throw new Error("未读取到当前 Wi‑Fi，请先连接目标 Wi‑Fi，并允许位置权限后重试。");
+      if (!ssid) throw new Error("未读取到当前 Wi‑Fi 名称，请确认已连接 Wi‑Fi、开启系统位置服务，并允许应用使用精确位置后重试。");
       if (wifiSsids.includes(ssid)) {
         setMessage(`当前 Wi‑Fi“${ssid}”已经在免 VPN 列表中。`);
       } else {
@@ -686,7 +687,7 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
   return <section className="mobile-connect-network-settings" aria-label="自动 VPN 网络设置">
     <div className="mobile-connect-network-heading">
       <strong>自动 VPN 网络设置</strong>
-      <span>除免 VPN 的 Wi‑Fi 外，App 运行时会自动检查并连接 VPN</span>
+      <span>免 VPN 的 Wi‑Fi 上会跳过连接；其他网络可自动或手动检查 VPN</span>
     </div>
     <form onSubmit={(event) => { void save(event); }}>
       <label className="mobile-connect-network-field" htmlFor="mobile-global-mac-host">
@@ -696,7 +697,7 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
         <small>用于私有 Bridge 地址和 SSH 默认主机；修改后无需重新配对。</small>
       </label>
       <div className="mobile-connect-network-field">
-        <span>免自动 VPN 的 Wi‑Fi</span>
+        <span>免 VPN 的 Wi‑Fi</span>
         <div className="mobile-connect-network-input-row">
           <input id="mobile-vpn-bypass-wifi" value={wifiInput} onChange={(event) => setWifiInput(event.target.value)}
             onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); } }}
@@ -706,7 +707,7 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
             {wifiReadBusy ? <span aria-hidden="true">…</span> : <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M2.5 8.8a15.6 15.6 0 0 1 19 0M5.8 12.5a10.2 10.2 0 0 1 12.4 0M9.2 16.1a5.2 5.2 0 0 1 5.6 0M12 20h.01" /></svg>}
           </button>
         </div>
-        <small>可手动输入 Wi‑Fi 名称后直接保存；右侧图标会读取当前已连接的 Wi‑Fi。</small>
+        <small>Android 将 Wi‑Fi 名称（SSID）归为位置敏感信息，读取时需要精确位置权限和开启系统位置服务。Bridge 只读取 SSID，不读取 GPS 坐标；也可手动输入名称后保存。</small>
         {wifiSsids.length ? <ul className="mobile-connect-network-list">
           {wifiSsids.map((ssid) => <li key={ssid}>
             <span>{ssid}</span>
@@ -810,8 +811,8 @@ export function MobileEnvironmentDialog({
         <dt>当前地址</dt>
         <dd>
           <span>{currentServer || "未连接"}</span>
-          <button type="button" className="mobile-environment-vpn-check" aria-label={vpnChecking ? "正在连接 VPN" : "检查并连接 VPN"}
-            title={vpnChecking ? "正在连接 VPN" : "检查并连接 VPN"} aria-busy={vpnChecking} data-loading={vpnChecking ? "true" : undefined}
+          <button type="button" className="mobile-environment-vpn-check" aria-label={vpnChecking ? "正在检查 VPN" : "检查并连接 VPN"}
+            title={vpnChecking ? "正在检查 VPN" : "检查并连接 VPN"} aria-busy={vpnChecking} data-loading={vpnChecking ? "true" : undefined}
             disabled={vpnChecking} onClick={onCheckVpn}>
             VPN
           </button>

@@ -39,7 +39,7 @@
 
 当前实现流程：
 
-1. Android 顶层 Activity 同步连接中心的免 VPN Wi-Fi 列表，启动、前台恢复及网络变化时检查 VPN；顶层 Activity 存活期间每 30 秒复查。免 VPN Wi-Fi 跳过启动；列表非空而 Wi-Fi 无法识别时先请求位置权限，仍无法识别则跳过。Bridge 是否配对、目标 IP 和端口是否可达不决定 VPN 启动。
+1. Android 顶层 Activity 同步连接中心的免 VPN Wi-Fi 列表，启动、前台恢复及网络变化时检查 VPN；顶层 Activity 存活期间每 30 秒复查。自动及摇一摇手动检查均遵守免 VPN Wi-Fi 列表；列表非空而 Wi-Fi 无法识别时先请求精确位置权限，并依赖系统位置服务读取 SSID，仍无法识别则跳过。Bridge 只读取 SSID，不读取 GPS 坐标。Bridge 是否配对、目标 IP 和端口是否可达不决定 VPN 启动。
 2. 绑定指定客户端并调用外部 API 的 `prepare`；首次控制授权和系统 VPN 授权由用户在前台确认。客户端未安装、无配置或授权失败时显示提示，现有 Bridge/SSH 功能仍可使用。[Android 包可见性](https://developer.android.com/training/package-visibility)
 3. 一个 profile 时自动选择，多个 profile 时由用户选择一次并保存标识。Bridge 不读取或复制 `.ovpn`、证书、私钥、账号密码。选中的 VPN 已连接或正在连接则等待；其他 VPN 活跃时不自动替换；暂停的选中 VPN 在没有其他活动 VPN 时恢复；认证失败时停止自动重试并提示用户。
 4. 调用 `startProfile` 或 `resume`，由现有客户端处理认证、协议和隧道；需要密码或授权时允许其显示原生界面。Bridge API 不可达时另外轮询当前 API 端口最多 60 秒，端口可达后通知工作台重试；不会自动重放 SSH 输入。
