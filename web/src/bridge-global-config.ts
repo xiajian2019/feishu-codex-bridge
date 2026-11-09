@@ -2,7 +2,7 @@
  * App-wide Mac target. Environment switching may change the port, but every
  * private Bridge endpoint and the default SSH target use this host.
  *
- * Native Android entry points receive this value from the WebView instead of
+ * Native SSH entry points receive this value from the WebView instead of
  * keeping a second user-specific IP constant.
  */
 export const BRIDGE_GLOBAL_MAC_HOST = "10.15.53.70";

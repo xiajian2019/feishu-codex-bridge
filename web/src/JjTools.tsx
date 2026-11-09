@@ -71,6 +71,7 @@ export function JjTools(): ReactElement {
   const [logs, setLogs] = useState(false);
   const [logFilter, setLogFilter] = useState("");
   const [logLines, setLogLines] = useState<string[]>([]);
+  const [selectableOutput, setSelectableOutput] = useState(false);
   const filteredOutput = useRef<HTMLPreElement | null>(null);
   const followFilteredOutput = useRef(true);
   const [status, setStatus] = useState<JjStatus | null>(null);
@@ -78,7 +79,7 @@ export function JjTools(): ReactElement {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selection, setSelection] = useState<TerminalSelectionDisplay | null>(null);
-  const [copiedFilteredLog, setCopiedFilteredLog] = useState(false);
+  const [copiedLog, setCopiedLog] = useState(false);
   const [reload, setReload] = useState(0);
   const terminalHost = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -209,13 +210,13 @@ export function JjTools(): ReactElement {
     } catch (failure) { reportError(failure); }
   };
 
-  const copyFilteredLogs = async (): Promise<void> => {
+  const copyVisibleLogs = async (): Promise<void> => {
     const text = matchingLines.join("\n");
     if (!text) return;
     try {
       await copyTextToClipboard(text);
-      setCopiedFilteredLog(true);
-      window.setTimeout(() => setCopiedFilteredLog(false), 1_500);
+      setCopiedLog(true);
+      window.setTimeout(() => setCopiedLog(false), 1_500);
     } catch (failure) {
       reportError(failure);
     }
@@ -228,7 +229,11 @@ export function JjTools(): ReactElement {
     ? logLines.filter((line) => line.toLocaleLowerCase().includes(logQuery))
     : logLines, [logLines, logQuery]);
 
-  useEffect(() => { setLogFilter(""); }, [selectedId]);
+  useEffect(() => {
+    setLogFilter("");
+    setSelectableOutput(false);
+    setCopiedLog(false);
+  }, [selectedId]);
   useEffect(() => { followFilteredOutput.current = true; }, [logQuery]);
   useEffect(() => {
     const output = filteredOutput.current;
@@ -270,11 +275,31 @@ export function JjTools(): ReactElement {
       <div className="jj-log-filter">
         <input type="search" aria-label="日志关键词" placeholder="输入关键词过滤日志" value={logFilter} disabled={!selectedId} onChange={(event) => setLogFilter(event.target.value)} />
         {logQuery ? <span role="status">{matchingLines.length} 行</span> : null}
+        <div className="jj-log-actions">
+          <button
+            type="button"
+            className="jj-log-view-toggle"
+            aria-pressed={selectableOutput}
+            disabled={!logLines.length}
+            onClick={() => setSelectableOutput((value) => !value)}
+          >{selectableOutput ? "终端视图" : "选择复制"}</button>
+          <button
+            type="button"
+            className="jj-log-copy-button"
+            aria-label={copiedLog ? "日志已复制" : logQuery ? "复制匹配日志" : "复制日志"}
+            title={copiedLog ? "已复制" : logQuery ? "复制匹配日志" : "复制日志"}
+            disabled={!matchingLines.length}
+            onClick={() => void copyVisibleLogs()}
+          >{copiedLog ? "已复制" : "复制日志"}</button>
+        </div>
       </div>
       <div className="jj-terminal-frame">
-        <div ref={terminalHost} className="jj-terminal" aria-label="JJ 交互终端" />
+        <div ref={terminalHost} className="jj-terminal" aria-label="JJ 交互终端" aria-hidden={selectableOutput} />
         {!selectedId ? <div className="jj-terminal-placeholder">执行结果与交互提示显示在这里</div> : null}
-        {logQuery ? <div className="jj-filtered-output-wrap" aria-label="过滤后的日志">
+        {selectableOutput ? <div className="jj-selectable-output-wrap" aria-label="可选择的日志">
+          <pre className="jj-selectable-output" tabIndex={0}>{matchingLines.length ? matchingLines.join("\n") : "暂无日志"}</pre>
+        </div> : null}
+        {logQuery && !selectableOutput ? <div className="jj-filtered-output-wrap" aria-label="过滤后的日志">
           <pre ref={filteredOutput} className="jj-filtered-output" onScroll={(event) => {
             const output = event.currentTarget;
             followFilteredOutput.current = output.scrollHeight - output.scrollTop - output.clientHeight < 24;
@@ -282,20 +307,20 @@ export function JjTools(): ReactElement {
           <button
             type="button"
             className="jj-copy-filtered-log"
-            aria-label={copiedFilteredLog ? "已复制过滤日志" : "复制过滤日志"}
-            title={copiedFilteredLog ? "已复制" : "复制过滤日志"}
+            aria-label={copiedLog ? "日志已复制" : "复制匹配日志"}
+            title={copiedLog ? "已复制" : "复制匹配日志"}
             disabled={!matchingLines.length}
             onPointerDown={(event) => event.preventDefault()}
-            onClick={() => void copyFilteredLogs()}
+            onClick={() => void copyVisibleLogs()}
           >
             <svg viewBox="0 0 20 20" aria-hidden="true">
-              {copiedFilteredLog
+              {copiedLog
                 ? <path d="m4 10 4 4 8-8" />
                 : <><rect x="7" y="3" width="9" height="11" rx="1" /><path d="M5 7v9a1 1 0 0 0 1 1h7" /></>}
             </svg>
           </button>
         </div> : null}
-        {!logQuery && selection ? <button type="button" className="dashboard-terminal-copy-selection" style={{ left: selection.left, top: selection.top }} onPointerDown={(event) => event.preventDefault()} onClick={() => void copySelection()}>Copy</button> : null}
+        {!logQuery && !selectableOutput && selection ? <button type="button" className="dashboard-terminal-copy-selection" aria-label="复制所选日志" title="复制所选日志" style={{ left: selection.left, top: selection.top }} onPointerDown={(event) => event.preventDefault()} onClick={() => void copySelection()}>复制</button> : null}
       </div>
       <div className="jj-console-footer" role="group" aria-label="终端操作">
         {[["↑", "向上", "\x1b[A"], ["↓", "向下", "\x1b[B"], ["⇥", "Tab", "\t"], ["↵", "Enter", "\r"], ["^C", "Ctrl+C", "\x03"]].map(([icon, label, data]) =>

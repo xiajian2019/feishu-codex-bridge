@@ -55,6 +55,7 @@ const TERMINAL_HISTORY_UPDATE_DELAY_MS = 800;
 const TERMINAL_HISTORY_MIN_INTERVAL_MS = 2_000;
 const TERMINAL_HISTORY_MAX_STALE_MS = 5_000;
 const TERMINAL_HISTORY_CAPTURE_TIMEOUT_MS = 5_000;
+const SHELL_TERMINAL_IDLE_TIMEOUT_MS = 30 * 60 * 1_000;
 const CODEX_WORKTREE_TASK_DIRECTORY = join(tmpdir(), "feishu-codex-bridge", "codex-worktree-tasks");
 const TERMINAL_SHORTCUT_SEQUENCES: Readonly<Record<string, string>> = Object.freeze({
   "codex-escape": "\u001b",
@@ -215,6 +216,18 @@ interface TerminalData {
   historyCache?: boolean;
   terminal?: BunTerminal;
   proc?: BunSubprocess;
+  isAuthorized: () => boolean;
+}
+
+interface ShellTerminalData {
+  sessionId: string;
+  workingDirectory: string;
+  cols: number;
+  rows: number;
+  terminal?: BunTerminal;
+  proc?: BunSubprocess;
+  minimized?: boolean;
+  idleTimer?: ReturnType<typeof setTimeout>;
   isAuthorized: () => boolean;
 }
 
@@ -503,22 +516,23 @@ export class TmuxDashboardApi {
       const owner = deviceId ?? "local";
       const id = attachmentUpload[1];
       try {
+        const scope = await this.nativeAttachmentScope(request);
         if (request.method === "POST" && !id) {
           const body = await readJsonBody(request);
           await this.ensureAttachmentStorage();
           const name = attachmentStorageName(typeof body.fileName === "string" ? body.fileName : "", typeof body.contentType === "string" ? body.contentType : "");
-          sendJson(response, 201, await this.attachmentUploads.create(owner, name, body.sizeBytes, body.protocol === "parts" ? "parts" : "offset"));
+          sendJson(response, 201, await this.attachmentUploads.create(owner, name, body.sizeBytes, body.protocol === "parts" ? "parts" : "offset", scope));
         } else if (id && request.method === "PUT" && !attachmentUpload[2]) {
           const offset = url.searchParams.get("offset");
           if (offset === null || !/^\d+$/.test(offset)) throw new DashboardBodyError("Invalid attachment offset.", 400);
-          sendJson(response, 200, await this.attachmentUploads.append(id, owner, Number(offset), request, isAuthorized));
+          sendJson(response, 200, await this.attachmentUploads.append(id, owner, Number(offset), request, isAuthorized, scope));
         } else if (id && request.method === "GET" && !attachmentUpload[2]) {
-          sendJson(response, 200, this.attachmentUploads.status(id, owner));
+          sendJson(response, 200, this.attachmentUploads.status(id, owner, scope));
         } else if (id && request.method === "POST" && attachmentUpload[2]) {
           await readJsonBody(request);
-          sendJson(response, 200, await this.attachmentUploads.complete(id, owner));
+          sendJson(response, 200, await this.attachmentUploads.complete(id, owner, scope));
         } else if (id && request.method === "DELETE" && !attachmentUpload[2]) {
-          await this.attachmentUploads.cancel(id, owner);
+          await this.attachmentUploads.cancel(id, owner, scope);
           sendJson(response, 200, { ok: true });
         } else sendJson(response, 404, { error: "Attachment upload endpoint not found." });
       } catch (error) { if (!response.destroyed) sendDashboardError(response, error); }
@@ -527,7 +541,8 @@ export class TmuxDashboardApi {
     if (attachmentPart && request.method === "PUT") {
       const owner = deviceId ?? "local";
       try {
-        sendJson(response, 200, await this.attachmentUploads.appendPart(attachmentPart[1], owner, Number(attachmentPart[2]), request, isAuthorized));
+        const scope = await this.nativeAttachmentScope(request);
+        sendJson(response, 200, await this.attachmentUploads.appendPart(attachmentPart[1], owner, Number(attachmentPart[2]), request, isAuthorized, scope));
       } catch (error) { if (!response.destroyed) sendDashboardError(response, error); }
       return;
     }
@@ -921,6 +936,14 @@ export class TmuxDashboardApi {
         const record = this.db.observeTmuxSession(live);
         sendJson(response, 200, { session: { ...live, codexHomeId: record.codex_home_id } });
       } catch (error) { sendDashboardError(response, error); }
+      return;
+    }
+    const composerMatch = /^\/sessions\/([^/]+)\/composer$/.exec(apiPath);
+    if (request.method === "POST" && composerMatch) {
+      let sessionId: string;
+      try { sessionId = decodeURIComponent(composerMatch[1]!); }
+      catch { sendJson(response, 400, { error: "Invalid tmux session id." }); return; }
+      await this.handleComposerRequest(request, response, sessionId, deviceId, isAuthorized);
       return;
     }
     if (request.method === "GET" && apiPath === "/sessions") {
@@ -1566,6 +1589,168 @@ export class TmuxDashboardApi {
     sendJson(response, 404, { error: "Not found." });
   }
 
+  private async handleComposerRequest(
+    request: IncomingMessage,
+    response: ServerResponse,
+    sessionId: string,
+    deviceId: string | null,
+    isAuthorized: () => boolean,
+  ): Promise<void> {
+    try {
+      const client = firstHeaderValue(request.headers["x-bridge-client"]);
+      if (client !== "ios-native-ssh" && client !== "android-native-ssh") {
+        throw new DashboardBodyError("Composer API 仅支持原生 SSH 客户端。", 400);
+      }
+      const createdAt = expectedSessionCreatedAt(request);
+      if (createdAt === undefined) throw new DashboardBodyError("缺少 Session createdAt。", 400);
+      validateNativeSshBindingHeaders(request);
+      const session = await this.operations.findSession(sessionId);
+      if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+      assertExpectedSessionCreatedAt(request, session.createdAt);
+      if (session.createdAt !== createdAt) throw new DashboardBodyError("Session 已结束或重建，请刷新后重试。", 409);
+      if (!isAuthorized()) throw new DashboardBodyError("设备授权已失效。", 401);
+
+      const body = await readJsonBody(request);
+      const idempotencyKey = body.idempotencyKey;
+      if (typeof idempotencyKey !== "string" || idempotencyKey.length < 1 || idempotencyKey.length > 200
+        || /[\u0000-\u001f\u007f]/.test(idempotencyKey)) {
+        throw new DashboardBodyError("idempotencyKey 无效。", 400);
+      }
+      const text = typeof body.text === "string"
+        ? body.text.replace(/\r\n?/g, "\n").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "")
+        : "";
+      const attachments = await this.composerAttachments(body.attachments, deviceId, request, sessionId, createdAt);
+      const prompt = buildComposerPrompt(text, attachments);
+      if (!prompt.trim()) throw new DashboardBodyError("Enter a message or attach a file.", 400);
+      if (Buffer.byteLength(prompt, "utf8") > MAX_SUBMISSION_BYTES) {
+        throw new DashboardBodyError("The message is too long.", 400);
+      }
+      const record = this.db.observeTmuxSession(session);
+      const fingerprint = await submissionFingerprint(prompt, this.attachmentDirectories);
+      const claim = this.db.beginTmuxComposerAction({
+        sessionRecordId: record.record_id,
+        deviceId,
+        idempotencyKey,
+        content: prompt,
+        submissionFingerprint: fingerprint,
+      });
+      if (claim.kind === "conflict") {
+        throw new DashboardBodyError("相同幂等键对应了不同消息或 Session 上下文。", 409);
+      }
+      if (claim.kind === "existing") {
+        const resultUnknown = claim.status === "sending" || claim.status === "unconfirmed";
+        sendJson(response, resultUnknown ? 202 : 200, {
+          ok: claim.status === "sent" || claim.status === "confirmed",
+          duplicate: true,
+          actionId: claim.actionId,
+          status: claim.status,
+          resultUnknown,
+          ...(claim.error ? { error: claim.error } : {}),
+        });
+        return;
+      }
+
+      const inspectReviewPane = this.operations.inspectReviewPane ?? tmux.inspectReviewPane;
+      const pasteTextToPane = this.operations.pasteTextToPane ?? tmux.pasteTextToPane;
+      const sendEnterToPane = this.operations.sendEnterToPane ?? tmux.sendEnterToPane;
+      const pane = await inspectReviewPane(sessionId, session);
+      let pasteAttempted = false;
+      let pasted = false;
+      let enterAttempted = false;
+      try {
+        await pasteTextToPane(pane.paneId, prompt, async () => {
+          if (!isAuthorized()) throw new DashboardBodyError("设备授权已失效，消息结果未知。", 401);
+          const current = await this.operations.findSession(sessionId);
+          if (!current || current.createdAt !== createdAt) throw new DashboardBodyError("Session 已变化，消息结果未知。", 409);
+          pasteAttempted = true;
+        });
+        pasted = true;
+        await new Promise<void>((resolve) => setTimeout(resolve, TERMINAL_PASTE_SETTLE_MS));
+        await sendEnterToPane(pane.paneId, async () => {
+          if (!isAuthorized()) throw new DashboardBodyError("设备授权已失效，消息结果未知。", 401);
+          const current = await this.operations.findSession(sessionId);
+          if (!current || current.createdAt !== createdAt) throw new DashboardBodyError("Session 已变化，消息结果未知。", 409);
+          enterAttempted = true;
+        });
+        this.db.finishTmuxSessionAction(claim.actionId, "sent");
+        sendJson(response, 200, { ok: true, actionId: claim.actionId, status: "sent", resultUnknown: false });
+      } catch (error) {
+        const resultUnknown = pasted || pasteAttempted || enterAttempted;
+        const message = error instanceof Error ? error.message : "Composer 发送失败。";
+        this.db.finishTmuxSessionAction(claim.actionId, resultUnknown ? "unconfirmed" : "failed", message);
+        if (resultUnknown) {
+          sendJson(response, 202, { ok: false, actionId: claim.actionId, status: "unconfirmed", resultUnknown: true, error: message });
+        } else {
+          sendDashboardError(response, error);
+        }
+      }
+    } catch (error) {
+      if (!response.writableEnded) sendDashboardError(response, error);
+    }
+  }
+
+  private async nativeAttachmentScope(
+    request: IncomingMessage,
+    expectedSessionId?: string,
+    expectedCreatedAt?: number,
+  ): Promise<string | undefined> {
+    if (firstHeaderValue(request.headers["x-bridge-client"]) !== "ios-native-ssh") return undefined;
+    const sessionId = firstHeaderValue(request.headers["x-bridge-ssh-session-id"]);
+    const createdAt = expectedSessionCreatedAt(request);
+    const host = firstHeaderValue(request.headers["x-bridge-ssh-host"]);
+    const port = firstHeaderValue(request.headers["x-bridge-ssh-port"]);
+    const username = firstHeaderValue(request.headers["x-bridge-ssh-username"]);
+    if (!sessionId || !/^\$\d{1,16}$/.test(sessionId) || createdAt === undefined || !host || !port || !username) {
+      throw new DashboardBodyError("iOS Composer 附件缺少完整 Session 上下文。", 400);
+    }
+    if ((expectedSessionId && expectedSessionId !== sessionId) || (expectedCreatedAt !== undefined && expectedCreatedAt !== createdAt)) {
+      throw new DashboardBodyError("附件与当前 Session 上下文不一致。", 409);
+    }
+    if (host.length > 253 || /[\s\u0000-\u001f\u007f\/?#@]/.test(host)
+      || !/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65_535
+      || username.length > 255 || /[\s\u0000-\u001f\u007f]/.test(username)) {
+      throw new DashboardBodyError("iOS Composer 附件 SSH 上下文无效。", 400);
+    }
+    const live = await this.operations.findSession(sessionId);
+    if (!live) throw new tmux.SessionNotFoundError("tmux session not found.");
+    if (live.createdAt !== createdAt) throw new DashboardBodyError("Session 已结束或重建，请重新上传附件。", 409);
+    return [sessionId, String(createdAt), host.toLowerCase(), port, username].join("\u0000");
+  }
+
+  private async composerAttachments(
+    value: unknown,
+    deviceId: string | null,
+    request: IncomingMessage,
+    sessionId: string,
+    createdAt: number,
+  ): Promise<Array<{ name: string; contentType: string; path: string; isImage: boolean }>> {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.length > 16) throw new DashboardBodyError("附件列表无效。", 400);
+    const owner = deviceId ?? "local";
+    const scope = await this.nativeAttachmentScope(request, sessionId, createdAt);
+    const root = await realpath(this.attachmentDirectory).catch(() => null);
+    if (!root) throw new DashboardBodyError("附件存储不可用。", 503);
+    const result: Array<{ name: string; contentType: string; path: string; isImage: boolean }> = [];
+    for (const item of value) {
+      if (typeof item !== "object" || item === null || Array.isArray(item)) throw new DashboardBodyError("附件引用无效。", 400);
+      const record = item as Record<string, unknown>;
+      const uploadId = record.uploadId;
+      if (typeof uploadId !== "string" || !/^[a-f0-9-]{36}$/i.test(uploadId)) throw new DashboardBodyError("附件上传 ID 无效。", 400);
+      const status = this.attachmentUploads.status(uploadId, owner, scope) as { result?: { fileName?: unknown; filePath?: unknown } };
+      const filePath = status.result?.filePath;
+      if (typeof filePath !== "string") throw new DashboardBodyError("附件尚未上传完成。", 409);
+      const canonical = await realpath(filePath).catch(() => null);
+      const fileInfo = canonical ? await lstat(canonical).catch(() => null) : null;
+      if (!canonical || !fileInfo?.isFile() || fileInfo.isSymbolicLink() || (canonical !== root && !canonical.startsWith(`${root}${sep}`))) {
+        throw new DashboardBodyError("附件路径无效。", 400);
+      }
+      const name = normalizeComposerAttachmentName(record.name, typeof status.result?.fileName === "string" ? status.result.fileName : "attachment");
+      const contentType = normalizeComposerContentType(record.contentType);
+      result.push({ name, contentType, path: canonical, isImage: contentType.startsWith("image/") });
+    }
+    return result;
+  }
+
   public async handleUpgrade(
     request: IncomingMessage,
     socket: Duplex,
@@ -1579,7 +1764,9 @@ export class TmuxDashboardApi {
       return;
     }
     const url = new URL(request.url ?? "/", "http://localhost");
-    if (url.pathname !== "/tmux-dashboard/terminal") {
+    const shellTerminal = url.pathname === "/tmux-dashboard/shell"
+      || (url.pathname === "/tmux-dashboard/terminal" && url.searchParams.get("mode") === "shell");
+    if (!shellTerminal && url.pathname !== "/tmux-dashboard/terminal") {
       socket.destroy();
       return;
     }
@@ -1610,9 +1797,27 @@ export class TmuxDashboardApi {
       rejectUpgrade(socket, 409, "tmux session has changed.");
       return;
     }
-    const storedSession = this.db.observeTmuxSession(session);
     const cols = clampDimension(Number(url.searchParams.get("cols")), 20, 400) || 80;
     const rows = clampDimension(Number(url.searchParams.get("rows")), 5, 200) || 24;
+    if (shellTerminal) {
+      try {
+        const workingDirectory = await this.sessionDashboardWorkingDirectory(sessionId, session);
+        this.websocketServer.handleUpgrade(request, socket, head, (client) => {
+          this.clients.add(client);
+          this.openShellTerminal(client, {
+            sessionId,
+            workingDirectory,
+            cols,
+            rows,
+            isAuthorized,
+          });
+        });
+      } catch (error) {
+        rejectUpgrade(socket, error instanceof DashboardBodyError ? error.statusCode : 404, error instanceof Error ? error.message : "Session 工作目录不可用。");
+      }
+      return;
+    }
+    const storedSession = this.db.observeTmuxSession(session);
     this.websocketServer.handleUpgrade(request, socket, head, (client) => {
       this.clients.add(client);
       this.openTerminal(client, {
@@ -2021,6 +2226,171 @@ export class TmuxDashboardApi {
       entries,
       truncated: names.length > 2_000,
     };
+  }
+
+  private async openShellTerminal(client: WebSocket, data: ShellTerminalData): Promise<void> {
+    let cleanedUp = false;
+    let stopHeartbeat: (() => void) | null = null;
+    let outputFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    let outputBytes = 0;
+    const outputQueue: string[] = [];
+    const flushOutput = (): void => {
+      if (outputFlushTimer) clearTimeout(outputFlushTimer);
+      outputFlushTimer = null;
+      outputBytes = 0;
+      if (!ensureAuthorized() || client.readyState !== WebSocket.OPEN || outputQueue.length === 0) {
+        outputQueue.length = 0;
+        return;
+      }
+      client.send(outputQueue.splice(0).join(""));
+    };
+    const queueOutput = (output: string): void => {
+      if (cleanedUp || client.readyState !== WebSocket.OPEN) return;
+      outputQueue.push(output);
+      outputBytes += Buffer.byteLength(output);
+      if (outputBytes >= 256 * 1024) {
+        flushOutput();
+        return;
+      }
+      if (!outputFlushTimer) outputFlushTimer = setTimeout(flushOutput, 16);
+    };
+    const clearIdleTimer = (): void => {
+      if (data.idleTimer) clearTimeout(data.idleTimer);
+      data.idleTimer = undefined;
+    };
+    const scheduleIdleDestroy = (): void => {
+      clearIdleTimer();
+      data.idleTimer = setTimeout(() => {
+        data.idleTimer = undefined;
+        if (cleanedUp || !data.minimized) return;
+        cleanup();
+        if (client.readyState === WebSocket.OPEN) client.close(1000, "shell terminal idle timeout");
+      }, SHELL_TERMINAL_IDLE_TIMEOUT_MS);
+    };
+    const cleanup = (): void => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      this.clients.delete(client);
+      this.clientAuthorizationChecks.delete(client);
+      stopHeartbeat?.();
+      stopHeartbeat = null;
+      clearIdleTimer();
+      if (outputFlushTimer) clearTimeout(outputFlushTimer);
+      outputFlushTimer = null;
+      outputQueue.length = 0;
+      try {
+        if (data.proc && !data.proc.killed) data.proc.kill("SIGTERM");
+      } catch {
+        // The shell may already have exited.
+      }
+      try { data.terminal?.close(); } catch { /* Already closed. */ }
+    };
+    const ensureAuthorized = (): boolean => {
+      if (cleanedUp) return false;
+      if (data.isAuthorized()) return true;
+      cleanup();
+      if (client.readyState === WebSocket.OPEN) client.close(1008, "Session authorization expired or revoked");
+      return false;
+    };
+    this.clientAuthorizationChecks.set(client, ensureAuthorized);
+    client.once("close", cleanup);
+    client.once("error", cleanup);
+    stopHeartbeat = startTerminalHeartbeat(client, this.heartbeatIntervalMs, setInterval, clearInterval, ensureAuthorized);
+    client.on("message", (message, isBinary) => {
+      if (!ensureAuthorized() || isBinary) return;
+      let payload: unknown;
+      try { payload = JSON.parse(message.toString()); } catch { return; }
+      if (typeof payload !== "object" || payload === null) return;
+      const control = payload as { type?: unknown; data?: unknown; cols?: unknown; rows?: unknown };
+      if (control.type === "minimize") {
+        data.minimized = true;
+        scheduleIdleDestroy();
+        return;
+      }
+      if (control.type === "restore") {
+        data.minimized = false;
+        clearIdleTimer();
+        return;
+      }
+      if (control.type === "destroy") {
+        cleanup();
+        if (client.readyState === WebSocket.OPEN) client.close(1000, "shell terminal closed");
+        return;
+      }
+      if (control.type === "input") {
+        data.minimized = false;
+        clearIdleTimer();
+        const input = validateTerminalInput(control.data);
+        if (!input) {
+          if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "input-error", message: "终端输入单次不能超过 32 KiB。" }));
+          return;
+        }
+        try { data.terminal?.write(input); }
+        catch {
+          if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "input-error", message: "无法写入网页命令终端。" }));
+        }
+        return;
+      }
+      if (control.type === "resize") {
+        const cols = clampDimension(control.cols, 20, 400);
+        const rows = clampDimension(control.rows, 5, 200);
+        if (!cols || !rows) return;
+        data.cols = cols;
+        data.rows = rows;
+        data.terminal?.resize(cols, rows);
+        try { if (data.proc && !data.proc.killed) data.proc.kill("SIGWINCH"); } catch { /* Best effort. */ }
+      }
+    });
+
+    try {
+      if (!ensureAuthorized()) return;
+      const configuredShell = process.env.SHELL?.trim();
+      const shell = configuredShell && configuredShell.startsWith("/") ? configuredShell : "/bin/zsh";
+      const inheritedUtf8Locale = [process.env.LC_ALL, process.env.LC_CTYPE, process.env.LANG]
+        .find((locale) => locale && /UTF-?8/i.test(locale));
+      const terminalLocale = inheritedUtf8Locale ?? "C.UTF-8";
+      const child = (this.terminalRuntime ?? getBunRuntime()).spawn([shell, "-il"], {
+        cwd: data.workingDirectory,
+        env: {
+          ...process.env,
+          LANG: terminalLocale,
+          LC_CTYPE: terminalLocale,
+          TERM: "xterm-256color",
+          COLORTERM: "truecolor",
+          TMUX: undefined,
+          TMUX_PANE: undefined,
+        },
+        terminal: {
+          cols: data.cols,
+          rows: data.rows,
+          name: "xterm-256color",
+          data: (_terminal, output) => {
+            if (ensureAuthorized()) queueOutput(output);
+          },
+        },
+      });
+      data.proc = child;
+      data.terminal = child.terminal;
+      if (ensureAuthorized() && client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: "ready", workingDirectory: data.workingDirectory }));
+      }
+      void child.exited.then((exitCode) => {
+        if (cleanedUp) return;
+        if (ensureAuthorized() && client.readyState === WebSocket.OPEN) {
+          flushOutput();
+          client.send(JSON.stringify({ type: "exit", code: exitCode }));
+          client.close();
+        }
+        cleanup();
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "无法启动网页命令终端。";
+      if (ensureAuthorized() && client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: "error", message }));
+        client.close(1011, "Could not start shell terminal.");
+      }
+      cleanup();
+    }
   }
 
   private async openTerminal(client: WebSocket, data: TerminalData): Promise<void> {
@@ -2675,6 +3045,61 @@ async function readJsonBody(request: IncomingMessage): Promise<Record<string, un
     throw new Error("request body must be a JSON object");
   }
   return parsed as Record<string, unknown>;
+}
+
+function firstHeaderValue(value: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const normalized = raw?.split(",", 1)[0]?.trim();
+  return normalized || undefined;
+}
+
+function validateNativeSshBindingHeaders(request: IncomingMessage): void {
+  const host = firstHeaderValue(request.headers["x-bridge-ssh-host"]);
+  const port = firstHeaderValue(request.headers["x-bridge-ssh-port"]);
+  const username = firstHeaderValue(request.headers["x-bridge-ssh-username"]);
+  if (!host || host.length > 253 || /[\s\u0000-\u001f\u007f\/?#@]/.test(host)) {
+    throw new DashboardBodyError("SSH 主机上下文无效。", 400);
+  }
+  if (!port || !/^\d{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65_535) {
+    throw new DashboardBodyError("SSH 端口上下文无效。", 400);
+  }
+  if (!username || username.length > 255 || /[\s\u0000-\u001f\u007f]/.test(username)) {
+    throw new DashboardBodyError("SSH 用户名上下文无效。", 400);
+  }
+}
+
+function escapeComposerAttribute(value: string): string {
+  return value
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function normalizeComposerAttachmentName(value: unknown, fallback: string): string {
+  const candidate = typeof value === "string" ? value : fallback;
+  const normalized = candidate.replaceAll("\\", "/").split("/").pop()?.replace(/[\u0000-\u001f\u007f]/g, "").trim() ?? "";
+  return normalized.slice(0, 180) || "attachment";
+}
+
+function normalizeComposerContentType(value: unknown): string {
+  const raw = typeof value === "string" ? value.split(";", 1)[0]!.trim().toLowerCase() : "";
+  return /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(raw)
+    ? raw : "application/octet-stream";
+}
+
+function buildComposerPrompt(
+  text: string,
+  attachments: Array<{ name: string; contentType: string; path: string; isImage: boolean }>,
+): string {
+  const images = attachments.filter((attachment) => attachment.isImage)
+    .map((attachment, index) => `<image name=[Image #${index + 1}] path="${escapeComposerAttribute(attachment.path)}">`);
+  const files = attachments.filter((attachment) => !attachment.isImage)
+    .map((attachment) => `<file name="${escapeComposerAttribute(attachment.name)}" path="${escapeComposerAttribute(attachment.path)}">`);
+  const imageNote = images.length > 0 ? `请打开并查看我附上的图片，再结合上面的文字处理：\n${images.join("\n")}` : "";
+  const fileNote = files.length > 0 ? `请读取我附上的文件，再结合上面的文字处理：\n${files.join("\n")}` : "";
+  return [text.trim(), imageNote, fileNote].filter(Boolean).join("\n\n");
 }
 
 async function readBinaryBody(request: IncomingMessage, maxBytes: number, tooLargeMessage: string): Promise<Buffer> {

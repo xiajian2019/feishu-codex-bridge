@@ -99,6 +99,10 @@ bun run mobile:open:ios
 
 `mobile:build` 构建手机前端并同步两个原生工程，不会生成已签名 APK/IPA。iOS 需要完整 Xcode 26+ 和签名，Android 需要 JDK 21、SDK 36，并要求 Android 8（API 26）或更高版本以支持扫码配对。Android App 会在 Bridge 上的 APK 被重新编译后提示更新，也可以从连接页手动下载 APK 保存后安装。当前已生成原生源码，安装包编译、签名安装和真机验收尚待具备环境后完成。首次连接、文件分享、扫码配对、App 更新、凭据存储和构建步骤见 [手机 App 指南](doc/mobile-app.md)。
 
+如果 GitHub 依赖下载需要本机代理，可在当前 shell 中运行 `HTTP_PROXY=http://127.0.0.1:7897 HTTPS_PROXY=http://127.0.0.1:7897 bun run mobile:ios:resolve`。该命令只继承并镜像代理变量，不把本机代理地址写入仓库；解析完成后再运行 `bun run mobile:open:ios`。
+
+Android 原生 SSH 使用 ConnectBot/termlib；iOS 现已接入第一阶段原生 SSH 工作区，使用 SwiftTerm + SwiftNIO SSH，支持密码或未加密 Ed25519/ECDSA 私钥认证、主机密钥确认、PTY/resize、文本 Composer API-first、Composer 附件分块上传、主机配置保存和全屏/半屏入口。iOS SFTP 完整文件操作和真实设备验收仍单独跟进；Web tmux 工作台继续保留。
+
 ## 数据与安全边界
 
 - 配对会话保护受保护的网页和 API；设备可以在配对管理页撤销。

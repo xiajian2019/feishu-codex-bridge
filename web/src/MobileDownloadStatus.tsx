@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState, useSyncExternalStore, type ReactElement } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactElement } from "react";
 import {
   clearFinishedMobileDownloads, dismissMobileDownload, getMobileDownloads, isMobileDownloadActive,
-  subscribeMobileDownloads, type MobileDownloadTask,
+  isMobileDownloadPanelTask, subscribeMobileDownloads, type MobileDownloadTask,
 } from "./mobile-download-manager.js";
 import { cancelMobileDownload, openDownloadedFile, openMobileDownloads } from "./mobile-native.js";
 import "./mobile-download-status.css";
@@ -42,7 +42,8 @@ function Chevron({ collapsed }: { collapsed: boolean }): ReactElement {
 }
 
 export default function MobileDownloadStatus(): ReactElement {
-  const tasks = useSyncExternalStore(subscribeMobileDownloads, getMobileDownloads, getMobileDownloads);
+  const allTasks = useSyncExternalStore(subscribeMobileDownloads, getMobileDownloads, getMobileDownloads);
+  const tasks = useMemo(() => allTasks.filter(isMobileDownloadPanelTask), [allTasks]);
   const [collapsed, setCollapsed] = useState(false);
   const [announcement, setAnnouncement] = useState("");
   const [openError, setOpenError] = useState<string | null>(null);

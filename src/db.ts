@@ -4451,6 +4451,58 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
     });
   }
 
+  /**
+   * Claim a Composer HTTP request by the durable Session record and caller key.
+   * Unlike the short-lived content-fingerprint guard used by the WebSocket
+   * path, this preserves the client idempotency key for safe response replay.
+   */
+  public beginTmuxComposerAction(input: {
+    sessionRecordId: string;
+    deviceId: string | null;
+    idempotencyKey: string;
+    content: string;
+    submissionFingerprint: string;
+  }):
+    | { kind: "new"; actionId: string }
+    | { kind: "existing"; actionId: string; status: TmuxSessionActionStatus; error: string | null }
+    | { kind: "conflict" } {
+    return this.transaction(() => {
+      const session = this.getTmuxSession(input.sessionRecordId);
+      if (!session) throw new Error("tmux session record not found");
+      const existing = this.db.prepare(`SELECT action_id, status, error, content, submission_fingerprint
+        FROM tmux_session_actions
+        WHERE session_record_id = ? AND action_type = 'task_submit' AND request_id = ?
+        ORDER BY created_at DESC LIMIT 1`).get(session.record_id, input.idempotencyKey) as {
+          action_id: string; status: TmuxSessionActionStatus; error: string | null;
+          content: string; submission_fingerprint: string | null;
+        } | null;
+      if (existing) {
+        return existing.content === input.content
+          && existing.submission_fingerprint === input.submissionFingerprint
+          ? { kind: "existing" as const, actionId: existing.action_id, status: existing.status, error: existing.error }
+          : { kind: "conflict" as const };
+      }
+      const actionId = randomUUID();
+      this.db.prepare(`INSERT INTO tmux_session_actions
+        (action_id, session_record_id, tmux_session_id, session_name, project_key, working_directory,
+         device_id, action_type, request_id, content, submission_fingerprint, status, error, created_at, completed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'task_submit', ?, ?, ?, 'sending', NULL, ?, NULL)`).run(
+        actionId,
+        session.record_id,
+        session.tmux_session_id,
+        session.session_name,
+        session.project_key,
+        session.working_directory,
+        input.deviceId,
+        input.idempotencyKey,
+        input.content,
+        input.submissionFingerprint,
+        this.timestamp(),
+      );
+      return { kind: "new" as const, actionId };
+    });
+  }
+
   public finishTmuxSessionAction(
     actionId: string,
     status: Exclude<TmuxSessionActionStatus, "sending">,

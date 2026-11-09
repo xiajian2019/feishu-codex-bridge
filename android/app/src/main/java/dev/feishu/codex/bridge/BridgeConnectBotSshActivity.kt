@@ -19,6 +19,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -29,12 +30,14 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -110,6 +113,7 @@ private data class SshGitDownloadRequest(
 open class BridgeConnectBotSshActivity : BridgeActivity() {
     protected open fun isEmbeddedSshHost(): Boolean = false
     private var workspaceView: ComposeView? = null
+    private var embeddedSheet = false
     private var appUpdateBanner by mutableStateOf<BridgeAppUpdateBannerState?>(null)
     private var appUpdateOverlayView: ComposeView? = null
     private var previousStatusBarColor = 0
@@ -306,6 +310,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 EXTRA_BRIDGE_SERVER_ORIGIN,
                 savedInstanceState.getString(STATE_BRIDGE_SERVER_ORIGIN),
             ).putExtra(EXTRA_DEFAULT_HOST, savedInstanceState.getString(STATE_DEFAULT_HOST))
+                .putExtra(EXTRA_PRESENTATION_SHEET, savedInstanceState.getBoolean(STATE_PRESENTATION_SHEET))
             openEmbeddedSshWorkspace(restoredRequest)
         }
     }
@@ -313,6 +318,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         traceActivity(BridgeSshTraceEvent.ACTIVITY_SAVE_STATE)
         outState.putBoolean(STATE_WORKSPACE_VISIBLE, workspaceView != null)
+        outState.putBoolean(STATE_PRESENTATION_SHEET, embeddedSheet)
         bridgeServerOrigin?.let { outState.putString(STATE_BRIDGE_SERVER_ORIGIN, it) }
         if (configuredDefaultHost.isNotBlank()) outState.putString(STATE_DEFAULT_HOST, configuredDefaultHost)
         super.onSaveInstanceState(outState)
@@ -322,6 +328,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     fun openEmbeddedSshWorkspace(request: Intent?) {
         check(isEmbeddedSshHost())
         check(workspaceView == null) { "SSH workspace is already open" }
+        embeddedSheet = request?.getBooleanExtra(EXTRA_PRESENTATION_SHEET, false) == true
         BridgeSshActivityDiagnostics.record(BridgeSshTraceEvent.WORKSPACE_OPENED,
             BridgeSshTraceField.EMBEDDED to true)
         prepareWorkspace(request)
@@ -362,8 +369,10 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
                 return@runOnUiThread
             }
             val overlay = appUpdateOverlayView ?: ComposeView(this).apply {
-                isClickable = false
-                isFocusable = false
+                // The update prompt is modal. Do not let taps fall through to
+                // the WebView, including the global download panel underneath.
+                isClickable = true
+                isFocusable = true
                 setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
                 setContent {
                     BridgeSshTheme(nativeTheme) {
@@ -465,21 +474,46 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
     @Composable
     private fun WorkspaceContent() {
         BridgeSshTheme(nativeTheme) {
-            Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            if (embeddedSheet) {
                 Box(Modifier.fillMaxSize()) {
-                    val session = terminalSession
-                    val appSession = managedSession
-                    val generation = appSession?.bindingGeneration
-                    LaunchedEffect(appSession, generation) {
-                        if (appSession != null && managedSession === appSession) refreshManagedSessionBindings(appSession)
-                    }
-                    if (session != null) TerminalScreen(session)
-                    else Box(Modifier.fillMaxSize().safeDrawingPadding()) { SetupScreen() }
-                    pendingHostKey?.let { prompt -> HostKeyDialog(prompt) }
-                    if (keyGenerationDialog) KeyGenerationDialog()
-                    generatedPublicKeyDialog?.let { PublicKeyDialog(it) }
+                    Box(
+                        Modifier.fillMaxSize()
+                            .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.48f))
+                            .clickable(onClick = { closeActivity() }),
+                    )
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .fillMaxHeight(0.80f)
+                            .align(Alignment.BottomCenter)
+                            .semantics { contentDescription = "SSH 原生工作区" },
+                        shape = RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp),
+                        color = MaterialTheme.colorScheme.background,
+                        tonalElevation = 8.dp,
+                    ) { WorkspaceSurfaceContent() }
+                }
+            } else {
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                    WorkspaceSurfaceContent()
                 }
             }
+        }
+    }
+
+    @Composable
+    private fun WorkspaceSurfaceContent() {
+        Box(Modifier.fillMaxSize()) {
+            val session = terminalSession
+            val appSession = managedSession
+            val generation = appSession?.bindingGeneration
+            LaunchedEffect(appSession, generation) {
+                if (appSession != null && managedSession === appSession) refreshManagedSessionBindings(appSession)
+            }
+            if (session != null) TerminalScreen(session)
+            else Box(Modifier.fillMaxSize().safeDrawingPadding()) { SetupScreen() }
+            pendingHostKey?.let { prompt -> HostKeyDialog(prompt) }
+            if (keyGenerationDialog) KeyGenerationDialog()
+            generatedPublicKeyDialog?.let { PublicKeyDialog(it) }
         }
     }
 
@@ -3387,7 +3421,9 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         const val EXTRA_BRIDGE_SERVER_ORIGIN = "bridge.ssh.bridgeServerOrigin"
         const val EXTRA_DEFAULT_HOST = "bridge.ssh.defaultHost"
         const val EXTRA_MANAGE = "bridge.ssh.manage"
+        const val EXTRA_PRESENTATION_SHEET = "bridge.ssh.presentation.sheet"
         private const val STATE_WORKSPACE_VISIBLE = "bridge.ssh.workspaceVisible"
+        private const val STATE_PRESENTATION_SHEET = "bridge.ssh.presentation.sheet.state"
         private const val STATE_BRIDGE_SERVER_ORIGIN = "bridge.ssh.bridgeServerOrigin.state"
         private const val STATE_DEFAULT_HOST = "bridge.ssh.defaultHost.state"
     }

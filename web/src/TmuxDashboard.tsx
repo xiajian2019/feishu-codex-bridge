@@ -25,7 +25,8 @@ import {
 } from "./tmux-codex-account.js";
 import type { CodexUsageAccount } from "./types.js";
 import { useSystemNavigation } from "./WebNavigation.js";
-import { copyMobileText, getBridgeOrigin, isMobileApp, MOBILE_RESUME_EVENT } from "./mobile-runtime.js";
+import { copyMobileText, getBridgeOrigin, getMobileConnection, isMobileApp, MOBILE_RESUME_EVENT } from "./mobile-runtime.js";
+import { getConfiguredGlobalMacHost } from "./bridge-global-config.js";
 import { bridgeTransportMayBeReachable } from "./connection-state.js";
 import { getTmuxTerminalRenderTheme } from "./tmux-terminal-theme.js";
 import { failPendingTmuxSubmissionsOnDisconnect, type TerminalSubmissionResult } from "./tmux-terminal-utils.js";
@@ -38,7 +39,8 @@ import {
 } from "./tmux-session-refresh-policy.js";
 import { useTheme } from "./theme.js";
 import { useMobileBack } from "./use-mobile-back.js";
-import { TmuxSshShortcut } from "./TmuxSshShortcut.js";
+import { TmuxMobileTerminalMode, TmuxSshShortcut } from "./TmuxSshShortcut.js";
+import { TmuxShellTerminalSheet } from "./TmuxShellTerminal.js";
 
 const TmuxMessageComposer = lazy(() => import("./TmuxMessageComposer.js").then((module) => ({ default: module.TmuxMessageComposer })));
 const TmuxHistoryInspector = lazy(() => import("./TmuxSessionHistory.js").then((module) => ({ default: module.TmuxSessionHistory })));
@@ -387,6 +389,8 @@ export function TmuxDashboard(): ReactElement {
   const [connectionBannerDismissed, setConnectionBannerDismissed] = useState(false);
   const [terminalEverAttached, setTerminalEverAttached] = useState(false);
   const [terminalInputEnabled, setTerminalInputEnabled] = useState(false);
+  const [shellTerminalMounted, setShellTerminalMounted] = useState(false);
+  const [shellTerminalVisible, setShellTerminalVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
@@ -878,6 +882,8 @@ export function TmuxDashboard(): ReactElement {
     if (!session || session.endedAt || session.suspendedAt) return;
     cancelSessionsRequest();
     restoreSessionDetailRef.current = false;
+    setShellTerminalMounted(false);
+    setShellTerminalVisible(false);
     if (sessionId !== selectedId) {
       setTerminalInputEnabled(false);
       setTerminalEverAttached(false);
@@ -956,6 +962,8 @@ export function TmuxDashboard(): ReactElement {
     if (backendStatus !== "online" || !selectedId || sessions.some((session) => session.id === selectedId && !session.endedAt && !session.suspendedAt)) return;
     setSelectedId(null);
     setTerminalInputEnabled(false);
+    setShellTerminalMounted(false);
+    setShellTerminalVisible(false);
     setMobileView("sessions");
     setNavigationCollapsed(false);
   }, [backendStatus, sessions, selectedId, setNavigationCollapsed]);
@@ -2042,7 +2050,16 @@ export function TmuxDashboard(): ReactElement {
                 aria-label={`Backend ${backendStatus}`}
                 title={`Backend ${backendStatus}`}
               />
-              <TmuxSshShortcut onError={(message) => setToast({ message, isError: true })} />
+              <TmuxSshShortcut
+                onError={(message) => setToast({ message, isError: true })}
+                sessionSelection={selectedSession && getMobileConnection()?.server ? {
+                  bridgeOrigin: getMobileConnection()!.server,
+                  sessionId: selectedSession.id,
+                  createdAt: selectedSession.createdAt,
+                  expectedSshHost: getConfiguredGlobalMacHost(),
+                  expectedSshPort: 22,
+                } : undefined}
+              />
               <button
                 className={`dashboard-action dashboard-icon-button dashboard-refresh-button${sessionsRefreshing ? " is-refreshing" : ""}`}
                 type="button"
@@ -2170,31 +2187,29 @@ export function TmuxDashboard(): ReactElement {
             <div className="dashboard-active-session"><div><div className="dashboard-active-session-title"><strong>{selectedSession?.name ?? "No session selected"}</strong>{selectedSession ? <button className="dashboard-active-session-edit" type="button" onClick={openSessionEditDialog} disabled={Boolean(selectedSession.endedAt || selectedSession.suspendedAt)} aria-label="编辑 Session 名称和工作目录" title="编辑 Session 名称和工作目录"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m4 16.5-.8 4.3 4.3-.8L19 8.5 15.5 5z" /><path d="m13.8 6.7 3.5 3.5" /></svg></button> : null}</div><span title={selectedSession?.cwd}>{selectedSession?.workspaceBranch ? `任务分支 ${selectedSession.workspaceBranch} · ${selectedSession.workspaceStatus ?? "工作区"} · ` : ""}{selectedSession?.cwd ?? "Choose a session to open its terminal"}</span></div></div>
             {selectedSession ? (
               <div className="dashboard-codex-inline" aria-label="Session 账号与操作">
-                <button
-                  className={`dashboard-terminal-mode-toggle${terminalInputEnabled ? " is-active" : ""}`}
-                  type="button"
-                  disabled={terminalStatus !== "ATTACHED"}
-                  aria-pressed={terminalInputEnabled}
-                  aria-label={terminalInputEnabled ? "关闭终端输入，返回只读输出" : "开启终端输入"}
-                  title={terminalInputEnabled ? "关闭终端输入；返回只读输出" : "开启终端输入；按键会直接发送到当前 tmux Session"}
-                  onClick={() => setTerminalInputEnabled((current) => !current)}
-                >
-                  {terminalInputEnabled ? (
-                    <svg className="dashboard-terminal-mode-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                      <rect x="3" y="4" width="18" height="15" rx="2" />
-                      <path d="m7 9 3 3-3 3" />
-                      <path d="M13 15h3M17 8v6" />
-                    </svg>
-                  ) : (
-                    <svg className="dashboard-terminal-mode-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                      <rect x="3" y="4" width="18" height="15" rx="2" />
-                      <path d="m7 9 3 3-3 3" />
-                      <path d="M13 15h2" />
-                      <rect x="15" y="13" width="6" height="6" rx="1.2" />
-                      <path d="M17 13v-1a2 2 0 0 1 4 0v1" />
-                    </svg>
-                  )}
-                </button>
+                <TmuxMobileTerminalMode
+                  terminalInputEnabled={terminalInputEnabled}
+                  terminalAttached={terminalStatus === "ATTACHED"}
+                  onToggleTerminalInput={() => setTerminalInputEnabled((current) => !current)}
+                  onError={(message) => setToast({ message, isError: true })}
+                  onOpenWebShell={!isMobileApp() && selectedSession ? () => {
+                    if (!shellTerminalMounted) {
+                      setShellTerminalMounted(true);
+                      setShellTerminalVisible(true);
+                    } else {
+                      setShellTerminalVisible((current) => !current);
+                    }
+                  } : undefined}
+                  webShellOpen={shellTerminalVisible}
+                  webShellRetained={shellTerminalMounted && !shellTerminalVisible}
+                  sessionSelection={selectedSession && getMobileConnection()?.server ? {
+                    bridgeOrigin: getMobileConnection()!.server,
+                    sessionId: selectedSession.id,
+                    createdAt: selectedSession.createdAt,
+                    expectedSshHost: getConfiguredGlobalMacHost(),
+                    expectedSshPort: 22,
+                  } : undefined}
+                />
                 <button
                   className="dashboard-codex-usage-trigger"
                   type="button"
@@ -2320,6 +2335,18 @@ export function TmuxDashboard(): ReactElement {
             onScrollToBottom={() => terminalHistoryActionsRef.current?.bottom()}
             onExportScrollDiagnostics={exportScrollDiagnostics}
           /></Suspense> : null}
+          {shellTerminalMounted && selectedSession ? <TmuxShellTerminalSheet
+            sessionId={selectedSession.id}
+            sessionCreatedAt={selectedSession.createdAt}
+            visible={shellTerminalVisible}
+            onMinimize={() => setShellTerminalVisible(false)}
+            onRestore={() => setShellTerminalVisible(true)}
+            onClose={() => setShellTerminalVisible(false)}
+            onExpired={() => {
+              setShellTerminalMounted(false);
+              setShellTerminalVisible(false);
+            }}
+          /> : null}
         </section>
       </section>
       {sessionEditTarget ? (

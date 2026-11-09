@@ -2,6 +2,36 @@ import Foundation
 import Capacitor
 import Security
 
+enum BridgeIOSecureCredentialStore {
+    static let service = "dev.feishu.codex.bridge.credentials"
+
+    static func readToken(server: String) throws -> String? {
+        guard let url = URL(string: server), let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), url.host != nil,
+              url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+              server.count <= 2_048 else {
+            throw NSError(domain: "BridgeCredentials", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid Bridge server address."])
+        }
+        var request: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: server,
+            kSecAttrSynchronizable as String: false,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var value: CFTypeRef?
+        let status = SecItemCopyMatching(request as CFDictionary, &value)
+        request.removeAll(keepingCapacity: false)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = value as? Data,
+              let token = String(data: data, encoding: .utf8), !token.isEmpty else {
+            throw NSError(domain: "BridgeCredentials", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unable to read secure Bridge credentials."])
+        }
+        return token
+    }
+}
+
 @objc(BridgeCredentialsPlugin)
 public class BridgeCredentialsPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "BridgeCredentialsPlugin"
@@ -22,7 +52,7 @@ public class BridgeCredentialsPlugin: CAPPlugin, CAPBridgedPlugin {
         }
         return [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "dev.feishu.codex.bridge.credentials",
+            kSecAttrService as String: BridgeIOSecureCredentialStore.service,
             kSecAttrAccount as String: server,
             kSecAttrSynchronizable as String: false
         ]

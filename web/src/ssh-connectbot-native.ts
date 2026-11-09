@@ -1,10 +1,13 @@
 import { Capacitor, registerPlugin, type PluginListenerHandle } from "@capacitor/core";
+import type { BridgeSshSessionSelection } from "./bridge-ssh-session-context.js";
+
+export type { BridgeSshSessionContext, BridgeSshSessionSelection } from "./bridge-ssh-session-context.js";
 
 export interface BridgeConnectBotSshOpenRequest {
   host: string;
   port: number;
   username: string;
-  /** Origin only; the native side reads the matching token from AndroidKeyStore. */
+  /** Origin only; the native side keeps it as Bridge context and never receives a token. */
   bridgeServerOrigin?: string;
   password?: string;
   startupCommand?: string;
@@ -16,6 +19,8 @@ export interface BridgeConnectBotSshWorkspaceRequest {
   bridgeServerOrigin?: string;
   defaultHost?: string;
   mode?: "manage";
+  presentation?: "sheet";
+  sessionSelection?: BridgeSshSessionSelection;
 }
 
 export interface SshProfileOption {
@@ -56,7 +61,8 @@ export function openNativeTerminal(request: BridgeConnectBotSshOpenRequest): Pro
 }
 
 export function isNativeSshWorkspaceAvailable(): boolean {
-  return Capacitor.getPlatform() === "android" && Capacitor.isPluginAvailable("BridgeConnectBotSSH");
+  const platform = Capacitor.getPlatform();
+  return (platform === "android" || platform === "ios") && Capacitor.isPluginAvailable("BridgeConnectBotSSH");
 }
 
 export function openNativeSshWorkspace(request: BridgeConnectBotSshWorkspaceRequest): Promise<void> {

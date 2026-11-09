@@ -34,6 +34,7 @@ interface Upload {
   parts: Map<number, UploadPart>;
   cancelled?: boolean;
   result?: DownloadUploadResult;
+  scope?: string;
 }
 
 interface UploadPart {
@@ -55,14 +56,14 @@ export class DownloadUploadsService {
     this.timer = setInterval(() => {
       for (const item of this.uploads.values()) {
         if (!item.operation && item.partOperations.size === 0 && Date.now() - item.touchedAt > UPLOAD_TTL_MS) {
-          void this.cancel(item.id, item.owner).catch(() => {});
+          void this.cancel(item.id, item.owner, item.scope).catch(() => {});
         }
       }
     }, 60_000);
     this.timer.unref?.();
   }
 
-  async create(owner: string, fileName: unknown, sizeBytes: unknown, protocol: DownloadUploadProtocol = "offset") {
+  async create(owner: string, fileName: unknown, sizeBytes: unknown, protocol: DownloadUploadProtocol = "offset", scope?: string) {
     if (this.closed) throw new DownloadUploadError(503, "上传服务已停止。");
     if (typeof fileName !== "string" || !fileName.trim()) throw new DownloadUploadError(400, "请选择文件。");
     if (!Number.isSafeInteger(sizeBytes) || Number(sizeBytes) < 0) throw new DownloadUploadError(400, "文件大小无效。");
@@ -78,16 +79,16 @@ export class DownloadUploadsService {
       const normalizedSize = Number(sizeBytes);
       const item: Upload = { id: randomUUID(), owner, fileName: safeFileName(fileName), sizeBytes: normalizedSize,
         protocol, partCount: Math.ceil(normalizedSize / DOWNLOAD_UPLOAD_CHUNK_BYTES), offset: 0, directory, path,
-        touchedAt: Date.now(), partOperations: new Map(), parts: new Map() };
+        touchedAt: Date.now(), partOperations: new Map(), parts: new Map(), ...(scope ? { scope } : {}) };
       this.uploads.set(item.id, item);
       return this.view(item);
     } catch (error) { await rm(directory, { recursive: true, force: true }); throw error; }
   }
 
-  status(id: string, owner: string) { return this.view(this.require(id, owner)); }
+  status(id: string, owner: string, scope?: string) { return this.view(this.require(id, owner, scope)); }
 
-  async appendPart(id: string, owner: string, index: number, source: Readable, authorized: () => boolean = () => true) {
-    const item = this.require(id, owner);
+  async appendPart(id: string, owner: string, index: number, source: Readable, authorized: () => boolean = () => true, scope?: string) {
+    const item = this.require(id, owner, scope);
     if (item.protocol !== "parts") throw new DownloadUploadError(409, "该上传任务不支持并行分片。");
     if (!Number.isSafeInteger(index) || index < 0 || index >= item.partCount) throw new DownloadUploadError(400, "上传分片序号无效。");
     if (item.result) throw new DownloadUploadError(409, "该文件已上传完成。");
@@ -136,8 +137,8 @@ export class DownloadUploadsService {
     finally { item.partOperations.delete(index); }
   }
 
-  async append(id: string, owner: string, offset: number, source: Readable, authorized: () => boolean = () => true) {
-    const item = this.require(id, owner);
+  async append(id: string, owner: string, offset: number, source: Readable, authorized: () => boolean = () => true, scope?: string) {
+    const item = this.require(id, owner, scope);
     if (item.operation || item.result) throw new DownloadUploadError(409, "该文件正在处理或已上传完成。");
     if (!Number.isSafeInteger(offset) || offset !== item.offset) throw new DownloadUploadError(409, "上传进度已变化，请重新读取进度。");
     item.controller = new AbortController();
@@ -168,8 +169,8 @@ export class DownloadUploadsService {
     finally { item.operation = undefined; item.controller = undefined; }
   }
 
-  async complete(id: string, owner: string): Promise<DownloadUploadResult> {
-    const item = this.require(id, owner);
+  async complete(id: string, owner: string, scope?: string): Promise<DownloadUploadResult> {
+    const item = this.require(id, owner, scope);
     if (item.result) return item.result;
     if (item.completion) return item.completion;
     if (item.protocol === "parts") return this.completeParts(item);
@@ -182,9 +183,9 @@ export class DownloadUploadsService {
     try { return await operation; } finally { item.operation = undefined; item.completion = undefined; }
   }
 
-  async cancel(id: string, owner: string): Promise<void> {
+  async cancel(id: string, owner: string, scope?: string): Promise<void> {
     const item = this.uploads.get(id);
-    if (!item || item.owner !== owner) return;
+    if (!item || item.owner !== owner || item.scope !== scope) return;
     item.cancelled = true;
     item.controller?.abort();
     await item.operation?.catch(() => {});
@@ -196,12 +197,12 @@ export class DownloadUploadsService {
   async dispose(): Promise<void> {
     this.closed = true;
     clearInterval(this.timer);
-    await Promise.all([...this.uploads.values()].map((item) => this.cancel(item.id, item.owner)));
+    await Promise.all([...this.uploads.values()].map((item) => this.cancel(item.id, item.owner, item.scope)));
   }
 
-  private require(id: string, owner: string): Upload {
+  private require(id: string, owner: string, scope?: string): Upload {
     const item = this.uploads.get(id);
-    if (this.closed || !item || item.owner !== owner || item.cancelled) throw new DownloadUploadError(404, "上传记录不存在或已过期，请重新上传。");
+    if (this.closed || !item || item.owner !== owner || item.scope !== scope || item.cancelled) throw new DownloadUploadError(404, "上传记录不存在或已过期，请重新上传。");
     return item;
   }
 

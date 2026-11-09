@@ -2,6 +2,7 @@ package dev.feishu.codex.bridge
 
 import android.Manifest
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -255,9 +256,10 @@ internal class BridgeAutoVpnController(
         // Both automatic and user-initiated checks must honor Wi-Fi exemptions.
         wifiStartBlockReason(bypass, manual)?.let { return it }
 
-        val bound = bindProvider() ?: run {
+        val provider = bindProviderWithBootstrap()
+        val bound = provider.service ?: run {
             Log.i(TAG, "VPN check skipped: OpenVPN provider unavailable")
-            return report("未找到 OpenVPN for Android，无法连接 VPN。")
+            return report(if (provider.bootstrapStarted) "已后台发起 VPN 连接，请稍后重试。" else "未找到 OpenVPN for Android，无法连接 VPN。")
         }
         try {
             val service = bound.service
@@ -453,7 +455,49 @@ internal class BridgeAutoVpnController(
         }
     }
 
-    private suspend fun bindProvider(): BoundService? {
+    /**
+     * OpenVPN for Android exposes an exported external API service. Binding it
+     * with BIND_AUTO_CREATE starts the provider process without opening its UI,
+     * so Bridge remains the foreground app while the VPN is checked or started.
+     */
+    private suspend fun bindProviderWithRetry(): BoundService? {
+        bindProvider(INITIAL_SERVICE_TIMEOUT_MS)?.let { return it }
+        repeat(PROVIDER_BIND_RETRY_COUNT) {
+            delay(PROVIDER_STARTUP_DELAY_MS)
+            bindProvider(SERVICE_TIMEOUT_MS)?.let { return it }
+        }
+        return null
+    }
+
+    private suspend fun bindProviderWithBootstrap(): ProviderBindingResult {
+        bindProviderWithRetry()?.let { return ProviderBindingResult(it, false) }
+        val profileId = preferences.getString(PROFILE_ID, null)?.trim().orEmpty()
+        if (profileId.isEmpty() || !launchProviderProfile(profileId)) return ProviderBindingResult(null, false)
+        // LaunchVPN is a short-lived official shortcut Activity. Give its
+        // process a moment to create ExternalOpenVPNService, then bind again.
+        delay(PROVIDER_STARTUP_DELAY_MS)
+        return ProviderBindingResult(bindProviderWithRetry(), true)
+    }
+
+    private fun launchProviderProfile(profileId: String): Boolean {
+        val launchIntent = Intent(Intent.ACTION_MAIN).apply {
+            component = ComponentName(OPENVPN_PACKAGE, OPENVPN_LAUNCH_ACTIVITY)
+            putExtra(OPENVPN_PROFILE_UUID_EXTRA, profileId)
+            putExtra(OPENVPN_HIDE_LOG_EXTRA, true)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return try {
+            activity.startActivity(launchIntent)
+            Log.i(TAG, "Requested OpenVPN profile shortcut before retrying API service binding")
+            true
+        } catch (_: ActivityNotFoundException) {
+            false
+        } catch (_: SecurityException) {
+            false
+        }
+    }
+
+    private suspend fun bindProvider(timeoutMs: Long): BoundService? {
         val ready = CompletableDeferred<IOpenVPNAPIService>()
         val connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -476,7 +520,7 @@ internal class BridgeAutoVpnController(
         if (!bound) return null
         var handedOff = false
         try {
-            val service = withTimeoutOrNull(SERVICE_TIMEOUT_MS) { ready.await() } ?: return null
+            val service = withTimeoutOrNull(timeoutMs) { ready.await() } ?: return null
             handedOff = true
             return BoundService(activity, connection, service)
         } finally {
@@ -600,9 +644,17 @@ internal class BridgeAutoVpnController(
         fun close() { runCatching { context.unbindService(connection) } }
     }
 
+    private data class ProviderBindingResult(
+        val service: BoundService?,
+        val bootstrapStarted: Boolean,
+    )
+
     companion object {
         private const val TAG = "BridgeAutoVpn"
         private const val OPENVPN_PACKAGE = "de.blinkt.openvpn"
+        private const val OPENVPN_LAUNCH_ACTIVITY = "de.blinkt.openvpn.LaunchVPN"
+        private const val OPENVPN_PROFILE_UUID_EXTRA = "de.blinkt.openvpn.shortcutProfileUUID"
+        private const val OPENVPN_HIDE_LOG_EXTRA = "de.blinkt.openvpn.showNoLogWindow"
         private const val PREFERENCES = "bridge_auto_vpn"
         private const val PROFILE_ID = "profile_id"
         private const val BYPASS_WIFI_SSIDS = "bypass_wifi_ssids"
@@ -610,7 +662,10 @@ internal class BridgeAutoVpnController(
         private const val START_RETRY_INTERVAL_MS = 30_000L
         private const val NETWORK_DEBOUNCE_MS = 1_000L
         private const val PROBE_TIMEOUT_MS = 1_500
+        private const val INITIAL_SERVICE_TIMEOUT_MS = 1_500L
         private const val SERVICE_TIMEOUT_MS = 5_000L
+        private const val PROVIDER_STARTUP_DELAY_MS = 500L
+        private const val PROVIDER_BIND_RETRY_COUNT = 3
         private const val STATUS_TIMEOUT_MS = 1_500L
         private const val MANUAL_CONNECT_TIMEOUT_MS = 30_000L
         private const val TARGET_WAIT_MS = 60_000L

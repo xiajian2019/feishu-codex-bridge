@@ -65,7 +65,7 @@ describe("mobile connection center", () => {
   });
 
   it("does not expose Android SSH metadata from a browser", async () => {
-    await expect(listBrowserSshOptions()).rejects.toThrow("ConnectBot SSH 仅支持 Android App。");
-    await expect(onBrowserSshReturnToWorkbench(() => {})).rejects.toThrow("ConnectBot SSH 仅支持 Android App。");
+    await expect(listBrowserSshOptions()).rejects.toThrow("原生 SSH 仅支持 Android/iOS App。");
+    await expect(onBrowserSshReturnToWorkbench(() => {})).rejects.toThrow("原生 SSH 仅支持 Android/iOS App。");
   });
 });

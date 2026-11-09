@@ -25,6 +25,11 @@ export function isMobileDownloadActive(task: MobileDownloadTask): boolean {
   return task.state !== "done" && task.state !== "error" && task.state !== "cancelled";
 }
 
+/** APK installer progress is rendered by the native update overlay, not this WebView panel. */
+export function isMobileDownloadPanelTask(task: MobileDownloadTask): boolean {
+  return task.destination !== "installer";
+}
+
 /** App-wide state, independent of routes. Never retains URLs or credentials. */
 export function createMobileDownloadManager() {
   let tasks: MobileDownloadTask[] = [];

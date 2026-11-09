@@ -6,7 +6,7 @@ App 与浏览器的功能差异、已发现风险和分批优化建议见 [App �
 
 当前 Android App 的整体架构、风险分级和整改顺序见 [Android App 架构与风险评审（2026-11-02）](android-app-architecture-review-2026-11-02.md)。该文档是实施建议和验收门槛，不代表风险已经修复。
 
-Web 工作台和 Android 原生 SSH 是长期并存的使用路径，二者均可独立增加功能；Web 工作台也面向 iPhone。当前 Web tmux 经 Bridge WebSocket 访问 Bridge 主机，Android 原生 SSH 经手机直连 SSH 主机；不能把 iPhone 的 Web tmux 访问等同于当前已实现 iOS 原生直接 SSH。
+Web 工作台和 Android/iOS 原生 SSH 是长期并存的使用路径，三者均可独立增加功能。当前 Web tmux 经 Bridge WebSocket 访问 Bridge 主机，原生 SSH 经手机直连 SSH 主机；Web tmux 与原生 SSH 不是同一条传输链路。
 
 内置单配置 OpenVPN 的可行性、包体目标和实施计划见 [手机 App 内置 OpenVPN 评估](mobile-openvpn-feasibility-2026-11-01.md)；当前仅为方案，尚未实现。
 
@@ -21,6 +21,14 @@ bun run mobile:build
 ```
 
 `mobile:build` 生成 `dist/mobile` 并执行 Capacitor sync；原有 `bun run build:web` 仍输出 `dist/web`，不会替换已部署网页。只同步已有构建可用 `bun run mobile:sync`。`mobile:doctor` 只读检查工具，不安装 SDK，不启动或重启 Bridge；缺少工具时以非零状态退出。
+
+首次或网络受限时解析 iOS SwiftPM 依赖，可使用 `HTTP_PROXY` / `HTTPS_PROXY`（也接受小写变量）：
+
+```bash
+HTTP_PROXY=http://127.0.0.1:7897 HTTPS_PROXY=http://127.0.0.1:7897 bun run mobile:ios:resolve
+```
+
+脚本会把已提供的代理变量同步为大小写两套后传给 `xcodebuild`；不保存代理地址，也不会覆盖 `CapApp-SPM/Package.swift`。SwiftPM/Git 是否完全使用代理仍取决于本机 Xcode/SwiftPM 版本和网络环境。
 
 Android App 在配对后及回前台时比较更新包与实际安装的 versionCode；首次连接旧版本也会提示，点击“稍后”暂缓 30 分钟。已下载、打开安装器和已安装分别记录，取消安装或拒绝安装权限后仍可重试。更新状态按服务器隔离。已配对且 Bridge 可访问时，即使停留在原生 SSH 工作区也会检查更新并在顶部提供更新、下载和稍后操作；未配对或 Bridge 不可访问时无法从该来源检查或下载。环境切换弹窗的 App 区域提供“检查更新”和“手动下载 App”；主动检查会重新显示已暂缓的新版本，手动下载也支持当前版本。原连接维护中的下载入口继续保留。
 
@@ -51,6 +59,12 @@ App 名称为 `Bridge`，应用标识为 `dev.feishu.codex.bridge`。正式发�
 如需复用已有设备，在已登录的设备管理页找到该授权，点击其“生成二维码”，再用目标设备扫码或打开链接。成功后保留原授权编号、名称和已延期的有效期，并轮换凭据使原登录退出；二维码五分钟内有效且只能使用一次，生成其他二维码会使未使用的旧码失效。有效授权及未标记撤销的过期授权可以复用；历史上已标记撤销的记录不会自动恢复。
 
 推荐 HTTPS；证书必须受手机系统信任。自用 HTTP 连接限局域网、回环、链路本地地址与私有网络地址（含常见 VPN 的 `100.64.0.0/10`）。公网 HTTP 会在连接页被拒绝。LAN HTTP 不提供传输加密，请只在可信网络使用。
+
+## iOS 原生 SSH 工作区
+
+iOS App 的 `SSH / Mac` 入口会打开原生工作区：支持密码登录、未加密 Ed25519/ECDSA 私钥登录、首次主机密钥确认、交互式 PTY、终端 resize、连接后命令、主机配置保存，以及从 Tmux 页面打开全屏或半屏工作区。私钥通过系统文件选择器导入，材料与元数据分离保存到 `WhenUnlockedThisDeviceOnly` Keychain，不进入 WebView；RSA、加密私钥暂不支持。当前 NIOSSH 暴露的是本次连接标识，不是可持久比较的 OpenSSH 标准指纹；密码只通过一次性原生调用进入连接对象，不写入 WebView 存储；主机配置只保存主机、端口、用户名、密钥 ID 和启动命令等非敏感元数据。选中已有 Tmux Session 时，iOS 会从配对 Bridge 读取 Session 列表，并使用 Keychain 中的 Bridge token 校验绑定的 `bridgeOrigin + SSH host/port/user + sessionId + createdAt`，身份不一致则拒绝 API 绑定。
+
+当前 iOS 首阶段尚未接入 SFTP 预览/上传/下载/API fallback、Bridge API-first Session 的完整读写操作、Composer 附件删除/断点恢复或后台常驻重连；已接入一层只读 Session 文件列表、Composer 附件选择/分块上传和 scoped 引用，SFTP transport adapter 仍需真实主机验收，Composer 文本已支持 API-first 和结果未知提示，Session 列表/identity 仍是只读绑定层。原生 SSH 依赖的 SwiftTerm、SwiftNIO SSH 和固定 revision 的 NIOSFTP 已加入 Xcode App target；Xcode 依赖解析、编译、真实 Mac `sshd`/tmux 和 iPhone 触摸/软键盘验收必须分别完成，不能用浏览器或源码检查替代。
 
 ## Android SSH 工作区
 
@@ -121,6 +135,11 @@ App 内置页面，不使用 Capacitor `server.url` 加载远端网页，也不�
 - 相机不可用时本地图片仍可识别；空白图片、无关二维码与配对码失效均有提示，可重新选择同一图片重试。模拟相机画面可实时识别并自动配对；退出后停止相机轨道。
 - 模拟系统图片选择器引发的同步 visibilitychange，扫码页保持存在并能继续配对；图片仍在解码时用系统返回退出，解码结束后不会在后台提交配对。配对码和设备 token 未写入浏览器存储。
 - 320/390/1280px 深浅主题无横向溢出，输入框保持 16px。仅重建 App 前端并同步原生工程，没有重新编译 APK/IPA、安装真机或部署服务；相机权限、系统相册和实际 Android/iOS WebView 行为仍需真机验收。
+
+2026-11-08 iOS SSH 阶段验证：
+
+- 使用 `HTTP_PROXY=http://127.0.0.1:7897 HTTPS_PROXY=http://127.0.0.1:7897 bun run mobile:ios:resolve` 解析 SwiftTerm `1.15.0`、SwiftNIO SSH `0.13.0` 与 SwiftNIO `2.81.0`；随后 `xcodebuild ... CODE_SIGNING_ALLOWED=NO build` 通过。
+- iOS 原生已覆盖密码/未加密 Ed25519/ECDSA 私钥、Session 列表只读选择、文本 Composer API-first、Composer 附件分块上传和 `bridgeOrigin + SSH host/port/user + sessionId + createdAt` identity 校验；未完成 SFTP 完整文件操作、签名安装和真机验收。
 
 2026-10-25 的开发机验证：
 

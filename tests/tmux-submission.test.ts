@@ -70,6 +70,47 @@ describe("tmux submission deduplication", () => {
     }
   });
 
+  it("persists Composer idempotency by Session record and rejects key reuse with different content", () => {
+    const db = new StateDatabase(":memory:");
+    try {
+      const session = db.recordTmuxSession({ id: "$11", name: "composer-api", cwd: "/tmp", createdAt: 11 });
+      const first = db.beginTmuxComposerAction({
+        sessionRecordId: session.record_id,
+        deviceId: null,
+        idempotencyKey: "composer-key-1",
+        content: "hello",
+        submissionFingerprint: "fingerprint-1",
+      });
+      expect(first).toMatchObject({ kind: "new" });
+      if (first.kind !== "new") throw new Error("expected a new Composer claim");
+      db.finishTmuxSessionAction(first.actionId, "sent");
+
+      expect(db.beginTmuxComposerAction({
+        sessionRecordId: session.record_id,
+        deviceId: null,
+        idempotencyKey: "composer-key-1",
+        content: "hello",
+        submissionFingerprint: "fingerprint-1",
+      })).toMatchObject({ kind: "existing", actionId: first.actionId, status: "sent" });
+      expect(db.beginTmuxComposerAction({
+        sessionRecordId: session.record_id,
+        deviceId: null,
+        idempotencyKey: "composer-key-1",
+        content: "changed",
+        submissionFingerprint: "fingerprint-2",
+      })).toEqual({ kind: "conflict" });
+      expect(db.beginTmuxComposerAction({
+        sessionRecordId: session.record_id,
+        deviceId: null,
+        idempotencyKey: "composer-key-2",
+        content: "changed",
+        submissionFingerprint: "fingerprint-2",
+      })).toMatchObject({ kind: "new" });
+    } finally {
+      db.close();
+    }
+  });
+
   it("keeps ended session history and sorts active sessions ahead of archived ones", () => {
     const db = new StateDatabase(":memory:");
     try {

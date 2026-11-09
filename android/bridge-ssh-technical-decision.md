@@ -1,6 +1,6 @@
 # ConnectBot SSH Android 技术决策
 
-状态：Android 首版切换到 ConnectBot 模块；以下按当前源码更新，iOS SSH 仍仅有决策记录。
+状态：Android 首版切换到 ConnectBot 模块；以下按当前源码更新。iOS 已另接入 SwiftTerm + SwiftNIO SSH 的密码/PTY 第一阶段，不复用 Android 原生实现；iOS 的未完成边界见 [iOS 技术决策记录](../doc/mobile-ssh-ios-decision.md)。
 
 ## 选择
 
@@ -42,7 +42,7 @@ Android native: passphrase and Host Key prompt stay in BridgeConnectBotSshActivi
 - Android 的 SSH 主入口使用连接中心中的原生 SSH 工作区；SSH CLI 和 Bridge 服务端已有相关实现，不能再表述为“未修改服务端”。
 - 不实现 Room 级别的完整 ConnectBot 密钥数据库或 Mosh；生成或主动导入的无口令 SSH 密钥通过 `BridgeSshKeyStore` 持久化，记录/密文在 App 私有 SharedPreferences，AES 包装密钥在 Android Keystore，使用时才解密到 Activity 内存。带口令私钥可选择用于当前连接，暂不支持保存。
 - tmux 选择器通过同一 SSH 连接上的临时 exec 通道读取现有会话；首次选择在当前交互式 shell 中发送 attach，已附加时先 detach 再 attach，连接本身不随 Session 切换重建。新建会话及窗口切换仍可通过终端或 Composer 操作。
-- iOS 方案暂不选型落地。未来需在当前 iOS 15 Capacitor 工程中单独验证 SwiftTerm + Citadel/SwiftNIO SSH 的依赖解析、Host Key、Keychain、PTY、前后台和真机行为，不能把 Android 插件实现视为 iOS 兼容证明。
+- iOS 当前使用独立的 SwiftTerm + SwiftNIO SSH 第一阶段实现，支持密码认证、主机指纹确认和 PTY；依赖解析、Keychain 私钥、SFTP、前后台和真实设备行为仍需单独验证，不能把 Android 插件实现视为 iOS 兼容证明。
 
 ## 依赖风险边界
 

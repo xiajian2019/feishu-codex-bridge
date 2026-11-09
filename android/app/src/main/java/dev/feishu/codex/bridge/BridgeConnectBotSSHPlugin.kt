@@ -63,6 +63,9 @@ class BridgeConnectBotSSHPlugin : Plugin() {
                 if (call.getString("mode") == "manage") {
                     putExtra(BridgeConnectBotSshActivity.EXTRA_MANAGE, true)
                 }
+                if (call.getString("presentation") == "sheet") {
+                    putExtra(BridgeConnectBotSshActivity.EXTRA_PRESENTATION_SHEET, true)
+                }
             }
         openInHost(call, request)
     }

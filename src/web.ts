@@ -1208,7 +1208,7 @@ export class DashboardServer {
 
   private trackNativeSshApiRequest(request: IncomingMessage, response: ServerResponse, pathname: string): void {
     const logger = this.options.logger;
-    if (!logger || request.headers["x-bridge-client"] !== "android-native-ssh") return;
+    if (!logger || !["android-native-ssh", "ios-native-ssh"].includes(String(request.headers["x-bridge-client"] ?? ""))) return;
     const route = nativeSshLogRoute(pathname);
     if (!route) return;
     const started = Date.now();
@@ -3426,7 +3426,7 @@ export class DashboardServer {
     response.setHeader("Access-Control-Expose-Headers", "Content-Disposition, Retry-After");
     if (request.method === "OPTIONS") {
       const methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
-      const headers = ["authorization", "content-type", "x-bridge-action-token", "x-file-name"];
+      const headers = ["authorization", "content-type", "x-bridge-action-token", "x-file-name", "x-bridge-client", "x-bridge-ssh-session-id", "x-bridge-session-created-at", "x-bridge-ssh-host", "x-bridge-ssh-port", "x-bridge-ssh-username"];
       const requestedMethod = firstHeaderValue(request.headers["access-control-request-method"]);
       const requestedHeaders = firstHeaderValue(request.headers["access-control-request-headers"])
         ?.toLowerCase().split(",").map((value) => value.trim()).filter(Boolean) ?? [];
@@ -3779,7 +3779,7 @@ function nativeSshLogRoute(pathname: string): { route: string; sessionId?: strin
     "/tmux-dashboard/api/sessions/suspended", "/tmux-dashboard/api/attachments/uploads",
   ]);
   if (plain.has(pathname)) return { route: pathname };
-  const session = /^\/tmux-dashboard\/api\/sessions\/(?:%24|\$)(\d{1,16})(?:\/(identity|skills|codex-account(?:\/check)?|git-changes(?:\/(?:content|download))?|files(?:\/(?:upload|download))?|resurrect\/save|suspend|resume))?$/i.exec(pathname);
+  const session = /^\/tmux-dashboard\/api\/sessions\/(?:%24|\$)(\d{1,16})(?:\/(identity|skills|codex-account(?:\/check)?|git-changes(?:\/(?:content|download))?|files(?:\/(?:upload|download))?|resurrect\/save|suspend|resume|composer))?$/i.exec(pathname);
   if (session) return { route: `/tmux-dashboard/api/sessions/:session${session[2] ? `/${session[2]}` : ""}`, sessionId: `$${session[1]}` };
   if (/^\/tmux-dashboard\/api\/attachments\/uploads\/[a-f0-9-]{1,64}(?:\/complete)?$/i.test(pathname)) {
     return { route: pathname.endsWith("/complete")

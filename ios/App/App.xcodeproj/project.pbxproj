@@ -13,8 +13,20 @@
 		B41D6E010000000000000001 /* BridgeCredentialsPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = B41D6E010000000000000011 /* BridgeCredentialsPlugin.swift */; };
 		B41D6E010000000000000002 /* BridgeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B41D6E010000000000000012 /* BridgeViewController.swift */; };
 		B41D6E010000000000000003 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = B41D6E010000000000000013 /* PrivacyInfo.xcprivacy */; };
+		C1A000000000000000000001 /* BridgeConnectBotSSHPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000011 /* BridgeConnectBotSSHPlugin.swift */; };
+		C1A000000000000000000002 /* BridgeIOSSHWorkspace.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000012 /* BridgeIOSSHWorkspace.swift */; };
+		C1A000000000000000000003 /* BridgeNativeThemePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000013 /* BridgeNativeThemePlugin.swift */; };
+		C1A000000000000000000008 /* BridgeIOSSHSessionAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000014 /* BridgeIOSSHSessionAPI.swift */; };
+		C1A000000000000000000009 /* BridgeIOSSHPrivateKeySupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000015 /* BridgeIOSSHPrivateKeySupport.swift */; };
+		C1A00000000000000000000A /* BridgeIOSSHKeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000016 /* BridgeIOSSHKeychainStore.swift */; };
+		C1A00000000000000000000C /* BridgeIOSSHSFTPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000017 /* BridgeIOSSHSFTPClient.swift */; };
 		2FAD9763203C412B000D30F8 /* config.xml in Resources */ = {isa = PBXBuildFile; fileRef = 2FAD9762203C412B000D30F8 /* config.xml */; };
 		4D22ABE92AF431CB00220026 /* CapApp-SPM in Frameworks */ = {isa = PBXBuildFile; productRef = 4D22ABE82AF431CB00220026 /* CapApp-SPM */; };
+		C1A000000000000000000004 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000021 /* SwiftTerm */; };
+		C1A000000000000000000005 /* NIOSSH in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000022 /* NIOSSH */; };
+		C1A000000000000000000006 /* NIOCore in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000023 /* NIOCore */; };
+		C1A000000000000000000007 /* NIOPosix in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000024 /* NIOPosix */; };
+		C1A00000000000000000000B /* NIOSFTP in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000025 /* NIOSFTP */; };
 		50379B232058CBB4000EE86E /* capacitor.config.json in Resources */ = {isa = PBXBuildFile; fileRef = 50379B222058CBB4000EE86E /* capacitor.config.json */; };
 		504EC3081FED79650016851F /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 504EC3071FED79650016851F /* AppDelegate.swift */; };
 		504EC30D1FED79650016851F /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 504EC30B1FED79650016851F /* Main.storyboard */; };
@@ -34,6 +46,13 @@
 		B41D6E010000000000000011 /* BridgeCredentialsPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeCredentialsPlugin.swift; sourceTree = "<group>"; };
 		B41D6E010000000000000012 /* BridgeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeViewController.swift; sourceTree = "<group>"; };
 		B41D6E010000000000000013 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		C1A000000000000000000011 /* BridgeConnectBotSSHPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeConnectBotSSHPlugin.swift; sourceTree = "<group>"; };
+		C1A000000000000000000012 /* BridgeIOSSHWorkspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeIOSSHWorkspace.swift; sourceTree = "<group>"; };
+		C1A000000000000000000013 /* BridgeNativeThemePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeNativeThemePlugin.swift; sourceTree = "<group>"; };
+		C1A000000000000000000014 /* BridgeIOSSHSessionAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeIOSSHSessionAPI.swift; sourceTree = "<group>"; };
+		C1A000000000000000000015 /* BridgeIOSSHPrivateKeySupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeIOSSHPrivateKeySupport.swift; sourceTree = "<group>"; };
+		C1A000000000000000000016 /* BridgeIOSSHKeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeIOSSHKeychainStore.swift; sourceTree = "<group>"; };
+		C1A000000000000000000017 /* BridgeIOSSHSFTPClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeIOSSHSFTPClient.swift; sourceTree = "<group>"; };
 		2FAD9762203C412B000D30F8 /* config.xml */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = config.xml; sourceTree = "<group>"; };
 		50379B222058CBB4000EE86E /* capacitor.config.json */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.json; path = capacitor.config.json; sourceTree = "<group>"; };
 		504EC3041FED79650016851F /* App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = App.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -62,6 +81,11 @@
 			buildActionMask = 2147483647;
 			files = (
 				4D22ABE92AF431CB00220026 /* CapApp-SPM in Frameworks */,
+				C1A000000000000000000004 /* SwiftTerm in Frameworks */,
+				C1A000000000000000000005 /* NIOSSH in Frameworks */,
+				C1A000000000000000000006 /* NIOCore in Frameworks */,
+				C1A000000000000000000007 /* NIOPosix in Frameworks */,
+				C1A00000000000000000000B /* NIOSFTP in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -92,6 +116,13 @@
 			isa = PBXGroup;
 			children = (
 				B41D6E010000000000000011 /* BridgeCredentialsPlugin.swift */,
+				C1A000000000000000000011 /* BridgeConnectBotSSHPlugin.swift */,
+				C1A000000000000000000012 /* BridgeIOSSHWorkspace.swift */,
+				C1A000000000000000000013 /* BridgeNativeThemePlugin.swift */,
+				C1A000000000000000000014 /* BridgeIOSSHSessionAPI.swift */,
+				C1A000000000000000000015 /* BridgeIOSSHPrivateKeySupport.swift */,
+				C1A000000000000000000016 /* BridgeIOSSHKeychainStore.swift */,
+				C1A000000000000000000017 /* BridgeIOSSHSFTPClient.swift */,
 				A73101000000000000000011 /* BridgeShareInboxPlugin.swift */,
 				A73101000000000000000016 /* App.entitlements */,
 				B41D6E010000000000000012 /* BridgeViewController.swift */,
@@ -130,6 +161,11 @@
 			name = App;
 			packageProductDependencies = (
 				4D22ABE82AF431CB00220026 /* CapApp-SPM */,
+				C1A000000000000000000021 /* SwiftTerm */,
+				C1A000000000000000000022 /* NIOSSH */,
+				C1A000000000000000000023 /* NIOCore */,
+				C1A000000000000000000024 /* NIOPosix */,
+				C1A000000000000000000025 /* NIOSFTP */,
 			);
 			productName = App;
 			productReference = 504EC3041FED79650016851F /* App.app */;
@@ -163,6 +199,10 @@
 			mainGroup = 504EC2FB1FED79650016851F;
 			packageReferences = (
 				D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */,
+				C1A000000000000000000031 /* XCRemoteSwiftPackageReference "SwiftTerm" */,
+				C1A000000000000000000032 /* XCRemoteSwiftPackageReference "swift-nio-ssh" */,
+				C1A000000000000000000033 /* XCRemoteSwiftPackageReference "swift-nio" */,
+				C1A000000000000000000034 /* XCRemoteSwiftPackageReference "swift-nio-sftp" */,
 			);
 			productRefGroup = 504EC3051FED79650016851F /* Products */;
 			projectDirPath = "";
@@ -199,6 +239,13 @@
 			buildActionMask = 2147483647;
 			files = (
 				B41D6E010000000000000001 /* BridgeCredentialsPlugin.swift in Sources */,
+				C1A000000000000000000001 /* BridgeConnectBotSSHPlugin.swift in Sources */,
+				C1A000000000000000000002 /* BridgeIOSSHWorkspace.swift in Sources */,
+				C1A000000000000000000003 /* BridgeNativeThemePlugin.swift in Sources */,
+				C1A000000000000000000008 /* BridgeIOSSHSessionAPI.swift in Sources */,
+				C1A000000000000000000009 /* BridgeIOSSHPrivateKeySupport.swift in Sources */,
+				C1A00000000000000000000A /* BridgeIOSSHKeychainStore.swift in Sources */,
+				C1A00000000000000000000C /* BridgeIOSSHSFTPClient.swift in Sources */,
 				A73101000000000000000001 /* BridgeShareInboxPlugin.swift in Sources */,
 				B41D6E010000000000000002 /* BridgeViewController.swift in Sources */,
 				504EC3081FED79650016851F /* AppDelegate.swift in Sources */,
@@ -422,11 +469,71 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		C1A000000000000000000031 /* XCRemoteSwiftPackageReference "SwiftTerm" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/migueldeicaza/SwiftTerm.git";
+			requirement = {
+				kind = exactVersion;
+				version = 1.15.0;
+			};
+		};
+		C1A000000000000000000032 /* XCRemoteSwiftPackageReference "swift-nio-ssh" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-nio-ssh.git";
+			requirement = {
+				kind = exactVersion;
+				version = 0.13.0;
+			};
+		};
+		C1A000000000000000000033 /* XCRemoteSwiftPackageReference "swift-nio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-nio.git";
+			requirement = {
+				kind = exactVersion;
+				version = 2.81.0;
+			};
+		};
+		C1A000000000000000000034 /* XCRemoteSwiftPackageReference "swift-nio-sftp" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/EkkoG/swift-nio-sftp.git";
+			requirement = {
+				kind = revision;
+				revision = 748e88568638463370816dbaaaf9684237258501;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		4D22ABE82AF431CB00220026 /* CapApp-SPM */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */;
 			productName = "CapApp-SPM";
+		};
+		C1A000000000000000000021 /* SwiftTerm */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C1A000000000000000000031 /* XCRemoteSwiftPackageReference "SwiftTerm" */;
+			productName = "SwiftTerm";
+		};
+		C1A000000000000000000022 /* NIOSSH */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C1A000000000000000000032 /* XCRemoteSwiftPackageReference "swift-nio-ssh" */;
+			productName = "NIOSSH";
+		};
+		C1A000000000000000000023 /* NIOCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C1A000000000000000000033 /* XCRemoteSwiftPackageReference "swift-nio" */;
+			productName = "NIOCore";
+		};
+		C1A000000000000000000024 /* NIOPosix */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C1A000000000000000000033 /* XCRemoteSwiftPackageReference "swift-nio" */;
+			productName = "NIOPosix";
+		};
+		C1A000000000000000000025 /* NIOSFTP */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C1A000000000000000000034 /* XCRemoteSwiftPackageReference "swift-nio-sftp" */;
+			productName = "NIOSFTP";
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

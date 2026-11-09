@@ -24,16 +24,18 @@
 .jj-run-meta { align-items: baseline; justify-content: space-between; margin-bottom: 10px; font-size: 12px; }
 .jj-run-meta code { min-width: 0; overflow-wrap: anywhere; }
 .jj-run-meta span { flex-shrink: 0; color: var(--muted); }
-.jj-log-filter { margin-bottom: 10px; }
-.jj-log-filter input { flex: 1; }
+.jj-log-filter { flex-wrap: wrap; margin-bottom: 10px; }
+.jj-log-filter input { flex: 1 1 240px; }
 .jj-log-filter > span { flex-shrink: 0; color: var(--muted); font-size: 12px; }
+.jj-log-actions { display: flex; flex: 0 0 auto; gap: 6px; }
+.jj-log-actions button { white-space: nowrap; }
 .jj-terminal-frame { position: relative; overflow: hidden; border-radius: 8px; background: #10141a; }
-.jj-terminal { height: 380px; padding: 10px; touch-action: none; }
+.jj-terminal { height: clamp(420px, 58vh, 560px); padding: 10px; touch-action: none; }
 .jj-terminal .xterm { height: 100%; color: #d8dee9; }
 .jj-terminal .xterm-viewport { overscroll-behavior: contain; }
-.jj-filtered-output-wrap { position: absolute; inset: 0; z-index: 10; pointer-events: none; }
-.jj-filtered-output { position: absolute; inset: 0; margin: 0; padding: 10px; overflow: auto; color: #d8dee9; background: #10141a; font: 13px/1.5 "SFMono-Regular", Menlo, Monaco, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; touch-action: pan-y; overscroll-behavior: contain; pointer-events: auto; }
-.jj-filtered-output::selection { color: #fff; background: #41536b; }
+.jj-filtered-output-wrap, .jj-selectable-output-wrap { position: absolute; inset: 0; z-index: 10; pointer-events: none; }
+.jj-filtered-output, .jj-selectable-output { position: absolute; inset: 0; margin: 0; padding: 10px; overflow: auto; color: #d8dee9; background: #10141a; font: 13px/1.5 "SFMono-Regular", Menlo, Monaco, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; touch-action: pan-y; overscroll-behavior: contain; pointer-events: auto; user-select: text; -webkit-user-select: text; -webkit-touch-callout: default; cursor: text; }
+.jj-filtered-output::selection, .jj-selectable-output::selection { color: #fff; background: #41536b; }
 .jj-copy-filtered-log { position: absolute; right: 10px; bottom: 10px; z-index: 11; display: grid; place-items: center; width: 32px; min-width: 32px; height: 32px; min-height: 32px; padding: 0; border: 1px solid #526174; border-radius: 8px; color: #d8dee9; background: #1d2733e6; box-shadow: 0 3px 10px #0006; pointer-events: auto; }
 .jj-copy-filtered-log svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .jj-copy-filtered-log:hover:not(:disabled), .jj-copy-filtered-log:focus-visible { color: #fff; border-color: #8de0bd; background: #24533f; }
@@ -46,7 +48,7 @@
   .jj-card { padding: 11px; }
   .jj-pod-fields { grid-template-columns: minmax(0, 1fr) 96px; gap: 10px; }
   .jj-builds label { flex: 1; }
-  .jj-terminal { height: 340px; padding: 6px; }
+  .jj-terminal { height: clamp(420px, 58vh, 520px); padding: 6px; }
   .jj-filtered-output { padding: 6px; }
   .jj-copy-filtered-log { right: 8px; bottom: 8px; }
   .jj-run-meta { flex-wrap: wrap; gap: 4px; }
