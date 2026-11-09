@@ -9,6 +9,7 @@ const webRoot = fileURLToPath(new URL(".", import.meta.url));
 const apiTarget = process.env.BRIDGE_WEB_API_TARGET ?? "http://127.0.0.1:17310";
 const tmuxApiTarget = process.env.BRIDGE_TMUX_API_TARGET ?? apiTarget;
 const tmuxWebSocketTarget = tmuxApiTarget.replace(/^http/, "ws");
+const nativeAppOrigins = new Set(["capacitor://localhost", "http://localhost", "https://localhost"]);
 
 export default defineConfig({
   root: webRoot,
@@ -34,6 +35,11 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 5173,
     strictPort: true,
+    cors: {
+      origin: ["capacitor://localhost", "http://localhost", "https://localhost"],
+      methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowedHeaders: ["Accept", "Authorization", "Content-Type", "X-Bridge-Action-Token"],
+    },
     watch: {
       // Native projects and generated assets must not invalidate the Web dev server.
       // Keep shared web/src modules watched, even when they also serve the App.
@@ -81,7 +87,11 @@ export default defineConfig({
         changeOrigin: true,
         configure: (proxy) => {
           proxy.on("proxyReq", (proxyRequest, request) => {
-            proxyRequest.setHeader("Origin", apiTarget);
+            // Keep the native WebView origin so Bridge can emit the CORS
+            // headers required by iOS WKWebView. Browser requests stay
+            // same-origin with the local API target as before.
+            const origin = request.headers.origin;
+            proxyRequest.setHeader("Origin", origin && nativeAppOrigins.has(origin) ? origin : apiTarget);
             proxyRequest.removeHeader("X-Bridge-Public-Origin");
             const host = request.headers.host;
             const protocol = (request.socket as typeof request.socket & { encrypted?: boolean }).encrypted ? "https" : "http";
