@@ -14,6 +14,9 @@ html.bridge-mobile-app #root {
 }
 html.bridge-mobile-app .system-navigation-shell { top: var(--bridge-safe-top); }
 html.bridge-mobile-app .system-navigation-shell.is-collapsed { left: var(--bridge-safe-left); }
+/* The tmux detail shell owns the bottom edge; keep its composer from being
+   lifted by the root's global safe-area padding when the keyboard is hidden. */
+html.bridge-mobile-app.tmux-terminal-detail #root { padding-bottom: 0; }
 html.bridge-mobile-app .task-detail-page,
 html.bridge-mobile-app .codex-thread-page-shell { height: calc(100dvh - 53px - var(--bridge-safe-height)); }
 html.bridge-mobile-app .task-detail-composer { padding-bottom: 7px; }

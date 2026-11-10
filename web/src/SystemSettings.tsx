@@ -7,6 +7,7 @@ import { fetchWorkbenchSettings, updateWorkbenchSettings, type WorkbenchNotifica
 import "./workbench.css";
 import { readMobileNotificationPreferences, updateMobileNotificationPreferences, type MobileNotificationPreferences } from "./mobile-notifications.js";
 import { getMobileNotificationPermission } from "./mobile-runtime.js";
+import { IOSOtaPanel, isIphoneOtaSurface } from "./IOSOtaPanel.js";
 
 export function SystemSettings(): ReactElement {
   const { mode, setMode } = useTheme();
@@ -129,6 +130,7 @@ export function SystemSettings(): ReactElement {
         <NotificationPreferenceRow title="恢复上次工作页面" description="按环境和设备恢复；通知、分享及显式打开目标优先，不恢复执行操作。" checked={nativePreferences.restoreLocation} disabled={nativeBusy} onChange={(restoreLocation) => updateNative({ restoreLocation })} />
         {nativeError ? <p className="workbench-page-error" role="alert">{nativeError}</p> : null}
       </section> : null}
+      {isIphoneOtaSurface() ? <IOSOtaPanel /> : null}
       <section className="system-settings-notifications" aria-label="通知偏好">
         <header className="workbench-page-header">
           <div><h2>通知偏好</h2><p className="workbench-settings-note">{isMobileApp() ? "以下事件类别由后端保存；本机原生通知另由上方设备设置控制。待处理中心始终可查看已有记录。" : "站内通知保留在任务面板；浏览器通知在页面打开时检查新通知，并需要浏览器授权。"}</p></div>

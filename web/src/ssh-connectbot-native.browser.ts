@@ -1,11 +1,12 @@
 import type { PluginListenerHandle } from "@capacitor/core";
-import type { AppUpdateAction, BridgeConnectBotSshOpenRequest, BridgeConnectBotSshWorkspaceRequest, NativeAppUpdateBanner, SshOptions, SshWorkspaceClosedEvent } from "./ssh-connectbot-native.js";
+import type { AppUpdateAction, BridgeConnectBotSshOpenRequest, BridgeConnectBotSshWorkspaceRequest, NativeAppUpdateBanner, NativeSshPlatform, SshOptions, SshWorkspaceClosedEvent } from "./ssh-connectbot-native.js";
 
 export function openNativeTerminal(_request: BridgeConnectBotSshOpenRequest): Promise<void> {
   return Promise.reject(new Error("原生 SSH 仅支持 Android/iOS App。"));
 }
 
 export function isNativeSshWorkspaceAvailable(): boolean { return false; }
+export function getNativeSshPlatform(): NativeSshPlatform | null { return null; }
 
 export function openNativeSshWorkspace(_request?: BridgeConnectBotSshWorkspaceRequest): Promise<void> {
   return Promise.reject(new Error("原生 SSH 仅支持 Android/iOS App。"));

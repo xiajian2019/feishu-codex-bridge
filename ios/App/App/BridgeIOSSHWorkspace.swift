@@ -4,10 +4,84 @@ import NIOCore
 import NIOPosix
 import NIOSSH
 import NIOSFTP
+import OSLog
 import SwiftTerm
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
+
+private let bridgeIOSSHOSLogger = Logger(
+    subsystem: Bundle.main.bundleIdentifier ?? "dev.feishu.codex.bridge",
+    category: "SSH"
+)
+
+private final class BridgeIOSSHDiagnosticStore {
+    static let shared = BridgeIOSSHDiagnosticStore()
+
+    private let lock = NSLock()
+    private var entries: [String] = []
+    private var totalBytes = 0
+    private let maxEntries = 400
+    private let maxBytes = 128 * 1024
+
+    func append(level: String, message: String) {
+        let timestamp = Int(Date().timeIntervalSince1970 * 1_000)
+        let line = "\(timestamp) [\(level)] \(message)"
+        lock.lock()
+        entries.append(line)
+        totalBytes += line.utf8.count
+        while entries.count > maxEntries || totalBytes > maxBytes {
+            guard !entries.isEmpty else { break }
+            totalBytes -= entries.removeFirst().utf8.count
+        }
+        lock.unlock()
+    }
+
+    func snapshot() -> String {
+        lock.lock()
+        let lines = entries
+        lock.unlock()
+        let body = lines.isEmpty ? "（暂无 SSH 调试日志）" : lines.joined(separator: "\n")
+        return "Bridge iOS SSH diagnostics\n\(body)"
+    }
+}
+
+private enum BridgeIOSSHLog {
+    private static func record(level: String, message: String) {
+        BridgeIOSSHDiagnosticStore.shared.append(level: level, message: message)
+    }
+
+    static func debug(_ message: String) {
+        record(level: "DEBUG", message: message)
+        bridgeIOSSHOSLogger.debug("\(message, privacy: .public)")
+    }
+
+    static func info(_ message: String) {
+        record(level: "INFO", message: message)
+        bridgeIOSSHOSLogger.info("\(message, privacy: .public)")
+    }
+
+    static func error(_ message: String) {
+        record(level: "ERROR", message: message)
+        bridgeIOSSHOSLogger.error("\(message, privacy: .public)")
+    }
+
+    static func snapshot() -> String {
+        BridgeIOSSHDiagnosticStore.shared.snapshot()
+    }
+}
+
+private func bridgeIOSSHLogHash(_ value: String) -> String {
+    let digest = SHA256.hash(data: Data(value.utf8))
+    return String(Data(digest).base64EncodedString().prefix(12))
+}
+
+private func bridgeIOSSHErrorDetails(_ error: Error) -> String {
+    let nsError = error as NSError
+    let description = String(describing: error)
+    let shortened = description.count > 240 ? String(description.prefix(240)) + "…" : description
+    return "type=\(String(reflecting: type(of: error))) domain=\(nsError.domain) code=\(nsError.code) message=\(shortened)"
+}
 
 enum BridgeIOSSHWorkspaceLaunch {
     enum Presentation: Equatable {
@@ -118,6 +192,51 @@ final class BridgeIOSSHProfileStore {
     private func persist(_ profiles: [BridgeIOSSHProfile]) {
         guard let data = try? JSONEncoder().encode(Array(profiles.prefix(32))) else { return }
         defaults.set(data, forKey: defaultsKey)
+    }
+}
+
+private final class BridgeIOSSHHostKeyStore {
+    static let shared = BridgeIOSSHHostKeyStore()
+
+    private let defaultsKey = "bridge.ios.ssh.host-keys.v1"
+    private let defaults: UserDefaults
+    private let lock = NSLock()
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func trustedKey(host: String, port: Int) -> String? {
+        withLock {
+            guard let data = defaults.data(forKey: defaultsKey),
+                  let values = try? JSONDecoder().decode([String: String].self, from: data) else {
+                return nil
+            }
+            return values[storageKey(host: host, port: port)]
+        }
+    }
+
+    func trust(key: String, host: String, port: Int) {
+        withLock {
+            var values: [String: String] = [:]
+            if let data = defaults.data(forKey: defaultsKey),
+               let stored = try? JSONDecoder().decode([String: String].self, from: data) {
+                values = stored
+            }
+            values[storageKey(host: host, port: port)] = key
+            guard let data = try? JSONEncoder().encode(values) else { return }
+            defaults.set(data, forKey: defaultsKey)
+        }
+    }
+
+    private func storageKey(host: String, port: Int) -> String {
+        "\(host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())\u{0}\(port)"
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
     }
 }
 
@@ -235,6 +354,12 @@ enum BridgeIOSSHSessionPickerState: Equatable {
     case unavailable(String)
 }
 
+private struct BridgeIOSSHVisiblePublicKey: Identifiable {
+    let id: String
+    let label: String
+    let value: String
+}
+
 @MainActor
 private final class BridgeIOSSHWorkspaceModel: ObservableObject {
     @Published var host: String
@@ -243,10 +368,14 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
     @Published var password: String
     @Published var startupCommand: String
     @Published var profiles: [BridgeIOSSHProfile]
+    @Published private(set) var selectedProfileId: String?
+    @Published private(set) var profileSelectionMessage: String?
     @Published var keys: [BridgeIOSSHKeyMetadata]
     @Published var selectedKeyId: String
+    @Published var visiblePublicKey: BridgeIOSSHVisiblePublicKey?
     @Published var state: BridgeIOSSHState = .setup
     @Published var pendingHostKey: String?
+    @Published var pendingHostKeyChanged = false
     @Published var session: BridgeIOSSHSession?
     @Published var composerText = ""
     @Published private(set) var composerState: BridgeIOSSHComposerState = .idle
@@ -276,6 +405,8 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
         let savedProfiles = BridgeIOSSHProfileStore.shared.list()
         let availableKeys = (try? keychainStore.listMetadata()) ?? []
         profiles = savedProfiles
+        selectedProfileId = nil
+        profileSelectionMessage = nil
         keys = availableKeys
         switch launch {
         case .terminal(let host, let port, let username, let password, let startupCommand, _, let keyId):
@@ -289,35 +420,60 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
             sessionSelection = nil
             selectedSessionSelection = nil
             initialConnection = true
-        case .manager(let defaultHost, _, _, _, let selection):
+        case .manager(let defaultHost, _, _, let manageMode, let selection):
             let recent = savedProfiles.first
+            selectedProfileId = recent?.id
             self.host = recent?.host ?? defaultHost
             self.port = String(recent?.port ?? 22)
             self.username = recent?.username ?? ""
             self.password = ""
             self.startupCommand = recent?.startupCommand ?? ""
-            selectedKeyId = recent.flatMap { profile in availableKeys.contains(where: { $0.id == profile.keyId }) ? profile.keyId : nil } ?? ""
+            let recentKeyId = recent.flatMap { profile in availableKeys.contains(where: { $0.id == profile.keyId }) ? profile.keyId : nil } ?? ""
+            selectedKeyId = recentKeyId
             bridgeServerOrigin = launch.bridgeServerOrigin
             sessionSelection = selection
             selectedSessionSelection = selection
-            initialConnection = false
+            // The normal workspace entry is the quick path: use the most recent
+            // saved key-backed profile immediately. Management mode keeps the
+            // setup screen available for editing or adding a host.
+            initialConnection = !manageMode && recent != nil && !recentKeyId.isEmpty
         }
     }
 
     func startIfNeeded() {
         guard !hasStarted else { return }
         hasStarted = true
+        if sessionSelection != nil { refreshRemoteSessions() }
         if initialConnection { connect() }
-        else { refreshRemoteSessions() }
     }
 
     func select(_ profile: BridgeIOSSHProfile) {
+        selectedProfileId = profile.id
+        profileSelectionMessage = "已载入主机配置：\(profile.label)"
         host = profile.host
         port = String(profile.port)
         username = profile.username
         startupCommand = profile.startupCommand
         password = ""
         selectedKeyId = keys.contains(where: { $0.id == profile.keyId }) ? profile.keyId : ""
+        state = .setup
+        clearSessionSelection()
+    }
+
+    func connect(profile: BridgeIOSSHProfile) {
+        select(profile)
+        connect()
+    }
+
+    func prepareNewProfile() {
+        selectedProfileId = nil
+        profileSelectionMessage = nil
+        host = ""
+        port = "22"
+        username = ""
+        password = ""
+        startupCommand = ""
+        selectedKeyId = keys.first?.id ?? ""
         state = .setup
         clearSessionSelection()
     }
@@ -332,6 +488,33 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
             selectedKeyId = metadata.id
             password = ""
             state = .setup
+        } catch {
+            state = .failed(error.localizedDescription)
+        }
+    }
+
+    func generateKey() {
+        do {
+            let id = UUID().uuidString
+            let material = BridgeIOSSHPrivateKeyGenerator.generateEd25519PKCS8()
+            let metadata = try keychainStore.importKey(
+                material: material, label: "iPhone Ed25519 \(id.prefix(8))", id: id
+            )
+            keys = try keychainStore.listMetadata()
+            selectedKeyId = metadata.id
+            password = ""
+            state = .setup
+            showPublicKey(metadata)
+        } catch {
+            state = .failed(error.localizedDescription)
+        }
+    }
+
+    func showPublicKey(_ metadata: BridgeIOSSHKeyMetadata) {
+        do {
+            let parsed = try keychainStore.parsedKey(for: metadata.id)
+            visiblePublicKey = BridgeIOSSHVisiblePublicKey(id: metadata.id, label: metadata.label,
+                                                          value: parsed.publicKeyOpenSSH)
         } catch {
             state = .failed(error.localizedDescription)
         }
@@ -435,17 +618,24 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
     }
 
     func clearSessionSelection() {
+        sessionListTask?.cancel()
+        sessionListTask = nil
+        remoteSessions = []
         sessionSelection = nil
         selectedSessionSelection = nil
         selectedRemoteSession = nil
         apiBindingState = .none
-        sessionPickerState = bridgeServerOrigin == nil ? .idle : .loaded
+        sessionPickerState = .idle
     }
 
     func connect() {
         let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedUser = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        BridgeIOSSHLog.info(
+            "workspace connect requested hostHash=\(bridgeIOSSHLogHash(trimmedHost)) port=\(port) userHash=\(bridgeIOSSHLogHash(trimmedUser)) hasSessionSelection=\(sessionSelection != nil) hasKey=\(!selectedKeyId.isEmpty)"
+        )
         guard !trimmedHost.isEmpty, !trimmedUser.isEmpty, let parsedPort = Int(port), (1...65_535).contains(parsedPort) else {
+            BridgeIOSSHLog.error("workspace connect rejected: invalid host, port, or username")
             state = .failed("请输入有效的主机、端口和用户名。")
             return
         }
@@ -456,21 +646,30 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
             do {
                 authentication = .privateKey(try keychainStore.parsedKey(for: selectedKeyId))
             } catch {
+                BridgeIOSSHLog.error("workspace private-key load failed: \(bridgeIOSSHErrorDetails(error))")
                 state = .failed(error.localizedDescription)
                 return
             }
         } else {
             authentication = .password(password)
         }
+        BridgeIOSSHLog.debug(
+            "workspace authentication prepared method=\(selectedKeyId.isEmpty ? "password" : "private-key")"
+        )
         if let selection = sessionSelection {
+            BridgeIOSSHLog.debug(
+                "workspace session selection validating bridgeOriginHash=\(bridgeIOSSHLogHash(selection.bridgeOrigin)) sessionId=\(selection.sessionId) createdAt=\(selection.createdAt)"
+            )
             guard selection.bridgeOrigin == bridgeServerOrigin,
                   selection.sessionId.range(of: #"^\$\d{1,16}$"#, options: .regularExpression) != nil,
                   selection.createdAt >= 0 else {
+                BridgeIOSSHLog.error("workspace session selection rejected: invalid Bridge context")
                 state = .failed("Bridge Session 上下文无效，请刷新后重新选择。")
                 return
             }
             if selection.expectedSshHost != nil && selection.expectedSshHost != trimmedHost.lowercased()
                 || selection.expectedSshPort != nil && selection.expectedSshPort != parsedPort {
+                BridgeIOSSHLog.error("workspace session selection rejected: SSH target changed")
                 state = .failed("SSH 目标已变化，请重新选择当前 Session。")
                 return
             }
@@ -488,25 +687,39 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
             apiBindingState = .none
         }
         state = .connecting
+        BridgeIOSSHLog.info(
+            "workspace starting SSH session hostHash=\(bridgeIOSSHLogHash(trimmedHost)) port=\(parsedPort) apiBinding=\(boundContext != nil)"
+        )
         pendingHostKey = nil
+        pendingHostKeyChanged = false
         hostKeyDecision = nil
         session?.disconnect()
         let next = BridgeIOSSHSession(host: trimmedHost, port: parsedPort, username: trimmedUser,
                                       authentication: authentication, startupCommand: startupCommand,
                                       onState: { [weak self] nextState in
+                                          BridgeIOSSHLog.debug(
+                                              "workspace received session state=\(String(describing: nextState))"
+                                          )
                                           DispatchQueue.main.async {
                                               guard let self else { return }
                                               switch nextState {
                                               case .connecting: self.state = .connecting
                                               case .connected: self.state = .connected
-                                              case .failed: self.state = .failed("SSH 连接失败，请检查主机、端口、认证信息或网络。")
+                                              case .failed:
+                                                  BridgeIOSSHLog.error("workspace mapped SSH session failure to generic UI error")
+                                                  self.state = .failed("SSH 连接失败，请检查主机、端口、认证信息或网络。")
                                               }
                                           }
-                                      }, onHostKey: { [weak self] fingerprint, decision in
+                                      }, onHostKey: { [weak self] fingerprint, changed, decision in
+                                          BridgeIOSSHLog.info(
+                                              "workspace received host-key prompt fingerprint=\(fingerprint) changed=\(changed)"
+                                          )
                                           DispatchQueue.main.async {
                                               guard let self else { decision(false); return }
                                               self.pendingHostKey = fingerprint
+                                              self.pendingHostKeyChanged = changed
                                               self.hostKeyDecision = decision
+                                              BridgeIOSSHLog.debug("workspace displayed host-key confirmation alert")
                                           }
                                       })
         session = next
@@ -514,16 +727,23 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
         if let context = boundContext {
             apiVerificationGeneration += 1
             let verificationGeneration = apiVerificationGeneration
+            BridgeIOSSHLog.debug(
+                "workspace API identity verification started bridgeOriginHash=\(bridgeIOSSHLogHash(context.bridgeOrigin)) sessionId=\(context.sessionId) generation=\(verificationGeneration)"
+            )
             Task { @MainActor [weak self] in
                 do {
                     _ = try await BridgeIOSSHSessionAPI.verifyIdentity(context)
                     guard let self, self.apiVerificationGeneration == verificationGeneration,
                           self.boundContext == context else { return }
+                    BridgeIOSSHLog.info("workspace API identity verification succeeded generation=\(verificationGeneration)")
                     self.apiBindingState = .verified
                 } catch let error as BridgeIOSSHSessionAPIError {
                     guard let self else { return }
                     guard self.apiVerificationGeneration == verificationGeneration,
                           self.boundContext == context else { return }
+                    BridgeIOSSHLog.error(
+                        "workspace API identity verification failed generation=\(verificationGeneration) error=\(error.localizedDescription)"
+                    )
                     switch error {
                     case .identityMismatch:
                         self.apiBindingState = .mismatch(error.localizedDescription)
@@ -535,6 +755,9 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
                 } catch {
                     guard let self, self.apiVerificationGeneration == verificationGeneration,
                           self.boundContext == context else { return }
+                    BridgeIOSSHLog.error(
+                        "workspace API identity verification failed with unexpected error generation=\(verificationGeneration) error=\(bridgeIOSSHErrorDetails(error))"
+                    )
                     self.apiBindingState = .unavailable("Bridge Session API 暂时不可用；SSH 仍可独立使用。")
                 }
             }
@@ -542,10 +765,19 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
     }
 
     func decideHostKey(_ accepted: Bool) {
-        let decision = hostKeyDecision
+        guard let decision = hostKeyDecision else {
+            BridgeIOSSHLog.debug(
+                "workspace host-key decision ignored accepted=\(accepted) reason=no-pending-decision"
+            )
+            return
+        }
+        BridgeIOSSHLog.info(
+            "workspace host-key decision accepted=\(accepted) hasPendingDecision=true fingerprint=\(pendingHostKey ?? "none")"
+        )
         hostKeyDecision = nil
         pendingHostKey = nil
-        decision?(accepted)
+        pendingHostKeyChanged = false
+        decision(accepted)
         if !accepted {
             session?.disconnect()
             state = .failed("已拒绝此 SSH 主机密钥。")
@@ -718,13 +950,19 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
         BridgeIOSSHProfileStore.shared.save(host: host, port: parsedPort, username: username,
                                             startupCommand: startupCommand, keyId: selectedKeyId)
         profiles = BridgeIOSSHProfileStore.shared.list()
+        selectedProfileId = profiles.first(where: { $0.host == host && $0.port == parsedPort && $0.username == username })?.id
+        profileSelectionMessage = "主机配置已保存"
     }
 
     func disconnect() {
+        BridgeIOSSHLog.info(
+            "workspace disconnect requested hasSession=\(session != nil) hasBoundContext=\(boundContext != nil)"
+        )
         apiVerificationGeneration += 1
         hostKeyDecision?(false)
         hostKeyDecision = nil
         pendingHostKey = nil
+        pendingHostKeyChanged = false
         session?.disconnect()
         session = nil
         sftpClient = nil
@@ -741,11 +979,18 @@ private struct BridgeIOSSHWorkspaceView: View {
     @StateObject private var model: BridgeIOSSHWorkspaceModel
     private let launch: BridgeIOSSHWorkspaceLaunch
     @State private var isImportingKey = false
+    @State private var isShowingRemoteSessions: Bool
+    @State private var isShowingConfiguration: Bool
+    @State private var isShowingSecurityDetails = false
+    @State private var isPublicKeyCopied = false
     @State private var isImportingComposerAttachment = false
     @State private var isShowingFiles = false
+    @State private var isDiagnosticsCopied = false
 
     init(launch: BridgeIOSSHWorkspaceLaunch, onClose: @escaping (Bool) -> Void) {
         self.launch = launch
+        _isShowingRemoteSessions = State(initialValue: launch.sessionSelection != nil)
+        _isShowingConfiguration = State(initialValue: BridgeIOSSHProfileStore.shared.list().isEmpty)
         _model = StateObject(wrappedValue: BridgeIOSSHWorkspaceModel(launch: launch, onClose: onClose))
     }
 
@@ -760,14 +1005,16 @@ private struct BridgeIOSSHWorkspaceView: View {
         }
         .preferredColorScheme(BridgeNativeThemePlugin.preferredColorScheme)
         .onAppear { model.startIfNeeded() }
-        .alert("确认 SSH 主机", isPresented: Binding(
+        .alert(model.pendingHostKeyChanged ? "SSH 主机密钥已变化" : "确认 SSH 主机", isPresented: Binding(
             get: { model.pendingHostKey != nil },
-            set: { if !$0 { model.decideHostKey(false) } }
+            set: { if !$0 && model.pendingHostKey != nil { model.decideHostKey(false) } }
         )) {
-            Button("信任并继续") { model.decideHostKey(true) }
+            Button(model.pendingHostKeyChanged ? "重新信任并继续" : "信任并继续") { model.decideHostKey(true) }
             Button("拒绝", role: .cancel) { model.decideHostKey(false) }
         } message: {
-            Text("首次连接必须确认主机密钥。当前 NIOSSH 只能提供本次连接标识，不是 OpenSSH 标准指纹。\n\n\(model.pendingHostKey ?? "未知")\n\n只在确认目标主机可信时继续。")
+            Text(model.pendingHostKeyChanged
+                 ? "已保存的 SSH 主机密钥与本次连接不一致。主机重装、IP 复用或中间人攻击都可能导致变化；只有确认目标主机可信时才重新信任。\n\n\(model.pendingHostKey ?? "未知")"
+                 : "首次连接会记录 SSH 主机密钥，之后相同主机将自动信任，不再重复询问。\n\n\(model.pendingHostKey ?? "未知")")
         }
         .fileImporter(
             isPresented: $isImportingKey,
@@ -791,66 +1038,119 @@ private struct BridgeIOSSHWorkspaceView: View {
         .sheet(isPresented: $isShowingFiles) {
             BridgeIOSSHFilesView(model: model)
         }
-    }
-
-    private var terminalView: some View {
-        ZStack(alignment: .top) {
-            Color.black.ignoresSafeArea()
-            if let session = model.session {
-                BridgeIOSSHTerminalRepresentable(session: session)
-                    .ignoresSafeArea(.container, edges: [.bottom, .leading, .trailing])
-            }
-            VStack(spacing: 0) {
-                HStack(spacing: 10) {
+        .sheet(item: $model.visiblePublicKey) { key in
+            NavigationView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text(key.label).font(.headline)
+                    Text("将此公钥追加到 SSH 主机的 ~/.ssh/authorized_keys，然后使用此密钥连接。")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                    ScrollView {
+                        Text(key.value)
+                            .font(.system(size: 12, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 160)
                     Button {
-                        model.disconnect()
+                        UIPasteboard.general.string = key.value
+                        isPublicKeyCopied = true
                     } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 18, weight: .semibold))
-                            .frame(width: 34, height: 34)
+                        Label(isPublicKeyCopied ? "已复制公钥" : "复制公钥", systemImage: "doc.on.doc")
+                            .frame(maxWidth: .infinity)
                     }
-                    Text("\(model.username)@\(model.host)")
-                        .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                        .lineLimit(1)
+                    .buttonStyle(.borderedProminent)
                     Spacer()
-                    if model.boundContext != nil {
-                        Text(apiBindingLabel)
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(apiBindingColor)
-                    }
-                    if model.selectedRemoteSession != nil {
-                        Button("文件") {
-                            model.loadSessionFiles()
-                            isShowingFiles = true
-                        }
-                        .font(.system(size: 12, weight: .semibold))
-                    }
-                    Text(stateLabel)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(stateColor)
-                    Button("关闭") { model.onClose(false) }
-                        .font(.system(size: 13, weight: .semibold))
                 }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
-                .padding(.bottom, 7)
-                .background(.black.opacity(0.84))
-                Spacer()
-                composerView
-                if case .failed(let message) = model.state {
-                    HStack(spacing: 8) {
-                        Text(message).font(.system(size: 12)).lineLimit(2)
-                        Spacer()
-                        Button("重连") { model.connect() }.font(.system(size: 12, weight: .semibold))
+                .padding(20)
+                .navigationTitle("SSH 公钥")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("完成") { model.visiblePublicKey = nil }
                     }
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .background(.red.opacity(0.72))
                 }
             }
         }
+    }
+
+    private var terminalView: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            if let session = model.session {
+                BridgeIOSSHTerminalRepresentable(session: session)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) { terminalHeader }
+        .safeAreaInset(edge: .bottom, spacing: 0) { terminalBottomBar }
+    }
+
+    private var terminalHeader: some View {
+        HStack(spacing: 10) {
+            Button {
+                model.disconnect()
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 18, weight: .semibold))
+                    .frame(width: 34, height: 34)
+            }
+            Text("\(model.username)@\(model.host)")
+                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            if model.boundContext != nil {
+                Text(apiBindingLabel)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(apiBindingColor)
+            }
+            if model.selectedRemoteSession != nil {
+                Button("文件") {
+                    model.loadSessionFiles()
+                    isShowingFiles = true
+                }
+                .font(.system(size: 12, weight: .semibold))
+            }
+            Text(stateLabel)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(stateColor)
+            Button("关闭") { model.onClose(false) }
+                .font(.system(size: 13, weight: .semibold))
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+        .padding(.bottom, 7)
+        .frame(maxWidth: .infinity)
+        .background(.black.opacity(0.92))
+    }
+
+    private var terminalBottomBar: some View {
+        VStack(spacing: 0) {
+            if case .failed(let message) = model.state {
+                HStack(spacing: 8) {
+                    Text(message).font(.system(size: 12)).lineLimit(2)
+                    Spacer()
+                    Button(isDiagnosticsCopied ? "已复制" : "复制日志") {
+                        UIPasteboard.general.string = BridgeIOSSHLog.snapshot()
+                        isDiagnosticsCopied = true
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    Button("重连") {
+                        isDiagnosticsCopied = false
+                        model.connect()
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(.red.opacity(0.72))
+            }
+            composerView
+        }
+        .frame(maxWidth: .infinity)
+        .background(Color.black)
     }
 
     private var composerView: some View {
@@ -934,70 +1234,132 @@ private struct BridgeIOSSHWorkspaceView: View {
 
                 if !model.profiles.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("已保存的主机").font(.system(size: 13, weight: .semibold)).foregroundStyle(.secondary)
+                        HStack(alignment: .firstTextBaseline) {
+                            Text("已保存的主机")
+                                .font(.system(size: 15, weight: .semibold))
+                            Spacer()
+                            Text("点击直接进入终端")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.secondary)
+                        }
                         ForEach(model.profiles) { profile in
-                            Button { model.select(profile) } label: {
-                                HStack(spacing: 10) {
-                                    Image(systemName: "server.rack")
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(profile.label).font(.system(size: 14, weight: .semibold))
-                                        Text("\(profile.username)@\(profile.host):\(profile.port)")
-                                            .font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary)
+                            HStack(spacing: 8) {
+                                Button { model.connect(profile: profile) } label: {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: "server.rack")
+                                            .foregroundStyle(Color.accentColor)
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text(profile.label)
+                                                .font(.system(size: 15, weight: .semibold))
+                                                .lineLimit(1)
+                                            Text("\(profile.username)@\(profile.host):\(profile.port)")
+                                                .font(.system(size: 12, design: .monospaced))
+                                                .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                        }
+                                        Spacer(minLength: 6)
+                                        Image(systemName: "arrow.right")
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundStyle(Color.accentColor)
                                     }
-                                    Spacer()
-                                    Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                                 }
-                                .padding(12)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(.secondary.opacity(0.09), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("连接到 \(profile.label)")
+                                .accessibilityHint("直接打开 SSH 终端")
+
+                                Button {
+                                    model.select(profile)
+                                    isShowingConfiguration = true
+                                } label: {
+                                    Image(systemName: "pencil")
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .frame(width: 32, height: 32)
+                                }
+                                .buttonStyle(.bordered)
+                                .accessibilityLabel("编辑 \(profile.label)")
                             }
-                            .buttonStyle(.plain)
+                            .padding(12)
+                            .background(.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        }
+
+                        Button {
+                            model.prepareNewProfile()
+                            isShowingConfiguration = true
+                        } label: {
+                            Label("添加另一台主机", systemImage: "plus")
+                                .font(.system(size: 13, weight: .semibold))
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                } else {
+                    Text("还没有保存的主机，请先配置一台 SSH 主机。")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+                }
+
+                DisclosureGroup(isExpanded: $isShowingConfiguration) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        keyPickerView
+                        Divider()
+                        VStack(alignment: .leading, spacing: 12) {
+                            BridgeIOSSHField(title: "主机", prompt: "mac.local 或 IP 地址", text: $model.host, keyboard: .URL)
+                            HStack(spacing: 12) {
+                                BridgeIOSSHField(title: "端口", prompt: "22", text: $model.port, keyboard: .numberPad)
+                                    .frame(width: 104)
+                                BridgeIOSSHField(title: "用户名", prompt: "登录用户名", text: $model.username, keyboard: .asciiCapable)
+                            }
+                            BridgeIOSSHSecureField(title: "密码", prompt: "仅保留在本次连接内", text: $model.password)
+                            BridgeIOSSHField(title: "连接后命令（可选）", prompt: "例如 tmux attach -t codex", text: $model.startupCommand, keyboard: .default)
+                        }
+
+                        if case .failed(let message) = model.state {
+                            Text(message)
+                                .font(.system(size: 13))
+                                .foregroundStyle(.red)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+
+                        HStack(spacing: 12) {
+                            Button { model.saveProfile() } label: {
+                                Label("保存主机", systemImage: "bookmark")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            Button { model.connect() } label: {
+                                if model.state == .connecting { ProgressView().tint(.white) }
+                                else { Label("连接终端", systemImage: "arrow.right") }
+                            }
+                            .frame(maxWidth: .infinity)
+                            .buttonStyle(.borderedProminent)
+                            .disabled(model.state == .connecting)
                         }
                     }
+                    .padding(.top, 12)
+                } label: {
+                    Label("连接设置", systemImage: "slider.horizontal.3")
+                        .font(.system(size: 15, weight: .semibold))
                 }
+                .padding(14)
+                .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
 
                 if model.bridgeServerOrigin != nil {
-                    remoteSessionPickerView
-                }
-
-                keyPickerView
-
-                VStack(alignment: .leading, spacing: 12) {
-                    BridgeIOSSHField(title: "主机", prompt: "mac.local 或 IP 地址", text: $model.host, keyboard: .URL)
-                    HStack(spacing: 12) {
-                        BridgeIOSSHField(title: "端口", prompt: "22", text: $model.port, keyboard: .numberPad)
-                            .frame(width: 104)
-                        BridgeIOSSHField(title: "用户名", prompt: "登录用户名", text: $model.username, keyboard: .asciiCapable)
+                    DisclosureGroup("绑定 Bridge Session（可选）", isExpanded: $isShowingRemoteSessions) {
+                        remoteSessionPickerView.padding(.top, 8)
                     }
-                    BridgeIOSSHSecureField(title: "密码", prompt: "仅保留在本次连接内", text: $model.password)
-                    BridgeIOSSHField(title: "连接后命令（可选）", prompt: "例如 tmux attach -t codex", text: $model.startupCommand, keyboard: .default)
+                    .onChange(of: isShowingRemoteSessions) { expanded in
+                        if expanded && model.sessionPickerState == .idle { model.refreshRemoteSessions() }
+                    }
                 }
 
-                if case .failed(let message) = model.state {
-                    Text(message)
-                        .font(.system(size: 13))
-                        .foregroundStyle(.red)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                DisclosureGroup("安全说明", isExpanded: $isShowingSecurityDetails) {
+                    Text("私钥只保存在 iOS Keychain，不会进入 WebView、URL 或日志。支持未加密 Ed25519/ECDSA；加密私钥和 RSA 需要先转换。首次连接会记录主机密钥，之后仅在密钥变化时重新确认。")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 6)
                 }
-
-                HStack(spacing: 12) {
-                    Button { model.saveProfile() } label: {
-                        Label("保存主机", systemImage: "bookmark")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    Button { model.connect() } label: {
-                        if model.state == .connecting { ProgressView().tint(.white) }
-                        else { Label("连接终端", systemImage: "arrow.right") }
-                    }
-                    .frame(maxWidth: .infinity)
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.state == .connecting)
-                }
-                Text("私钥只保存在 iOS Keychain，不会进入 WebView、URL 或日志。支持未加密 Ed25519/ECDSA；加密私钥和 RSA 需要先转换。主机指纹不会默认接受，首次连接需要确认。")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                .font(.system(size: 13, weight: .semibold))
             }
             .padding(.horizontal, 20)
             .padding(.top, 22)
@@ -1013,6 +1375,14 @@ private struct BridgeIOSSHWorkspaceView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button {
+                    isPublicKeyCopied = false
+                    model.generateKey()
+                } label: {
+                    Label("生成", systemImage: "plus")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.bordered)
+                Button {
                     isImportingKey = true
                 } label: {
                     Label("导入", systemImage: "square.and.arrow.down")
@@ -1022,7 +1392,7 @@ private struct BridgeIOSSHWorkspaceView: View {
             }
 
             if model.keys.isEmpty {
-                Text("尚未导入私钥。选择密码登录，或从“文件”导入未加密的 Ed25519/ECDSA 私钥。")
+                Text("可生成 Ed25519 密钥、导入未加密的 Ed25519/ECDSA 私钥，或使用密码登录。")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1047,6 +1417,12 @@ private struct BridgeIOSSHWorkspaceView: View {
                             }
                         }
                         .buttonStyle(.plain)
+                        Button("公钥") {
+                            isPublicKeyCopied = false
+                            model.showPublicKey(key)
+                        }
+                        .font(.system(size: 12, weight: .semibold))
+                        .buttonStyle(.borderless)
                         Button(role: .destructive) {
                             model.deleteKey(key)
                         } label: {
@@ -1389,39 +1765,80 @@ private enum BridgeIOSSHSessionError: Error {
 }
 
 private final class BridgeIOSSHHostKeyDelegate: NIOSSHClientServerAuthenticationDelegate {
-    private let onUnknownHostKey: (String, @escaping (Bool) -> Void) -> Void
+    private let connectionID: String
+    private let host: String
+    private let port: Int
+    private let onUnknownHostKey: (String, Bool, @escaping (Bool) -> Void) -> Void
 
-    init(onUnknownHostKey: @escaping (String, @escaping (Bool) -> Void) -> Void) {
+    init(connectionID: String, host: String, port: Int,
+         onUnknownHostKey: @escaping (String, Bool, @escaping (Bool) -> Void) -> Void) {
+        self.connectionID = connectionID
+        self.host = host
+        self.port = port
         self.onUnknownHostKey = onUnknownHostKey
     }
 
     func validateHostKey(hostKey: NIOSSHPublicKey, validationCompletePromise: EventLoopPromise<Void>) {
-        let fingerprint = Self.fingerprint(for: hostKey)
-        onUnknownHostKey(fingerprint) { accepted in
-            if accepted { validationCompletePromise.succeed(()) }
-            else { validationCompletePromise.fail(BridgeIOSSHSessionError.hostKeyRejected) }
+        let openSSHKey = String(openSSHPublicKey: hostKey)
+        let fingerprint = Self.fingerprint(for: openSSHKey)
+        BridgeIOSSHLog.info(
+            "[\(connectionID)] host-key challenge received fingerprint=\(fingerprint)"
+        )
+        let trustedKey = BridgeIOSSHHostKeyStore.shared.trustedKey(host: host, port: port)
+        if let trustedKey, trustedKey == openSSHKey {
+            BridgeIOSSHLog.info("[\(connectionID)] host-key matches stored trust; accepting without prompt")
+            validationCompletePromise.succeed(())
+            return
+        }
+        let changed = trustedKey != nil
+        if changed {
+            BridgeIOSSHLog.error("[\(connectionID)] host-key differs from stored trust; waiting for explicit replacement")
+        } else {
+            BridgeIOSSHLog.info("[\(connectionID)] host-key is not trusted yet; waiting for explicit approval")
+        }
+        onUnknownHostKey(fingerprint, changed) { accepted in
+            BridgeIOSSHLog.info(
+                "[\(self.connectionID)] host-key decision callback accepted=\(accepted)"
+            )
+            if accepted {
+                BridgeIOSSHHostKeyStore.shared.trust(key: openSSHKey, host: self.host, port: self.port)
+                BridgeIOSSHLog.info("[\(self.connectionID)] host-key trust saved for hostHash=\(bridgeIOSSHLogHash(self.host)) port=\(self.port)")
+                BridgeIOSSHLog.debug("[\(self.connectionID)] completing host-key validation promise")
+                validationCompletePromise.succeed(())
+            } else {
+                BridgeIOSSHLog.debug("[\(self.connectionID)] failing host-key validation promise")
+                validationCompletePromise.fail(BridgeIOSSHSessionError.hostKeyRejected)
+            }
         }
     }
 
-    private static func fingerprint(for hostKey: NIOSSHPublicKey) -> String {
-        // NIOSSH exposes the key as a Hashable verification object, but not its
-        // wire bytes. Hash the stable reflected key representation for a
-        // user-visible, per-session confirmation label; never accept silently.
-        let material = String(reflecting: hostKey)
-        let digest = SHA256.hash(data: Data(material.utf8))
-        return "本次连接标识：" + Data(digest).base64EncodedString().trimmingCharacters(in: CharacterSet(charactersIn: "="))
+    private static func fingerprint(for openSSHKey: String) -> String {
+        let components = openSSHKey.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+        let material = components.count > 1
+            ? Data(base64Encoded: String(components[1])) ?? Data(openSSHKey.utf8)
+            : Data(openSSHKey.utf8)
+        let digest = SHA256.hash(data: material)
+        let encoded = Data(digest).base64EncodedString().replacingOccurrences(of: "=", with: "")
+        return "SHA256:\(encoded)"
     }
 }
 
 private final class BridgeIOSSHErrorHandler: ChannelInboundHandler {
     typealias InboundIn = Any
+    private let connectionID: String
+    private let stage: String
     private let onError: (Error) -> Void
 
-    init(onError: @escaping (Error) -> Void) {
+    init(connectionID: String, stage: String, onError: @escaping (Error) -> Void) {
+        self.connectionID = connectionID
+        self.stage = stage
         self.onError = onError
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
+        BridgeIOSSHLog.error(
+            "[\(connectionID)] pipeline error stage=\(stage) channelActive=\(context.channel.isActive) \(bridgeIOSSHErrorDetails(error))"
+        )
         onError(error)
         context.close(promise: nil)
     }
@@ -1429,23 +1846,32 @@ private final class BridgeIOSSHErrorHandler: ChannelInboundHandler {
 
 private final class BridgeIOSSHShellChannelHandler: ChannelInboundHandler {
     typealias InboundIn = SSHChannelData
+    private let connectionID: String
     private weak var terminal: BridgeIOSSHTerminalView?
     private let term: String
     private let initialWindowSize: (cols: Int, rows: Int)
 
-    init(terminal: BridgeIOSSHTerminalView?, term: String, initialWindowSize: (cols: Int, rows: Int)) {
+    init(connectionID: String, terminal: BridgeIOSSHTerminalView?, term: String, initialWindowSize: (cols: Int, rows: Int)) {
+        self.connectionID = connectionID
         self.terminal = terminal
         self.term = term
         self.initialWindowSize = initialWindowSize
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
+        BridgeIOSSHLog.debug("[\(connectionID)] shell handler added")
         context.channel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).whenFailure { error in
+            BridgeIOSSHLog.error(
+                "[\(self.connectionID)] failed to set allowRemoteHalfClosure \(bridgeIOSSHErrorDetails(error))"
+            )
             context.fireErrorCaught(error)
         }
     }
 
     func channelActive(context: ChannelHandlerContext) {
+        BridgeIOSSHLog.info(
+            "[\(connectionID)] shell channel active; requesting PTY term=\(term) cols=\(initialWindowSize.cols) rows=\(initialWindowSize.rows)"
+        )
         context.triggerUserOutboundEvent(SSHChannelRequestEvent.PseudoTerminalRequest(
             wantReply: false, term: term, terminalCharacterWidth: initialWindowSize.cols,
             terminalRowHeight: initialWindowSize.rows, terminalPixelWidth: 0,
@@ -1467,9 +1893,11 @@ private final class BridgeIOSSHShellChannelHandler: ChannelInboundHandler {
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         if let status = event as? SSHChannelRequestEvent.ExitStatus {
+            BridgeIOSSHLog.info("[\(connectionID)] remote shell exit status=\(status.exitStatus)")
             let terminal = terminal
             DispatchQueue.main.async { terminal?.feed(text: "\n[SSH] Session exited with status \(status.exitStatus)\n") }
         } else if let signal = event as? SSHChannelRequestEvent.ExitSignal {
+            BridgeIOSSHLog.info("[\(connectionID)] remote shell exit signal=\(signal.signalName)")
             let terminal = terminal
             DispatchQueue.main.async { terminal?.feed(text: "\n[SSH] Session closed: \(signal.signalName)\n") }
         } else {
@@ -1479,22 +1907,24 @@ private final class BridgeIOSSHShellChannelHandler: ChannelInboundHandler {
 }
 
 final class BridgeIOSSHSession {
+    private let connectionID = String(UUID().uuidString.prefix(8))
     private let host: String
     private let port: Int
     private let username: String
     private let authentication: BridgeIOSSHAuthentication
     private let startupCommand: String
     private let onState: (BridgeIOSSHSessionState) -> Void
-    private let onHostKey: (String, @escaping (Bool) -> Void) -> Void
+    private let onHostKey: (String, Bool, @escaping (Bool) -> Void) -> Void
     private weak var terminal: BridgeIOSSHTerminalView?
     private var group: MultiThreadedEventLoopGroup?
     private var channel: Channel?
     private var sessionChannel: Channel?
     private var sshHandler: NIOSSHHandler?
+    private var phase = "created"
 
     init(host: String, port: Int, username: String, authentication: BridgeIOSSHAuthentication, startupCommand: String,
          onState: @escaping (BridgeIOSSHSessionState) -> Void,
-         onHostKey: @escaping (String, @escaping (Bool) -> Void) -> Void) {
+         onHostKey: @escaping (String, Bool, @escaping (Bool) -> Void) -> Void) {
         self.host = host
         self.port = port
         self.username = username
@@ -1502,6 +1932,9 @@ final class BridgeIOSSHSession {
         self.startupCommand = startupCommand
         self.onState = onState
         self.onHostKey = onHostKey
+        BridgeIOSSHLog.debug(
+            "[\(connectionID)] session initialized hostHash=\(bridgeIOSSHLogHash(host)) port=\(port) userHash=\(bridgeIOSSHLogHash(username)) auth=\(Self.authenticationLabel(authentication)) startupCommandPresent=\(!startupCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)"
+        )
     }
 
     fileprivate func attach(terminal: BridgeIOSSHTerminalView) {
@@ -1514,6 +1947,8 @@ final class BridgeIOSSHSession {
     }
 
     func connect() {
+        phase = "starting"
+        BridgeIOSSHLog.info("[\(connectionID)] connect started")
         onState(.connecting)
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.group = group
@@ -1524,28 +1959,51 @@ final class BridgeIOSSHSession {
         case .privateKey(let key):
             userAuthDelegate = BridgeIOSSHPrivateKeyAuthDelegate(username: username, key: key)
         }
-        let serverAuthDelegate = BridgeIOSSHHostKeyDelegate(onUnknownHostKey: onHostKey)
+        BridgeIOSSHLog.debug("[\(connectionID)] authentication delegate prepared")
+        let serverAuthDelegate = BridgeIOSSHHostKeyDelegate(
+            connectionID: connectionID, host: host, port: port, onUnknownHostKey: onHostKey
+        )
         let bootstrap = ClientBootstrap(group: group)
             .channelInitializer { [weak self] channel in
                 channel.eventLoop.makeCompletedFuture {
+                    self?.phase = "installing-ssh-handler"
+                    if let self {
+                        BridgeIOSSHLog.debug("[\(self.connectionID)] TCP channel initializer running")
+                    }
                     let ssh = NIOSSHHandler(
                         role: .client(.init(userAuthDelegate: userAuthDelegate, serverAuthDelegate: serverAuthDelegate)),
                         allocator: channel.allocator,
                         inboundChildChannelInitializer: nil
                     )
                     try channel.pipeline.syncOperations.addHandler(ssh)
-                    try channel.pipeline.syncOperations.addHandler(BridgeIOSSHErrorHandler { [weak self] error in
+                    if let self {
+                        BridgeIOSSHLog.debug("[\(self.connectionID)] NIOSSH handler installed")
+                    }
+                    try channel.pipeline.syncOperations.addHandler(BridgeIOSSHErrorHandler(
+                        connectionID: self?.connectionID ?? "unknown",
+                        stage: "transport",
+                        onError: { [weak self] error in
                         self?.failed(error)
-                    })
+                        }
+                    ))
                 }
             }
             .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
             .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
+        phase = "tcp-connect"
+        BridgeIOSSHLog.debug(
+            "[\(connectionID)] starting TCP connect hostHash=\(bridgeIOSSHLogHash(host)) port=\(port)"
+        )
         bootstrap.connect(host: host, port: port).whenComplete { [weak self] result in
             guard let self else { return }
             switch result {
-            case .failure(let error): self.failed(error)
+            case .failure(let error):
+                self.phase = "tcp-connect-failed"
+                BridgeIOSSHLog.error("[\(self.connectionID)] TCP connect failed \(bridgeIOSSHErrorDetails(error))")
+                self.failed(error)
             case .success(let channel):
+                self.phase = "tcp-connected"
+                BridgeIOSSHLog.info("[\(self.connectionID)] TCP connect succeeded; channel active=\(channel.isActive)")
                 self.channel = channel
                 self.createSessionChannel(on: channel)
             }
@@ -1553,7 +2011,11 @@ final class BridgeIOSSHSession {
     }
 
     func send(_ data: Data) {
-        guard let sessionChannel else { return }
+        guard let sessionChannel else {
+            BridgeIOSSHLog.error("[\(connectionID)] send ignored: no session channel bytes=\(data.count) phase=\(phase)")
+            return
+        }
+        BridgeIOSSHLog.debug("[\(connectionID)] sending terminal bytes=\(data.count)")
         sessionChannel.eventLoop.execute {
             var buffer = sessionChannel.allocator.buffer(capacity: data.count)
             buffer.writeBytes(data)
@@ -1562,7 +2024,11 @@ final class BridgeIOSSHSession {
     }
 
     func resize(cols: Int, rows: Int) {
-        guard cols > 0, rows > 0, let sessionChannel else { return }
+        guard cols > 0, rows > 0, let sessionChannel else {
+            BridgeIOSSHLog.debug("[\(connectionID)] resize ignored cols=\(cols) rows=\(rows) hasSessionChannel=\(sessionChannel != nil)")
+            return
+        }
+        BridgeIOSSHLog.debug("[\(connectionID)] resizing PTY cols=\(cols) rows=\(rows)")
         sessionChannel.eventLoop.execute {
             sessionChannel.triggerUserOutboundEvent(SSHChannelRequestEvent.WindowChangeRequest(
                 terminalCharacterWidth: cols, terminalRowHeight: rows,
@@ -1573,6 +2039,10 @@ final class BridgeIOSSHSession {
     func disconnect() {
         let channel = self.channel
         let group = self.group
+        BridgeIOSSHLog.info(
+            "[\(connectionID)] disconnect requested phase=\(phase) hasTCPChannel=\(channel != nil) hasSessionChannel=\(sessionChannel != nil)"
+        )
+        phase = "disconnecting"
         self.channel = nil
         self.sessionChannel = nil
         self.sshHandler = nil
@@ -1582,46 +2052,69 @@ final class BridgeIOSSHSession {
     }
 
     fileprivate func openSFTPClient() -> EventLoopFuture<SFTPClient>? {
-        guard let channel, let sshHandler else { return nil }
+        guard let channel, let sshHandler else {
+            BridgeIOSSHLog.error("[\(connectionID)] cannot open SFTP: SSH channel or handler unavailable phase=\(phase)")
+            return nil
+        }
+        BridgeIOSSHLog.debug("[\(connectionID)] opening SFTP channel")
         return SFTPClient.openChannel(with: sshHandler, on: channel)
     }
 
     private var currentState: BridgeIOSSHSessionState { sessionChannel == nil ? .connecting : .connected }
 
     private func createSessionChannel(on channel: Channel) {
+        phase = "waiting-for-ssh-handler"
+        BridgeIOSSHLog.debug("[\(connectionID)] waiting for NIOSSH handler")
         channel.pipeline.handler(type: NIOSSHHandler.self).whenComplete { [weak self] result in
             guard let self else { return }
             switch result {
-            case .failure(let error): self.failed(error)
+            case .failure(let error):
+                self.phase = "ssh-handler-failed"
+                BridgeIOSSHLog.error("[\(self.connectionID)] NIOSSH handler lookup failed \(bridgeIOSSHErrorDetails(error))")
+                self.failed(error)
             case .success(let sshHandler):
+                self.phase = "creating-session-channel"
+                BridgeIOSSHLog.debug("[\(self.connectionID)] NIOSSH handler ready; creating session channel")
                 self.sshHandler = sshHandler
                 let promise = channel.eventLoop.makePromise(of: Channel.self)
                 sshHandler.createChannel(promise, channelType: .session) { [weak self] child, type in
                     guard let self, type == .session else {
+                        BridgeIOSSHLog.error("[\(self?.connectionID ?? "unknown")] session channel creation returned unexpected channel type")
                         return channel.eventLoop.makeFailedFuture(BridgeIOSSHSessionError.invalidChannelType)
                     }
+                    BridgeIOSSHLog.debug("[\(self.connectionID)] configuring session channel pipeline")
                     let terminal = self.terminal
                     let size = terminal?.getTerminal()
                     return child.eventLoop.makeCompletedFuture {
                         try child.pipeline.syncOperations.addHandler(BridgeIOSSHShellChannelHandler(
-                            terminal: terminal, term: "xterm-256color",
+                            connectionID: self.connectionID, terminal: terminal, term: "xterm-256color",
                             initialWindowSize: (cols: max(size?.cols ?? 80, 1), rows: max(size?.rows ?? 24, 1))))
-                        try child.pipeline.syncOperations.addHandler(BridgeIOSSHErrorHandler { [weak self] error in
+                        try child.pipeline.syncOperations.addHandler(BridgeIOSSHErrorHandler(
+                            connectionID: self.connectionID,
+                            stage: "session-channel",
+                            onError: { [weak self] error in
                             self?.failed(error)
-                        })
+                            }
+                        ))
                     }
                 }
                 promise.futureResult.whenComplete { [weak self] result in
                     guard let self else { return }
                     switch result {
-                    case .failure(let error): self.failed(error)
+                    case .failure(let error):
+                        self.phase = "session-channel-failed"
+                        BridgeIOSSHLog.error("[\(self.connectionID)] session channel failed \(bridgeIOSSHErrorDetails(error))")
+                        self.failed(error)
                     case .success(let child):
+                        self.phase = "connected"
+                        BridgeIOSSHLog.info("[\(self.connectionID)] SSH session channel connected active=\(child.isActive)")
                         self.sessionChannel = child
                         self.onState(.connected)
                         self.sendInitialResize()
                         if !self.startupCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                                 guard let self else { return }
+                                BridgeIOSSHLog.debug("[\(self.connectionID)] sending startup command bytes=\(self.startupCommand.utf8.count)")
                                 self.send(Data((self.startupCommand + "\r").utf8))
                             }
                         }
@@ -1639,6 +2132,11 @@ final class BridgeIOSSHSession {
     }
 
     private func failed(_ error: Error) {
+        let failurePhase = phase
+        BridgeIOSSHLog.error(
+            "[\(connectionID)] session failed phase=\(failurePhase) tcpActive=\(channel?.isActive ?? false) sessionActive=\(sessionChannel?.isActive ?? false) \(bridgeIOSSHErrorDetails(error))"
+        )
+        phase = "failed"
         onState(.failed)
         let terminal = terminal
         DispatchQueue.main.async {
@@ -1650,5 +2148,12 @@ final class BridgeIOSSHSession {
     private static func safeError(_ error: Error) -> String {
         let value = String(describing: error)
         return value.count > 180 ? String(value.prefix(180)) + "…" : value
+    }
+
+    private static func authenticationLabel(_ authentication: BridgeIOSSHAuthentication) -> String {
+        switch authentication {
+        case .password: return "password"
+        case .privateKey: return "private-key"
+        }
     }
 }

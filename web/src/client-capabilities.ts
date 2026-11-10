@@ -1,5 +1,5 @@
 export const CLIENT_PROTOCOL_VERSION = 1;
-export type BridgeFeature = "tmux" | "codex-history" | "download-uploads" | "mobile-apk-update" | "backups";
+export type BridgeFeature = "tmux" | "codex-history" | "download-uploads" | "mobile-apk-update" | "mobile-ios-ota" | "backups";
 export interface BridgeCapabilities {
   schemaVersion: 1;
   protocolVersion: number;
@@ -10,7 +10,7 @@ export interface BridgeCapabilities {
 let current: BridgeCapabilities | null = null;
 const labels: Record<BridgeFeature, string> = {
   tmux: "终端与 Session 文件", "codex-history": "Codex 历史", "download-uploads": "文件上传",
-  "mobile-apk-update": "App 更新", backups: "数据备份",
+  "mobile-apk-update": "App 更新", "mobile-ios-ota": "iOS 安装", backups: "数据备份",
 };
 
 export function parseBridgeCapabilities(value: unknown): BridgeCapabilities | null {
@@ -37,6 +37,7 @@ export function assertBridgeApiSupported(path: string): void {
   if (path.startsWith("/tmux-dashboard/")) feature = "tmux";
   else if (path.startsWith("/api/codex/threads") || path === "/api/codex/homes") feature = "codex-history";
   else if (path.startsWith("/api/download-uploads")) feature = "download-uploads";
+  else if (path.startsWith("/api/mobile/ios-ota")) feature = "mobile-ios-ota";
   else if (path.startsWith("/api/mobile/update")) feature = "mobile-apk-update";
   else if (path.startsWith("/api/system/backups")) feature = "backups";
   const message = feature && bridgeFeatureUnavailable(feature);

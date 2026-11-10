@@ -44,6 +44,19 @@ enum BridgeIOSSHPrivateKeyFormat: String, Codable, Sendable {
     case pkcs8 = "pkcs8"
 }
 
+enum BridgeIOSSHPrivateKeyGenerator {
+    static func generateEd25519PKCS8() -> Data {
+        let key = Curve25519.Signing.PrivateKey()
+        // RFC 8410 PrivateKeyInfo: Ed25519 OID and the nested 32-byte seed.
+        var der = Data([
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+            0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+        ])
+        der.append(key.rawRepresentation)
+        return der
+    }
+}
+
 enum BridgeIOSSHPrivateKeyParseError: Error, LocalizedError {
     case malformedPEM
     case unsupportedPEMLabel(String)

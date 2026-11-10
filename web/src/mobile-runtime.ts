@@ -355,6 +355,12 @@ export async function shareBridgeFile(path: string, fileName = "bridge-file"): P
   await downloadBridgeFile(path, fileName);
 }
 
+export async function openIosOtaPage(value: string): Promise<void> {
+  const url = new URL(value);
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !/\/[A-Za-z0-9_-]{43}\/$/.test(url.pathname)) throw new Error("iOS 安装地址无效。");
+  await (await import("./mobile-native.js")).openIosOtaPage(url.href);
+}
+
 export async function openBridgeExternal(value: string): Promise<void> {
   const url = new URL(value, getBridgeOrigin());
   if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("只支持 HTTP 或 HTTPS 链接。");

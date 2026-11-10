@@ -13,6 +13,7 @@ import {
   type MobileApkUpdate,
 } from "./mobile-runtime.js";
 import MobileDownloadStatus from "./MobileDownloadStatus.js";
+import { IOSOtaPanel, isIphoneOtaSurface } from "./IOSOtaPanel.js";
 import { getMobileDownloads, subscribeMobileDownloads, type MobileDownloadTask } from "./mobile-download-manager.js";
 import MobilePairingScanner from "./MobilePairingScanner.js";
 import { bridgeFeatureUnavailable, getBridgeCapabilities } from "./client-capabilities.js";
@@ -586,6 +587,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
                 void disconnectMobileConnection().catch(() => {}).finally(() => { setBusy(false); setEditing(false); });
               }}>断开并清除本机配对</button>
           </div>}
+          {isIphoneOtaSurface() ? <IOSOtaPanel compact /> : <>
           <div className="mobile-connect-update">
             <div className="mobile-connect-update-heading">
               <span className="mobile-connect-update-icon" aria-hidden="true">↓</span>
@@ -600,6 +602,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
             {apkDownloadMessage ? <p className="mobile-connect-update-message" role="status">{apkDownloadMessage}</p> : null}
             {apkUpdateError ? <p className="mobile-connect-error" role="alert">{apkUpdateError}</p> : null}
           </div>
+          </>}
           <MobileAutoVpnSettings disabled={busy} onApplied={() => setAddress(getMobileConnection()?.server ?? "")} />
         </details> : null}
       </>}
@@ -789,6 +792,7 @@ export function MobileEnvironmentDialog({
       <p className="mobile-environment-description">切换只更换后端 API，不会加载该环境的网页。当前配对和各环境草稿会保留；未配对的环境需先配对。</p>
       <div className="mobile-environment-app" aria-label="App 版本与更新">
         <div className="mobile-environment-app-version"><span>App 版本</span><strong>{appVersion}</strong></div>
+        {isIphoneOtaSurface() ? <IOSOtaPanel compact /> : <>
         <div className="mobile-environment-app-actions">
           <button type="button" className="mobile-connect-secondary" disabled={appActionsBusy} onClick={onCheckUpdate}>
             {appChecking ? "检查中…" : "检查更新"}
@@ -799,6 +803,7 @@ export function MobileEnvironmentDialog({
         </div>
         {appMessage ? <p className="mobile-environment-app-message" role="status">{appMessage}</p> : null}
         {appError ? <p className="mobile-connect-error" role="alert">{appError}</p> : null}
+        </>}
         <details className="mobile-environment-version-details">
           <summary>版本详情</summary>
           <dl className="mobile-environment-versions">

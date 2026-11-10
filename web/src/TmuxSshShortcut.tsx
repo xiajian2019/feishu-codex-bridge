@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactElement } from "react";
 import { getMobileConnection, isMobileApp } from "./mobile-runtime.js";
-import { isNativeSshWorkspaceAvailable, openNativeSshWorkspace } from "./ssh-connectbot-native.js";
+import { getNativeSshPlatform, isNativeSshWorkspaceAvailable, openNativeSshWorkspace, type NativeSshPlatform } from "./ssh-connectbot-native.js";
 import { getConfiguredGlobalMacHost } from "./bridge-global-config.js";
 import type { BridgeSshSessionSelection } from "./bridge-ssh-session-context.js";
 
@@ -77,7 +77,8 @@ export function TmuxMobileTerminalMode({
 }): ReactElement {
   const menuRef = useRef<HTMLDetailsElement | null>(null);
   const [opening, setOpening] = useState(false);
-  const nativeAvailable = isNativeSshWorkspaceAvailable();
+  const nativePlatform: NativeSshPlatform | null = isNativeSshWorkspaceAvailable() ? getNativeSshPlatform() : null;
+  const nativeAvailable = nativePlatform !== null;
   const closeMenu = (): void => {
     if (menuRef.current) menuRef.current.open = false;
   };
@@ -121,11 +122,12 @@ export function TmuxMobileTerminalMode({
         <button type="button" role="menuitem" disabled={!terminalAttached && !webShellOpen} aria-pressed={webShellOpen} onClick={() => { closeMenu(); onOpenWebShell(); }}>
           {webShellOpen ? "最小化命令终端" : webShellRetained ? "恢复命令终端" : "打开命令终端"}
         </button>
-      ) : (
+      ) : null}
+      {nativeAvailable ? (
         <button type="button" role="menuitem" disabled={!nativeAvailable || opening} onClick={() => void openNativeSheet()}>
-          {opening ? "正在打开原生 SSH…" : nativeAvailable ? "打开原生 SSH（半屏）" : "原生 SSH 仅支持 Android/iOS App"}
+          {opening ? "正在打开原生 SSH…" : nativePlatform === "android" ? "打开原生 SSH（安卓半屏）" : "打开原生 SSH（iOS 半屏）"}
         </button>
-      )}
+      ) : null}
     </div>
   </details>;
 }

@@ -8,6 +8,7 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import type { Duplex } from "node:stream";
 
 import { StateDatabase } from "./db.js";
+import { MobileIosOta } from "./mobile-ios-ota.js";
 import { WorkbenchError, WorkbenchService } from "./workbench.js";
 import {
   checkBridgeBackupUpgradeCompatibility,
@@ -156,6 +157,8 @@ export interface DashboardServerOptions {
   downloadsDirectory?: string;
   /** Local debug APK exposed only to authenticated native App clients. */
   mobileApkPath?: string;
+  iosOtaDirectory?: string;
+  iosOtaSource?: string;
   jjTools?: JjToolsService;
   webRoot?: string;
   auth?: WebPairingAuth;
@@ -182,6 +185,7 @@ export class DashboardServer {
   private readonly webRoot: string;
   private readonly taskAttachmentsDirectory: string;
   private readonly mobileApks: MobileApkStore;
+  private readonly mobileIosOta: MobileIosOta;
   private readonly linkTools: LinkToolsService;
   private readonly downloadUploads: DownloadUploadsService;
   private readonly jjTools: JjToolsService;
@@ -212,6 +216,7 @@ export class DashboardServer {
         ?? join(process.cwd(), "android", "app", "build", "outputs", "apk", "debug", "app-debug.apk"),
     );
     this.mobileApks = new MobileApkStore(mobileApkPath, join(dirname(mobileApkPath), ".bridge-updates"));
+    this.mobileIosOta = new MobileIosOta({ directory: options.iosOtaDirectory, source: options.iosOtaSource });
     this.linkTools = new LinkToolsService({ proxy: options.linkToolProxy });
     this.downloadUploads = new DownloadUploadsService({ directory: options.downloadsDirectory });
     this.jjTools = options.jjTools ?? new JjToolsService();
@@ -399,7 +404,7 @@ export class DashboardServer {
         ...(status.authenticated ? { client: {
           schemaVersion: 1, protocolVersion: 1, minimumClientProtocol: 1,
           version: await readBridgeVersion(),
-          features: ["download-uploads", "mobile-apk-update", "backups",
+          features: ["download-uploads", "mobile-apk-update", "mobile-ios-ota", "backups",
             ...(this.options.tmuxDashboard ? ["tmux"] : []),
             ...(this.options.codexHistory ? ["codex-history"] : [])],
         } } : {}),
@@ -550,6 +555,23 @@ export class DashboardServer {
       response,
       publicWebRequest || url.pathname === "/healthz" || Boolean(scopedDemoAccess),
     )) return;
+    if (url.pathname === "/api/mobile/ios-ota" || url.pathname.startsWith("/api/mobile/ios-ota/")) {
+      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Referrer-Policy", "no-referrer");
+      if (mutating && !this.requireActionAuthorization(request, response)) return;
+      try {
+        if (request.method === "GET" && url.pathname === "/api/mobile/ios-ota") {
+          sendJson(response, 200, await this.mobileIosOta.status());
+        } else if (request.method === "POST" && url.pathname === "/api/mobile/ios-ota/link") {
+          sendJson(response, 200, await this.mobileIosOta.createLink());
+        } else if (request.method === "POST" && url.pathname === "/api/mobile/ios-ota/publish") {
+          sendJson(response, 202, this.mobileIosOta.startPublish());
+        } else sendJson(response, 404, { error: "iOS OTA 接口不存在。" });
+      } catch (error) {
+        sendJson(response, 409, { error: error instanceof Error ? error.message : "iOS OTA 操作失败。" });
+      }
+      return;
+    }
     if (url.pathname === "/api/workbench" || url.pathname.startsWith("/api/workbench/")) {
       if (mutating && !this.requireActionAuthorization(request, response)) return;
       try {

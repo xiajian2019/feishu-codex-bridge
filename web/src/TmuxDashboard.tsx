@@ -204,6 +204,12 @@ async function copyTextToClipboard(value: string): Promise<void> {
   if (!copied) throw new Error("Clipboard access is unavailable in this browser.");
 }
 
+function isMacDesktopTerminalSelection(): boolean {
+  if (typeof window === "undefined" || typeof navigator === "undefined" || isMobileApp()) return false;
+  const platform = navigator.platform || navigator.userAgent;
+  return /Mac/i.test(platform) && window.matchMedia("(pointer: fine)").matches;
+}
+
 function normalizeTmuxSession(value: unknown): TmuxSession | null {
   if (typeof value !== "object" || value === null) return null;
   const record = value as Record<string, unknown>;
@@ -1457,6 +1463,28 @@ export function TmuxDashboard(): ReactElement {
           });
         });
       };
+      const autoCopySelectionOnMouseUp = (selectedTerminal: Terminal): void => {
+        if (!isMacDesktopTerminalSelection() || selectedTerminal !== activeTerminalInstanceRef.current) return;
+        const text = selectedTerminal.getSelection();
+        if (!text) return;
+        void copyTextToClipboard(text).then(() => {
+          if (disposed || activeTerminalInstanceRef.current !== selectedTerminal) return;
+          selectedTerminal.clearSelection();
+          setTerminalSelection(null);
+        }).catch((copyError: unknown) => {
+          if (disposed) return;
+          setToast({
+            message: copyError instanceof Error ? copyError.message : "自动复制终端选区失败，请使用 Copy。",
+            isError: true,
+          });
+        });
+      };
+      const copyLiveSelectionOnMouseUp = (event: globalThis.MouseEvent): void => {
+        if (event.target instanceof Node && host.contains(event.target)) autoCopySelectionOnMouseUp(terminal);
+      };
+      const copyHistorySelectionOnMouseUp = (event: globalThis.MouseEvent): void => {
+        if (event.target instanceof Node && historyHost.contains(event.target)) autoCopySelectionOnMouseUp(historyTerminal);
+      };
       const resizeObserver = new ResizeObserver(() => {
         if (isKeyboardOpen()) {
           keyboardResizePending = true;
@@ -1468,6 +1496,8 @@ export function TmuxDashboard(): ReactElement {
       resizeObserver.observe(host);
       host.addEventListener("keydown", copyTerminalSelectionOnKeyDown);
       historyHost.addEventListener("keydown", copyTerminalSelectionOnKeyDown);
+      host.ownerDocument.addEventListener("mouseup", copyLiveSelectionOnMouseUp, true);
+      historyHost.ownerDocument.addEventListener("mouseup", copyHistorySelectionOnMouseUp, true);
       window.addEventListener("resize", onWindowResize);
       window.addEventListener("focusout", onComposerFocusOut, true);
       window.visualViewport?.addEventListener("resize", onViewportResize);
@@ -1482,6 +1512,8 @@ export function TmuxDashboard(): ReactElement {
         inputSubscription.dispose();
         host.removeEventListener("keydown", copyTerminalSelectionOnKeyDown);
         historyHost.removeEventListener("keydown", copyTerminalSelectionOnKeyDown);
+        host.ownerDocument.removeEventListener("mouseup", copyLiveSelectionOnMouseUp, true);
+        historyHost.ownerDocument.removeEventListener("mouseup", copyHistorySelectionOnMouseUp, true);
         window.removeEventListener("resize", onWindowResize);
         window.removeEventListener("focusout", onComposerFocusOut, true);
         window.visualViewport?.removeEventListener("resize", onViewportResize);
@@ -2192,7 +2224,7 @@ export function TmuxDashboard(): ReactElement {
                   terminalAttached={terminalStatus === "ATTACHED"}
                   onToggleTerminalInput={() => setTerminalInputEnabled((current) => !current)}
                   onError={(message) => setToast({ message, isError: true })}
-                  onOpenWebShell={!isMobileApp() && selectedSession ? () => {
+                  onOpenWebShell={selectedSession ? () => {
                     if (!shellTerminalMounted) {
                       setShellTerminalMounted(true);
                       setShellTerminalVisible(true);

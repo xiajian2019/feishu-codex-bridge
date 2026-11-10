@@ -11,7 +11,7 @@
 已实现：
 
 - 密码 SSH、交互式 PTY、终端输入输出、窗口 resize、连接后启动命令；
-- 首次主机密钥确认，拒绝时不会继续 SSH 握手；当前显示的是本次连接标识，不是 OpenSSH 标准指纹；
+- 首次主机密钥确认，拒绝时不会继续 SSH 握手；显示稳定的 OpenSSH `SHA256:` 指纹，并按主机和端口持久保存已确认的主机密钥；
 - 全屏与 `pageSheet` 半屏 presentation、关闭/恢复工作台、深浅主题同步；
 - 主机非敏感配置保存，并保持 Android 兼容的列表响应形状。
 - 从 Tmux 选中 Session 打开原生工作区时传递 `bridgeOrigin`、`sessionId`、`createdAt` 和预期 SSH 主机/端口；iOS 在实际 SSH 登录后补齐用户名，形成完整 `BridgeSshSessionContext`。目标变化会拒绝绑定，不自动切换或重试。
@@ -20,7 +20,7 @@
 - Composer 文本已增加 API-first 入口：服务端校验 `createdAt`、SSH 上下文和 Action Token，按 Session record + `idempotencyKey` 持久重放；iOS 原生 Composer 在 API 未绑定时才回退 SSH PTY，网络写入不确定时保留“结果未知”。
 - SFTP transport layer 已固定到 `swift-nio-sftp` revision `748e88568638463370816dbaaaf9684237258501` 并通过当前 Xcode target 编译；当前已接入只读的一层 Session 文件列表，仍未接入预览、上传、下载、API/SFTP fallback 或真实主机验收。
 
-当前明确未实现：加密/RSA 私钥、SFTP 预览/上传/下载/API fallback、Session API 的完整读写操作、Composer 附件删除/断点恢复、后台常驻 SSH 重连和已确认主机指纹的持久化。它们不能从 Android 实现或本次源码检查推断为已完成。
+当前明确未实现：加密/RSA 私钥、SFTP 预览/上传/下载/API fallback、Session API 的完整读写操作、Composer 附件删除/断点恢复和后台常驻 SSH 重连。它们不能从 Android 实现或本次源码检查推断为已完成。
 
 `swift-nio-sftp` 当前没有正式 release/tag，因此工程锁定 commit 而不是 branch；后续发布前仍需评估受控 fork、许可证和上游维护状态。Composer 的文本 HTTP endpoint 和 iOS 附件选择/分块上传链路已接入；服务端附件记录现在可绑定设备、Session、createdAt 和 SSH 上下文，但断点恢复、删除和真实附件验收仍待完成。
 
@@ -108,7 +108,7 @@ Android 原生 SSH 的终端输入、输出、滚动、选择和快捷键目前�
 ### Host Key
 
 - 首次连接必须有明确的 Host Key 展示和确认流程；不能默认“接受任何 Host Key”，也不能把指纹校验失败伪装成普通网络重试。
-- 后续应按主机身份保存已确认的 Host Key/指纹，并能在变化时阻断连接、显示差异并允许用户重新审查。具体存储位置、迁移和删除策略待实现阶段确定。
+- 已按规范化主机和端口将已确认的 Host Key 保存在独立的 iOS `UserDefaults` 命名空间；相同密钥自动通过，密钥变化时阻断握手并显示差异提示，用户明确重新信任后才替换记录。
 - Host Key 的确认记录与 Bridge 设备授权、Bridge Cookie、WebSocket 票据分离。
 
 ### Keychain

@@ -27,6 +27,7 @@ export const downloadBridgeFile = appOnly;
 export const shareBridgeFile = appOnly;
 export const shareMobileBlob = appOnly;
 export const openBridgeExternal = appOnly;
+export const openIosOtaPage = appOnly;
 export const openMobileDemo = appOnly;
 export const copyMobileText = appOnly;
 export const copyMobileImage = appOnly;

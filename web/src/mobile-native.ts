@@ -47,6 +47,7 @@ interface UpdaterPlugin {
 }
 const Credentials = registerPlugin<CredentialPlugin>("BridgeCredentials");
 const Updater = registerPlugin<UpdaterPlugin>("BridgeUpdater");
+const IOSOta = registerPlugin<{ open(options: { url: string }): Promise<void> }>("BridgeIOSOta");
 const ShareInbox = registerPlugin<{
   listShares(): Promise<{ shares: MobileShare[] }>;
   getFile(options: { shareId: string; fileId: string }): Promise<{ uri: string }>;
@@ -428,6 +429,11 @@ export async function openDownloadedFile(id: string): Promise<void> {
   const task = getMobileDownloads().find((item) => item.id === id);
   if (!task?.nativeId || task.state !== "done") throw new Error("请在系统下载中查看此文件。");
   await Updater.openDownloadedFile({ id: task.nativeId });
+}
+
+export async function openIosOtaPage(url: string): Promise<void> {
+  if (Capacitor.getPlatform() !== "ios" || !Capacitor.isPluginAvailable("BridgeIOSOta")) throw new Error("当前 iOS App 版本不支持直接打开安装页，请使用 Safari。");
+  await IOSOta.open({ url });
 }
 
 export async function openExternal(url: string): Promise<void> {

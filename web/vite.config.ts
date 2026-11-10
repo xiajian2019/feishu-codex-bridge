@@ -10,6 +10,11 @@ const apiTarget = process.env.BRIDGE_WEB_API_TARGET ?? "http://127.0.0.1:17310";
 const tmuxApiTarget = process.env.BRIDGE_TMUX_API_TARGET ?? apiTarget;
 const tmuxWebSocketTarget = tmuxApiTarget.replace(/^http/, "ws");
 const nativeAppOrigins = new Set(["capacitor://localhost", "http://localhost", "https://localhost"]);
+const dualProxy = process.env.BRIDGE_DEV_PROXY_INTERNAL === "1";
+const clientAddress = (request: import("node:http").IncomingMessage): string | undefined => {
+  const forwarded = request.headers["x-bridge-dev-peer"];
+  return dualProxy && typeof forwarded === "string" ? forwarded : request.socket.remoteAddress;
+};
 
 export default defineConfig({
   root: webRoot,
@@ -35,6 +40,7 @@ export default defineConfig({
     host: "0.0.0.0",
     port: 5173,
     strictPort: true,
+    ...(dualProxy ? { hmr: { clientPort: Number(process.env.BRIDGE_DEV_PUBLIC_PORT) || 5173 } } : {}),
     cors: {
       origin: ["capacitor://localhost", "http://localhost", "https://localhost"],
       methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -67,7 +73,7 @@ export default defineConfig({
             const forwardedPort = Array.isArray(forwardedPortHeader) ? forwardedPortHeader[0] : forwardedPortHeader;
             if (forwardedPort) proxyRequest.setHeader("X-Forwarded-Port", forwardedPort.split(",", 1)[0]!.trim());
 
-            const address = request.socket.remoteAddress;
+            const address = clientAddress(request);
             if (address) proxyRequest.setHeader("X-Forwarded-For", address);
           });
         },
@@ -77,7 +83,7 @@ export default defineConfig({
         ws: true,
         configure: (proxy) => {
           proxy.on("proxyReqWs", (proxyRequest, request) => {
-            const address = request.socket.remoteAddress;
+            const address = clientAddress(request);
             if (address) proxyRequest.setHeader("X-Forwarded-For", address);
           });
         },
@@ -94,12 +100,12 @@ export default defineConfig({
             proxyRequest.setHeader("Origin", origin && nativeAppOrigins.has(origin) ? origin : apiTarget);
             proxyRequest.removeHeader("X-Bridge-Public-Origin");
             const host = request.headers.host;
-            const protocol = (request.socket as typeof request.socket & { encrypted?: boolean }).encrypted ? "https" : "http";
+            const protocol = (request.socket as typeof request.socket & { encrypted?: boolean }).encrypted || (dualProxy && request.headers["x-forwarded-proto"] === "https") ? "https" : "http";
             if (host) {
               try { proxyRequest.setHeader("X-Bridge-Public-Origin", new URL(`${protocol}://${host}`).origin); }
               catch { /* Invalid hosts are not recorded as access metadata. */ }
             }
-            const address = request.socket.remoteAddress;
+            const address = clientAddress(request);
             if (address) proxyRequest.setHeader("X-Forwarded-For", address);
           });
         },

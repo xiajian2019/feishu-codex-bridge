@@ -60,9 +60,88 @@ App 名称为 `Bridge`，应用标识为 `dev.feishu.codex.bridge`。正式发�
 
 推荐 HTTPS；证书必须受手机系统信任。自用 HTTP 连接限局域网、回环、链路本地地址与私有网络地址（含常见 VPN 的 `100.64.0.0/10`）。公网 HTTP 会在连接页被拒绝。LAN HTTP 不提供传输加密，请只在可信网络使用。
 
+## iOS 命令行构建与安装
+
+在 Xcode 中完成一次设备配对和自动签名配置后，可用以下命令构建最新前端、同步 iOS 资源和插件、编译签名并安装到已配对的 iPhone：
+
+```bash
+bun run mobile:ios:install
+```
+
+默认同时支持 USB 有线和 Wi-Fi / 局域网连接，脚本会根据设备当前的连接方式自动选择安装通道。设备完成一次有线配对后，可以拔线再运行 `bun run mobile:ios:install --check`，确认显示 `Wi-Fi / 局域网`；保留数据线时则会显示 `USB`。如果有多台设备，用 `--device "设备名称"` 指定；需要强制只走无线时加 `--wireless-only`。`--allow-usb` 仍作为旧命令兼容，但 USB 已默认支持。首次下载 Swift 包可能需要较长时间。
+
+`devicectl` 使用 CoreDevice 已知的设备名称、UDID 或 DNS 名称；单独知道 iPhone 的 Wi-Fi IP 不代表 CoreDevice 能发现它。无线安装前先拔掉 USB 并检查：
+
+```bash
+bun run mobile:ios:install -- --check
+bun run mobile:ios:install -- --device "设备 UDID" --wireless-only
+```
+
+仍可使用 `--ip` 或 `BRIDGE_IOS_DEVICE_IP`，但只有 CoreDevice 将该地址识别为设备时才可使用；脚本会在构建前检查，并在 `--wireless-only` 下核对实际连接方式。如果无法识别，请先检查 Xcode 的设备配对和网络发现，再改用 `--device`。
+
+`bun run mobile:ios:install --build-only` 只生成签名 App，不安装、不启用自动续签；未发现设备时使用通用 iOS 构建目标。手动构建默认使用现有签名配置；需要 Xcode 更新签名配置时，可显式加 `--allow-provisioning-updates`。脚本核对同步后的 Web 资源、Bundle ID 和签名，安装后再检查设备上是否存在 Bridge。设备必须保持可连接，必要时解锁并确认系统提示。
+
+成功安装后，脚本为该 checkout 和设备启用 macOS 用户级自动续签任务，并保存本次安装的 App 快照。它每小时检查一次主 App、分享扩展的描述文件以及实际签名证书，以最早到期时间为准；剩余不超过 24 小时时，通过 Xcode 已登录的账户申请新描述文件并重签快照，再覆盖安装到原设备。个人团队通常受限的是 7 天描述文件，不一定是签名证书本身。后台续签不会构建或安装工作区中后来修改的 App 代码；只有在确实取得更长有效期、团队、App 身份和签名权限一致时才安装。需要新描述文件时，脚本使用只用于申请签名的临时工程调用 Xcode，再用获得的描述文件重签快照。它不撤销证书，只临时移开与本 App 精确匹配的自动管理缓存；备份放在 Xcode 监听目录之外，操作结束后恢复，遇到同名新文件时保留备份。
+
+```bash
+bun run mobile:ios:install -- --renew-status        # 查看是否启用和已登记的最早到期时间
+bun run mobile:ios:install -- --renew-now           # 立即尝试续签已登记设备
+bun run mobile:ios:install -- --disable-auto-renew  # 停用自动续签，保留 App 和快照
+```
+
+定时任务需要 Mac 已开机且用户已登录、Xcode 账户和签名钥匙串可用、Mac 可连接 Apple 服务，并且 iPhone 已配对且可通过 USB 或局域网连接；可能需要解锁手机或在 Mac 确认钥匙串访问。指定 `--wireless-only` 安装时，后台也遵守无线限制。失败会写入 `--renew-status` 显示的日志、尝试发送 Mac 通知，并在下次整点重试；Mac 休眠期间错过的检查会在唤醒后合并执行，关机或长期离线无法保证及时续签。若检测到设备上的安装位置或版本改变，会暂停自动覆盖并要求重新运行安装命令；这些元数据不能证明其他工具从未替换过相同位置和版本的 App。状态显示的是本脚本上次成功登记的签名信息，不是从手机实时读取的到期时间。此前已安装的 App 需要重新运行一次安装命令才能登记和启用自动续签；不要删除或移动该 checkout，调度任务会从这里运行脚本。即使自动化已启用，Apple 账户授权、设备连接或签名服务出现问题仍可能导致过期，无法承诺永不中断。
+
+### iOS OTA 无线安装
+
+OTA 使用已签名的 App 生成 IPA，并提供独立的 Safari 安装页；系统读取 HTTPS manifest 后负责下载和安装。可以使用现有 VPN 的 Mac IPv4，也可以使用 Tailscale 私网 HTTPS。两种方式都要求 iPhone 能通过对应网络访问 Mac，且描述文件包含该设备；安装页请求成功或 IPA 下载完成都不代表 iOS 已安装成功。
+
+连接 VPN 后，以下命令构建当前 checkout 的手机前端及 iOS App、生成安装包并启动用户级 OTA 服务；VPN 有多个 IPv4 时用 `--vpn-ip` 指定 Mac 自己的地址：
+
+```bash
+bun run mobile:ios:ota -- --vpn-ip 10.0.0.42
+```
+
+VPN IP 直连需要可信 HTTPS。首次运行会在当前用户的 `Library/Application Support/Feishu Codex Bridge/ios-ota-tls` 下生成独立根证书和仅本机使用的私钥，在终端打印供 iPhone 安装的 `.cer` 文件及 SHA-256 指纹。通过 AirDrop 等可信方式把 **`.cer` 公钥证书**发送到 iPhone，在“设置 → 通用 → VPN 与设备管理”安装，再到“设置 → 通用 → 关于本机 → 证书信任设置”启用完全信任。此根证书会被 iPhone 全局信任，私钥应留在 Mac；不用时可在 iPhone 移除证书。如果已有受 iPhone 信任且包含该 IP 的证书，可用 `--tls-cert <证书> --tls-key <私钥>`，无需生成本地根证书。VPN IP 变化后需用新 IP 重启 OTA 服务；自动生成的服务证书会使用同一根证书更新。
+
+Tailscale 模式使用 Tailnet 的 HTTPS 证书，不需要把本地根证书装进 iPhone。Mac 和 iPhone 需要连接同一 Tailnet，并在 Tailscale 管理后台启用 HTTPS Certificates：
+
+```bash
+bun run mobile:ios:ota -- --check --tailscale
+bun run mobile:ios:ota -- --tailscale
+```
+
+脚本只配置自己的 Tailscale HTTPS 端口，默认 `18443`，本机服务默认 `18731`；发现已有其他服务占用时停止，不执行 `tailscale serve reset` 或覆盖其他路由。也可以用 `--base-url https://...` 指向已存在的可信 HTTPS 反向代理；此模式只启动本机回环 HTTP 服务，外部代理需由使用者自行配置。
+
+命令完成后会打印 24 小时内有效的安装链接及二维码，有效期不会超过签名到期时间。首次在 iPhone Safari 打开短时链接会为该浏览器建立 30 天的 OTA 授权；把输出的 HTTPS 首页添加到主屏幕后，可以在授权期内直接打开并安装最新已发布的包。该授权独立于 Bridge 配对，仅用于 OTA；不要把安装链接或根证书私钥发给他人。需要撤销 OTA 浏览器授权和全部未过期链接时运行 `bun run mobile:ios:ota -- --revoke-sessions`。之后可用 `bun run mobile:ios:ota -- --link` 生成新链接，`bun run mobile:ios:ota -- --stop` 停止 OTA 服务，安装包和证书保留。
+
+每次运行默认命令会重新构建并发布当前 checkout 的代码。若只想发布已经构建的签名 App，可用 `--app ios/App/build/DeviceDerivedData/Build/Products/Debug-iphoneos/App.app`；`--no-serve` 只生成包。签名剩余不超过 24 小时时，发布过程先申请新描述文件并重签快照。OTA 服务启动后还会每小时检查最新安装包：临近到期时自动重签并发布**相同 App 的新签名包**，无需 iPhone 当时被 Mac 发现；手机仍需打开安装页并确认系统安装，新签名才会在手机生效。续签失败会记录到 OTA 目录的 `refresh-error.log` 并尝试在 Mac 通知，下次整点重试。
+
+OTA 通过 iOS 系统安装，不会自动向现有 `mobile:ios:install` 续签任务登记安装成功；系统更换安装位置后，旧续签任务会按保护规则暂停。需要恢复 Mac 的自动覆盖续签时，重新连接设备并运行一次 `bun run mobile:ios:install`。不能因文件已下载就推断手机已安装，实际 Safari、证书信任和 iPhone 安装仍须真机验收。
+
+已配对 Bridge 的 iPhone App 可以从环境切换窗口打开 iOS 安装页；iPhone Safari 中也可在“系统管理 → 系统设置”查看安装包状态、打开安装页或触发 Mac 构建发布。Android 和桌面 Web 不显示 iOS 入口。安装链接通过已配对会话和操作令牌签发，链接最多有效 30 分钟；系统安装器不携带 Bridge 会话，未过期的链接与 Bridge 设备撤销独立，应避免转发。构建发布只生成并发布安装包，不代表手机已经安装。
+
+安装版 Bridge 启动目录不在源码 checkout 时，会尝试读取当前用户唯一的 OTA LaunchAgent 定位服务及源码；有多个服务或路径不同可设置 `FEISHU_CODEX_BRIDGE_IOS_OTA_DIR` 和 `FEISHU_CODEX_BRIDGE_IOS_OTA_SOURCE`，必要时用 `FEISHU_CODEX_BRIDGE_IOS_OTA_BUN` 指定 Bun。Bridge 必须能访问对应目录和源码，后台构建依赖 Mac 的 Xcode、签名账户及钥匙串。
+
+开发服务可以复用 iPhone 已信任的 OTA 根证书，为 Mac 当前 LAN IP 单独签发 5173 服务证书：
+
+```bash
+bun run dev:https:configure -- --ip 10.15.53.70  # 换成 Mac 当前 IPv4
+bun run dev:web:restart                          # 仅重启当前 checkout 的 Vite
+```
+
+配置后，同一个 5173 端口同时支持原有 HTTP 与 HTTPS；如 `https://10.15.53.70:5173/`。HTTPS 证书仅覆盖配置时指定的 IP、`127.0.0.1` 与 `localhost`，IP 变化后需重新配置并重启 Vite。该证书与 OTA 服务端证书分开，根证书不变；不改变 17310 API、7310 安装版服务或用户数据。HTTPS 需要手机能访问该 IP，并已在系统证书信任设置中完全信任根证书。
+
+无线连接排查可运行：
+
+```bash
+bun run network:ip-audit -- --ip 10.15.53.70 --target 10.15.64.113
+```
+
+脚本读取网卡的子网掩码、网关和到目标地址的路由，然后对本地网段做受控 ICMP/ARP 探测。输出中的“候选地址”只代表本次没有观察到响应，不能当作地址所有权确认；手动配置前应使用 DHCP 保留或让网络管理员确认。`--no-probe` 只读取路由，不发送探测包；`--json` 输出机器可读结果。
+
 ## iOS 原生 SSH 工作区
 
-iOS App 的 `SSH / Mac` 入口会打开原生工作区：支持密码登录、未加密 Ed25519/ECDSA 私钥登录、首次主机密钥确认、交互式 PTY、终端 resize、连接后命令、主机配置保存，以及从 Tmux 页面打开全屏或半屏工作区。私钥通过系统文件选择器导入，材料与元数据分离保存到 `WhenUnlockedThisDeviceOnly` Keychain，不进入 WebView；RSA、加密私钥暂不支持。当前 NIOSSH 暴露的是本次连接标识，不是可持久比较的 OpenSSH 标准指纹；密码只通过一次性原生调用进入连接对象，不写入 WebView 存储；主机配置只保存主机、端口、用户名、密钥 ID 和启动命令等非敏感元数据。选中已有 Tmux Session 时，iOS 会从配对 Bridge 读取 Session 列表，并使用 Keychain 中的 Bridge token 校验绑定的 `bridgeOrigin + SSH host/port/user + sessionId + createdAt`，身份不一致则拒绝 API 绑定。
+iOS App 的 `SSH / Mac` 入口会打开原生工作区：支持密码登录、未加密 Ed25519/ECDSA 私钥登录、首次主机密钥确认、交互式 PTY、终端 resize、连接后命令、主机配置保存，以及从 Tmux 页面打开全屏或半屏工作区。可在手机上生成 Ed25519 密钥，或通过系统文件选择器导入私钥；公钥可查看和复制，并需添加到 SSH 主机的 `~/.ssh/authorized_keys`。私钥材料与元数据分离保存到 `WhenUnlockedThisDeviceOnly` Keychain，不进入 WebView；RSA、加密私钥暂不支持。主机密钥显示稳定的 OpenSSH `SHA256:` 指纹，并按规范化主机和端口持久保存已确认的公钥；相同主机密钥自动信任，变化时才重新确认。密码只通过一次性原生调用进入连接对象，不写入 WebView 存储；主机配置只保存主机、端口、用户名、密钥 ID 和启动命令等非敏感元数据。普通进入工作区会自动载入最近保存且有可用私钥的主机并连接；管理模式才打开主机设置。主机设置默认不读取或展开 Bridge Session；可按需展开绑定，或从已选 Tmux Session 打开时自动读取。iOS 使用 Keychain 中的 Bridge token 校验绑定的 `bridgeOrigin + SSH host/port/user + sessionId + createdAt`，身份不一致则拒绝 API 绑定。
 
 当前 iOS 首阶段尚未接入 SFTP 预览/上传/下载/API fallback、Bridge API-first Session 的完整读写操作、Composer 附件删除/断点恢复或后台常驻重连；已接入一层只读 Session 文件列表、Composer 附件选择/分块上传和 scoped 引用，SFTP transport adapter 仍需真实主机验收，Composer 文本已支持 API-first 和结果未知提示，Session 列表/identity 仍是只读绑定层。原生 SSH 依赖的 SwiftTerm、SwiftNIO SSH 和固定 revision 的 NIOSFTP 已加入 Xcode App target；Xcode 依赖解析、编译、真实 Mac `sshd`/tmux 和 iPhone 触摸/软键盘验收必须分别完成，不能用浏览器或源码检查替代。
 
