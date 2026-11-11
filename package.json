@@ -22,6 +22,7 @@
     "build:web": "bun run --bun vite build --config web/vite.config.ts",
     "mobile:build": "bun scripts/mobile.mjs build",
     "mobile:sync": "bun scripts/mobile.mjs sync",
+    "mobile:android:build": "bun scripts/build-apk.mjs",
     "mobile:ios:resolve": "bun scripts/ios-resolve-deps.mjs",
     "mobile:ios:install": "bun scripts/ios-device.mjs",
     "mobile:ios:ota": "bun scripts/ios-ota.mjs",

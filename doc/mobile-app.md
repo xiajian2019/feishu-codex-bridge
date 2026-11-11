@@ -43,7 +43,7 @@ Android 构建通过 `scripts/mobile-version.mjs` 分配构建号，使用被忽
 | 平台 | 构建环境 | 打开工程 | 安装方式 |
 | --- | --- | --- | --- |
 | iOS 15+ | macOS、完整 Xcode 26+、Apple 签名账号；依赖使用 Swift Package Manager | `bun run mobile:open:ios` | 在 Xcode 选择 App target、Signing & Capabilities 中的 Team 和手机，执行 Run；分发需另行签名、Archive/TestFlight |
-| Android 8+（API 26） | JDK 21+、Android SDK compile SDK 37.2、platform-tools；Android target SDK 为 36 | `bun run mobile:open:android` | 本地 debug APK 固定生成 `arm64-v8a`；Android Studio Run；或在 `android` 目录执行 `./gradlew assembleDebug`，安装 `app/build/outputs/apk/debug/app-debug.apk` |
+| Android 8+（API 26） | JDK 21+、Android SDK compile SDK 37.2、platform-tools；Android target SDK 为 36 | `bun run mobile:open:android` | 本机打包：`bun run mobile:android:build`，实际逻辑位于项目 `scripts/build-apk.mjs`；生成固定为 `arm64-v8a` 的 debug APK，不会自动安装。APK 位于 `android/app/build/outputs/apk/debug/app-debug.apk` |
 
 JDK 不在默认路径时设置 `JAVA_HOME`；SDK 不在默认目录时设置 `ANDROID_HOME`，或通过 Android Studio 生成被忽略的 `android/local.properties`。首次 Android 构建需要下载 Gradle 和 Maven 依赖，首次 iOS 构建需要解析 Swift packages。当前 `mobile:doctor` 仍检查 Platform 36，不会确认 compile SDK 37.2 已安装；以实际 Gradle 构建为准。
 

@@ -70,7 +70,6 @@
 		504EC3111FED79650016851F /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		504EC3131FED79650016851F /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		50B271D01FEDC1A000F3C39B /* public */ = {isa = PBXFileReference; lastKnownFileType = folder; path = public; sourceTree = "<group>"; };
-		517BF56830A16362003D3AE2 /* App copy-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = "App copy-Info.plist"; path = "/Users/xiajian/works/feishu-codex-bridge/ios/App/App copy-Info.plist"; sourceTree = "<absolute>"; };
 		9582B6822FE993A50072D4E8 /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneDelegate.swift; sourceTree = "<group>"; };
 		958DCC722DB07C7200EA8C5F /* debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = debug.xcconfig; path = ../debug.xcconfig; sourceTree = SOURCE_ROOT; };
 		A73101000000000000000011 /* BridgeShareInboxPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeShareInboxPlugin.swift; sourceTree = "<group>"; };
@@ -121,7 +120,6 @@
 				958DCC722DB07C7200EA8C5F /* debug.xcconfig */,
 				A73101000000000000000024 /* ShareExtension */,
 				504EC3061FED79650016851F /* App */,
-				517BF56830A16362003D3AE2 /* App copy-Info.plist */,
 				504EC3051FED79650016851F /* Products */,
 			);
 			sourceTree = "<group>";
