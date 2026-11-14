@@ -126,6 +126,14 @@ internal class BridgeAutoVpnController(
 
     fun onPause() {
         resumed.value = false
+        networkDebounce?.cancel()
+        networkDebounce = null
+        delayedStartCheck?.cancel()
+        delayedStartCheck = null
+        targetProbe?.cancel()
+        targetProbe = null
+        activeTarget = null
+        globalChecks.cancel()
         if (userDeclinedPrompt) resetPromptBlockOnResume = true
     }
 
@@ -174,6 +182,7 @@ internal class BridgeAutoVpnController(
 
     /** Probe the API target only to retry Bridge after it becomes reachable. */
     fun request(target: BridgeVpnTarget) {
+        if (!resumed.value) return
         // A recovery request carries the Web Wi-Fi settings even if its initial
         // configure call failed. Never replace a newer native snapshot here.
         if (bypassWifiSsids == null) configure(target.bypassWifiSsids) else requestGlobalCheck()
@@ -203,6 +212,7 @@ internal class BridgeAutoVpnController(
     }
 
     private fun scheduleNetworkCheck() {
+        if (!resumed.value) return
         scope.launch {
             networkDebounce?.cancel()
             networkDebounce = scope.launch {
@@ -213,8 +223,13 @@ internal class BridgeAutoVpnController(
     }
 
     private fun requestGlobalCheck() {
-        if (bypassWifiSsids != null) globalChecks.request()
-        else Log.i(TAG, "VPN check deferred until network settings are synchronized")
+        if (!resumed.value) {
+            Log.i(TAG, "VPN check deferred until Bridge returns to the foreground")
+        } else if (bypassWifiSsids != null) {
+            globalChecks.request()
+        } else {
+            Log.i(TAG, "VPN check deferred until network settings are synchronized")
+        }
     }
 
     fun readCurrentWifiSsid(): CompletableFuture<String?> {

@@ -49,14 +49,18 @@ describe("iOS device installation selection", () => {
   });
 
   test("parses explicit build, wireless IP, and provisioning options without installing implicitly", () => {
-    expect(parseOptions(["--build-only", "--device", "My iPhone"])).toMatchObject({ buildOnly: true, device: "My iPhone", wirelessOnly: false });
+    expect(parseOptions(["--build-only", "--device", "My iPhone", "--build-number", "42"])).toMatchObject({ buildOnly: true, device: "My iPhone", buildNumber: 42, wirelessOnly: false });
     expect(parseOptions(["--ip", "10.15.64.113"])).toMatchObject({ ip: "10.15.64.113", device: null });
     expect(parseOptions(["--wireless-only"]).wirelessOnly).toBe(true);
     expect(parseOptions(["--allow-usb"]).wirelessOnly).toBe(false);
     expect(parseOptions(["--allow-provisioning-updates"]).allowProvisioningUpdates).toBe(true);
+    expect(parseOptions(["--vpn"]).vpn).toBe(true);
     expect(() => parseOptions(["--device"])).toThrow();
     expect(() => parseOptions(["--ip", "10.15.64.999"])).toThrow("无效的 iPhone IPv4 地址");
     expect(() => parseOptions(["--device", "My iPhone", "--ip", "10.15.64.113"])).toThrow("不能同时使用");
     expect(() => parseOptions(["--check", "--build-only"])).toThrow();
+    expect(() => parseOptions(["--build-number", "0"])).toThrow("正整数");
+    expect(() => parseOptions(["--check", "--build-number", "42"])).toThrow("构建选项");
+    expect(() => parseOptions(["--renew-status", "--build-number", "42"])).toThrow("续签操作");
   });
 });

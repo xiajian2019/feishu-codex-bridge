@@ -97,7 +97,7 @@ describe("Bridge connection state cache", () => {
 
       markBridgeRequestFailure(new TypeError("Failed to fetch"));
       expect(getBridgeConnectionSnapshot()).toMatchObject({ failureKind: "api-network-unreachable", browserOnline: true, target: "unknown" });
-      expect(vpnRequests).toBe(1);
+      expect(vpnRequests).toBe(0);
 
       windowEvents.dispatchEvent(new Event("bridge:mobile-vpn-target-unreachable"));
       expect(getBridgeConnectionSnapshot()).toMatchObject({ failureKind: "target-unreachable", target: "unreachable" });
@@ -109,16 +109,19 @@ describe("Bridge connection state cache", () => {
       // A stale offline hint must not suppress a real transport failure.
       markBridgeRequestFailure(new TypeError("Failed to fetch"));
       expect(getBridgeConnectionSnapshot()).toMatchObject({ failureKind: "browser-offline", browserOnline: false });
-      expect(vpnRequests).toBe(2);
+      expect(vpnRequests).toBe(0);
       markBridgeRequestFailure(new TypeError("Failed to fetch"));
-      expect(vpnRequests).toBe(2);
+      expect(vpnRequests).toBe(0);
       markBridgeRequestSuccess();
       markBridgeRequestFailure(new DOMException("cancelled", "AbortError"));
-      expect(vpnRequests).toBe(2);
+      expect(vpnRequests).toBe(0);
+      markBridgeRequestSuccess();
+      markBridgeRequestFailure(new DOMException("probe aborted", "AbortError"), undefined, { notifyNetworkRecovery: true });
+      expect(vpnRequests).toBe(1);
       markBridgeRequestFailure(new Error("unauthorized"), 401);
-      expect(vpnRequests).toBe(2);
+      expect(vpnRequests).toBe(1);
       markBridgeRequestFailure(new TypeError("Failed to fetch"));
-      expect(vpnRequests).toBe(3);
+      expect(vpnRequests).toBe(1);
     } finally {
       if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
       else Reflect.deleteProperty(globalThis, "window");

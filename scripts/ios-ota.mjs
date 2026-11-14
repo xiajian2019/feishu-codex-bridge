@@ -12,6 +12,7 @@ import { inspectSignedApp, notifyRenewalIssue, readProfile, renewalDue, renewalP
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const bundleId = "dev.feishu.codex.bridge";
+const supportedBundleIds = new Set([bundleId]);
 const defaultDirectory = join(root, "ios/App/build/ios-ota");
 const maxTicketMs = 24 * 60 * 60 * 1000;
 const portalSessionMs = 30 * 24 * 60 * 60 * 1000;
@@ -19,8 +20,8 @@ const tokenPattern = /^[A-Za-z0-9_-]{43}$/;
 const revisionPattern = /^[a-f0-9]{64}$/;
 
 export function parseOtaOptions(args) {
-  const result = { mode: "publish", app: null, baseUrl: null, device: null, directory: defaultDirectory,
-    port: 18731, httpsPort: 18443, vpnIp: null, tailscale: false, tlsCert: null, tlsKey: null,
+  const result = { mode: "publish", app: null, vpn: false, baseUrl: null, device: null, directory: defaultDirectory,
+    port: 18731, httpsPort: 18443, vpnIp: null, tailscale: false, tlsCert: null, tlsKey: null, buildNumber: null,
     noServe: false, allowProvisioningUpdates: true, help: false };
   let modeSet = false;
   for (let i = 0; i < args.length; i++) {
@@ -31,16 +32,21 @@ export function parseOtaOptions(args) {
       modeSet = true; result.mode = arg.slice(2);
     } else if (arg === "--help" || arg === "-h") result.help = true;
     else if (arg === "--no-serve") result.noServe = true;
+    else if (arg === "--vpn") result.vpn = true;
     else if (arg === "--tailscale") result.tailscale = true;
     else if (arg === "--allow-provisioning-updates") result.allowProvisioningUpdates = true;
     else if (arg === "--no-provisioning-updates") result.allowProvisioningUpdates = false;
-    else if (["--app", "--base-url", "--device", "--directory", "--port", "--https-port", "--vpn-ip", "--tls-cert", "--tls-key"].includes(arg)) {
+    else if (["--app", "--base-url", "--device", "--directory", "--build-number", "--port", "--https-port", "--vpn-ip", "--tls-cert", "--tls-key"].includes(arg)) {
       const value = args[++i];
       if (!value || value.startsWith("--")) throw new Error(`${arg} 需要参数。`);
       if (arg === "--app") result.app = resolve(value);
       else if (arg === "--base-url") result.baseUrl = normalizeOtaBaseUrl(value);
       else if (arg === "--device") result.device = value;
       else if (arg === "--directory") result.directory = resolve(value);
+      else if (arg === "--build-number") {
+        if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) < 1) throw new Error("--build-number 需要正整数。");
+        result.buildNumber = Number(value);
+      }
       else if (arg === "--vpn-ip") { if (isIP(value) !== 4) throw new Error("--vpn-ip 必须是本机的 IPv4 地址。"); result.vpnIp = value; }
       else if (arg === "--tls-cert") result.tlsCert = resolve(value);
       else if (arg === "--tls-key") result.tlsKey = resolve(value);
@@ -57,7 +63,9 @@ export function parseOtaOptions(args) {
   }
   if (Boolean(result.tlsCert) !== Boolean(result.tlsKey)) throw new Error("--tls-cert 和 --tls-key 必须同时指定。");
   if (result.tailscale && result.tlsCert || result.baseUrl && result.tlsCert) throw new Error("自定义 TLS 证书仅用于 VPN IP 直连。");
-  if ((result.app || result.device) && result.mode !== "publish") throw new Error("构建选项只能用于生成安装包。");
+  if ((result.app || result.device || result.buildNumber !== null) && result.mode !== "publish") throw new Error("构建选项只能用于生成安装包。");
+  if (result.app && result.buildNumber !== null) throw new Error("--app 不能与 --build-number 同时使用。");
+  if (result.app && result.vpn) throw new Error("--app 不能与 --vpn 同时使用；已有 App 请直接传入对应产物。");
   return result;
 }
 
@@ -94,8 +102,51 @@ function command(file, args, options = {}) {
 }
 function readPlist(file, key) { return command("/usr/bin/plutil", ["-extract", key, "raw", "-o", "-", file]).trim(); }
 
+export function parseOtaBuildNumber(value) {
+  const text = String(value ?? "").trim();
+  if (!/^\d+$/.test(text) || !Number.isSafeInteger(Number(text)) || Number(text) < 1) {
+    throw new Error("iOS OTA 构建号必须是正整数。");
+  }
+  return Number(text);
+}
+
+function publishedBuildNumber(directory) {
+  if (!existsSync(stateFile(directory))) return null;
+  const build = readLatest(directory).metadata.build;
+  return parseOtaBuildNumber(build);
+}
+
+function projectBuildNumber(source) {
+  const project = join(source, "ios/App/App.xcodeproj/project.pbxproj");
+  if (!existsSync(project)) return null;
+  const values = [...readFileSync(project, "utf8").matchAll(/CURRENT_PROJECT_VERSION\s*=\s*([0-9]+);/g)]
+    .map((match) => parseOtaBuildNumber(match[1]));
+  return values.length ? Math.max(...values) : null;
+}
+
+export function nextOtaBuildNumber(directory, source = root) {
+  const published = publishedBuildNumber(directory) ?? 0;
+  const project = projectBuildNumber(source) ?? 1;
+  if (published >= Number.MAX_SAFE_INTEGER) throw new Error("iOS OTA 构建号已达到安全上限，请调整版本策略。");
+  return Math.max(project, published + 1);
+}
+
+export function assertOtaBuildNumberAdvances(directory, current) {
+  const build = parseOtaBuildNumber(current);
+  const published = publishedBuildNumber(directory);
+  if (published !== null && build <= published) {
+    throw new Error(`本次 iOS OTA 构建号 ${build} 不高于已发布的 ${published}，无法作为覆盖更新；请重新构建并递增 CFBundleVersion。`);
+  }
+  return build;
+}
+
+export function assertOtaBuildAdvances(directory, app) {
+  const current = parseOtaBuildNumber(readPlist(join(app, "Info.plist"), "CFBundleVersion"));
+  return assertOtaBuildNumberAdvances(directory, current);
+}
+
 export function parseRelease(value) {
-  if (!value || value.schema !== 1 || value.bundleId !== bundleId || !revisionPattern.test(value.revision ?? "") ||
+  if (!value || value.schema !== 1 || !supportedBundleIds.has(value.bundleId) || !revisionPattern.test(value.revision ?? "") ||
       !Number.isSafeInteger(value.size) || value.size <= 0 || typeof value.version !== "string" || !value.version ||
       typeof value.build !== "string" || !value.build || !Number.isFinite(Date.parse(value.expiresAt)) ||
       !Number.isFinite(Date.parse(value.publishedAt))) throw new Error("OTA 安装包元数据无效。");
@@ -146,7 +197,8 @@ export async function createOtaRelease(app, directory, requestedDevice = null, n
     const snapshot = join(payload, "App.app");
     mkdirSync(payload, { recursive: true, mode: 0o700 });
     command("/usr/bin/ditto", [app, snapshot]);
-    if (readPlist(join(snapshot, "Info.plist"), "CFBundleIdentifier") !== bundleId) throw new Error("App 的 Bundle ID 与 Bridge 不一致。");
+    const appBundleId = readPlist(join(snapshot, "Info.plist"), "CFBundleIdentifier");
+    if (!supportedBundleIds.has(appBundleId)) throw new Error("App 的 Bundle ID 与 Bridge 不一致。");
     const profile = readProfile(join(snapshot, "embedded.mobileprovision"));
     if (!profile.devices.length) throw new Error("描述文件没有可安装设备。");
     if (requestedDevice && !profile.devices.includes(requestedDevice)) throw new Error("主 App 描述文件不包含指定设备。");
@@ -181,7 +233,7 @@ export async function createOtaRelease(app, directory, requestedDevice = null, n
     command("/usr/bin/ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", payload, tempIpa]);
     const revision = await fileSha256(tempIpa);
     const size = statSync(tempIpa).size;
-    const metadata = parseRelease({ schema: 1, bundleId, revision, size, version, build,
+    const metadata = parseRelease({ schema: 1, bundleId: appBundleId, revision, size, version, build,
       expiresAt: signing.effectiveExpiry, publishedAt: new Date(now).toISOString(), deviceCount: valid.length });
     const destination = join(releaseDirectory(directory), `${revision}.ipa`);
     if (existsSync(destination)) {
@@ -275,16 +327,114 @@ export function otaManifest(base, token, metadata) {
   return plist(`<key>items</key><array><dict>${assets}<key>metadata</key><dict>${info}</dict></dict></array>`);
 }
 
-export function otaPage(base, token, metadata) {
+function otaPageContentSecurityPolicy(nonce) {
+  return `default-src 'none'; script-src 'nonce-${nonce}'; connect-src 'self'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`;
+}
+
+function mergeByteRange(ranges, start, end) {
+  if (end < start) return ranges;
+  const sorted = [...ranges, [start, end]].sort((left, right) => left[0] - right[0]);
+  const merged = [];
+  for (const range of sorted) {
+    const previous = merged.at(-1);
+    if (!previous || range[0] > previous[1] + 1) merged.push([...range]);
+    else previous[1] = Math.max(previous[1], range[1]);
+  }
+  return merged;
+}
+
+function byteRangeCoverage(ranges) {
+  return ranges.reduce((total, [start, end]) => total + end - start + 1, 0);
+}
+
+export function otaPage(base, token, metadata, nonce = randomBytes(18).toString("base64")) {
   const manifestUrl = `${normalizeOtaBaseUrl(base)}/${token}/manifest.plist`;
   const installUrl = `itms-services://?action=download-manifest&url=${encodeURIComponent(manifestUrl)}`;
+  const basePath = new URL(normalizeOtaBaseUrl(base)).pathname.replace(/\/+$/, "");
+  const statusUrlLiteral = JSON.stringify(`${basePath}/${token}/download-status.json`).replaceAll("<", "\\u003c");
+  const publishedAt = new Date(metadata.publishedAt).toLocaleString("zh-CN", { hour12: false });
   const date = new Date(metadata.expiresAt).toLocaleString("zh-CN", { hour12: false });
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="referrer" content="no-referrer"><link rel="icon" href="data:,"><title>安装 Bridge</title>
-<style>:root{color-scheme:light dark;font:16px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;background:#f2f3f7;color:#182230}*{box-sizing:border-box}body{margin:0;min-height:100dvh;display:grid;place-items:center;padding:24px}main{width:min(100%,440px)}.brand{display:flex;align-items:center;gap:14px;margin-bottom:24px}.icon{width:58px;height:58px;border-radius:17px;display:grid;place-items:center;background:#2563eb;color:#fff;font-size:27px;font-weight:700}h1{font-size:24px;margin:0}p{margin:4px 0;color:#586678}.button{display:block;border-radius:14px;background:#2563eb;color:white;padding:15px;text-align:center;text-decoration:none;font-weight:650}.card{margin-top:18px;padding:4px 16px;border-radius:14px;background:#fff}.row{display:flex;justify-content:space-between;gap:16px;padding:12px 0;border-bottom:1px solid #e6eaf0}.row:last-child{border:0}.row span{color:#586678}.row b{text-align:right;overflow-wrap:anywhere}#status{margin-top:16px;padding:12px;border-radius:10px;background:#e7efff;color:#1c4189}#status[hidden]{display:none}.hint{margin-top:18px;font-size:14px}@media(prefers-color-scheme:dark){:root{background:#10151e;color:#e9edf5}p,.row span{color:#a7b3c4}.card{background:#1b2330}.row{border-color:#303b4a}#status{background:#1d3557;color:#d1e3ff}}</style></head>
+<style>:root{color-scheme:light dark;font:16px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;background:#f2f3f7;color:#182230}*{box-sizing:border-box}body{margin:0;min-height:100dvh;display:grid;place-items:center;padding:24px}main{width:min(100%,440px)}.brand{display:flex;align-items:center;gap:14px;margin-bottom:24px}.icon{width:58px;height:58px;border-radius:17px;display:grid;place-items:center;background:#2563eb;color:#fff;font-size:27px;font-weight:700}h1{font-size:24px;margin:0}p{margin:4px 0;color:#586678}.button{display:block;border-radius:14px;background:#2563eb;color:white;padding:15px;text-align:center;text-decoration:none;font-weight:650}.card{margin-top:18px;padding:4px 16px;border-radius:14px;background:#fff}.row{display:flex;justify-content:space-between;gap:16px;padding:12px 0;border-bottom:1px solid #e6eaf0}.row:last-child{border:0}.row span{color:#586678}.row b{text-align:right;overflow-wrap:anywhere}#status{margin-top:16px;padding:12px;border-radius:10px;background:#e7efff;color:#1c4189}#transfer-progress{display:block;width:100%;height:8px;margin-top:8px}#transfer-progress[hidden]{display:none}#status[hidden]{display:none}.hint{margin-top:18px;font-size:14px}@media(prefers-color-scheme:dark){:root{background:#10151e;color:#e9edf5}p,.row span{color:#a7b3c4}.card{background:#1b2330}.row{border-color:#303b4a}#status{background:#1d3557;color:#d1e3ff}}</style></head>
 <body><main><div class="brand"><div class="icon" aria-hidden="true">B</div><div><h1>安装 Bridge</h1><p>版本 ${xml(metadata.version)} · 构建 ${xml(metadata.build)}</p></div></div>
-<a class="button" id="install" href="${xml(installUrl)}">安装 Bridge</a><div id="status" role="note">点按后请在 iPhone 上确认系统提示，并检查安装结果。</div>
-<div class="card"><div class="row"><span>签名有效至</span><b>${xml(date)}</b></div><div class="row"><span>安装包</span><b>${xml((metadata.size / 1024 / 1024).toFixed(1))} MB</b></div></div>
-<p class="hint">请在 iPhone 的 Safari 中打开本页。安装时保留原 App，以便系统覆盖更新。</p></main></body></html>`;
+<a class="button" id="install" href="${xml(installUrl)}">安装 Bridge</a><div id="status" role="status" aria-live="polite">点按后请在 iPhone 上确认系统提示。IPA 下载由 iOS 安装器处理；Safari 不显示普通下载进度。</div><p id="transfer-label" hidden></p><progress id="transfer-progress" max="${metadata.size}" value="0" hidden aria-label="此安装链接累计的服务端输出"></progress>
+<div class="card"><div class="row"><span>OTA 包生成时间</span><b>${xml(publishedAt)}</b></div><div class="row"><span>签名有效至</span><b>${xml(date)}</b></div><div class="row"><span>安装包</span><b>${xml((metadata.size / 1024 / 1024).toFixed(1))} MB</b></div></div>
+<p class="hint">请在 iPhone 的 Safari 中打开本页。安装时保留原 App，以便系统覆盖更新。</p></main>
+<script nonce="${xml(nonce)}">(() => {
+  const statusUrl = ${statusUrlLiteral};
+  const totalBytes = ${metadata.size};
+  const install = document.getElementById("install");
+  const status = document.getElementById("status");
+  const progress = document.getElementById("transfer-progress");
+  const progressLabel = document.getElementById("transfer-label");
+  let installRequested = false;
+  let requestObserved = false;
+  let polling = false;
+  let deadline = 0;
+  let timer = 0;
+  const formatBytes = (value) => value < 1048576 ? Math.round(value / 1024) + " KB" : (value / 1048576).toFixed(1) + " MB";
+  const render = (snapshot) => {
+    if (snapshot.requestCount > 0) {
+      requestObserved = true;
+      installRequested = true;
+      if (snapshot.state !== "sent" && !polling) { polling = true; deadline = Date.now() + 300000; }
+      if (snapshot.state === "downloading") deadline = Date.now() + 300000;
+    }
+    if (!snapshot.requestCount) {
+      progress.hidden = true;
+      progressLabel.hidden = true;
+      status.textContent = installRequested
+        ? "尚未收到 IPA 请求。请在 iOS 系统提示中点“安装”；此页面不会代替系统确认。"
+        : "点按后请在 iPhone 上确认系统提示。IPA 下载由 iOS 安装器处理；Safari 不显示普通下载进度。";
+      return;
+    }
+    progress.hidden = false;
+    progressLabel.hidden = false;
+    const lastRequest = snapshot.lastRequestAt ? new Date(snapshot.lastRequestAt).toLocaleString() : "未知";
+    progressLabel.textContent = "此链接累计的服务端输出 · 最近请求 " + lastRequest;
+    progress.max = snapshot.totalBytes;
+    progress.value = Math.min(snapshot.bytesSent, snapshot.totalBytes);
+    progress.setAttribute("aria-valuetext", formatBytes(snapshot.bytesSent) + " / " + formatBytes(snapshot.totalBytes));
+    if (snapshot.state === "sent") {
+      status.textContent = "此链接的包请求累计已覆盖完整 IPA（" + formatBytes(snapshot.totalBytes) + "），服务端响应已写完。iPhone 是否收到及安装仍需确认；同一链接的历史请求会合并。";
+    } else if (snapshot.activeRequests > 0) {
+      status.textContent = "此链接有 IPA 请求：服务端累计输出 " + formatBytes(snapshot.bytesSent) + " / " + formatBytes(snapshot.totalBytes) + "。这不是 iPhone 安装进度；同一链接的请求会合并。";
+    } else {
+      status.textContent = "当前没有活跃 IPA 请求；此链接累计输出 " + formatBytes(snapshot.bytesSent) + " / " + formatBytes(snapshot.totalBytes) + "。要单独追踪一次安装，请从 App 重新打开安装页。";
+    }
+  };
+  const refresh = async () => {
+    if (timer) { window.clearTimeout(timer); timer = 0; }
+    try {
+      const response = await fetch(statusUrl, { cache: "no-store" });
+      if (!response.ok) throw new Error("状态暂不可读");
+      render(await response.json());
+    } catch {
+      status.textContent = "暂时无法读取服务端传输状态；请以 iOS 系统安装提示为准。";
+    }
+    if (polling && Date.now() < deadline) timer = window.setTimeout(refresh, 1000);
+    else if (polling) {
+      polling = false;
+      status.textContent = requestObserved
+        ? status.textContent + " 自动刷新已暂停；返回本页可重新查询。"
+        : "仍未观察到 IPA 请求。请确认已在 iOS 系统提示中点“安装”。";
+    }
+  };
+  const resumePolling = () => {
+    if (installRequested && !polling) { polling = true; deadline = Date.now() + 300000; }
+    void refresh();
+  };
+  install.addEventListener("click", () => {
+    installRequested = true;
+    polling = true;
+    deadline = Date.now() + 300000;
+    status.textContent = "已打开 iOS 安装器，等待系统请求 " + formatBytes(totalBytes) + " IPA…";
+    void refresh();
+  });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) resumePolling(); });
+  window.addEventListener("pageshow", resumePolling);
+  void refresh();
+})();</script></body></html>`;
 }
 
 export function parseRange(header, size) {
@@ -299,12 +449,15 @@ export function parseRange(header, size) {
 }
 
 export function createOtaHandler(directory, serviceId, now = Date.now) {
+  const transfers = new Map();
   return (request, response) => {
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("Referrer-Policy", "no-referrer");
     response.setHeader("X-Content-Type-Options", "nosniff");
     response.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'");
     if (!["GET", "HEAD"].includes(request.method)) { response.writeHead(405, { Allow: "GET, HEAD" }); response.end(); return; }
+    const requestTime = now();
+    for (const [token, transfer] of transfers) if (transfer.expires <= requestTime) transfers.delete(token);
     const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
     if (pathname === "/health") {
       const body = JSON.stringify({ service: serviceId });
@@ -323,7 +476,9 @@ export function createOtaHandler(directory, serviceId, now = Date.now) {
       try {
         const next = createInstallLink(directory, settings.base, now());
         const token = new URL(next.url).pathname.split("/").filter(Boolean).at(-1);
-        const body = otaPage(settings.base, token, next.metadata);
+        const nonce = randomBytes(18).toString("base64");
+        const body = otaPage(settings.base, token, next.metadata, nonce);
+        response.setHeader("Content-Security-Policy", otaPageContentSecurityPolicy(nonce));
         response.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(body) });
         response.end(request.method === "HEAD" ? undefined : body);
       } catch {
@@ -332,18 +487,37 @@ export function createOtaHandler(directory, serviceId, now = Date.now) {
       }
       return;
     }
-    const match = /^\/(?:.*\/)?([A-Za-z0-9_-]{43})\/(|manifest\.plist|[a-f0-9]{64}\.ipa)$/.exec(pathname);
-    const ticket = match ? resolveInstallTicket(directory, match[1], now()) : null;
+    const match = /^\/(?:.*\/)?([A-Za-z0-9_-]{43})\/(|manifest\.plist|download-status\.json|[a-f0-9]{64}\.ipa)$/.exec(pathname);
+    const ticket = match ? resolveInstallTicket(directory, match[1], requestTime) : null;
     if (!ticket) { response.writeHead(404); response.end(); return; }
     const part = match[2];
     if (!part || part === "manifest.plist") {
-      const body = part ? otaManifest(ticket.base, ticket.token, ticket.metadata) : otaPage(ticket.base, ticket.token, ticket.metadata);
+      const nonce = !part ? randomBytes(18).toString("base64") : null;
+      const body = part ? otaManifest(ticket.base, ticket.token, ticket.metadata) : otaPage(ticket.base, ticket.token, ticket.metadata, nonce);
+      if (nonce) response.setHeader("Content-Security-Policy", otaPageContentSecurityPolicy(nonce));
       const headers = { "Content-Type": part ? "text/xml; charset=utf-8" : "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(body) };
       if (!part && request.method === "GET" && !requestPortalSession(request, directory, serviceId, now())) {
         try { headers["Set-Cookie"] = issuePortalSession(directory, serviceId, ticket.base, now()); }
         catch { response.writeHead(503); response.end(); return; }
       }
       response.writeHead(200, headers);
+      response.end(request.method === "HEAD" ? undefined : body); return;
+    }
+    if (part === "download-status.json") {
+      const transfer = transfers.get(ticket.token);
+      const bytesSent = byteRangeCoverage(transfer?.sentRanges ?? []);
+      const completedBytes = byteRangeCoverage(transfer?.completedRanges ?? []);
+      const snapshot = {
+        state: !transfer ? "waiting" : transfer.activeRequests > 0 ? "downloading" : completedBytes >= ticket.metadata.size ? "sent" : "interrupted",
+        requestCount: transfer?.requestCount ?? 0,
+        activeRequests: transfer?.activeRequests ?? 0,
+        bytesSent,
+        completedBytes,
+        totalBytes: ticket.metadata.size,
+        lastRequestAt: transfer?.lastRequestAt ?? null,
+      };
+      const body = JSON.stringify(snapshot);
+      response.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Content-Length": Buffer.byteLength(body) });
       response.end(request.method === "HEAD" ? undefined : body); return;
     }
     if (part !== `${ticket.metadata.revision}.ipa`) { response.writeHead(404); response.end(); return; }
@@ -353,6 +527,19 @@ export function createOtaHandler(directory, serviceId, now = Date.now) {
     if (range) headers["Content-Range"] = `bytes ${range.start}-${range.end}/${ticket.metadata.size}`;
     response.writeHead(range ? 206 : 200, headers);
     if (request.method === "HEAD") { response.end(); return; }
+    let transfer = transfers.get(ticket.token);
+    if (!transfer || transfer.expires <= now()) {
+      while (transfers.size >= 200) transfers.delete(transfers.keys().next().value);
+      transfer = { expires: ticket.expires, requestCount: 0, activeRequests: 0, lastRequestAt: null, sentRanges: [], completedRanges: [] };
+      transfers.set(ticket.token, transfer);
+    }
+    transfer.requestCount++;
+    transfer.activeRequests++;
+    transfer.lastRequestAt = requestTime;
+    const requestStart = range?.start ?? 0;
+    const requestEnd = range?.end ?? ticket.metadata.size - 1;
+    let nextOffset = requestStart;
+    let responseFinished = false;
     const stream = createReadStream(ticket.path, range || undefined);
     const authorizationCheck = setInterval(() => {
       if (!resolveInstallTicket(directory, ticket.token, now())) response.destroy();
@@ -360,7 +547,21 @@ export function createOtaHandler(directory, serviceId, now = Date.now) {
     authorizationCheck.unref?.();
     stream.once("error", (error) => response.destroy(error));
     stream.once("end", () => clearInterval(authorizationCheck));
-    response.once("close", () => { clearInterval(authorizationCheck); stream.destroy(); });
+    stream.on("data", (chunk) => {
+      const end = Math.min(requestEnd, nextOffset + chunk.length - 1);
+      if (end >= nextOffset) transfer.sentRanges = mergeByteRange(transfer.sentRanges, nextOffset, end);
+      nextOffset = end + 1;
+    });
+    response.once("finish", () => {
+      responseFinished = true;
+      transfer.activeRequests = Math.max(0, transfer.activeRequests - 1);
+      if (nextOffset > requestStart) transfer.completedRanges = mergeByteRange(transfer.completedRanges, requestStart, Math.min(requestEnd, nextOffset - 1));
+    });
+    response.once("close", () => {
+      clearInterval(authorizationCheck);
+      stream.destroy();
+      if (!responseFinished) transfer.activeRequests = Math.max(0, transfer.activeRequests - 1);
+    });
     stream.pipe(response);
   };
 }
@@ -657,7 +858,9 @@ function showHelp() {
   console.log(`用法：bun run mobile:ios:ota -- [选项]
   默认构建签名 App、生成 OTA 包并启动私有 HTTPS 安装服务。
   --app <App.app>                使用已有签名 App，跳过构建
+  --vpn                          默认构建改为 AppVpn（需要 Network Extension 权限的付费团队）
   --device <UDID>                检查描述文件包含该 iPhone/iPad
+  --build-number <正整数>        覆盖本次 OTA 构建号；默认自动递增
   --allow-provisioning-updates   允许 Xcode 更新签名配置（默认）
   --no-provisioning-updates      构建时只使用现有签名配置
   --no-serve                     只生成安装包，不启动服务或修改 Tailscale
@@ -748,12 +951,19 @@ async function main() {
   if (options.mode === "publish") {
     let app = options.app;
     if (!app) {
-      const args = [join(root, "scripts/ios-device.mjs"), "--build-only"];
+      const buildNumber = options.buildNumber ?? nextOtaBuildNumber(options.directory, root);
+      if (options.buildNumber !== null) assertOtaBuildNumberAdvances(options.directory, buildNumber);
+      const args = [join(root, "scripts/ios-device.mjs"), "--build-only", "--build-number", String(buildNumber)];
+      if (options.vpn) args.push("--vpn");
+      if (options.device) args.push("--device", options.device);
       if (options.allowProvisioningUpdates) args.push("--allow-provisioning-updates");
       command(process.execPath, args, { cwd: root, stdio: "inherit" });
       const buildDir = resolve(process.env.BRIDGE_IOS_DERIVED_DATA || join(root, "ios/App/build/DeviceDerivedData"));
-      app = join(buildDir, "Build/Products/Debug-iphoneos/App.app");
+      const configuration = options.vpn ? "Debug" : "PersonalDebug";
+      const product = options.vpn ? "AppVpn.app" : "App.app";
+      app = join(buildDir, `Build/Products/${configuration}-iphoneos`, product);
     }
+    assertOtaBuildAdvances(options.directory, app);
     const release = await createOtaRelease(app, options.directory, options.device);
     console.log(`已生成 Bridge ${release.version} (${release.build}) OTA 安装包，签名到期 ${new Date(release.expiresAt).toLocaleString()}。`);
     if (options.noServe) { console.log(`安装包目录：${options.directory}；未启动服务。`); return; }

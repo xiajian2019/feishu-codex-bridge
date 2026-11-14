@@ -24,6 +24,13 @@ describe("mobile connection center", () => {
     expect(html).not.toContain('aria-label="SSH 登录"');
   });
 
+  it("renders the standalone App-only VPN route while the connection gate is not ready", () => {
+    const html = renderConnectionCenter("/system-management/app-only-vpn-poc");
+    expect(html).toContain("已配对的 Bridge 内容");
+    expect(html).not.toContain("正在恢复连接");
+    expect(html).not.toContain("连接你的 Mac");
+  });
+
   it("keeps App version details expandable and exposes the manual update actions inside the environment dialog", () => {
     const html = renderToStaticMarkup(createElement(MobileEnvironmentDialog, {
       options: [], busy: null, message: null, currentServer: "https://bridge.fixture", appVersion: "0.5.0 (100)",
@@ -55,7 +62,7 @@ describe("mobile connection center", () => {
   });
 
   it("places the global target and Wi-Fi VPN exemption settings in connection management", () => {
-    const html = renderToStaticMarkup(createElement(MobileAutoVpnSettings));
+    const html = renderToStaticMarkup(createElement(MemoryRouter, null, createElement(MobileAutoVpnSettings)));
     expect(html).toContain("自动 VPN 网络设置");
     expect(html).toContain("全局 IP");
     expect(html).toContain("免 VPN 的 Wi‑Fi");

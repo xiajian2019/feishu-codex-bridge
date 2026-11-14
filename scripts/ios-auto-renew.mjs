@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 
 export const RENEW_WINDOW_MS = 24 * 60 * 60 * 1000;
-const bundleId = "dev.feishu.codex.bridge";
+const legacyBundleId = "dev.feishu.codex.bridge";
 
 function command(file, args, options = {}) {
   const result = spawnSync(file, args, { encoding: "utf8", ...options });
@@ -72,6 +72,7 @@ function signedEntitlements(path) {
 
 export function inspectSignedApp(app, deviceUdid) {
   command("/usr/bin/codesign", ["--verify", "--deep", "--strict", app]);
+  const mainBundleId = plistValue(join(app, "Info.plist"), "CFBundleIdentifier");
   const profiles = [];
   const walk = (directory) => {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -89,12 +90,12 @@ export function inspectSignedApp(app, deviceUdid) {
     }
   };
   walk(app);
-  const main = profiles.find((profile) => profile.bundleId === bundleId);
+  const main = profiles.find((profile) => profile.bundleId === mainBundleId);
   if (!main || profiles.some((profile) => profile.team !== main.team) ||
       new Set(profiles.map((profile) => profile.bundleId)).size !== profiles.length) {
     throw new Error("App 和扩展的描述文件不完整或签名团队不一致。");
   }
-  return { team: main.team, profiles, effectiveExpiry: effectiveExpiry(profiles) };
+  return { bundleId: main.bundleId, team: main.team, profiles, effectiveExpiry: effectiveExpiry(profiles) };
 }
 
 export function effectiveExpiry(profiles) {
@@ -181,6 +182,7 @@ function stateApp(directory, record) {
 }
 
 export function assertInstalledMatches(record, installed) {
+  const bundleId = record.bundleId ?? legacyBundleId;
   if (!installed || installed.bundleIdentifier !== bundleId || !installed.bundleContainerPath ||
       installed.bundleContainerPath !== record.bundleContainerPath || installed.bundleVersion !== record.bundleVersion) {
     throw new Error("手机上的 Bridge 已被移除或由其他方式更换，已暂停自动覆盖；请重新运行安装命令。");
@@ -188,6 +190,7 @@ export function assertInstalledMatches(record, installed) {
 }
 
 export function rememberInstallation(paths, device, app, installed, signing, wirelessOnly) {
+  const bundleId = signing.bundleId ?? installed?.bundleIdentifier ?? legacyBundleId;
   if (!installed?.bundleContainerPath || installed.bundleIdentifier !== bundleId || typeof installed.bundleVersion !== "string") {
     throw new Error("无法确认设备上的 App 安装身份，未启用自动续签。");
   }
@@ -199,7 +202,7 @@ export function rememberInstallation(paths, device, app, installed, signing, wir
   try { previous = JSON.parse(readFileSync(join(directory, "state.json"), "utf8")); } catch {}
   try {
     archiveApp(app, archivePath, signing);
-    const record = { version: 1, udid: device.udid, name: device.name, wirelessOnly, archive,
+    const record = { version: 1, bundleId, udid: device.udid, name: device.name, wirelessOnly, archive,
       bundleContainerPath: installed.bundleContainerPath, bundleVersion: installed.bundleVersion,
       signing, installedAt: new Date().toISOString() };
     const staged = join(directory, `state-${randomUUID()}.tmp`);
@@ -484,15 +487,15 @@ export function renewOne(directory, record, api, options = {}) {
     throw new Error("续签快照与已登记的签名不一致，请重新运行安装命令。");
   }
   const device = api.device(record);
-  assertInstalledMatches(record, api.installed(device.udid));
+  assertInstalledMatches(record, api.installed(device.udid, record.bundleId ?? legacyBundleId));
   const temp = mkdtempSync(join(tmpdir(), "bridge-ios-renew-"));
   try {
     const candidate = api.renew(directory, record, temp, now);
     validateRenewal(snapshot, candidate.signing, record.udid, now);
-    assertInstalledMatches(record, api.installed(device.udid));
+    assertInstalledMatches(record, api.installed(device.udid, record.bundleId ?? legacyBundleId));
     api.install(device, candidate.app);
-    const installed = api.installed(device.udid);
-    if (!installed?.bundleContainerPath || installed.bundleIdentifier !== bundleId) throw new Error("安装后无法确认 Bridge，未更新续签记录。");
+    const installed = api.installed(device.udid, record.bundleId ?? legacyBundleId);
+    if (!installed?.bundleContainerPath || installed.bundleIdentifier !== (record.bundleId ?? legacyBundleId)) throw new Error("安装后无法确认 Bridge，未更新续签记录。");
     api.remember(device, candidate.app, installed, candidate.signing, record.wirelessOnly);
     return true;
   } finally {

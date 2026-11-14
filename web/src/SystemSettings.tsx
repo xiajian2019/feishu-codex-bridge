@@ -8,6 +8,7 @@ import "./workbench.css";
 import { readMobileNotificationPreferences, updateMobileNotificationPreferences, type MobileNotificationPreferences } from "./mobile-notifications.js";
 import { getMobileNotificationPermission } from "./mobile-runtime.js";
 import { IOSOtaPanel, isIphoneOtaSurface } from "./IOSOtaPanel.js";
+import { CrashDiagnosticsPanel } from "./CrashDiagnosticsPanel.js";
 
 export function SystemSettings(): ReactElement {
   const { mode, setMode } = useTheme();
@@ -131,6 +132,7 @@ export function SystemSettings(): ReactElement {
         {nativeError ? <p className="workbench-page-error" role="alert">{nativeError}</p> : null}
       </section> : null}
       {isIphoneOtaSurface() ? <IOSOtaPanel /> : null}
+      <CrashDiagnosticsPanel />
       <section className="system-settings-notifications" aria-label="通知偏好">
         <header className="workbench-page-header">
           <div><h2>通知偏好</h2><p className="workbench-settings-note">{isMobileApp() ? "以下事件类别由后端保存；本机原生通知另由上方设备设置控制。待处理中心始终可查看已有记录。" : "站内通知保留在任务面板；浏览器通知在页面打开时检查新通知，并需要浏览器授权。"}</p></div>

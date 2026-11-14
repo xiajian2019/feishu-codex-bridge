@@ -33,6 +33,7 @@ const DemoCatalog = lazy(() => import("./DemoCatalog.js").then((module) => ({ de
 const JjTools = lazy(() => import("./JjTools.js").then((module) => ({ default: module.JjTools })));
 const UploadDownloads = lazy(() => import("./UploadDownloads.js").then((module) => ({ default: module.UploadDownloads })));
 const MobileInboxPage = lazy(() => import("./MobileInboxPage.js").then((module) => ({ default: module.MobileInboxPage })));
+const MobileAppOnlyVpnPocPage = lazy(() => import("./MobileAppOnlyVpnPocPage.js"));
 
 function LegacyDirectTasksRedirect() {
   const location = useLocation();
@@ -230,6 +231,7 @@ async function mountApp(): Promise<void> {
                   <Route path="/system-management/backups" element={<BackendFeatureGate feature="backups"><SystemBackups /></BackendFeatureGate>} />
                   <Route path="/system-management/workspaces" element={<TaskWorkspaces />} />
                   <Route path="/system-management/settings" element={<SystemSettings />} />
+                  <Route path="/system-management/app-only-vpn-poc" element={<MobileAppOnlyVpnPocPage />} />
                   <Route path="/system-management/automations" element={<Automations />} />
                   <Route path="/system-management/machines" element={<ExecutionMachines />} />
                   <Route path="/pair-admin" element={<Navigate to="/system-management/devices" replace />} />

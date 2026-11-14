@@ -7,8 +7,8 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  assertTailscalePortAvailable, createInstallLink, createOtaHandler, discoverVpnAddresses, ensureVpnCertificate,
-  normalizeOtaBaseUrl, otaManifest, otaPage, parseOtaOptions, parseRange, refreshAgentPlist, refreshOtaRelease,
+  assertOtaBuildNumberAdvances, assertTailscalePortAvailable, createInstallLink, createOtaHandler, discoverVpnAddresses, ensureVpnCertificate,
+  nextOtaBuildNumber, normalizeOtaBaseUrl, otaManifest, otaPage, parseOtaBuildNumber, parseOtaOptions, parseRange, refreshAgentPlist, refreshOtaRelease,
   resolveInstallTicket, revokePortalSessions, servicePaths,
 } from "../scripts/ios-ota.mjs";
 
@@ -38,6 +38,22 @@ describe("iOS OTA installation", () => {
     expect(() => parseOtaOptions(["--vpn-ip", "not-an-ip"])).toThrow();
     expect(() => parseOtaOptions(["--vpn-ip", "10.0.0.1", "--tailscale"])).toThrow();
     expect(() => parseOtaOptions(["--tls-cert", "/tmp/cert"])).toThrow();
+    expect(parseOtaOptions(["--build-number", "42"]).buildNumber).toBe(42);
+    expect(parseOtaOptions(["--vpn"]).vpn).toBe(true);
+    expect(() => parseOtaOptions(["--build-number", "0"])).toThrow("正整数");
+    expect(() => parseOtaOptions(["--app", "/tmp/App.app", "--build-number", "42"])).toThrow("不能与");
+  });
+
+  test("allocates a build number newer than both the project and the published OTA package", () => {
+    const { dir } = fixture();
+    const source = mkdtempSync(join(tmpdir(), "bridge-ios-ota-source-")); dirs.push(source);
+    mkdirSync(join(source, "ios/App/App.xcodeproj"), { recursive: true });
+    writeFileSync(join(source, "ios/App/App.xcodeproj/project.pbxproj"), "CURRENT_PROJECT_VERSION = 1;\nCURRENT_PROJECT_VERSION = 1;");
+    expect(parseOtaBuildNumber("42")).toBe(42);
+    expect(nextOtaBuildNumber(dir, source)).toBe(2);
+    expect(assertOtaBuildNumberAdvances(dir, 2)).toBe(2);
+    expect(() => assertOtaBuildNumberAdvances(dir, 1)).toThrow("不高于已发布");
+    expect(() => parseOtaBuildNumber("1.0")).toThrow("正整数");
   });
 
   test("discovers only IPv4 VPN interfaces", () => {
@@ -71,6 +87,8 @@ describe("iOS OTA installation", () => {
     const page = otaPage(ticket!.base, token, metadata);
     expect(page).toContain("itms-services://?action=download-manifest&amp;url=");
     expect(page).toContain("点按后请在 iPhone 上确认");
+    expect(page).toContain("OTA 包生成时间");
+    expect(page).toContain("2026/11/9 12:00:00");
     expect(page).not.toContain("安装成功");
   });
 

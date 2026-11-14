@@ -1190,7 +1190,7 @@ pre {
 .tmux-code-editor .cm-focused .cm-selectionBackground { background-color: #365f90 !important; }
 .tmux-code-editor .cm-content ::selection { color: #fff !important; background-color: #365f90 !important; }
 
-@media (max-width: 760px) {
+@media (max-width: 760px), (pointer: coarse) and (max-width: 1024px) {
   .web-navigation { padding: 8px 14px; }
   .tmux-files-page { min-height: calc(100svh - 49px); }
   .tmux-files-page.is-navigation-collapsed { min-height: 100svh; }
@@ -1355,6 +1355,45 @@ pre {
   .dashboard-composer-input { box-sizing: border-box; min-height: 40px; max-height: 128px; }
   .dashboard-compose-send { min-width: 40px; min-height: 40px; padding: 0; }
   .dashboard-send-label { display: none; }
+}
+
+/* Keep both panes visible on a touch device in landscape, but use a compact
+   split instead of the wide desktop proportions. */
+@media (pointer: coarse) and (min-width: 761px) and (max-width: 1024px) {
+  .dashboard-page { height: calc(100dvh - 53px); min-height: 0; overflow: hidden; }
+  .dashboard-page.is-navigation-collapsed { height: 100dvh; }
+  /* Safari's viewport-fit=cover lets the dashboard use the full landscape
+     width. Keep the camera-side inset, but do not reserve a mirrored blank
+     strip on the opposite edge. The native App owns its insets on #root. */
+  html:not(.bridge-mobile-app) .dashboard-page { padding-left: env(safe-area-inset-left, 0px); padding-right: 0; }
+  .dashboard-main { grid-template-columns: 240px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); min-height: 0; }
+  .dashboard-main.is-mobile-sessions .dashboard-workspace,
+  .dashboard-main.is-mobile-terminal .dashboard-sidebar { display: flex; }
+  .dashboard-sidebar { padding: 8px 8px 6px; border-right: 1px solid #27313d; border-bottom: 0; }
+  .dashboard-sidebar-heading { margin-bottom: 6px; }
+  .dashboard-sidebar-heading h2 { font-size: 12px; }
+  .dashboard-session-tools { gap: 2px; }
+  .dashboard-session-tools .dashboard-icon-button,
+  .dashboard-session-tools .dashboard-ssh-shortcut { width: 28px; min-width: 28px; height: 28px; min-height: 28px; }
+  .dashboard-filter { min-height: 34px; margin-bottom: 5px; }
+  .dashboard-session-list { gap: 6px; padding: 2px 0 5px; }
+  .dashboard-session-card { gap: 2px; padding: 5px 7px; }
+  .dashboard-session-top strong { font-size: 12px; }
+  .dashboard-session-path { font-size: 10px; }
+  .dashboard-session-meta { font-size: 10px; }
+  .dashboard-session-actions { min-height: 32px; padding: 1px 5px 3px; }
+  .dashboard-session-actions > * { height: 30px; min-height: 30px; }
+  .dashboard-session-actions button,
+  .dashboard-session-actions .dashboard-codex-home-select { padding: 2px 4px; font-size: 9px; }
+  .dashboard-workspace-toolbar { flex-basis: 48px; padding: 4px 8px; }
+  .dashboard-main.is-mobile-terminal .dashboard-mobile-back { display: none; }
+  .dashboard-active-session-title { font-size: 10px; }
+  .dashboard-active-session div span { max-width: 34vw; font-size: 8px; }
+  .dashboard-composer { margin: 4px 8px 6px; padding: 6px 8px; gap: 4px; }
+  /* In landscape the safe-area inset belongs to the side edges. Do not let
+     the generic mobile bottom margin lift the composer above the viewport. */
+  .dashboard-main.is-mobile-terminal .dashboard-composer { margin-bottom: 4px; }
+  .dashboard-composer-input { min-height: 34px; max-height: 80px; }
 }
 
 @media (max-width: 360px) {

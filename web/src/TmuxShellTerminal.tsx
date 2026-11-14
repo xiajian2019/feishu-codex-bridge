@@ -3,6 +3,7 @@ import type { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { useEffect, useLayoutEffect, useRef, useState, type ReactElement } from "react";
 import { getTmuxTerminalRenderTheme } from "./tmux-terminal-theme.js";
+import { isolateTmuxTerminalKeyboard } from "./tmux-terminal-keyboard.js";
 import { useTheme } from "./theme.js";
 import { mobileStreamUrl } from "./mobile-runtime.js";
 
@@ -113,6 +114,7 @@ export function TmuxShellTerminalSheet({
         theme: getTmuxTerminalRenderTheme(resolvedThemeRef.current),
         minimumContrastRatio: resolvedThemeRef.current === "light" ? 7 : 1,
       });
+      isolateTmuxTerminalKeyboard(terminal);
       fitAddon = new FitAddon();
       terminal.loadAddon(fitAddon);
       try { terminal.loadAddon(new CanvasAddon()); } catch { /* DOM renderer remains available. */ }

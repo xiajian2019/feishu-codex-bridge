@@ -8,10 +8,12 @@ import { createMobileVpnRetry } from "./mobile-vpn-retry.js";
 import {
   checkMobileApkUpdate, checkMobileConnection, disconnectMobileConnection, downloadMobileApkUpdate, getMobileConnection,
   initializeMobileRuntime, installMobileApkUpdate, MOBILE_CONNECTION_EVENT, MOBILE_RESUME_EVENT, MOBILE_SETTINGS_EVENT,
-  MOBILE_SHAKE_EVENT, openMobileConnectionSettings, pairMobileConnection, switchMobileConnection,
+  MOBILE_OPENVPN_CONNECT_EVENT, MOBILE_SHAKE_EVENT, openExternalOpenVPNConnect, openMobileConnectionSettings, pairMobileConnection,
+  stopMobileVpnRecoveryMonitor, switchMobileConnection,
   applyConfiguredBridgeNetworkSettings, checkAndConnectMobileVpn, getMobileAppVersion, getMobileAppBuild, readCurrentWifiSsid, supportsMobileApkUpdates,
-  type MobileApkUpdate,
+  getMobileVpnCapability, importMobileVpnProfile, isMobileApp, type MobileApkUpdate,
 } from "./mobile-runtime.js";
+import type { MobileVpnCapability } from "./mobile-vpn-contract.js";
 import MobileDownloadStatus from "./MobileDownloadStatus.js";
 import { IOSOtaPanel, isIphoneOtaSurface } from "./IOSOtaPanel.js";
 import { getMobileDownloads, subscribeMobileDownloads, type MobileDownloadTask } from "./mobile-download-manager.js";
@@ -39,6 +41,7 @@ export default function MobileConnectionGate({ children }: { children: ReactNode
 export function MobileConnectionContent({ children }: { children: ReactNode }): ReactElement {
   const location = useLocation();
   const navigate = useNavigate();
+  const isStandaloneMobileRoute = location.pathname === "/system-management/app-only-vpn-poc";
   const [state, setState] = useState<ConnectionState>("loading");
   const [mode, setMode] = useState<"bridge" | "ssh">(() => {
     try { return window.localStorage.getItem("bridge.connection.mode") === "ssh" ? "ssh" : "bridge"; }
@@ -93,6 +96,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
   const [environmentMessage, setEnvironmentMessage] = useState<string | null>(null);
   const [vpnChecking, setVpnChecking] = useState(false);
   const [vpnMessage, setVpnMessage] = useState<string | null>(null);
+  const [vpnCapability, setVpnCapability] = useState<MobileVpnCapability | null>(null);
   const vpnCheckingRef = useRef(false);
   const vpnMessageTimerRef = useRef<number | null>(null);
   const [appVersion, setAppVersion] = useState("读取中…");
@@ -122,6 +126,11 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
   };
 
   useEffect(() => { void getMobileAppVersion().then(setAppVersion).catch(() => setAppVersion("暂不可读")); }, []);
+  useEffect(() => {
+    let active = true;
+    void getMobileVpnCapability().then((capability) => { if (active) setVpnCapability(capability); }).catch(() => {});
+    return () => { active = false; };
+  }, []);
   useEffect(() => {
     if ((location.state as { mobileOpenConnectionSettings?: boolean } | null)?.mobileOpenConnectionSettings !== true) return;
     setAddress(getMobileConnection()?.server ?? ""); setMode("bridge"); setEditing(true); setError(null);
@@ -168,19 +177,30 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
   }, [revision]);
 
   useEffect(() => {
+    // The native monitor is armed only by the dedicated Bridge connectivity
+    // probe after it fails. Leaving Bridge mode must disarm any active probe.
+    return () => { void stopMobileVpnRecoveryMonitor(); };
+  }, [editing, mode]);
+
+  useEffect(() => {
     const onVpnReachable = (): void => {
       if (document.visibilityState === "hidden") return;
       if (vpnRetry.onReachable(stateRef.current, editingRef.current)) vpnRecoveryEventsToSkip.current = 2;
     };
     const onApiUnavailable = (): void => vpnRetry.onUnavailable(stateRef.current, editingRef.current);
     const onApiReachable = (): void => vpnRetry.onReachableApi();
+    const onOpenVPNConnect = (): void => {
+      setVpnMessage("Bridge 不可达，已打开 OpenVPN Connect；请在其中选择已导入的配置并连接。");
+    };
     window.addEventListener("bridge:mobile-vpn-reachable", onVpnReachable);
     window.addEventListener("bridge:api-network-unreachable", onApiUnavailable);
     window.addEventListener("bridge:api-reachable", onApiReachable);
+    window.addEventListener(MOBILE_OPENVPN_CONNECT_EVENT, onOpenVPNConnect);
     return () => {
       window.removeEventListener("bridge:mobile-vpn-reachable", onVpnReachable);
       window.removeEventListener("bridge:api-network-unreachable", onApiUnavailable);
       window.removeEventListener("bridge:api-reachable", onApiReachable);
+      window.removeEventListener(MOBILE_OPENVPN_CONNECT_EVENT, onOpenVPNConnect);
     };
   }, [vpnRetry]);
 
@@ -481,6 +501,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
       vpnChecking={vpnChecking}
       vpnMessage={vpnMessage}
       onCheckVpn={() => { void checkVpnManually(); }}
+      vpnAvailable={vpnCapability?.enabled === true || vpnCapability?.externalOpenVPNConnect === true}
       appVersion={appVersion}
       appChecking={apkCheckBusy}
       appDownloading={apkDownloadBusy}
@@ -497,8 +518,9 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
 
   if (scannerOpen) return <MobilePairingScanner onPair={scanAndPair} onClose={() => setScannerOpen(false)} />;
 
-  if (state === "ready" && !editing && mode === "bridge") return <>
-    <MobileNavigationBridge />
+  const canRenderWorkbench = state === "ready" && !editing && mode === "bridge";
+  if (canRenderWorkbench || isStandaloneMobileRoute) return <>
+    {canRenderWorkbench ? <MobileNavigationBridge /> : null}
     {children}
     {environmentDialog}
   </>;
@@ -617,6 +639,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
 }
 
 export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }: { disabled?: boolean; onApplied?: () => void }): ReactElement {
+  const navigate = useNavigate();
   const [globalHost, setGlobalHost] = useState(getConfiguredGlobalMacHost);
   const [wifiSsids, setWifiSsids] = useState(() => readBridgeNetworkSettings().vpnBypassWifiSsids);
   const [wifiInput, setWifiInput] = useState("");
@@ -624,6 +647,17 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
   const [wifiReadBusy, setWifiReadBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [vpnCapability, setVpnCapability] = useState<MobileVpnCapability | null>(null);
+  const [vpnProfileBusy, setVpnProfileBusy] = useState(false);
+  const [vpnProfileMessage, setVpnProfileMessage] = useState<string | null>(null);
+  const [vpnProfileError, setVpnProfileError] = useState<string | null>(null);
+  const [openVPNConnectBusy, setOpenVPNConnectBusy] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void getMobileVpnCapability().then((capability) => { if (active) setVpnCapability(capability); }).catch(() => {});
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     const refresh = (): void => {
@@ -672,7 +706,7 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
     setWifiReadBusy(true); setError(null); setMessage(null);
     try {
       const ssid = await readCurrentWifiSsid();
-      if (!ssid) throw new Error("未读取到当前 Wi‑Fi 名称，请确认已连接 Wi‑Fi、开启系统位置服务，并允许应用使用精确位置后重试。");
+      if (!ssid) throw new Error("未读取到当前 Wi‑Fi 名称；请手动输入 SSID 后保存。");
       if (wifiSsids.includes(ssid)) {
         setMessage(`当前 Wi‑Fi“${ssid}”已经在免 VPN 列表中。`);
       } else {
@@ -684,6 +718,32 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
       setError(cause instanceof Error ? cause.message : "无法读取当前 Wi‑Fi，请重试。");
     } finally {
       setWifiReadBusy(false);
+    }
+  };
+
+  const importVpnProfile = async (): Promise<void> => {
+    if (disabled || busy || vpnProfileBusy) return;
+    setVpnProfileBusy(true); setVpnProfileMessage(null); setVpnProfileError(null);
+    try {
+      setVpnProfileMessage(await importMobileVpnProfile());
+    } catch (cause) {
+      setVpnProfileError(cause instanceof Error ? cause.message : "VPN 配置导入失败，请重试。");
+    } finally {
+      setVpnProfileBusy(false);
+    }
+  };
+
+  const openExternalVpn = async (): Promise<void> => {
+    if (disabled || busy || openVPNConnectBusy) return;
+    setOpenVPNConnectBusy(true); setVpnProfileMessage(null); setVpnProfileError(null);
+    try {
+      if (!await openExternalOpenVPNConnect()) {
+        setVpnProfileError("无法打开 OpenVPN Connect，请确认已安装该 App。");
+      } else {
+        setVpnProfileMessage("已打开 OpenVPN Connect，请在其中选择已导入的配置并连接。");
+      }
+    } finally {
+      setOpenVPNConnectBusy(false);
     }
   };
 
@@ -710,7 +770,7 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
             {wifiReadBusy ? <span aria-hidden="true">…</span> : <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M2.5 8.8a15.6 15.6 0 0 1 19 0M5.8 12.5a10.2 10.2 0 0 1 12.4 0M9.2 16.1a5.2 5.2 0 0 1 5.6 0M12 20h.01" /></svg>}
           </button>
         </div>
-        <small>Android 将 Wi‑Fi 名称（SSID）归为位置敏感信息，读取时需要精确位置权限和开启系统位置服务。Bridge 只读取 SSID，不读取 GPS 坐标；也可手动输入名称后保存。</small>
+        <small>免 VPN SSID 会跳过自动启动，手动输入仍可用。Android 读取 SSID 需要精确位置权限和系统位置服务；iOS 当前 SSID 读取可能受权限限制，无法读取时请手动输入。Bridge 只读取 SSID，不读取 GPS 坐标。</small>
         {wifiSsids.length ? <ul className="mobile-connect-network-list">
           {wifiSsids.map((ssid) => <li key={ssid}>
             <span>{ssid}</span>
@@ -721,11 +781,33 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
           </li>)}
         </ul> : <small>尚未添加 Wi‑Fi。手机设置里显示的 Wi‑Fi 名称就是 SSID。</small>}
       </div>
+      {vpnCapability?.platform === "ios" ? <div className="mobile-connect-network-field">
+        <span>OpenVPN 配置</span>
+        {vpnCapability.profileImport ? <>
+          <small>仅通过原生文件选择器导入 .ovpn；配置内容和密钥不会写入网页存储，也不会显示在页面中。</small>
+          <button type="button" className="mobile-connect-secondary mobile-connect-network-save" disabled={disabled || busy || vpnProfileBusy}
+            onClick={() => { void importVpnProfile(); }}>
+            {vpnProfileBusy ? "正在导入…" : "选择并导入 .ovpn"}
+          </button>
+        </> : vpnCapability.externalOpenVPNConnect ? <>
+          <small role="status">当前构建未启用系统 Packet Tunnel；Bridge 不可达时会尝试打开 OpenVPN Connect，但需要你在其中选择已导入的配置并连接。</small>
+          <button type="button" className="mobile-connect-secondary mobile-connect-network-save" disabled={disabled || busy || openVPNConnectBusy}
+            onClick={() => { void openExternalVpn(); }}>
+            {openVPNConnectBusy ? "正在打开…" : "打开 OpenVPN Connect"}
+          </button>
+        </> : <small role="status">当前 iOS App 尚未配置 BridgeAutoVpn，自动 VPN 暂未启用；免 VPN Wi‑Fi 和手动输入仍可用，请更新 App 或完成原生 VPN 配置。</small>}
+        {vpnProfileMessage ? <p className="mobile-connect-network-message" role="status">{vpnProfileMessage}</p> : null}
+        {vpnProfileError ? <p className="mobile-connect-error" role="alert">{vpnProfileError}</p> : null}
+      </div> : null}
       {message ? <p className="mobile-connect-network-message" role="status">{message}</p> : null}
       {error ? <p className="mobile-connect-error" role="alert">{error}</p> : null}
       <button type="submit" className="mobile-connect-secondary mobile-connect-network-save" disabled={disabled || busy}>
         {busy ? "正在保存…" : "保存网络配置"}
       </button>
+      {isMobileApp() ? <button type="button" className="mobile-connect-secondary mobile-connect-network-save"
+        disabled={disabled || busy} onClick={() => navigate("/system-management/app-only-vpn-poc")}>
+        打开 App-only VPN 实验页
+      </button> : null}
     </form>
   </section>;
 }
@@ -757,7 +839,7 @@ function buildEnvironmentOptions(server: string): EnvironmentOption[] {
 
 export function MobileEnvironmentDialog({
   options, busy, message, currentServer, vpnChecking, vpnMessage, onCheckVpn, appVersion, appChecking, appDownloading, appActionsBusy,
-  appMessage, appError, onCheckUpdate, onDownloadApp, onSelect, onOpenConnectionSettings, onClose,
+  appMessage, appError, onCheckUpdate, onDownloadApp, onSelect, onOpenConnectionSettings, onClose, vpnAvailable,
 }: {
   options: EnvironmentOption[];
   busy: string | null;
@@ -766,6 +848,7 @@ export function MobileEnvironmentDialog({
   vpnChecking: boolean;
   vpnMessage: string | null;
   onCheckVpn: () => void;
+  vpnAvailable?: boolean;
   appVersion: string;
   appChecking: boolean;
   appDownloading: boolean;
@@ -818,7 +901,7 @@ export function MobileEnvironmentDialog({
           <span>{currentServer || "未连接"}</span>
           <button type="button" className="mobile-environment-vpn-check" aria-label={vpnChecking ? "正在检查 VPN" : "检查并连接 VPN"}
             title={vpnChecking ? "正在检查 VPN" : "检查并连接 VPN"} aria-busy={vpnChecking} data-loading={vpnChecking ? "true" : undefined}
-            disabled={vpnChecking} onClick={onCheckVpn}>
+            disabled={vpnChecking || vpnAvailable === false} onClick={onCheckVpn}>
             VPN
           </button>
         </dd>

@@ -24,6 +24,17 @@ html.bridge-mobile-app .task-detail-composer { padding-bottom: 7px; }
   html.bridge-mobile-app .dashboard-page { height: calc(100dvh - 53px - var(--bridge-safe-height)); min-height: 0; }
   html.bridge-mobile-app .dashboard-page.is-navigation-collapsed { height: calc(100dvh - var(--bridge-safe-height)); }
 }
+@media (orientation: landscape) and (min-width: 761px) {
+  /* In the native landscape terminal view the camera-side inset is the only
+     horizontal guard we need. Do not mirror it on the right or reserve the
+     portrait/home-indicator bottom inset in the dashboard shell. */
+  html.bridge-mobile-app.tmux-terminal-detail #root { padding-right: 0; padding-bottom: 0; }
+  html.bridge-mobile-app.tmux-terminal-detail .dashboard-page,
+  html.bridge-mobile-app.tmux-terminal-detail .dashboard-page.is-navigation-collapsed {
+    height: calc(100dvh - var(--bridge-safe-top));
+  }
+  html.bridge-mobile-app.tmux-terminal-detail .dashboard-sidebar { padding-left: 4px; }
+}
 @media (max-width: 760px) {
   /* #root already reserves the home indicator / Android gesture area. */
   html.bridge-mobile-app .dashboard-composer,

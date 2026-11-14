@@ -32,6 +32,9 @@ import { getTmuxTerminalRenderTheme } from "./tmux-terminal-theme.js";
 import { failPendingTmuxSubmissionsOnDisconnect, type TerminalSubmissionResult } from "./tmux-terminal-utils.js";
 import { getTmuxTerminalTransport, type TmuxTerminalTransport, type TmuxTerminalTransportEvent } from "./tmux-terminal-runtime.js";
 import { terminalHistorySnapshot } from "./tmux-terminal-history.js";
+import { isolateTmuxTerminalKeyboard } from "./tmux-terminal-keyboard.js";
+import { TmuxTerminalReplayGuard } from "./tmux-terminal-replay.js";
+import { clearTmuxWebShellState, loadTmuxWebShellState, saveTmuxWebShellState } from "./tmux-web-shell-store.js";
 import {
   isSessionListRefreshStale,
   shouldRefreshSessionListOnPageShow,
@@ -118,6 +121,13 @@ type TaskCreationContext = {
 type Toast = { message: string; isError: boolean; durationMs?: number };
 type SubmissionResult = TerminalSubmissionResult;
 type SessionInspector = { kind: "history"; sessionId: string | null } | { kind: "git"; sessionId: string };
+type ShellTerminalState = { sessionId: string; sessionCreatedAt: number; visible: boolean };
+
+const MOBILE_VIEWPORT_QUERY = "(max-width: 760px), (pointer: coarse) and (max-width: 1024px)";
+
+function compactMobileViewport(): boolean {
+  return isMobileApp() || window.matchMedia(MOBILE_VIEWPORT_QUERY).matches;
+}
 
 function CodexHomeSelect({
   session,
@@ -370,7 +380,7 @@ export function TmuxDashboard(): ReactElement {
   const initialRouteParams = new URLSearchParams(window.location.search);
   const initialSelectedId = initialRouteParams.get("session");
   const shouldRestoreSessionDetail = Boolean(initialSelectedId) && initialRouteParams.get("view") !== "sessions";
-  const [isMobile, setIsMobile] = useState(() => window.matchMedia("(max-width: 760px)").matches);
+  const [isMobile, setIsMobile] = useState(compactMobileViewport);
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [sessions, setSessions] = useState<TmuxSession[]>([]);
   const [resurrectStatus, setResurrectStatus] = useState<TmuxResurrectStatus | null>(null);
@@ -395,8 +405,7 @@ export function TmuxDashboard(): ReactElement {
   const [connectionBannerDismissed, setConnectionBannerDismissed] = useState(false);
   const [terminalEverAttached, setTerminalEverAttached] = useState(false);
   const [terminalInputEnabled, setTerminalInputEnabled] = useState(false);
-  const [shellTerminalMounted, setShellTerminalMounted] = useState(false);
-  const [shellTerminalVisible, setShellTerminalVisible] = useState(false);
+  const [shellTerminalState, setShellTerminalState] = useState<ShellTerminalState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
@@ -455,8 +464,8 @@ export function TmuxDashboard(): ReactElement {
   const codexUsageAbortRef = useRef<AbortController | null>(null);
   const codexUsageCacheRef = useRef(new Map<string, { at: number; account: CodexUsageAccount }>());
   useEffect(() => {
-    const media = window.matchMedia("(max-width: 760px)");
-    const update = (): void => setIsMobile(media.matches);
+    const media = window.matchMedia(MOBILE_VIEWPORT_QUERY);
+    const update = (): void => setIsMobile(compactMobileViewport());
     media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
   }, []);
@@ -474,7 +483,7 @@ export function TmuxDashboard(): ReactElement {
     const params = new URLSearchParams(location.search);
     if (selectedId) {
       params.set("session", selectedId);
-      if (window.matchMedia("(max-width: 760px)").matches) params.set("view", mobileView);
+      if (isMobile) params.set("view", mobileView);
       else params.delete("view");
     } else {
       params.delete("session");
@@ -484,7 +493,7 @@ export function TmuxDashboard(): ReactElement {
     const search = query ? `?${query}` : "";
     if (search === location.search) return;
     navigate({ pathname: location.pathname, search, hash: location.hash }, { replace: true, state: location.state });
-  }, [location.hash, location.pathname, location.search, location.state, mobileView, navigate, selectedId]);
+  }, [isMobile, location.hash, location.pathname, location.search, location.state, mobileView, navigate, selectedId]);
 
   useEffect(() => {
     const state = location.state as { sessionFileForward?: unknown } | null;
@@ -501,10 +510,10 @@ export function TmuxDashboard(): ReactElement {
 
   useLayoutEffect(() => {
     const detailClass = "tmux-terminal-detail";
-    const mobileDetailRequested = restoreSessionDetailRef.current && window.matchMedia("(max-width: 760px)").matches;
+    const mobileDetailRequested = restoreSessionDetailRef.current && isMobile;
     document.documentElement.classList.toggle(detailClass, mobileView === "terminal" || mobileDetailRequested);
     return () => document.documentElement.classList.remove(detailClass);
-  }, [mobileView]);
+  }, [isMobile, mobileView]);
 
   const cancelSessionsRequest = useCallback((): void => {
     sessionsLoadSequenceRef.current += 1;
@@ -784,7 +793,7 @@ export function TmuxDashboard(): ReactElement {
   }, []);
 
   const openSessionInspector = (kind: "history" | "git", sessionId?: string): void => {
-    const desktop = window.matchMedia("(min-width: 761px)").matches;
+    const desktop = !isMobile;
     if (desktop) {
       if (kind === "git" && sessionId) setSessionInspector({ kind, sessionId });
       else setSessionInspector({ kind: "history", sessionId: sessionId ?? null });
@@ -814,6 +823,36 @@ export function TmuxDashboard(): ReactElement {
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? null;
   const sessionEditTarget = sessions.find((session) => session.id === sessionEditTargetId) ?? null;
   const terminalVisible = Boolean(selectedSession) && (!isMobile || mobileView === "terminal");
+  const selectedSessionId = selectedSession?.id ?? null;
+  const selectedSessionCreatedAt = selectedSession?.createdAt ?? null;
+  const shellTerminalMounted = Boolean(
+    shellTerminalState
+    && selectedSessionId === shellTerminalState.sessionId
+    && selectedSessionCreatedAt === shellTerminalState.sessionCreatedAt,
+  );
+  const shellTerminalVisible = shellTerminalMounted && shellTerminalState?.visible === true;
+  useEffect(() => {
+    if (selectedSessionId === null || selectedSessionCreatedAt === null) {
+      setShellTerminalState(null);
+      return;
+    }
+    const stored = loadTmuxWebShellState(selectedSessionId, selectedSessionCreatedAt);
+    setShellTerminalState(stored ? {
+      sessionId: selectedSessionId,
+      sessionCreatedAt: selectedSessionCreatedAt,
+      visible: stored.visible,
+    } : null);
+  }, [selectedSessionCreatedAt, selectedSessionId]);
+
+  const updateShellTerminalState = (session: TmuxSession, visible: boolean): void => {
+    const next = { sessionId: session.id, sessionCreatedAt: session.createdAt, visible };
+    setShellTerminalState(next);
+    saveTmuxWebShellState(session.id, session.createdAt, { visible });
+  };
+  const closeShellTerminal = (session: TmuxSession): void => {
+    setShellTerminalState((current) => current?.sessionId === session.id && current.sessionCreatedAt === session.createdAt ? null : current);
+    clearTmuxWebShellState(session.id, session.createdAt);
+  };
   const selectedCodexHomeLabel = selectedSession
     ? resolveCodexHomeLabel(selectedSession.codexHomeId, codexHomes, codexUsageAccount)
     : "";
@@ -888,15 +927,13 @@ export function TmuxDashboard(): ReactElement {
     if (!session || session.endedAt || session.suspendedAt) return;
     cancelSessionsRequest();
     restoreSessionDetailRef.current = false;
-    setShellTerminalMounted(false);
-    setShellTerminalVisible(false);
     if (sessionId !== selectedId) {
       setTerminalInputEnabled(false);
       setTerminalEverAttached(false);
       setTerminalStatus("CONNECTING");
     }
     setSelectedId(sessionId);
-    if (window.matchMedia("(max-width: 760px)").matches) {
+    if (isMobile) {
       setNavigationCollapsed(true);
       setMobileView("terminal");
     }
@@ -968,8 +1005,7 @@ export function TmuxDashboard(): ReactElement {
     if (backendStatus !== "online" || !selectedId || sessions.some((session) => session.id === selectedId && !session.endedAt && !session.suspendedAt)) return;
     setSelectedId(null);
     setTerminalInputEnabled(false);
-    setShellTerminalMounted(false);
-    setShellTerminalVisible(false);
+    setShellTerminalState(null);
     setMobileView("sessions");
     setNavigationCollapsed(false);
   }, [backendStatus, sessions, selectedId, setNavigationCollapsed]);
@@ -977,7 +1013,7 @@ export function TmuxDashboard(): ReactElement {
   useEffect(() => {
     if (!restoreSessionDetailRef.current || backendStatus !== "online") return;
     restoreSessionDetailRef.current = false;
-    if (selectedId && sessions.some((session) => session.id === selectedId) && window.matchMedia("(max-width: 760px)").matches) {
+    if (selectedId && sessions.some((session) => session.id === selectedId) && isMobile) {
       sessionsLoadSequenceRef.current += 1;
       setMobileView("terminal");
       setNavigationCollapsed(true);
@@ -1024,6 +1060,7 @@ export function TmuxDashboard(): ReactElement {
         theme: getTmuxTerminalRenderTheme(resolvedThemeRef.current),
         minimumContrastRatio: resolvedThemeRef.current === "light" ? 7 : 1,
       });
+      isolateTmuxTerminalKeyboard(terminal);
       const fit = new FitAddon();
       terminal.loadAddon(fit);
       terminal.open(host);
@@ -1046,7 +1083,7 @@ export function TmuxDashboard(): ReactElement {
 
       const fitTerminal = (): void => {
         fit.fit();
-        if (window.matchMedia("(max-width: 760px)").matches && terminal.element) {
+        if (isMobile && terminal.element) {
           // FitAddon reserves 15px even for overlay scrollbars. Use the actual
           // mobile scrollbar width, keeping the terminal's scrollback enabled.
           const screen = host.querySelector<HTMLElement>(".xterm-screen");
@@ -1234,8 +1271,25 @@ export function TmuxDashboard(): ReactElement {
       };
       terminalHistoryActionsRef.current = historyActions;
 
+      let paintedConnectionId: number | null = null;
+      const markTerminalAttached = (): void => {
+        everAttached = true;
+        setTerminalEverAttached(true);
+        setTerminalStatus("ATTACHED");
+      };
+      const replayGuard = new TmuxTerminalReplayGuard(terminal, (replaying) => {
+        if (disposed) return;
+        if (terminal.textarea) {
+          terminal.textarea.readOnly = replaying || !terminalInputEnabled;
+          terminal.textarea.inputMode = !replaying && terminalInputEnabled ? "text" : "none";
+        }
+        if (!replaying && paintedConnectionId !== null && paintedConnectionId === activeConnectionId && transport.isOpen()) {
+          markTerminalAttached();
+        }
+      });
+
       const inputSubscription = terminal.onData((input) => {
-        if (!terminalInputEnabled || disposed || !transport.isOpen()) return;
+        if (!terminalInputEnabled || disposed || replayGuard.active || !transport.isOpen()) return;
         transport.send({ type: "input", data: input });
       });
       const removeTouchScrolling = bindMobileTerminalTouch(host, terminal, setTerminalSelection, {
@@ -1257,7 +1311,6 @@ export function TmuxDashboard(): ReactElement {
       });
 
       let lastTerminalRenderDiagnosticAt = 0;
-      let paintedConnectionId: number | null = null;
       const writeTerminalOutput = (data: string | Uint8Array, connectionId: number): void => {
         const needsReady = paintedConnectionId !== connectionId;
         if (!needsReady && !isDebugLogCaptureActive()) {
@@ -1268,9 +1321,7 @@ export function TmuxDashboard(): ReactElement {
           if (disposed || terminalInstanceRef.current !== terminal) return;
           if (paintedConnectionId !== connectionId) {
             paintedConnectionId = connectionId;
-            everAttached = true;
-            setTerminalEverAttached(true);
-            setTerminalStatus("ATTACHED");
+            if (!replayGuard.active) markTerminalAttached();
           }
           if (!isDebugLogCaptureActive()) return;
           const now = Date.now();
@@ -1307,6 +1358,14 @@ export function TmuxDashboard(): ReactElement {
       };
       const onTransportEvent = (event: TmuxTerminalTransportEvent): void => {
         if (disposed) return;
+        if (event.type === "replay-start") {
+          replayGuard.start();
+          return;
+        }
+        if (event.type === "replay-end") {
+          replayGuard.finish();
+          return;
+        }
         if (event.type === "output") {
           ensureConnection(event.connectionId);
           if (historyProtocol === null) historyProtocol = false;
@@ -1416,7 +1475,7 @@ export function TmuxDashboard(): ReactElement {
       };
       const onWindowResize = (): void => {
         if (
-          window.matchMedia("(max-width: 760px)").matches
+          isMobile
           && host.clientWidth === lastHostWidth
           && host.clientHeight === lastHostHeight
         ) return;
@@ -1547,7 +1606,7 @@ export function TmuxDashboard(): ReactElement {
       setToast({ message: failure instanceof Error ? failure.message : "终端初始化失败。", isError: true });
     });
     return () => { cancelled = true; disposeTerminal?.(); };
-  }, [selectedSession?.id, selectedSession?.createdAt, terminalInputEnabled, terminalVisible]);
+  }, [isMobile, selectedSession?.id, selectedSession?.createdAt, terminalInputEnabled, terminalVisible]);
 
   useEffect(() => {
     const terminals = [terminalInstanceRef.current, terminalHistoryInstanceRef.current];
@@ -1847,7 +1906,7 @@ export function TmuxDashboard(): ReactElement {
       const createdSession = normalizeTmuxSession(result.session);
       if (!createdSession) throw new Error("创建接口返回了无法识别的 Session，请刷新列表。");
       setCreateOpen(false);
-      if (window.matchMedia("(max-width: 760px)").matches) {
+      if (isMobile) {
         setNavigationCollapsed(true);
         setMobileView("terminal");
       }
@@ -1943,7 +2002,7 @@ export function TmuxDashboard(): ReactElement {
       if (selectedId === session.id) {
         setSelectedId(null);
         setTerminalInputEnabled(false);
-        if (window.matchMedia("(max-width: 760px)").matches) {
+        if (isMobile) {
           setMobileView("sessions");
           setNavigationCollapsed(false);
         }
@@ -1971,7 +2030,7 @@ export function TmuxDashboard(): ReactElement {
       setTerminalInputEnabled(false);
       setTerminalEverAttached(false);
       setTerminalStatus("CONNECTING");
-      if (window.matchMedia("(max-width: 760px)").matches) {
+      if (isMobile) {
         setNavigationCollapsed(true);
         setMobileView("terminal");
       }
@@ -1997,7 +2056,7 @@ export function TmuxDashboard(): ReactElement {
         setSelectedId(null);
         setTerminalInputEnabled(false);
       }
-      if (wasSelected && window.matchMedia("(max-width: 760px)").matches) {
+      if (wasSelected && isMobile) {
         setMobileView("sessions");
         setNavigationCollapsed(false);
       }
@@ -2225,12 +2284,7 @@ export function TmuxDashboard(): ReactElement {
                   onToggleTerminalInput={() => setTerminalInputEnabled((current) => !current)}
                   onError={(message) => setToast({ message, isError: true })}
                   onOpenWebShell={selectedSession ? () => {
-                    if (!shellTerminalMounted) {
-                      setShellTerminalMounted(true);
-                      setShellTerminalVisible(true);
-                    } else {
-                      setShellTerminalVisible((current) => !current);
-                    }
+                    updateShellTerminalState(selectedSession, shellTerminalMounted ? !shellTerminalVisible : true);
                   } : undefined}
                   webShellOpen={shellTerminalVisible}
                   webShellRetained={shellTerminalMounted && !shellTerminalVisible}
@@ -2371,13 +2425,10 @@ export function TmuxDashboard(): ReactElement {
             sessionId={selectedSession.id}
             sessionCreatedAt={selectedSession.createdAt}
             visible={shellTerminalVisible}
-            onMinimize={() => setShellTerminalVisible(false)}
-            onRestore={() => setShellTerminalVisible(true)}
-            onClose={() => setShellTerminalVisible(false)}
-            onExpired={() => {
-              setShellTerminalMounted(false);
-              setShellTerminalVisible(false);
-            }}
+            onMinimize={() => updateShellTerminalState(selectedSession, false)}
+            onRestore={() => updateShellTerminalState(selectedSession, true)}
+            onClose={() => closeShellTerminal(selectedSession)}
+            onExpired={() => closeShellTerminal(selectedSession)}
           /> : null}
         </section>
       </section>

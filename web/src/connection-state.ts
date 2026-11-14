@@ -110,7 +110,11 @@ export function markBridgeRequestSuccess(): void {
   }
 }
 
-export function markBridgeRequestFailure(error: unknown, status?: number): void {
+export function markBridgeRequestFailure(
+  error: unknown,
+  status?: number,
+  options: { notifyNetworkRecovery?: boolean } = {},
+): void {
   const browserOffline = typeof navigator !== "undefined" && navigator.onLine === false;
   const failureKind: Exclude<BridgeFailureKind, null> = browserOffline
     ? "browser-offline"
@@ -131,11 +135,10 @@ export function markBridgeRequestFailure(error: unknown, status?: number): void 
     lastError: error instanceof Error ? error.message : String(error),
   } satisfies BridgeConnectionSnapshot;
   // WebView's online hint can be stale even with a usable underlying network.
-  // Leave that hint in the UI state, but send transport failures to Android,
-  // which checks the real network and Wi-Fi policy before starting a VPN.
-  const cancelled = error instanceof DOMException && error.name === "AbortError";
+  // Leave that hint in the UI state. Only the dedicated Bridge connectivity
+  // probe opts into native VPN recovery; ordinary API calls must not launch it.
   if (status !== undefined) transportFailureNotified = false;
-  const notifyVpn = status === undefined && !cancelled && !transportFailureNotified;
+  const notifyVpn = status === undefined && options.notifyNetworkRecovery === true && !transportFailureNotified;
   if (notifyVpn) transportFailureNotified = true;
   publish(next);
   if (notifyVpn) {

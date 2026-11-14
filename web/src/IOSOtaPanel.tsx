@@ -1,11 +1,17 @@
 import { useCallback, useEffect, useState, type ReactElement } from "react";
 import { getActionToken } from "./api.js";
 import { readBridgeJson } from "./bridge-json.js";
-import { getBridgeOrigin, isMobileApp, openIosOtaPage } from "./mobile-runtime.js";
+import { getBridgeOrigin, getMobileAppBuild, getMobileAppVersion, isMobileApp, openIosOtaPage } from "./mobile-runtime.js";
 import "./ios-ota.css";
 
 type Release = { revision: string; version: string; build: string; size: number; expiresAt: string; publishedAt: string };
 type OtaStatus = { available: boolean; serviceRunning: boolean; release: Release | null; publish: { state: "idle" | "running" | "succeeded" | "failed"; message?: string } };
+
+function numericBuild(value: string | undefined): number | null {
+  if (!value || !/^\d+$/.test(value)) return null;
+  const build = Number(value);
+  return Number.isSafeInteger(build) && build > 0 ? build : null;
+}
 
 /** The iOS distribution flow is intentionally absent from Android and desktop Web. */
 export function isIphoneOtaSurface(): boolean {
@@ -26,6 +32,8 @@ async function otaRequest<T>(path: string, method: "GET" | "POST" = "GET"): Prom
 
 export function IOSOtaPanel({ compact = false }: { compact?: boolean }): ReactElement | null {
   const [status, setStatus] = useState<OtaStatus | null>(null);
+  const [currentApp, setCurrentApp] = useState<{ version: string; build: number | null } | null>(null);
+  const [currentAppLoading, setCurrentAppLoading] = useState(() => isMobileApp());
   const [busy, setBusy] = useState<"load" | "open" | "publish" | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -36,6 +44,16 @@ export function IOSOtaPanel({ compact = false }: { compact?: boolean }): ReactEl
     finally { if (!quiet) setBusy(null); }
   }, []);
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    if (!isMobileApp()) { setCurrentAppLoading(false); return; }
+    let active = true;
+    void Promise.all([getMobileAppVersion(), getMobileAppBuild()]).then(([version, build]) => {
+      if (active) setCurrentApp({ version, build: Number.isSafeInteger(build) && build > 0 ? build : null });
+    }).catch(() => {
+      if (active) setCurrentApp({ version: "暂不可读", build: null });
+    }).finally(() => { if (active) setCurrentAppLoading(false); });
+    return () => { active = false; };
+  }, []);
   useEffect(() => {
     if (status?.publish.state !== "running") return;
     const timer = window.setInterval(() => void load(true), 3_000);
@@ -63,17 +81,27 @@ export function IOSOtaPanel({ compact = false }: { compact?: boolean }): ReactEl
   };
   if (!isIphoneOtaSurface()) return null;
   const building = status?.publish.state === "running";
+  const targetBuild = numericBuild(status?.release?.build);
+  const targetIsNotNewer = isMobileApp() && !currentAppLoading && currentApp?.build !== null && currentApp?.build !== undefined
+    && targetBuild !== null && targetBuild <= currentApp.build;
+  const installReady = Boolean(status?.available && status?.serviceRunning && !currentAppLoading && !targetIsNotNewer);
   return <section className={`ios-ota-panel${compact ? " ios-ota-compact" : ""}`} aria-label="iOS 安装与更新">
-    <div className="ios-ota-heading"><div><h2>iPhone 安装与更新</h2><p>在 iPhone 上打开安装页，按系统提示完成安装。</p></div>
-      <button type="button" onClick={() => void load()} disabled={busy !== null}>刷新</button></div>
-    {status?.release ? <p className="ios-ota-detail">最新安装包 {status.release.version} ({status.release.build}) · 签名至 {new Date(status.release.expiresAt).toLocaleString()}</p>
+    <div className="ios-ota-heading"><h2>iPhone 安装与更新</h2>
+      <button className={`ios-ota-refresh${busy === "load" ? " is-loading" : ""}`} type="button" onClick={() => void load()} disabled={busy !== null}
+        aria-label={busy === "load" ? "正在刷新 iOS 安装状态" : "刷新 iOS 安装状态"}
+        title={busy === "load" ? "正在刷新 iOS 安装状态" : "刷新 iOS 安装状态"}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.93-4M4 4v4h4M4 13a8 8 0 0 0 14.93 4M20 20v-4h-4" /></svg>
+      </button>
+    </div>
+    {isMobileApp() ? <p className="ios-ota-detail">当前 App {currentAppLoading ? "正在读取…" : `${currentApp?.version ?? "未知版本"}${currentApp?.build ? ` · 构建 ${currentApp.build}` : ""}`}</p> : null}
+    {status?.release ? <p className="ios-ota-detail">最新安装包 {status.release.version}（构建 {status.release.build}） · 生成于 {new Date(status.release.publishedAt).toLocaleString()} · 签名至 {new Date(status.release.expiresAt).toLocaleString()}</p>
       : <p className="ios-ota-detail">暂无可用的 iOS 安装包。</p>}
     {status && !status.serviceRunning ? <p className="ios-ota-detail">安装服务未启动，请在 Mac 上启动 OTA 服务。</p> : null}
+    {targetIsNotNewer ? <p className="ios-ota-detail" role="status">当前 App 已是构建 {currentApp?.build}，请先构建并发布新的 OTA 构建。</p> : null}
     <div className="ios-ota-actions">
-      <button type="button" onClick={() => void open()} disabled={busy !== null || !status?.available || !status.serviceRunning}>{busy === "open" ? "正在打开…" : "打开安装页"}</button>
+      <button type="button" onClick={() => void open()} disabled={busy !== null || !installReady}>{busy === "open" ? "正在打开…" : "打开安装页"}</button>
       <button type="button" onClick={() => void publish()} disabled={busy !== null || building}>{building ? "正在构建…" : "构建并发布"}</button>
     </div>
-    <p className="ios-ota-detail">构建使用 Mac 当前源码；签名临近到期时会刷新安装包，iPhone 仍需确认安装。</p>
     {status?.publish.message ? <p className="ios-ota-detail" role="status">{status.publish.message}</p> : null}
     {message ? <p className="ios-ota-detail" role="status">{message}</p> : null}
     {error ? <p className="ios-ota-error" role="alert">{error}</p> : null}

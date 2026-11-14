@@ -29,4 +29,9 @@ internal class BridgeAutoVpnCheckQueue(
         next.invokeOnCompletion { if (job === next) job = null }
         next.start()
     }
+
+    fun cancel() {
+        pending = false
+        job?.cancel()
+    }
 }

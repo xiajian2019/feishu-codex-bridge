@@ -16,6 +16,8 @@ export type TmuxTerminalControlMessage = {
 
 export type TmuxTerminalTransportEvent =
   | { type: "output"; data: string | Uint8Array; connectionId: number }
+  | { type: "replay-start" }
+  | { type: "replay-end" }
   | { type: "history"; data: string; connectionId: number }
   | { type: "history-error"; connectionId: number }
   | { type: "history-ready"; connectionId: number }
@@ -86,8 +88,11 @@ export class TmuxTerminalTransport {
     if (!this.replayComplete) {
       this.forceReconnect();
     } else {
+      const hasReplay = this.replayChunks.length > 0;
+      if (hasReplay) listener({ type: "replay-start" });
       if (this.historyProtocol) listener({ type: "history-ready", connectionId: this.connectionId });
       for (const chunk of this.replayChunks) listener({ type: "output", data: chunk, connectionId: this.connectionId });
+      if (hasReplay) listener({ type: "replay-end" });
       if (this.history !== null) listener({ type: "history", data: this.history, connectionId: this.connectionId });
     }
     this.connect();

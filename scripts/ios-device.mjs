@@ -16,8 +16,10 @@ export function parseOptions(args) {
   const options = {
     check: false,
     buildOnly: false,
+    buildNumber: null,
     wirelessOnly: false,
     allowProvisioningUpdates: false,
+    vpn: false,
     device: null,
     ip: null,
     help: false,
@@ -28,9 +30,18 @@ export function parseOptions(args) {
     if (arg === "--") continue;
     if (arg === "--check") options.check = true;
     else if (arg === "--build-only") options.buildOnly = true;
+    else if (arg === "--build-number") {
+      const value = args[++i];
+      if (!value || value.startsWith("--")) throw new Error("--build-number 需要正整数。");
+      if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) < 1) {
+        throw new Error("--build-number 需要正整数。");
+      }
+      options.buildNumber = Number(value);
+    }
     else if (arg === "--allow-usb") options.wirelessOnly = false;
     else if (arg === "--wireless-only") options.wirelessOnly = true;
     else if (arg === "--allow-provisioning-updates") options.allowProvisioningUpdates = true;
+    else if (arg === "--vpn") options.vpn = true;
     else if (arg === "--help" || arg === "-h") options.help = true;
     else if (["--renew-status", "--renew-now", "--renew-run", "--disable-auto-renew"].includes(arg)) {
       if (options.renewalMode) throw new Error("续签操作不能同时使用。");
@@ -45,8 +56,8 @@ export function parseOptions(args) {
     }
     else throw new Error(`无法识别的参数：${arg}`);
   }
-  if (options.check && options.buildOnly) throw new Error("--check 和 --build-only 不能同时使用。");
-  if (options.renewalMode && (options.check || options.buildOnly || options.device || options.ip || options.wirelessOnly || options.allowProvisioningUpdates)) {
+  if (options.check && (options.buildOnly || options.buildNumber !== null)) throw new Error("--check 不能与构建选项同时使用。");
+  if (options.renewalMode && (options.check || options.buildOnly || options.buildNumber !== null || options.device || options.ip || options.wirelessOnly || options.allowProvisioningUpdates || options.vpn)) {
     throw new Error("续签操作不能与设备、构建或签名选项一起使用。");
   }
   if (!options.renewalMode && !options.device && !options.ip) options.ip = process.env.BRIDGE_IOS_DEVICE_IP?.trim() || null;
@@ -122,11 +133,13 @@ function printHelp() {
   默认构建最新 iOS App，并安装到唯一的 USB 或 Wi-Fi / 局域网设备。
   --check                        查看已配对设备与连接方式，不构建或安装
   --build-only                   只构建签名 App，不安装；没有设备时使用通用 iOS 目标
+  --build-number <正整数>        覆盖本次构建的 CFBundleVersion（OTA 更新使用）
   --device <名称或 UDID>         选择设备；多台设备时必须指定
   --ip <IPv4>                    使用 CoreDevice 可识别的设备地址；无法替代无线发现和配对
   --wireless-only                只允许 Wi-Fi / 局域网安装
   --allow-usb                    兼容旧命令；USB 现在默认支持
   --allow-provisioning-updates   允许 Xcode 更新 Apple 签名配置
+  --vpn                          构建 AppVpn（需要 Network Extension 权限的付费团队）
   --renew-status                 查看自动续签状态和签名到期时间
   --renew-now                    立即尝试为已登记设备续签并安装
   --disable-auto-renew           停用本 checkout 的自动续签任务
@@ -236,9 +249,9 @@ function withBuildLock(action) {
   }
 }
 
-function installedApp(udid) {
-  const result = readDeviceJSON(["device", "info", "apps", "--device", udid, "--bundle-id", bundleId, "--include-container-paths"]);
-  return result.result?.apps?.find((item) => item.bundleIdentifier === bundleId) ?? null;
+function installedApp(udid, targetBundleId = bundleId) {
+  const result = readDeviceJSON(["device", "info", "apps", "--device", udid, "--bundle-id", targetBundleId, "--include-container-paths"]);
+  return result.result?.apps?.find((item) => item.bundleIdentifier === targetBundleId) ?? null;
 }
 
 function installApp(device, app, label) {
@@ -315,15 +328,19 @@ function main() {
     verifyWebAssets(webOutput, join(root, "ios/App/App/public"));
 
     const derived = resolve(process.env.BRIDGE_IOS_DERIVED_DATA || join(buildDir, "DeviceDerivedData"));
-    const buildArgs = ["-project", "ios/App/App.xcodeproj", "-scheme", "App", "-configuration", "Debug",
+    const build = options.vpn
+      ? { scheme: "AppVpn", configuration: "Debug", product: "AppVpn.app", bundleId }
+      : { scheme: "App", configuration: "PersonalDebug", product: "App.app", bundleId };
+    const buildArgs = ["-project", "ios/App/App.xcodeproj", "-scheme", build.scheme, "-configuration", build.configuration,
       "-destination", device ? `platform=iOS,id=${device.udid}` : "generic/platform=iOS", "-derivedDataPath", derived];
     if (process.env.BRIDGE_IOS_SPM_CACHE) buildArgs.push("-clonedSourcePackagesDirPath", resolve(process.env.BRIDGE_IOS_SPM_CACHE));
     if (options.allowProvisioningUpdates) buildArgs.push("-allowProvisioningUpdates");
+    if (options.buildNumber !== null) buildArgs.push(`CURRENT_PROJECT_VERSION=${options.buildNumber}`);
     buildArgs.push("-quiet", "build");
     run("xcodebuild", buildArgs, "[3/4] 编译并签名 iOS App");
-    const app = join(derived, "Build/Products/Debug-iphoneos/App.app");
+    const app = join(derived, `Build/Products/${build.configuration === "Release" ? "Release" : build.configuration === "Debug" ? "Debug" : build.configuration}-iphoneos`, build.product);
     const info = join(app, "Info.plist");
-    if (readPlistValue(info, "CFBundleIdentifier") !== bundleId) throw new Error("构建结果的 Bundle ID 与 Bridge 不一致，已停止安装。");
+    if (readPlistValue(info, "CFBundleIdentifier") !== build.bundleId) throw new Error("构建结果的 Bundle ID 与 Bridge 不一致，已停止安装。");
     verifyWebAssets(webOutput, join(app, "public"));
     run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app]);
     console.log(`签名 App：${app}`);
@@ -334,7 +351,7 @@ function main() {
     assertInstallTransport(current, options.wirelessOnly);
     const installTransport = current.transport === "localNetwork" ? "无线" : "USB";
     installApp(current, app, `[4/4] 安装到 ${current.name}（${installTransport}）`);
-    const installed = installedApp(current.udid);
+    const installed = installedApp(current.udid, build.bundleId);
     if (!installed) throw new Error("安装命令已返回成功，但设备上未能确认 Bridge；请检查手机上的应用列表。");
     console.log("安装命令成功，已在设备上确认 Bridge 存在。");
     try {
