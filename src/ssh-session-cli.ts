@@ -1,18 +1,8 @@
-import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
-import type { IncomingMessage, ServerResponse } from "node:http";
 import { join, resolve } from "node:path";
-import { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
-import { buildCodexAppServerEnvironment } from "./codex-app-server.js";
-import { CodexHistoryService } from "./codex-history.js";
-import { isExecutableCodexPath, resolveCodexCliPath } from "./codex-path.js";
-import { loadConfig } from "./config.js";
-import { StateDatabase } from "./db.js";
-import { DatabaseSync, type SqliteDatabase } from "./sqlite.js";
-import { resolveBridgeDataRoot, resolveBridgeProjectRoot, isSingleBinaryRuntime } from "./portable-runtime.js";
-import { TmuxDashboardApi } from "./tmux-dashboard-api.js";
+import { resolveBridgeDataRoot, isSingleBinaryRuntime } from "./portable-runtime.js";
+import { DirectBridgeSshBackend } from "./ssh-session-direct.js";
 
 const RESULT_PREFIX = "BRIDGE_SSH_RESULT:";
 const DASHBOARD_PREFIX = "/tmux-dashboard/api";
@@ -27,6 +17,7 @@ interface SshSessionRequest {
   path?: string;
   root?: string;
   home?: string;
+  cwd?: string;
 }
 
 export interface BridgeSshBackend {
@@ -76,7 +67,7 @@ function validateRequest(input: unknown): SshSessionRequest {
     request.id = id;
     request.createdAt = value.createdAt as number;
   }
-  for (const field of ["path", "root", "home"] as const) {
+  for (const field of ["path", "root", "home", "cwd"] as const) {
     if (value[field] !== undefined) {
       const candidate = text(value[field], field);
       if (candidate.length > 4096 || candidate.includes("\0")) throw new Error(`${field} 无效。`);
@@ -98,18 +89,18 @@ export async function executeBridgeSshSessionRequest(input: unknown, backend: Br
     const record = array(suspended.sessions).map(object).find((item) => item.id === id && item.createdAt === createdAt);
     if (!record) throw new Error("挂起的 Session 已变化，请刷新后重试。");
     const result = await backend.request("POST", `${prefix}/resume`, {}, createdAt, action);
-    return { name: object(result.session).name };
+    return { name: object(result.session).name, ...(result.source === "ssh-fallback" ? { source: result.source } : {}) };
   }
   const identityResult = await backend.request("GET", `${prefix}/identity`, undefined, createdAt, action);
   const session = object(identityResult.session);
   const name = text(session.name, "Session 名称");
   if (action === "save" || action === "suspend") {
-    await backend.request("POST", `${prefix}/${action === "save" ? "resurrect/save" : "suspend"}`, {}, createdAt, action);
-    return { name };
+    const result = await backend.request("POST", `${prefix}/${action === "save" ? "resurrect/save" : "suspend"}`, {}, createdAt, action);
+    return { name, ...(result.source === "ssh-fallback" ? { source: result.source } : {}) };
   }
   if (action === "end") {
-    await backend.request("DELETE", prefix, undefined, createdAt, action);
-    return { name };
+    const result = await backend.request("DELETE", prefix, undefined, createdAt, action);
+    return { name, ...(result.source === "ssh-fallback" ? { source: result.source } : {}) };
   }
   if (action === "accounts") {
     const [options, history] = await Promise.all([
@@ -126,11 +117,11 @@ export async function executeBridgeSshSessionRequest(input: unknown, backend: Br
   if (action === "mark_account") {
     const home = text(request.home, "Codex 账号");
     const result = await backend.request("POST", `${prefix}/codex-account`, { homeId: home }, createdAt, action);
-    return { selected: object(result.session).codexHomeId };
+    return { selected: object(result.session).codexHomeId, ...(result.source === "ssh-fallback" ? { source: result.source } : {}) };
   }
   if (action === "refresh_account") {
     const result = await backend.request("POST", `${prefix}/codex-account/check`, {}, createdAt, action);
-    if (result.status === "matched") return { selected: object(result.home).id };
+    if (result.status === "matched") return { selected: object(result.home).id, ...(result.source === "ssh-fallback" ? { source: result.source } : {}) };
     if (result.status === "not-running") throw new Error("当前 pane 没有运行中的 Codex，请手动选择账号。");
     if (result.status === "unmatched") throw new Error("当前 Codex Home 不在账号列表中，请手动选择。");
     throw new Error("无法读取当前 Codex 的环境，请手动选择账号。");
@@ -231,8 +222,9 @@ function parseCliOptions(argv: string[]): BridgeSshCliOptions {
   const dataRoot = resolveBridgeDataRoot(import.meta.url);
   dbPath = resolve(dbPath || join(dataRoot, "runtime", "bridge.db"));
   configPath = resolve(configPath || join(dataRoot, "config.json"));
-  if (!existsSync(dbPath)) throw new Error(`Bridge 数据库不存在：${dbPath}；请配置 FEISHU_CODEX_BRIDGE_SSH_DB。`);
-  const databasePath = realpathSync(dbPath);
+  // Keep accepting --db and the legacy environment variable for existing
+  // callers, but the SSH fallback never checks, opens or writes that path.
+  const databasePath = dbPath;
   const port = portValue ? Number(portValue) : undefined;
   if (portValue && (!Number.isSafeInteger(port) || port! < 1 || port! > 65535)) throw new Error("Bridge 端口无效。 ");
   return { request, databasePath, configPath, ports: port ? [port] : DEFAULT_PORTS, offline };
@@ -247,169 +239,17 @@ function safeFailureMessage(error: unknown): string {
     .slice(0, 240);
 }
 
-function isReadonlyCodexOperation(operation?: string): boolean {
-  return operation === "accounts" || operation === "usage";
-}
-
-function createSshSessionFallback(options: BridgeSshCliOptions, operation?: string): BridgeSshBackend {
-  return isReadonlyCodexOperation(operation)
-    ? new ReadOnlyCodexBridgeSshBackend(options)
-    : new OfflineBridgeSshBackend(options);
-}
-
-function assertDatabaseUnused(databasePath: string): void {
-  try {
-    const output = execFileSync("lsof", ["-t", "--", databasePath], { encoding: "utf8", timeout: 4_000, stdio: ["ignore", "pipe", "pipe"] });
-    const holders = output.split(/\s+/).map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 0 && pid !== process.pid);
-    if (holders.length) throw new Error("Bridge 数据库正被其他进程使用，不能执行离线操作。 ");
-  } catch (error) {
-    if (error instanceof Error && error.message.includes("正被其他进程使用")) throw error;
-    const failure = error as NodeJS.ErrnoException & { status?: number; stdout?: string; stderr?: string };
-    if (failure.status === 1 && !failure.stdout?.trim() && !failure.stderr?.trim()) return;
-    throw new Error("无法确认 Bridge 数据库是否被占用，请先停止相关服务并检查 lsof。 ");
-  }
-}
-
-function createCodexHistoryService(
-  options: BridgeSshCliOptions,
-  usageSnapshotStore?: StateDatabase,
-): CodexHistoryService {
-  let executable = resolveCodexCliPath()?.path || "codex";
-  let environment: Record<string, string> = Object.fromEntries(
-    Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
-  );
-  if (existsSync(options.configPath)) {
-    const config = loadConfig(options.configPath);
-    if (isExecutableCodexPath(config.codex.cliPath)) executable = config.codex.cliPath;
-    environment = buildCodexAppServerEnvironment(config);
-  }
-  return new CodexHistoryService({
-    executable,
-    environment,
-    cwd: resolveBridgeProjectRoot(import.meta.url),
-    ...(usageSnapshotStore ? { usageSnapshotStore } : {}),
-  });
-}
-
-function openReadonlyBridgeDatabase(databasePath: string): SqliteDatabase {
-  const isBun = typeof (globalThis as typeof globalThis & { Bun?: unknown }).Bun !== "undefined";
-  const Sqlite = DatabaseSync as unknown as new (
-    path: string,
-    options?: { readonly?: boolean; readOnly?: boolean },
-  ) => SqliteDatabase;
-  const database = new Sqlite(databasePath, isBun ? { readonly: true } : { readOnly: true });
-  database.exec("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;");
-  return database;
-}
-
-export class ReadOnlyCodexBridgeSshBackend implements BridgeSshBackend {
-  private readonly db: SqliteDatabase;
-  private readonly history: CodexHistoryService;
-
-  public constructor(options: BridgeSshCliOptions) {
-    this.db = openReadonlyBridgeDatabase(options.databasePath);
-    this.history = createCodexHistoryService(options);
-  }
-
-  private readSession(path: string, createdAt?: number): JsonObject {
-    const match = /^\/tmux-dashboard\/api\/sessions\/([^/]+)\/identity$/.exec(path);
-    const expectedCreatedAt = createdAt;
-    if (!match || typeof expectedCreatedAt !== "number" || !Number.isSafeInteger(expectedCreatedAt)) {
-      throw new Error("只读 fallback 缺少有效 Session 身份。");
-    }
-    let sessionId: string;
-    try { sessionId = decodeURIComponent(match[1]!); }
-    catch { throw new Error("只读 fallback 的 Session 标识无效。"); }
-    const row = this.db.prepare(`SELECT tmux_session_id, session_name, working_directory,
-        working_directory_override, tmux_created_at, codex_home_id
-      FROM tmux_sessions
-      WHERE tmux_session_id = ? AND tmux_created_at = ?
-      ORDER BY (ended_at IS NULL) DESC, first_seen_at DESC LIMIT 1`).get(sessionId, expectedCreatedAt) as Record<string, unknown> | undefined;
-    if (!row) throw new Error("只读 fallback 找不到当前 Session，可能已结束或已重建。");
-    return { session: {
-      id: row.tmux_session_id,
-      name: row.session_name,
-      cwd: row.working_directory_override ?? row.working_directory,
-      createdAt: row.tmux_created_at,
-      codexHomeId: row.codex_home_id,
-    } };
-  }
-
-  public async request(method: "GET" | "POST" | "DELETE", path: string, _body?: JsonObject, createdAt?: number, _operation?: string): Promise<JsonObject> {
-    if (method !== "GET") throw new Error("账号/用量只读 fallback 不执行数据库写操作。");
-    if (/^\/tmux-dashboard\/api\/sessions\/[^/]+\/identity$/.test(path)) return this.readSession(path, createdAt);
-    if (path === `${DASHBOARD_PREFIX}/codex-homes`) {
-      return { codexHomes: this.history.listHomes().map(({ id, label, available }) => ({ id, label, available })) };
-    }
-    if (path === "/api/codex/homes") return { homes: this.history.listHomes() as unknown as unknown[] };
-    if (path.startsWith("/api/codex/usage?")) {
-      const home = new URL(path, "http://localhost").searchParams.get("home") || undefined;
-      return this.history.readUsage(home) as unknown as JsonObject;
-    }
-    throw new Error("账号/用量只读 fallback 不支持该操作。");
-  }
-
-  public close(): void {
-    this.db.close();
-  }
-}
-
-/** An explicit offline invocation calls the Web API implementation in-process. */
-class OfflineBridgeSshBackend implements BridgeSshBackend {
-  private readonly db: StateDatabase;
-  private readonly api: TmuxDashboardApi;
-  private history: CodexHistoryService | null = null;
-  constructor(private readonly options: BridgeSshCliOptions) {
-    assertDatabaseUnused(options.databasePath);
-    this.db = new StateDatabase(options.databasePath);
-    this.api = new TmuxDashboardApi({ db: this.db, autoRestoreSessions: false, manageSessionSnapshots: true });
-  }
-  private getHistory(): CodexHistoryService {
-    if (this.history) return this.history;
-    this.history = createCodexHistoryService(this.options, this.db);
-    return this.history;
-  }
-  async request(method: "GET" | "POST" | "DELETE", path: string, body?: JsonObject, createdAt?: number, _operation?: string): Promise<JsonObject> {
-    if (method === "GET" && path === "/api/codex/homes") return { homes: this.getHistory().listHomes() };
-    if (method === "GET" && path.startsWith("/api/codex/usage?")) {
-      const home = new URL(path, "http://localhost").searchParams.get("home") || undefined;
-      return this.getHistory().readUsage(home) as unknown as JsonObject;
-    }
-    const payload = body === undefined ? [] : [Buffer.from(JSON.stringify(body))];
-    const request = Readable.from(payload) as unknown as IncomingMessage;
-    Object.assign(request, { method, url: path, headers: createdAt === undefined ? {} : { "x-bridge-session-created-at": String(createdAt) } });
-    let statusCode = 200;
-    let responseBody = "";
-    const response = {
-      get statusCode() { return statusCode; }, set statusCode(value: number) { statusCode = value; },
-      setHeader() { return this; }, end(value?: string | Buffer) { if (value !== undefined) responseBody += value.toString(); return this; },
-    } as unknown as ServerResponse;
-    await this.api.handleRequest(request, response);
-    const value = responseBody ? object(JSON.parse(responseBody)) : {};
-    if (statusCode >= 400) throw new Error(typeof value.error === "string" ? value.error : `Bridge 操作失败 (${statusCode})。`);
-    return value;
-  }
-  async close(): Promise<void> { await this.api.stop(); this.db.close(); }
-}
-
 export async function runBridgeSshSessionCli(argv = process.argv.slice(2)): Promise<void> {
   let backend: BridgeSshBackend | null = null;
   try {
     const options = parseCliOptions(argv);
-    // This process is the SSH fallback itself. The App has already tried the
-    // token-authenticated Bridge API before opening this command, so the CLI
-    // must use local Codex/SQLite state directly instead of re-entering the
-    // Bridge API and creating a second authentication path.
-    try {
-      backend = createSshSessionFallback(options, options.request.action);
-    } catch (error) {
-      const prefix = isReadonlyCodexOperation(options.request.action) ? "只读 Codex fallback" : "本地 CLI fallback";
-      throw new Error(`${prefix}失败：${safeFailureMessage(error)}`);
-    }
+    // The App tries the paired Bridge API first. Its SSH fallback uses tmux,
+    // Git, Codex app-server and scoped snapshot files, never the Bridge DB.
+    backend = new DirectBridgeSshBackend(options.request, options.configPath);
     const result = await executeBridgeSshSessionRequest(options.request, backend);
     console.log(RESULT_PREFIX + JSON.stringify({ ok: true, result }));
   } catch (error) {
-    console.log(RESULT_PREFIX + JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "Bridge SSH 操作失败。" }));
+    console.log(RESULT_PREFIX + JSON.stringify({ ok: false, error: safeFailureMessage(error) || "Bridge SSH 操作失败。" }));
   } finally { await backend?.close?.(); }
 }
 

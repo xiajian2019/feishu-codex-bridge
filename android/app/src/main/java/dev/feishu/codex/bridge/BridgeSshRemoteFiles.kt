@@ -27,8 +27,11 @@ internal data class BridgeSshRemoteFile(
 internal class BridgeSshRemoteFiles internal constructor(
     private val resolveCurrentRoot: suspend () -> String,
     private val openSftp: suspend () -> SftpClient,
+    private val api: BridgeSshApiClient? = null,
+    private val apiTarget: BridgeSshTmuxSession? = null,
+    private val canReadRemote: suspend (String) -> Boolean = { true },
 ) {
-    constructor(transport: BridgeCbSshTransport, target: BridgeSshTmuxSession?, tmux: BridgeSshTmuxClient?) : this(
+    constructor(transport: BridgeCbSshTransport, target: BridgeSshTmuxSession?, tmux: BridgeSshTmuxClient?, api: BridgeSshApiClient? = null) : this(
         resolveCurrentRoot = {
             if (target != null) {
                 val live = checkNotNull(tmux).listSessions().firstOrNull { it.id == target.id && it.createdAt == target.createdAt }
@@ -41,11 +44,26 @@ internal class BridgeSshRemoteFiles internal constructor(
             }
         },
         openSftp = { transport.openSftp() },
+        api = api,
+        apiTarget = target,
+        canReadRemote = { path ->
+            val result = transport.exec(BridgeSshAttachmentTransfer.remoteReadCheckCommand(path), maxOutputBytes = 16 * 1024)
+            (result.exitInfo as? SessionExit.Status)?.code == 0L
+        },
     )
 
     private var initialRoot: String? = null
 
     suspend fun list(relative: String): Pair<String, List<BridgeSshRemoteFile>> = withContext(Dispatchers.IO) {
+        requireRelative(relative)
+        if (api != null && apiTarget != null) {
+            try {
+                val result = api.listFiles(apiTarget, relative, initialRoot)
+                rememberRoot(result.first)
+                return@withContext result
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (_: BridgeSshApiFallbackException) { /* Continue with the SSH host's SFTP. */ }
+        }
         openSftp().use { sftp ->
             val root = root(sftp)
             val path = checkedPath(sftp, root, relative, directory = true)
@@ -65,18 +83,44 @@ internal class BridgeSshRemoteFiles internal constructor(
 
     suspend fun preview(relative: String): Pair<String, Boolean> = withContext(Dispatchers.IO) {
         val buffer = ByteArrayOutputStream()
-        val truncated = transfer(relative, buffer, PREVIEW_BYTES)
+        val truncated = transferApiFirst(relative, buffer, PREVIEW_BYTES)
         val bytes = buffer.toByteArray()
         require(bytes.none { it == 0.toByte() }) { "此文件不是文本，请下载后打开。" }
         bytes.toString(Charsets.UTF_8) to truncated
     }
 
     suspend fun absolutePath(relative: String): String = withContext(Dispatchers.IO) {
+        requireRelative(relative)
+        if (api != null && apiTarget != null && relative.isNotEmpty()) {
+            try {
+                val parent = relative.substringBeforeLast('/', "")
+                val name = relative.substringAfterLast('/')
+                val result = api.listFiles(apiTarget, parent, initialRoot)
+                rememberRoot(result.first)
+                check(result.second.any { it.name == name && !it.directory }) { "文件已失效或无法访问。" }
+                val path = result.first.trimEnd('/') + "/" + relative
+                if (!canReadRemote(path)) throw BridgeSshApiRequestException("当前 SSH 主机无法读取此文件，请核对 Bridge 和 SSH 目标。")
+                return@withContext path
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (_: BridgeSshApiFallbackException) { /* Continue with the SSH host's SFTP. */ }
+        }
         openSftp().use { sftp -> checkedPath(sftp, root(sftp), relative, directory = false) }
     }
 
     suspend fun download(relative: String, output: OutputStream) = withContext(Dispatchers.IO) {
-        transfer(relative, output, null)
+        transferApiFirst(relative, output, null)
+    }
+
+    private suspend fun transferApiFirst(relative: String, output: OutputStream, maxBytes: Long?): Boolean {
+        requireRelative(relative)
+        if (api != null && apiTarget != null) {
+            try {
+                val root = apiRoot(api, apiTarget)
+                return api.downloadFile(apiTarget, relative, root, output, maxBytes)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (_: BridgeSshApiFallbackException) { /* No API bytes reached output; try SFTP. */ }
+        }
+        return transfer(relative, output, maxBytes)
     }
 
     private suspend fun transfer(relative: String, output: OutputStream, maxBytes: Long?): Boolean {
@@ -103,6 +147,15 @@ internal class BridgeSshRemoteFiles internal constructor(
 
     suspend fun upload(relativeDirectory: String, name: String, input: InputStream) = withContext(Dispatchers.IO) {
         require(validName(name)) { "文件名无效。" }
+        requireRelative(relativeDirectory)
+        if (api != null && apiTarget != null) {
+            try {
+                val root = apiRoot(api, apiTarget)
+                api.uploadFile(apiTarget, relativeDirectory, root, name, input)
+                return@withContext
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (_: BridgeSshApiFallbackException) { /* No upload was started; try SFTP. */ }
+        }
         openSftp().use { sftp ->
             val root = root(sftp)
             val directory = checkedPath(sftp, root, relativeDirectory, directory = true)
@@ -146,10 +199,25 @@ internal class BridgeSshRemoteFiles internal constructor(
         val raw = resolveCurrentRoot()
         require(raw.startsWith('/') && raw.none(Char::isISOControl)) { "远端目录无效。" }
         val canonical = sftp.realpath(raw).getOrThrow().trimEnd('/').ifEmpty { "/" }
+        rememberRoot(canonical)
+        return canonical
+    }
+
+    private suspend fun apiRoot(client: BridgeSshApiClient, target: BridgeSshTmuxSession): String {
+        val root = client.listFiles(target, "", initialRoot).first
+        rememberRoot(root)
+        return root
+    }
+
+    private fun rememberRoot(root: String) {
+        val canonical = root.trimEnd('/').ifEmpty { "/" }
         val previous = initialRoot
         check(previous == null || previous == canonical) { "Session 目录已变化，请重新打开文件页。" }
         initialRoot = canonical
-        return canonical
+    }
+
+    private fun requireRelative(relative: String) {
+        require(relative.isEmpty() || relative.split('/').all(::validName)) { "路径无效。" }
     }
 
     private suspend fun checkedPath(sftp: SftpClient, root: String, relative: String, directory: Boolean): String {

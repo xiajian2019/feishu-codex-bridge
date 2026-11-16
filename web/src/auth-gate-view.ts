@@ -2,13 +2,11 @@ export type AuthGateView = "content" | "loading" | "mobile-connection" | "browse
 
 /** Native pairing belongs to the connection center; browsers keep their pairing flow. */
 export function authGateView(options: {
-  standaloneSsh: boolean;
   mobile: boolean;
   authenticated: boolean | null;
   offlineFallback: boolean;
   hasError: boolean;
 }): AuthGateView {
-  if (options.standaloneSsh) return "content";
   if (options.mobile && (options.authenticated === false || (options.authenticated === null && options.hasError))) {
     return "mobile-connection";
   }

@@ -437,7 +437,8 @@ if (scenario?.startsWith("android-apk-")) {
     assert.equal(installations.length, install ? 1 : 0);
     assert.equal(apkSaves.length, install ? 0 : 1);
     assert.deepEqual(phases.map((item) => item.phase), install ? ["downloading", "downloaded", "installer-opened"] : ["downloading", "downloaded"]);
-    assert.equal(getMobileDownloads()[0]?.state, "done");
+    if (install) assert.equal(getMobileDownloads()[0], undefined);
+    else assert.equal(getMobileDownloads()[0]?.state, "done");
   }
   process.exit(0);
 }
@@ -446,7 +447,7 @@ if (scenario === "android") {
   const downloading = native.downloadBridgeFile(url, "report.pdf", token);
   assert.equal(getMobileDownloads()[0]?.state, "preparing");
   assert.equal(enqueues.length, 1);
-  assert.deepEqual(enqueues[0]!.options, { url, token, fileName: "report.pdf", mimeType: "application/pdf", userAgent });
+  assert.deepEqual(enqueues[0]!.options, { url, serverOrigin: "https://bridge.fixture", token, fileName: "report.pdf", mimeType: "application/pdf", userAgent });
   enqueues[0]!.pending.resolve({ id: 701, fileName: "report (1).pdf" });
   await downloading;
   assert.equal(getMobileDownloads()[0]?.state, "queued");

@@ -1,6 +1,5 @@
 package dev.feishu.codex.bridge;
 
-import com.hierynomus.sshj.common.KeyDecryptionFailedException;
 import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.CharArrayReader;
@@ -9,103 +8,49 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Base64;
-import net.schmizz.sshj.userauth.keyprovider.FileKeyProvider;
-import net.schmizz.sshj.userauth.keyprovider.KeyFormat;
-import net.schmizz.sshj.userauth.keyprovider.KeyProviderUtil;
-import net.schmizz.sshj.userauth.password.PasswordFinder;
-import net.schmizz.sshj.userauth.password.Resource;
+import org.connectbot.sshlib.SshKeys;
 
 /**
- * Parses in-memory SSH private keys without creating a file or persisting key material.
- *
- * The sshj providers read lazily, so callers must keep the supplied char arrays alive until
- * the provider has been used for authentication. The caller may then wipe the arrays; the
- * provider retains the parsed KeyPair, not the source reader's original characters.
+ * Inspects in-memory SSH private keys without creating a file or persisting key material.
+ * ConnectBot's key reader performs the actual unencrypted-key validation.
  */
 final class BridgeSshKeySupport {
     static final int MAX_PRIVATE_KEY_BYTES = 256 * 1024;
     static final String PRIVATE_KEY_FORMAT_UNSUPPORTED = "PRIVATE_KEY_FORMAT_UNSUPPORTED";
     static final String PRIVATE_KEY_INVALID = "PRIVATE_KEY_INVALID";
-    static final String PRIVATE_KEY_PASSPHRASE_REQUIRED = "PRIVATE_KEY_PASSPHRASE_REQUIRED";
-    static final String PRIVATE_KEY_PASSPHRASE_INVALID = "PRIVATE_KEY_PASSPHRASE_INVALID";
 
     private BridgeSshKeySupport() {}
 
-    static KeyFormat detectFormat(char[] privateKey) throws IOException {
+    static String detectFormat(char[] privateKey) throws IOException {
         if (privateKey == null || privateKey.length == 0) {
             throw new IOException(PRIVATE_KEY_INVALID);
         }
-        // The boolean tells sshj whether a PEM key without an explicit PKCS#8 header should
-        // be treated as the legacy OpenSSH format. PKCS#8 has distinct PRIVATE KEY headers.
-        boolean legacyOpenSshPem = hasLegacyOpenSshPemHeader(privateKey);
-        return KeyProviderUtil.detectKeyFileFormat(new CharArrayReader(privateKey), legacyOpenSshPem);
-    }
-
-    static FileKeyProvider createProvider(char[] privateKey, char[] passphrase)
-        throws IOException {
-        KeyFormat format = detectFormat(privateKey);
-        FileKeyProvider provider;
-        switch (format) {
-            case OpenSSH:
-                provider = new net.schmizz.sshj.userauth.keyprovider.OpenSSHKeyFile();
-                break;
-            case OpenSSHv1:
-                provider = new com.hierynomus.sshj.userauth.keyprovider.OpenSSHKeyV1KeyFile();
-                break;
-            case PKCS8:
-                provider = new net.schmizz.sshj.userauth.keyprovider.PKCS8KeyFile();
-                break;
-            case PuTTY:
-                throw new BridgeSshKeyException(PRIVATE_KEY_FORMAT_UNSUPPORTED);
-            case Unknown:
-            default:
-                throw new BridgeSshKeyException(PRIVATE_KEY_FORMAT_UNSUPPORTED);
+        String header = firstNonEmptyLine(privateKey);
+        if (header == null || header.startsWith("PuTTY-User-Key-File-")) {
+            throw new BridgeSshKeyException(PRIVATE_KEY_FORMAT_UNSUPPORTED);
         }
-
-        PasswordFinder finder = passphrase == null ? null : new CopyingPasswordFinder(passphrase);
-        provider.init(new CharArrayReader(privateKey), finder);
-        return provider;
+        if (header.contains("OPENSSH PRIVATE KEY")) return "openssh-new";
+        if (header.endsWith("RSA PRIVATE KEY-----")
+            || header.endsWith("DSA PRIVATE KEY-----")
+            || header.endsWith("EC PRIVATE KEY-----")) return "openssh";
+        if (header.contains("PRIVATE KEY-----")) return "pkcs8";
+        throw new BridgeSshKeyException(PRIVATE_KEY_FORMAT_UNSUPPORTED);
     }
 
     static KeyInfo inspectForPicker(char[] privateKey) throws IOException {
-        KeyFormat format = detectFormat(privateKey);
-        String formatName;
-        switch (format) {
-            case OpenSSH:
-                formatName = "openssh";
-                break;
-            case OpenSSHv1:
-                formatName = "openssh-new";
-                break;
-            case PKCS8:
-                formatName = "pkcs8";
-                break;
-            case PuTTY:
-            case Unknown:
-            default:
-                throw new BridgeSshKeyException(PRIVATE_KEY_FORMAT_UNSUPPORTED);
-        }
-
+        String formatName = detectFormat(privateKey);
         boolean encrypted = isEncrypted(privateKey);
         if (!encrypted) {
+            String pem = new String(privateKey);
             try {
-                createProvider(privateKey, null).getPrivate();
+                SshKeys.INSTANCE.decodePemPrivateKey(pem, null);
             } catch (Exception error) {
-                // Do not carry sshj's provider/resource exception into the Capacitor response.
                 throw new BridgeSshKeyException(PRIVATE_KEY_INVALID);
+            } finally {
+                pem = null;
             }
         }
         return new KeyInfo(formatName, encrypted);
-    }
-
-    static String errorCodeForKeyRead(Throwable error, boolean encrypted, boolean hasPassphrase) {
-        if (encrypted) {
-            return hasPassphrase
-                ? PRIVATE_KEY_PASSPHRASE_INVALID
-                : PRIVATE_KEY_PASSPHRASE_REQUIRED;
-        }
-        if (error instanceof KeyDecryptionFailedException) return PRIVATE_KEY_INVALID;
-        return PRIVATE_KEY_INVALID;
     }
 
     static boolean isEncrypted(char[] privateKey) {
@@ -133,14 +78,6 @@ final class BridgeSshKeySupport {
 
     static void clear(char[] secret) {
         if (secret != null) Arrays.fill(secret, '\u0000');
-    }
-
-    private static boolean hasLegacyOpenSshPemHeader(char[] privateKey) {
-        String header = firstNonEmptyLine(privateKey);
-        if (header == null) return false;
-        return header.endsWith("RSA PRIVATE KEY-----")
-            || header.endsWith("DSA PRIVATE KEY-----")
-            || header.endsWith("EC PRIVATE KEY-----");
     }
 
     private static String firstNonEmptyLine(char[] value) {
@@ -213,24 +150,6 @@ final class BridgeSshKeySupport {
             return new String(value, StandardCharsets.US_ASCII);
         } finally {
             Arrays.fill(value, (byte) 0);
-        }
-    }
-
-    private static final class CopyingPasswordFinder implements PasswordFinder {
-        private final char[] passphrase;
-
-        CopyingPasswordFinder(char[] passphrase) {
-            this.passphrase = passphrase;
-        }
-
-        @Override
-        public char[] reqPassword(Resource<?> resource) {
-            return passphrase.clone();
-        }
-
-        @Override
-        public boolean shouldRetry(Resource<?> resource) {
-            return false;
         }
     }
 

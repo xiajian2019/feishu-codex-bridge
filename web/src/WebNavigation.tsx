@@ -62,6 +62,12 @@ export function WebNavigation(): ReactElement {
   const activePopover = systemOpen ? "system" : null;
 
   useEffect(() => {
+    const closeForMobileEnvironment = (): void => setSystemOpen(false);
+    window.addEventListener("bridge:mobile-environment-open", closeForMobileEnvironment);
+    return () => window.removeEventListener("bridge:mobile-environment-open", closeForMobileEnvironment);
+  }, []);
+
+  useEffect(() => {
     if (systemActive) setSystemOpen(true);
   }, [systemActive]);
   useEffect(() => {

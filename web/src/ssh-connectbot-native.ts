@@ -1,10 +1,13 @@
 import { Capacitor, registerPlugin, type PluginListenerHandle } from "@capacitor/core";
+import type { BridgeSshSessionSelection } from "./bridge-ssh-session-context.js";
+
+export type { BridgeSshSessionContext, BridgeSshSessionSelection } from "./bridge-ssh-session-context.js";
 
 export interface BridgeConnectBotSshOpenRequest {
   host: string;
   port: number;
   username: string;
-  /** Origin only; the native side reads the matching token from AndroidKeyStore. */
+  /** Origin only; the native side keeps it as Bridge context and never receives a token. */
   bridgeServerOrigin?: string;
   password?: string;
   startupCommand?: string;
@@ -16,7 +19,11 @@ export interface BridgeConnectBotSshWorkspaceRequest {
   bridgeServerOrigin?: string;
   defaultHost?: string;
   mode?: "manage";
+  presentation?: "sheet";
+  sessionSelection?: BridgeSshSessionSelection;
 }
+
+export type NativeSshPlatform = "android" | "ios";
 
 export interface SshProfileOption {
   id: string; label: string; host: string; port: number; username: string; keyId: string; startupCommand: string;
@@ -33,6 +40,8 @@ export interface NativeAppUpdateBanner {
   error?: string;
   busy?: boolean;
   downloaded?: boolean;
+  progressPercent?: number;
+  progressText?: string;
 }
 
 interface BridgeConnectBotSSHPlugin {
@@ -54,7 +63,19 @@ export function openNativeTerminal(request: BridgeConnectBotSshOpenRequest): Pro
 }
 
 export function isNativeSshWorkspaceAvailable(): boolean {
-  return Capacitor.getPlatform() === "android" && Capacitor.isPluginAvailable("BridgeConnectBotSSH");
+  return getNativeSshPlatform() !== null;
+}
+
+/**
+ * Native SSH presents the same request differently on each mobile platform:
+ * Android embeds a Compose surface over the existing WebView, while iOS uses
+ * a UIKit page sheet. Keep the platform explicit at the Web boundary so a
+ * missing native plugin never turns into a misleading half-screen action.
+ */
+export function getNativeSshPlatform(): NativeSshPlatform | null {
+  const platform = Capacitor.getPlatform();
+  if ((platform !== "android" && platform !== "ios") || !Capacitor.isPluginAvailable("BridgeConnectBotSSH")) return null;
+  return platform;
 }
 
 export function openNativeSshWorkspace(request: BridgeConnectBotSshWorkspaceRequest): Promise<void> {

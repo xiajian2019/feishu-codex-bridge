@@ -272,7 +272,7 @@ describe("bounded tmux Session enumeration", () => {
       } });
       try {
         const response = responseFixture();
-        await api.handleRequest({ method: "GET", url: "/tmux-dashboard/api/sessions/%2417/files" } as IncomingMessage,
+        await api.handleRequest({ method: "GET", url: "/tmux-dashboard/api/sessions/%2417/files", headers: {} } as IncomingMessage,
           response as unknown as ServerResponse);
         expect(response.statusCode).toBe(200);
         const result = JSON.parse(response.body);

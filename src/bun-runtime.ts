@@ -18,6 +18,7 @@ interface BunRuntime {
   spawn(
     command: string[],
     options: {
+      cwd?: string;
       env?: NodeJS.ProcessEnv;
       stdout?: "pipe";
       stderr?: "pipe";

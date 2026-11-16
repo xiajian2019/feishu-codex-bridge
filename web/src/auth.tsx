@@ -1,6 +1,5 @@
 import { Fragment, useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import * as QRCode from "qrcode";
-import { useLocation } from "react-router";
 import { useMobileBack } from "./use-mobile-back.js";
 import { startForegroundPolling, isAppForeground } from "./foreground-polling.js";
 import { getActionToken } from "./api.js";
@@ -14,7 +13,6 @@ import { readGlobalAuthState, writeGlobalAuthState } from "./auth-state.js";
 
 import { PairingClaim } from "./PairingClaim.js";
 import { recordAuthStatus, type AuthStatus } from "./pairing-diagnostics.js";
-import { isStandaloneSshPath } from "./ssh-route.js";
 import { authGateView } from "./auth-gate-view.js";
 import { DeviceAuthorizations } from "./DeviceAuthorizations.js";
 import "./device-authorizations.css";
@@ -37,8 +35,6 @@ interface PairingInfo {
 }
 
 export function AuthGate({ children }: { children: ReactNode }): ReactElement {
-  const location = useLocation();
-  const standaloneSsh = isStandaloneSshPath(location.pathname);
   const initial = readGlobalAuthState<AuthStatus>(getBridgeOrigin(), getLocalDraftScope());
   const [status, setStatus] = useState<AuthStatus | null>(() => initial?.status ?? null);
   const [error, setError] = useState<string | null>(() => initial?.error ?? null);
@@ -56,7 +52,6 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
   }, [status, error, offlineFallback]);
 
   useEffect(() => {
-    if (standaloneSsh) return;
     let cancelled = false;
     void loadAuthStatus(pairingClaimRef)
       .then((nextStatus) => {
@@ -80,10 +75,10 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
     return () => {
       cancelled = true;
     };
-  }, [standaloneSsh]);
+  }, []);
 
   useEffect(() => {
-    if (standaloneSsh || (!status && !offlineFallback)) return;
+    if (!status && !offlineFallback) return;
     let cancelled = false;
     let pending = false;
     const revalidate = (): void => {
@@ -117,9 +112,9 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
       window.removeEventListener("focus", revalidate);
       document.removeEventListener("visibilitychange", revalidate);
     };
-  }, [offlineFallback, standaloneSsh, status?.authenticated]);
+  }, [offlineFallback, status?.authenticated]);
 
-  const view = authGateView({ standaloneSsh, mobile: isMobileApp(), authenticated: status?.authenticated ?? null,
+  const view = authGateView({ mobile: isMobileApp(), authenticated: status?.authenticated ?? null,
     offlineFallback, hasError: Boolean(error) });
   useEffect(() => {
     if (view === "mobile-connection") {
@@ -127,7 +122,6 @@ export function AuthGate({ children }: { children: ReactNode }): ReactElement {
     }
   }, [view, error]);
 
-  if (standaloneSsh) return <>{children}</>;
   if (view === "mobile-connection") return <AuthShell><div className="route-loading">正在打开 App 连接中心…</div></AuthShell>;
   if (view === "content") return <Fragment key={getLocalDraftScope() ?? "legacy"}>
     {authenticatedPairingError ? <div className="pairing-error pairing-inline-alert" role="alert">
@@ -490,7 +484,7 @@ export function PairingAdmin(): ReactElement {
   const saveDeviceName = async (sessionId: string): Promise<void> => {
     const deviceName = editingDeviceName.trim();
     if (!deviceName) {
-      setError("设备名称不能为空。");
+      setError("备注不能为空。");
       return;
     }
     setRenamingDeviceId(sessionId);
@@ -517,7 +511,7 @@ export function PairingAdmin(): ReactElement {
       setEditingDeviceId(null);
       setEditingDeviceName("");
       await loadManagement();
-      setNotice("名称 / 备注已更新。");
+      setNotice("备注已更新。");
     } catch (requestError: unknown) {
       setError(requestError instanceof Error ? requestError.message : String(requestError));
     } finally {
@@ -628,18 +622,18 @@ export function PairingAdmin(): ReactElement {
     ? devices.find((device) => device.sessionId === editingDeviceId) ?? null
     : null;
 
-  const renderPairingCard = (): ReactElement | null => pairing ? (
+  const renderPairingCard = (compact = false): ReactElement | null => pairing ? (
     <div className="device-qr-card">
       <div className="device-qr-frame">
         {qrDataUrl ? <img src={qrDataUrl} alt="设备配对二维码" /> : <span>二维码生成中…</span>}
       </div>
       <div className="device-qr-copy">
-        <strong>扫码或打开链接配对</strong>
-        <span>二维码和链接 5 分钟有效，配对成功后立即失效。</span>
+        {!compact ? <strong>扫码或打开链接配对</strong> : null}
+        {compact ? <span className="device-reuse-expiry">5 分钟有效 · 仅可使用一次<br />有效期至 {formatDate(pairing.expiresAt)}</span> : <span>二维码和链接 5 分钟有效，配对成功后立即失效。</span>}
         <div className="device-pairing-link">
-          <p>没有扫码功能？在需要配对的设备上打开此链接：</p>
+          {!compact ? <p>没有扫码功能？在需要配对的设备上打开此链接：</p> : null}
           <div className="device-pairing-link-row">
-            <a href={pairing.pairingUrl} target="_blank" rel="noreferrer" onClick={(event) => {
+            <a href={pairing.pairingUrl} title={compact ? pairing.pairingUrl : undefined} target="_blank" rel="noreferrer" onClick={(event) => {
               if (!isMobileApp()) return;
               event.preventDefault();
               void openBridgeExternal(pairing.pairingUrl).catch((failure: unknown) => {
@@ -719,17 +713,16 @@ export function PairingAdmin(): ReactElement {
 
       {pairingTarget ? (
         <dialog ref={pairingDialogRef} className="device-reuse-dialog" aria-labelledby="device-reuse-title" onCancel={(event) => { event.preventDefault(); closePairingDialog(); }}>
-          <h2 id="device-reuse-title">复用设备授权</h2>
-          <p><strong>{describeDevice(pairingTarget).name}</strong> · 授权 #{describeDevice(pairingTarget).shortId}</p>
-          <p>扫码成功后保留这条授权的编号和备注，原来的登录会退出。已延期的有效期会保留。</p>
-          <p>二维码 5 分钟内只能使用一次；生成新的二维码会使之前未使用的二维码失效。</p>
-          <div className="device-pairing-actions">
-            <button className="secondary" type="button" disabled={pairingBusy} onClick={() => void generatePairingQr(pairingTarget)}>{pairingBusy ? "正在生成…" : "重新生成二维码"}</button>
-            {pairing ? <span className="device-pairing-expiry">有效期至 {formatDate(pairing.expiresAt)}</span> : null}
-          </div>
-          {pairing ? renderPairingCard() : pairingBusy ? <p role="status">正在生成二维码…</p> : null}
+          <header className="device-reuse-heading">
+            <h2 id="device-reuse-title">为 {describeDevice(pairingTarget).name} 重新配对</h2>
+            <button className="secondary device-reuse-close" type="button" aria-label="关闭" onClick={closePairingDialog}>×</button>
+          </header>
+          <p className="device-reuse-notice">配对后原登录退出，备注和已延期的有效期保留；重新生成将使旧码失效。</p>
+          {pairing ? renderPairingCard(true) : pairingBusy ? <p role="status">正在生成二维码…</p> : null}
           {pairingError ? <p className="device-command-error" role="alert">{pairingError}</p> : null}
-          <div className="device-modal-actions"><button className="secondary" type="button" onClick={closePairingDialog}>关闭</button></div>
+          <div className="device-reuse-actions">
+            <button className="secondary" type="button" disabled={pairingBusy} onClick={() => void generatePairingQr(pairingTarget)}>{pairingBusy ? "正在生成…" : "重新生成二维码"}</button>
+          </div>
         </dialog>
       ) : null}
 
@@ -744,28 +737,28 @@ export function PairingAdmin(): ReactElement {
           <section className="device-name-modal" role="dialog" aria-modal="true" aria-labelledby="device-name-modal-title">
             <div className="device-modal-heading">
               <div>
-                <h2 id="device-name-modal-title">名称 / 备注</h2>
+                <h2 id="device-name-modal-title">修改备注</h2>
               </div>
               <button className="secondary device-modal-close" type="button" aria-label="关闭" onClick={cancelRename}>
                 ×
               </button>
             </div>
-            <p className="device-modal-description">{describeDevice(editingDevice).name} · {describeDevice(editingDevice).browser} · #{describeDevice(editingDevice).shortId}</p>
+            <p className="device-modal-description">{describeDevice(editingDevice).name} · {describeDevice(editingDevice).browser}</p>
             <form onSubmit={(event) => {
               event.preventDefault();
               void saveDeviceName(editingDevice.sessionId);
             }}>
-              <label className="device-name-field" htmlFor="device-name-modal-input">
-                名称 / 备注
+              <div className="device-name-field">
                 <input
                   id="device-name-modal-input"
+                  aria-label="备注"
                   value={editingDeviceName}
                   maxLength={80}
                   placeholder="例如：主力华为 · App"
                   autoFocus
                   onChange={(event) => setEditingDeviceName(event.target.value)}
                 />
-              </label>
+              </div>
               <div className="device-modal-actions">
                 <button className="secondary" type="button" disabled={renamingDeviceId !== null} onClick={cancelRename}>
                   取消

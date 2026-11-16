@@ -5,7 +5,14 @@
   <key>CAPACITOR_DEBUG</key>
 	<string>$(CAPACITOR_DEBUG)</string>
     <key>BridgeShareAppGroup</key><string>$(BRIDGE_SHARE_APP_GROUP)</string>
+    <key>BridgePacketTunnelBundleIdentifier</key><string>$(BRIDGE_PACKET_TUNNEL_BUNDLE_IDENTIFIER)</string>
+    <key>BridgeVpnKeychainAccessGroup</key><string>$(BRIDGE_VPN_KEYCHAIN_GROUP)</string>
     <key>CFBundleURLTypes</key><array><dict><key>CFBundleURLSchemes</key><array><string>bridgecodex</string></array></dict></array>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>openvpn</string>
+		<string>openvpn-connect</string>
+	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>

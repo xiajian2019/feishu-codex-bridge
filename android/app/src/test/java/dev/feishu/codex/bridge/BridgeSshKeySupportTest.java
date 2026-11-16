@@ -10,27 +10,22 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
-import net.schmizz.sshj.userauth.keyprovider.KeyFormat;
 import org.junit.Test;
 
 public class BridgeSshKeySupportTest {
     @Test
     public void selectsSupportedPemFormatsAndRejectsPuttyAsUnsupported() throws Exception {
-        assertEquals(KeyFormat.OpenSSH, BridgeSshKeySupport.detectFormat(chars(
+        assertEquals("openssh", BridgeSshKeySupport.detectFormat(chars(
             "-----BEGIN RSA PRIVATE KEY-----\nbody\n-----END RSA PRIVATE KEY-----\n")));
-        assertEquals(KeyFormat.OpenSSHv1, BridgeSshKeySupport.detectFormat(chars(
+        assertEquals("openssh-new", BridgeSshKeySupport.detectFormat(chars(
             "-----BEGIN OPENSSH PRIVATE KEY-----\nbody\n-----END OPENSSH PRIVATE KEY-----\n")));
-        assertEquals(KeyFormat.PKCS8, BridgeSshKeySupport.detectFormat(chars(
+        assertEquals("pkcs8", BridgeSshKeySupport.detectFormat(chars(
             "-----BEGIN PRIVATE KEY-----\nbody\n-----END PRIVATE KEY-----\n")));
-        assertEquals(KeyFormat.PKCS8, BridgeSshKeySupport.detectFormat(chars(
+        assertEquals("pkcs8", BridgeSshKeySupport.detectFormat(chars(
             "-----BEGIN ENCRYPTED PRIVATE KEY-----\nbody\n-----END ENCRYPTED PRIVATE KEY-----\n")));
-        assertEquals(KeyFormat.PuTTY, BridgeSshKeySupport.detectFormat(chars(
-            "PuTTY-User-Key-File-3: ed25519\nEncryption: none\n")));
-
-        try {
-            BridgeSshKeySupport.createProvider(chars(
-                "PuTTY-User-Key-File-3: ed25519\nEncryption: none\n"), null);
-        } catch (BridgeSshKeySupport.BridgeSshKeyException error) {
+        try { BridgeSshKeySupport.detectFormat(chars(
+            "PuTTY-User-Key-File-3: ed25519\nEncryption: none\n")); }
+        catch (BridgeSshKeySupport.BridgeSshKeyException error) {
             assertEquals(BridgeSshKeySupport.PRIVATE_KEY_FORMAT_UNSUPPORTED, error.code());
             return;
         }
@@ -49,12 +44,6 @@ public class BridgeSshKeySupportTest {
         assertTrue(BridgeSshKeySupport.isEncrypted(openSshV1Key("aes256-ctr")));
         assertFalse(BridgeSshKeySupport.isEncrypted(openSshV1Key("none")));
 
-        assertEquals(
-            BridgeSshKeySupport.PRIVATE_KEY_PASSPHRASE_REQUIRED,
-            BridgeSshKeySupport.errorCodeForKeyRead(new IOException("redacted"), true, false));
-        assertEquals(
-            BridgeSshKeySupport.PRIVATE_KEY_PASSPHRASE_INVALID,
-            BridgeSshKeySupport.errorCodeForKeyRead(new IOException("redacted"), true, true));
     }
 
     @Test

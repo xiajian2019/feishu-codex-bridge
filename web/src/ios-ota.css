@@ -1,0 +1,10 @@
+.ios-ota-panel{margin:16px 0;padding:14px;border:1px solid var(--border-color, #d8dce5);border-radius:12px}
+.ios-ota-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.ios-ota-heading button{flex:none;white-space:nowrap}
+.ios-ota-heading .ios-ota-refresh{display:grid;place-items:center;width:40px;min-width:40px;height:40px;min-height:40px;padding:8px}
+.ios-ota-refresh svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.ios-ota-refresh.is-loading svg{animation:ios-ota-spin .9s linear infinite}
+@keyframes ios-ota-spin{to{transform:rotate(360deg)}}
+.ios-ota-heading h2{font-size:16px;margin:0}.ios-ota-heading p,.ios-ota-detail{font-size:13px;line-height:1.45;margin:6px 0;color:var(--text-secondary, #687487)}
+.ios-ota-actions{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}.ios-ota-actions button,.ios-ota-heading button{min-height:36px;padding:6px 12px}
+.ios-ota-error{font-size:13px;color:#c33;margin:8px 0}.ios-ota-compact{padding:12px;margin:12px 0}

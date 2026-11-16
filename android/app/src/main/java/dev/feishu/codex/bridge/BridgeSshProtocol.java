@@ -1,10 +1,8 @@
 package dev.feishu.codex.bridge;
 
-import java.nio.charset.StandardCharsets;
-import java.util.Base64;
 import java.util.Locale;
 
-/** Small, Android-independent validation and wire helpers for BridgeSSH. */
+/** Small, Android-independent validation and host-key helpers for native SSH. */
 final class BridgeSshProtocol {
     /** The Web/App global config supplies the Mac host; native code has no IP fallback. */
     static final String DEFAULT_HOST = "";
@@ -22,7 +20,6 @@ final class BridgeSshProtocol {
     static final int MAX_PRIVATE_KEY_ID_LENGTH = 128;
     static final int MAX_PRIVATE_KEY_PASSPHRASE_LENGTH = 16 * 1024;
     static final int MAX_STARTUP_COMMAND_LENGTH = 8 * 1024;
-    static final int MAX_INPUT_BYTES = 1024 * 1024;
 
     private BridgeSshProtocol() {}
 
@@ -86,24 +83,6 @@ final class BridgeSshProtocol {
             throw new IllegalArgumentException("startupCommand");
         }
         return value.isEmpty() ? null : value;
-    }
-
-    static byte[] decodeInput(String value) {
-        if (value == null || value.length() > ((MAX_INPUT_BYTES + 2) / 3) * 4) {
-            throw new IllegalArgumentException("dataBase64");
-        }
-        final byte[] decoded;
-        try {
-            decoded = Base64.getDecoder().decode(value);
-        } catch (IllegalArgumentException error) {
-            throw new IllegalArgumentException("dataBase64");
-        }
-        if (decoded.length > MAX_INPUT_BYTES) throw new IllegalArgumentException("dataBase64");
-        return decoded;
-    }
-
-    static String encodeOutput(byte[] value) {
-        return Base64.getEncoder().encodeToString(value);
     }
 
     static String knownHostKey(String host, int port) {

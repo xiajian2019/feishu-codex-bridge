@@ -8,9 +8,7 @@ import java.security.KeyPairGenerator
 import java.security.SecureRandom
 import java.security.interfaces.RSAPublicKey
 import java.util.Base64
-import org.bouncycastle.asn1.pkcs.PrivateKeyInfo
-import org.bouncycastle.jcajce.interfaces.EdDSAPublicKey
-import org.bouncycastle.jce.provider.BouncyCastleProvider
+import com.google.crypto.tink.subtle.Ed25519Sign
 
 internal enum class BridgeSshKeyAlgorithm(val label: String, val format: String) {
     ED25519("Ed25519", "openssh-ed25519"),
@@ -28,9 +26,8 @@ internal data class BridgeGeneratedSshKey(
  * Minimal ConnectBot-style key generation for the native SSH workspace.
  *
  * The generated private key is returned as PKCS#8 PEM, which is already one
- * of the formats accepted by the existing cbssh authentication path. No new
- * crypto dependency is introduced: RSA comes from Android/JCA and Ed25519
- * uses the Bouncy Castle provider already present for sshj compatibility.
+ * of the formats accepted by the existing cbssh authentication path. RSA
+ * comes from Android/JCA and Ed25519 uses Tink, which cbssh also uses.
  */
 internal object BridgeSshKeyGenerator {
     fun generate(
@@ -38,21 +35,36 @@ internal object BridgeSshKeyGenerator {
         nickname: String,
     ): BridgeGeneratedSshKey {
         val safeNickname = normalizeNickname(nickname, algorithm)
-        val keyPair = when (algorithm) {
-            BridgeSshKeyAlgorithm.ED25519 -> generateEd25519()
-            BridgeSshKeyAlgorithm.RSA -> generateRsa()
+        return when (algorithm) {
+            BridgeSshKeyAlgorithm.ED25519 -> generateEd25519(safeNickname)
+            BridgeSshKeyAlgorithm.RSA -> {
+                val keyPair = generateRsa()
+                BridgeGeneratedSshKey(
+                    nickname = safeNickname,
+                    algorithm = algorithm,
+                    privateKeyPem = privateKeyPem(keyPair.private.encoded).toCharArray(),
+                    publicKeyLine = publicKeyLine(keyPair, safeNickname),
+                )
+            }
         }
-        return BridgeGeneratedSshKey(
-            nickname = safeNickname,
-            algorithm = algorithm,
-            privateKeyPem = privateKeyPem(keyPair).toCharArray(),
-            publicKeyLine = publicKeyLine(keyPair, safeNickname),
-        )
     }
 
-    private fun generateEd25519(): KeyPair {
-        val generator = KeyPairGenerator.getInstance("Ed25519", BouncyCastleProvider())
-        return generator.generateKeyPair()
+    private fun generateEd25519(nickname: String): BridgeGeneratedSshKey {
+        val seed = ByteArray(32)
+        SecureRandom().nextBytes(seed)
+        try {
+            val pair = Ed25519Sign.KeyPair.newKeyPairFromSeed(seed)
+            val encoded = BridgeEd25519Der.encodePrivateKey(seed)
+            val blob = ed25519PublicBlob(pair.publicKey)
+            return BridgeGeneratedSshKey(
+                nickname = nickname,
+                algorithm = BridgeSshKeyAlgorithm.ED25519,
+                privateKeyPem = privateKeyPem(encoded).toCharArray(),
+                publicKeyLine = "ssh-ed25519 ${Base64.getEncoder().encodeToString(blob)} $nickname",
+            )
+        } finally {
+            seed.fill(0)
+        }
     }
 
     private fun generateRsa(): KeyPair {
@@ -61,21 +73,7 @@ internal object BridgeSshKeyGenerator {
         return generator.generateKeyPair()
     }
 
-    private fun privateKeyPem(keyPair: KeyPair): String {
-        val source = keyPair.private.encoded
-        val encoded = try {
-            val info = PrivateKeyInfo.getInstance(source)
-            if (info.privateKeyAlgorithm.algorithm.id == "1.3.101.112") {
-                // Bouncy Castle includes an optional public key in Ed25519
-                // PKCS#8 output. cbssh/JCA readers also need the standard
-                // private-key-only form for import and authentication.
-                PrivateKeyInfo(info.privateKeyAlgorithm, info.parsePrivateKey()).encoded
-            } else {
-                source.copyOf()
-            }
-        } finally {
-            source.fill(0)
-        }
+    private fun privateKeyPem(encoded: ByteArray): String {
         return try {
             val body = Base64.getMimeEncoder(64, byteArrayOf('\n'.code.toByte()))
                 .encodeToString(encoded)
@@ -88,7 +86,6 @@ internal object BridgeSshKeyGenerator {
     private fun publicKeyLine(keyPair: KeyPair, nickname: String): String {
         val (algorithm, blob) = when (val publicKey = keyPair.public) {
             is RSAPublicKey -> "ssh-rsa" to rsaPublicBlob(publicKey)
-            is EdDSAPublicKey -> "ssh-ed25519" to ed25519PublicBlob(publicKey)
             else -> error("Unsupported generated SSH public key: ${publicKey.algorithm}")
         }
         return "$algorithm ${Base64.getEncoder().encodeToString(blob)} $nickname"
@@ -102,8 +99,7 @@ internal object BridgeSshKeyGenerator {
         return blob.toByteArray()
     }
 
-    private fun ed25519PublicBlob(publicKey: EdDSAPublicKey): ByteArray {
-        val raw = publicKey.getPointEncoding()
+    private fun ed25519PublicBlob(raw: ByteArray): ByteArray {
         require(raw.size == 32) { "Unexpected Ed25519 public key length" }
         val blob = ByteArrayOutputStream()
         writeSshString(blob, "ssh-ed25519".toByteArray(StandardCharsets.US_ASCII))

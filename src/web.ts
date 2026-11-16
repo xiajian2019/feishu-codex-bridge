@@ -8,6 +8,7 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import type { Duplex } from "node:stream";
 
 import { StateDatabase } from "./db.js";
+import { MobileIosOta } from "./mobile-ios-ota.js";
 import { WorkbenchError, WorkbenchService } from "./workbench.js";
 import {
   checkBridgeBackupUpgradeCompatibility,
@@ -156,6 +157,8 @@ export interface DashboardServerOptions {
   downloadsDirectory?: string;
   /** Local debug APK exposed only to authenticated native App clients. */
   mobileApkPath?: string;
+  iosOtaDirectory?: string;
+  iosOtaSource?: string;
   jjTools?: JjToolsService;
   webRoot?: string;
   auth?: WebPairingAuth;
@@ -182,6 +185,7 @@ export class DashboardServer {
   private readonly webRoot: string;
   private readonly taskAttachmentsDirectory: string;
   private readonly mobileApks: MobileApkStore;
+  private readonly mobileIosOta: MobileIosOta;
   private readonly linkTools: LinkToolsService;
   private readonly downloadUploads: DownloadUploadsService;
   private readonly jjTools: JjToolsService;
@@ -212,6 +216,7 @@ export class DashboardServer {
         ?? join(process.cwd(), "android", "app", "build", "outputs", "apk", "debug", "app-debug.apk"),
     );
     this.mobileApks = new MobileApkStore(mobileApkPath, join(dirname(mobileApkPath), ".bridge-updates"));
+    this.mobileIosOta = new MobileIosOta({ directory: options.iosOtaDirectory, source: options.iosOtaSource });
     this.linkTools = new LinkToolsService({ proxy: options.linkToolProxy });
     this.downloadUploads = new DownloadUploadsService({ directory: options.downloadsDirectory });
     this.jjTools = options.jjTools ?? new JjToolsService();
@@ -310,6 +315,7 @@ export class DashboardServer {
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = new URL(request.url ?? "/", "http://localhost");
+    this.trackNativeSshApiRequest(request, response, url.pathname);
     if (!this.allowMobileRequest(request, response, url)) return;
     // EventSource cannot set Authorization. Exchange a credential for a short-lived,
     // path-bound ticket instead of putting the device token in the URL.
@@ -398,7 +404,7 @@ export class DashboardServer {
         ...(status.authenticated ? { client: {
           schemaVersion: 1, protocolVersion: 1, minimumClientProtocol: 1,
           version: await readBridgeVersion(),
-          features: ["download-uploads", "mobile-apk-update", "backups",
+          features: ["download-uploads", "mobile-apk-update", "mobile-ios-ota", "backups",
             ...(this.options.tmuxDashboard ? ["tmux"] : []),
             ...(this.options.codexHistory ? ["codex-history"] : [])],
         } } : {}),
@@ -549,6 +555,23 @@ export class DashboardServer {
       response,
       publicWebRequest || url.pathname === "/healthz" || Boolean(scopedDemoAccess),
     )) return;
+    if (url.pathname === "/api/mobile/ios-ota" || url.pathname.startsWith("/api/mobile/ios-ota/")) {
+      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Referrer-Policy", "no-referrer");
+      if (mutating && !this.requireActionAuthorization(request, response)) return;
+      try {
+        if (request.method === "GET" && url.pathname === "/api/mobile/ios-ota") {
+          sendJson(response, 200, await this.mobileIosOta.status());
+        } else if (request.method === "POST" && url.pathname === "/api/mobile/ios-ota/link") {
+          sendJson(response, 200, await this.mobileIosOta.createLink());
+        } else if (request.method === "POST" && url.pathname === "/api/mobile/ios-ota/publish") {
+          sendJson(response, 202, this.mobileIosOta.startPublish());
+        } else sendJson(response, 404, { error: "iOS OTA 接口不存在。" });
+      } catch (error) {
+        sendJson(response, 409, { error: error instanceof Error ? error.message : "iOS OTA 操作失败。" });
+      }
+      return;
+    }
     if (url.pathname === "/api/workbench" || url.pathname.startsWith("/api/workbench/")) {
       if (mutating && !this.requireActionAuthorization(request, response)) return;
       try {
@@ -1205,6 +1228,30 @@ export class DashboardServer {
     sendJson(response, 404, { error: "not found" });
   }
 
+  private trackNativeSshApiRequest(request: IncomingMessage, response: ServerResponse, pathname: string): void {
+    const logger = this.options.logger;
+    if (!logger || !["android-native-ssh", "ios-native-ssh"].includes(String(request.headers["x-bridge-client"] ?? ""))) return;
+    const route = nativeSshLogRoute(pathname);
+    if (!route) return;
+    const started = Date.now();
+    let logged = false;
+    const log = (completed: boolean) => {
+      if (logged) return;
+      logged = true;
+      try {
+        logger.info("android native ssh api", {
+          ...route,
+          method: ["GET", "POST", "PUT", "DELETE"].includes(request.method ?? "") ? request.method : "OTHER",
+          status: response.headersSent ? response.statusCode : null,
+          completed,
+          durationMs: Date.now() - started,
+        });
+      } catch { /* Diagnostics must not disrupt a request. */ }
+    };
+    response.once("finish", () => log(true));
+    response.once("close", () => log(response.writableFinished));
+  }
+
   private async claimPairing(request: IncomingMessage, response: ServerResponse, mobile = false): Promise<void> {
     response.setHeader("Cache-Control", "no-store");
     // The initial claim cannot have an Action Token yet; the one-time code is
@@ -1445,7 +1492,14 @@ export class DashboardServer {
       return;
     }
     try {
-      const result = await history.readThread(homeId, threadId, url.searchParams.get("turns") !== "0");
+      const includeTurns = url.searchParams.get("turns") !== "0";
+      const updatedAtValue = url.searchParams.get("updatedAt");
+      const updatedAt = updatedAtValue !== null && Number.isFinite(Number(updatedAtValue))
+        ? Number(updatedAtValue)
+        : undefined;
+      const result = includeTurns && url.searchParams.get("view") === "summary"
+        ? await history.readThreadSummary(homeId, threadId, updatedAt)
+        : await history.readThread(homeId, threadId, includeTurns, updatedAt);
       sendJson(response, 200, result);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -3394,7 +3448,7 @@ export class DashboardServer {
     response.setHeader("Access-Control-Expose-Headers", "Content-Disposition, Retry-After");
     if (request.method === "OPTIONS") {
       const methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
-      const headers = ["authorization", "content-type", "x-bridge-action-token", "x-file-name"];
+      const headers = ["authorization", "content-type", "x-bridge-action-token", "x-file-name", "x-bridge-client", "x-bridge-ssh-session-id", "x-bridge-session-created-at", "x-bridge-ssh-host", "x-bridge-ssh-port", "x-bridge-ssh-username"];
       const requestedMethod = firstHeaderValue(request.headers["access-control-request-method"]);
       const requestedHeaders = firstHeaderValue(request.headers["access-control-request-headers"])
         ?.toLowerCase().split(",").map((value) => value.trim()).filter(Boolean) ?? [];
@@ -3738,6 +3792,23 @@ function buildPairingUrl(request: IncomingMessage, code: string): string {
   const url = new URL(`${protocol}://${configuredHost}/`);
   url.hash = "pair=" + encodeURIComponent(code);
   return url.toString();
+}
+
+function nativeSshLogRoute(pathname: string): { route: string; sessionId?: string } | null {
+  const plain = new Set([
+    "/api/codex/homes", "/api/codex/usage", "/api/skills",
+    "/tmux-dashboard/api/codex-homes", "/tmux-dashboard/api/sessions",
+    "/tmux-dashboard/api/sessions/suspended", "/tmux-dashboard/api/attachments/uploads",
+  ]);
+  if (plain.has(pathname)) return { route: pathname };
+  const session = /^\/tmux-dashboard\/api\/sessions\/(?:%24|\$)(\d{1,16})(?:\/(identity|skills|codex-account(?:\/check)?|git-changes(?:\/(?:content|download))?|files(?:\/(?:upload|download))?|resurrect\/save|suspend|resume|composer))?$/i.exec(pathname);
+  if (session) return { route: `/tmux-dashboard/api/sessions/:session${session[2] ? `/${session[2]}` : ""}`, sessionId: `$${session[1]}` };
+  if (/^\/tmux-dashboard\/api\/attachments\/uploads\/[a-f0-9-]{1,64}(?:\/complete)?$/i.test(pathname)) {
+    return { route: pathname.endsWith("/complete")
+      ? "/tmux-dashboard/api/attachments/uploads/:upload/complete"
+      : "/tmux-dashboard/api/attachments/uploads/:upload" };
+  }
+  return null;
 }
 
 function firstHeaderValue(value: string | string[] | undefined): string | undefined {

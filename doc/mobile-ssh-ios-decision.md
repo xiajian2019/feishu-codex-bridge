@@ -1,14 +1,38 @@
 # 移动端 SSH：iOS 技术决策记录
 
-状态：决策记录，未实现
+状态：原始 iOS 原生直接 SSH 决策记录。2026-11-07 已按本记录的后续路线接入第一阶段实现；当前仍未完成正式发布和真实设备验收。现有 Web tmux 工作台不受此状态影响。
 
 记录日期：2026-10-30
 
-## 结论
+## 2026-11-07/08 实施更新
 
-当前首版明确采用 Android 优先。Android 采用 ConnectBot `cbssh + termlib` 的原生 SSH/终端页面；React 只负责独立入口和连接配置。iOS 本轮不实现 SSH，只记录候选方案、兼容性风险和跨平台协议边界。
+原先“Android 优先、iOS 只记录决策”的结论已由用户最新需求覆盖。当前 iOS 工程新增 `BridgeConnectBotSSH` Capacitor 插件和 SwiftUI/UIKit 工作区，使用 SwiftTerm 渲染终端、SwiftNIO SSH 建立密码或未加密 Ed25519/ECDSA 私钥 SSH/PTY 连接，并与 Android 共用 React 入口、`openWorkspace`/`openTerminal`/`listOptions`/工作区可见性和关闭事件的接口形状。
 
-本文件不是 iOS 功能说明，也不是实现完成证明。仓库中没有因为本记录而新增 iOS SSH 代码、依赖、页面、路由或配置；后续任何进度报告都不能把本文件引用为“iOS 已支持 SSH”。
+已实现：
+
+- 密码 SSH、交互式 PTY、终端输入输出、窗口 resize、连接后启动命令；
+- 首次主机密钥确认，拒绝时不会继续 SSH 握手；显示稳定的 OpenSSH `SHA256:` 指纹，并按主机和端口持久保存已确认的主机密钥；
+- 全屏与 `pageSheet` 半屏 presentation、关闭/恢复工作台、深浅主题同步；
+- 主机非敏感配置保存，并保持 Android 兼容的列表响应形状。
+- 从 Tmux 选中 Session 打开原生工作区时传递 `bridgeOrigin`、`sessionId`、`createdAt` 和预期 SSH 主机/端口；iOS 在实际 SSH 登录后补齐用户名，形成完整 `BridgeSshSessionContext`。目标变化会拒绝绑定，不自动切换或重试。
+- 完整 context 可读取 Keychain 中的 Bridge token，调用 Session 列表与 `identity` API，并通过 `X-Bridge-Session-Created-At` 校验 `id/createdAt`；API 不可用时保留独立 SSH，但不会声称 API-first 已绑定。
+- iOS 原生工作区支持从系统文件选择器导入未加密的 Ed25519/ECDSA 私钥，私钥材料与元数据分离保存到 `WhenUnlockedThisDeviceOnly` Keychain；已有 Web `keyId` 选择会复用原生公钥认证。RSA、加密私钥和私钥材料进入 WebView 仍明确拒绝。
+- Composer 文本已增加 API-first 入口：服务端校验 `createdAt`、SSH 上下文和 Action Token，按 Session record + `idempotencyKey` 持久重放；iOS 原生 Composer 在 API 未绑定时才回退 SSH PTY，网络写入不确定时保留“结果未知”。
+- SFTP transport layer 已固定到 `swift-nio-sftp` revision `748e88568638463370816dbaaaf9684237258501` 并通过当前 Xcode target 编译；当前已接入只读的一层 Session 文件列表，仍未接入预览、上传、下载、API/SFTP fallback 或真实主机验收。
+
+当前明确未实现：加密/RSA 私钥、SFTP 预览/上传/下载/API fallback、Session API 的完整读写操作、Composer 附件删除/断点恢复和后台常驻 SSH 重连。它们不能从 Android 实现或本次源码检查推断为已完成。
+
+`swift-nio-sftp` 当前没有正式 release/tag，因此工程锁定 commit 而不是 branch；后续发布前仍需评估受控 fork、许可证和上游维护状态。Composer 的文本 HTTP endpoint 和 iOS 附件选择/分块上传链路已接入；服务端附件记录现在可绑定设备、Session、createdAt 和 SSH 上下文，但断点恢复、删除和真实附件验收仍待完成。
+
+上述 Session context 和 identity 校验是 API adapter 的第二阶段基础；后续 API 请求必须继续携带并校验完整上下文，不能只凭 Session ID 查询或写入。
+
+当前 Xcode App target 锁定的依赖入口为 SwiftTerm `1.15.0`、swift-nio-ssh `0.13.0` 和 swift-nio `2.81.0`；依赖解析受网络和本机 SwiftPM 缓存影响，版本锁定不等于已经完成编译或真机验收。
+
+## 原始结论（2026-10-30）
+
+当前首版当时明确采用 Android 优先。Android 采用 ConnectBot `cbssh + termlib` 的原生 SSH/终端页面；React 只负责独立入口和连接配置；iOS 当时只记录候选方案、兼容性风险和跨平台协议边界。
+
+本节是历史决策，不是当前实现状态的唯一依据。当前实现和验证状态以本文件顶部更新、源码、Xcode 工程和实际验收结果为准。
 
 Android SSH 与现有 Web tmux Dashboard 是两条独立链路：
 
@@ -17,9 +41,9 @@ Android SSH 与现有 Web tmux Dashboard 是两条独立链路：
 SSH 路径：     React 配置入口 → ConnectBot cbssh/termlib → Mac sshd → PTY → tmux attach
 ```
 
-两条路径可以共享移动端视觉语言和终端交互约定，但不共享 Bridge Bearer token、WebSocket、Bridge 数据库或 Web 端的任务状态。SSH 的目标是 Mac 的 `sshd` 和其后的 PTY；不是直接连接 tmux server，也不是在 Bridge 增加 SSH 中转服务。
+两条路径的终端传输不同：Web 通过 Bridge WebSocket 访问 Bridge 主机的 tmux；Android 原生通过 SSH 连接目标机的 `sshd` 和 PTY。Android 原生的账号/用量、Git、Session 管理、Session 文件和技能、Composer 附件优先使用当前配对 Bridge 的 Bearer/Action Token，符合安全回退条件时使用 SSH CLI 或 SFTP。原生终端输入和 Composer 消息仍走 SSH PTY；普通 SSH shell 没有 Session 时的文件、附件和技能使用 SSH/SFTP。SSH CLI 与 Web 也可能使用同一数据库。是否为同一主机及数据库取决于配置，不能从终端传输方式推断。Web 工作台和 Android 原生都长期保留，也都可以独立迭代。
 
-## 为什么 iOS 本轮只记录决策
+## 历史决策：为什么 iOS 当时只记录决策
 
 1. 用户已经确定首版 Android 优先。把 iOS 同时纳入实现会扩大原生传输、终端渲染、键盘、生命周期和真机验证范围，不能为 Android 首版提供必要收益。
 2. 当前工程的 iOS 最低平台是 iOS 15；`ios/App/CapApp-SPM/Package.swift` 由 Capacitor CLI 管理，并明确标注不要手工修改。新增 Swift SSH 依赖前，必须先验证它与当前 Capacitor SPM 结构、Swift/Xcode 工具链和 iOS 15 的组合，而不是直接改受管理文件。
@@ -57,7 +81,7 @@ SSH 路径：     React 配置入口 → ConnectBot cbssh/termlib → Mac sshd �
 
 Android 首版通过 native 页面实现这些边界，未来 iOS 只需选择自己的 native 页面或 React/xterm 页面，不应重新定义网络语义：
 
-- 连接输入：主机、端口、用户名、认证方式、Host Key 策略；不包含 Bridge API 地址、Bridge Bearer token 或任意本地仓库路径。
+- SSH 连接输入包含主机、端口、用户名、认证方式和 Host Key 策略；Bridge API origin 可作为单独的业务上下文，不能替代 SSH 主机身份，也不应把 Bearer token、私钥或任意本地仓库路径混入 SSH 连接参数。
 - 生命周期事件：连接中、需要确认 Host Key、需要认证、已认证、PTY 已建立、收到输出、连接关闭、连接错误。事件名称可以在 Android 实现时落成具体接口，但 iOS 不应依赖 Android 私有字段。
 - 终端操作：发送字节、调整列数/行数、关闭连接。输出应保持字节/分块语义，不能把 ANSI 控制序列先转成 Web 文本再让另一端猜测终端状态。
 - 远端目标：通过 SSH 登录 Mac 后，在明确的交互式 PTY 中执行或附加 tmux session。tmux session 的发现、选择和 attach 命令属于 SSH 端的交互流程，不等于 Bridge 的 Session API。
@@ -75,7 +99,7 @@ Android 首版通过 native 页面实现这些边界，未来 iOS 只需选择�
 
 ### 路线 B：React/xterm 页面
 
-该路线不再是 Android 首版主链路。当前 React/xterm 代码保留为过渡回退，但 SSH 终端输入、输出、滚动、选择和快捷键已转向原生 termlib。iOS 若未来复用 React/xterm，仍必须单独验证 Native → Capacitor → WebView → xterm 的吞吐、背压、中文/宽字符、alternate screen、选择、滚动、软键盘和前后台恢复。
+Android 原生 SSH 的终端输入、输出、滚动、选择和快捷键目前由 termlib 处理。Web tmux Dashboard 的 React/xterm 路径独立保留并继续面向 iPhone 等平台演进，不是 Android 原生的附属回退。旧的 React/xterm 直连 SSH 页面和 `BridgeSSH` 传输插件已移除；iOS 若未来实现直接 SSH 并复用 React/xterm，仍须单独验证 Native → Capacitor → WebView → xterm 的吞吐、背压、中文/宽字符、alternate screen、选择、滚动、软键盘和前后台恢复。
 
 这两条路线共享的是 SSH 的逻辑状态和数据边界，不代表共用实现。现有 Web tmux Dashboard 继续保留，不因新增 SSH 页面而移除、替换或削弱。
 
@@ -84,7 +108,7 @@ Android 首版通过 native 页面实现这些边界，未来 iOS 只需选择�
 ### Host Key
 
 - 首次连接必须有明确的 Host Key 展示和确认流程；不能默认“接受任何 Host Key”，也不能把指纹校验失败伪装成普通网络重试。
-- 后续应按主机身份保存已确认的 Host Key/指纹，并能在变化时阻断连接、显示差异并允许用户重新审查。具体存储位置、迁移和删除策略待实现阶段确定。
+- 已按规范化主机和端口将已确认的 Host Key 保存在独立的 iOS `UserDefaults` 命名空间；相同密钥自动通过，密钥变化时阻断握手并显示差异提示，用户明确重新信任后才替换记录。
 - Host Key 的确认记录与 Bridge 设备授权、Bridge Cookie、WebSocket 票据分离。
 
 ### Keychain
@@ -108,12 +132,12 @@ Android 首版通过 native 页面实现这些边界，未来 iOS 只需选择�
 ### Mosh 与 SFTP
 
 - Mosh 不在 Android 首版或本 iOS 决策的实现范围内。它涉及不同的传输、UDP/网络策略和服务器能力，不能作为 SSH 重连的简单替换。
-- SFTP 不在首版终端范围内。它是独立的文件传输能力，需要单独设计目录范围、覆盖策略、权限提示、断点/失败行为和与现有 Session 文件页、App 附件流的边界。
-- 在 SSH + PTY + tmux attach 经真实验证前，不增加 Mosh/SFTP 依赖，也不以“候选库支持”作为功能完成依据。
+- Android 原生 SSH 已实现完整 SFTP 文件和附件能力；iOS 当前已有 SFTP transport、只读一层文件列表和 Composer 附件分块上传，仍需补齐预览/下载/上传 UI、API/SFTP fallback、断点/失败行为和与现有 Session 文件页、App 附件流的边界。
+- iOS 侧如引入 Mosh/SFTP，须单独验证 SSH、PTY、tmux 和文件操作；不能以候选库支持或 Android 现有实现作为 iOS 功能完成依据。
 
 ## iOS 开始实现前的验证门槛
 
-未来若重新启动 iOS 实现，至少需要形成以下证据后才能更新状态：
+后续要把第一阶段更新为可发布能力，至少需要形成以下证据：
 
 1. 锁定候选库版本，并在当前 iOS 15 工程和实际 Xcode 工具链中完成依赖解析、编译和链接；不能直接修改由 Capacitor 管理的 `CapApp-SPM/Package.swift` 作为未经验证的接入手段。
 2. 使用真实 Mac `sshd` 和 tmux 验证密码/密钥认证、首次/已知/变化 Host Key、PTY attach、resize、中文和全屏终端输出。
@@ -122,7 +146,7 @@ Android 首版通过 native 页面实现这些边界，未来 iOS 只需选择�
 5. 若选择 React/xterm，补充 Native → Capacitor → WebView → xterm 的高吞吐、背压、alternate screen、触摸滚动、复制和软键盘证据；若选择原生页面，则补充原生终端渲染和交互证据。
 6. 单独检查候选库许可证、传递依赖、平台下限、维护状态和发布包体影响。
 
-在这些门槛完成前，iOS 状态保持“未实现、待评估”。
+在这些门槛完成前，iOS 原生直接 SSH 状态保持“已接入第一阶段、待编译/真机/安全验收”；现有 Web tmux 工作台继续维护和迭代。
 
 ## 参考资料
 

@@ -144,6 +144,7 @@ function createCodexHistoryService(
     cwd: projectRoot,
     environment: buildCodexAppServerEnvironment(config),
     listCacheStore: db,
+    detailCacheStore: db,
     threadHomePreferenceStore: db,
     runStore: db,
     usageSnapshotStore: db,

@@ -11,7 +11,12 @@ internal sealed class BridgeSshReconnectCredentials : Closeable {
     class StoredKey(private val keyId: String) : BridgeSshReconnectCredentials() {
         override suspend fun authenticate(context: Context, username: String, transport: BridgeCbSshTransport): AuthResult {
             val key = BridgeSshKeyStore.loadPrivateKey(context, keyId)
-            return try { transport.authenticatePublicKey(username, key) } finally { BridgeSshKeySupport.clear(key) }
+            val publicKeyLine = BridgeSshKeyStore.metadata(context, keyId).publicKeyLine
+            return try {
+                transport.authenticatePublicKey(username, key, publicKeyLine = publicKeyLine)
+            } finally {
+                BridgeSshKeySupport.clear(key)
+            }
         }
         override fun close() = Unit
     }

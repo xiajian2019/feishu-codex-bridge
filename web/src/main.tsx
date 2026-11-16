@@ -17,7 +17,6 @@ import "./styles.css";
 const TmuxDashboard = lazy(() => import("./TmuxDashboard.js").then((module) => ({ default: module.TmuxDashboard })));
 const TmuxSessionFiles = lazy(() => import("./TmuxSessionFiles.js").then((module) => ({ default: module.TmuxSessionFiles })));
 const TmuxSessionHistory = lazy(() => import("./TmuxSessionHistory.js").then((module) => ({ default: module.TmuxSessionHistory })));
-const SshPage = lazy(() => import("./SshPage.js").then((module) => ({ default: module.SshPage })));
 const TmuxGitChanges = lazy(() => import("./TmuxGitChanges.js").then((module) => ({ default: module.TmuxGitChanges })));
 const CodexHistory = lazy(() => import("./CodexHistory.js").then((module) => ({ default: module.CodexHistory })));
 const ShortcutManagement = lazy(() => import("./ShortcutManagement.js").then((module) => ({ default: module.ShortcutManagement })));
@@ -34,6 +33,7 @@ const DemoCatalog = lazy(() => import("./DemoCatalog.js").then((module) => ({ de
 const JjTools = lazy(() => import("./JjTools.js").then((module) => ({ default: module.JjTools })));
 const UploadDownloads = lazy(() => import("./UploadDownloads.js").then((module) => ({ default: module.UploadDownloads })));
 const MobileInboxPage = lazy(() => import("./MobileInboxPage.js").then((module) => ({ default: module.MobileInboxPage })));
+const MobileAppOnlyVpnPocPage = lazy(() => import("./MobileAppOnlyVpnPocPage.js"));
 
 function LegacyDirectTasksRedirect() {
   const location = useLocation();
@@ -215,7 +215,6 @@ async function mountApp(): Promise<void> {
                   <Route path="/codex-history" element={<BackendFeatureGate feature="codex-history"><CodexHistory /></BackendFeatureGate>} />
                   <Route path="/codex-history/:homeId/:threadId" element={<BackendFeatureGate feature="codex-history"><CodexHistory /></BackendFeatureGate>} />
                   <Route path="/demos" element={<DemoCatalog />} />
-                  <Route path="/ssh" element={<SshPage />} />
                   <Route path="/link-tools" element={<Navigate to="/system-management/uploads?tab=download" replace />} />
                   <Route path="/system-management/jj" element={<JjTools />} />
                   <Route path="/system-management/uploads" element={<UploadDownloads />} />
@@ -232,6 +231,7 @@ async function mountApp(): Promise<void> {
                   <Route path="/system-management/backups" element={<BackendFeatureGate feature="backups"><SystemBackups /></BackendFeatureGate>} />
                   <Route path="/system-management/workspaces" element={<TaskWorkspaces />} />
                   <Route path="/system-management/settings" element={<SystemSettings />} />
+                  <Route path="/system-management/app-only-vpn-poc" element={<MobileAppOnlyVpnPocPage />} />
                   <Route path="/system-management/automations" element={<Automations />} />
                   <Route path="/system-management/machines" element={<ExecutionMachines />} />
                   <Route path="/pair-admin" element={<Navigate to="/system-management/devices" replace />} />

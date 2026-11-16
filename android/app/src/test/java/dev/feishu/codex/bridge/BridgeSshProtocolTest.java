@@ -1,11 +1,9 @@
 package dev.feishu.codex.bridge;
 
-import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
-import java.nio.charset.StandardCharsets;
 import org.junit.Test;
 
 public class BridgeSshProtocolTest {
@@ -40,15 +38,6 @@ public class BridgeSshProtocolTest {
             BridgeSshProtocol.MAX_PRIVATE_KEY_ID_LENGTH + 1)));
         assertThrows(() -> BridgeSshProtocol.optionalPrivateKeyPassphrase(repeat('p',
             BridgeSshProtocol.MAX_PRIVATE_KEY_PASSPHRASE_LENGTH + 1)));
-    }
-
-    @Test
-    public void roundTripsBinaryInputAsIndependentBase64Events() {
-        byte[] first = new byte[]{0, 1, 2, 127, (byte) 0xff};
-        byte[] second = "你好，SSH".getBytes(StandardCharsets.UTF_8);
-        assertArrayEquals(first, BridgeSshProtocol.decodeInput(BridgeSshProtocol.encodeOutput(first)));
-        assertArrayEquals(second, BridgeSshProtocol.decodeInput(BridgeSshProtocol.encodeOutput(second)));
-        assertFalse(BridgeSshProtocol.encodeOutput(first).contains("\n"));
     }
 
     @Test

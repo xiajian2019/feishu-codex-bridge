@@ -1,5 +1,5 @@
 import { expect, it } from "bun:test";
-import { createMobileDownloadManager } from "../web/src/mobile-download-manager.js";
+import { createMobileDownloadManager, isMobileDownloadPanelTask } from "../web/src/mobile-download-manager.js";
 import { pairingCameraFailure } from "../web/src/pairing-scanner.js";
 
 function storage() {
@@ -20,6 +20,21 @@ it("restores native IDs after process loss and obtains actual OS results without
     return { downloads: [{ id: 71, fileName: "report (1).pdf", state: "done", downloadedBytes: 100, totalBytes: 100 }] };
   });
   expect(restarted.getSnapshot()[0]?.state).toBe("done");
+});
+it("does not restore a completed APK installer task after App restart", () => {
+  const disk = storage();
+  disk.rows.set("scope", JSON.stringify({ version: 1, tasks: [{
+    id: "apk", fileName: "bridge-update.apk", state: "done", destination: "installer",
+    downloadedBytes: 100, totalBytes: 100, updatedAt: Date.now(),
+  }] }));
+  const manager = createMobileDownloadManager();
+  manager.restore(disk, "scope");
+  expect(manager.getSnapshot()).toEqual([]);
+  expect(disk.getItem("scope")).toContain('"tasks":[]');
+});
+it("keeps native APK installer progress out of the WebView download panel", () => {
+  expect(isMobileDownloadPanelTask({ id: "apk", fileName: "bridge-update.apk", state: "downloading", downloadedBytes: 1, totalBytes: 2, destination: "installer", updatedAt: Date.now() })).toBe(false);
+  expect(isMobileDownloadPanelTask({ id: "file", fileName: "report.pdf", state: "downloading", downloadedBytes: 1, totalBytes: 2, destination: "downloads", updatedAt: Date.now() })).toBe(true);
 });
 it("does not mix restored transfers or late callbacks across device scopes, and clears only the current scope", async () => {
   const disk = storage(); const manager = createMobileDownloadManager();

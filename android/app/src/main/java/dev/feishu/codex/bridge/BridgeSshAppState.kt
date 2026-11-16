@@ -10,6 +10,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -21,14 +22,17 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.connectbot.sshlib.AuthResult
 import org.connectbot.sshlib.ConnectResult
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.CopyOnWriteArrayList
 
 /** One SSH identity in this Android app process; never holds an Activity or credentials. */
 internal data class BridgeSshAppConnectionKey(val host: String, val port: Int, val username: String) {
@@ -153,7 +157,7 @@ internal class BridgeSshAppSession(
                     appContext.getSharedPreferences(BRIDGE_SSH_KNOWN_HOSTS_PREFERENCES, Context.MODE_PRIVATE),
                     key.host, key.port, approval ?: { false },
                 )
-                val candidate = BridgeCbSshTransport(key.host, key.port, verifier)
+                val candidate = withContext(Dispatchers.IO) { BridgeCbSshTransport(key.host, key.port, verifier) }
                 next = candidate
                 val connection = try { withContext(Dispatchers.IO) { candidate.connect() } }
                     finally { verifier.clearApprovalHandler() }
@@ -161,6 +165,10 @@ internal class BridgeSshAppSession(
                     is ConnectResult.Success -> Unit
                     is ConnectResult.HostKeyRejected -> return@withTimeout BridgeSshRecoveryResult.Stop("SSH 主机指纹需要确认，请点击重连")
                     is ConnectResult.AlgorithmMismatch -> return@withTimeout BridgeSshRecoveryResult.Stop("SSH 算法协商失败，请检查主机配置")
+                    is ConnectResult.TransportError -> {
+                        BridgeAutoVpnRecoverySignal.request()
+                        return@withTimeout BridgeSshRecoveryResult.Retry("SSH 暂时不可达")
+                    }
                     else -> return@withTimeout BridgeSshRecoveryResult.Retry("SSH 暂时不可达")
                 }
                 when (withContext(Dispatchers.IO) { credentials.authenticate(appContext, key.username, candidate) }) {
@@ -230,7 +238,15 @@ internal class BridgeSshAppSession(
     }
 }
 
-/** App-process state. All registry operations are called on the main thread. */
+/**
+ * Application-process connection owner. The foreground service is only the
+ * Android process-protection lease; Activities never own or close sessions
+ * merely because their UI is detached.
+ *
+ * Process death remains an explicit boundary: no password or temporary key is
+ * persisted, and a later Activity opening can only auto-reconnect profiles
+ * backed by a saved Keystore key.
+ */
 internal object BridgeSshAppState {
     private val active = mutableStateListOf<BridgeSshAppSession>()
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -286,7 +302,14 @@ internal object BridgeSshAppState {
         traceService(BridgeSshTraceEvent.SERVICE_STOPPED)
         if (!backgroundServiceRequested) return
         backgroundServiceRequested = false
-        if (needsBackgroundProtection()) backgroundProtectionWarning = BACKGROUND_WARNING
+        if (needsBackgroundProtection()) {
+            backgroundProtectionWarning = BACKGROUND_WARNING
+            // An unexpected service teardown must not leave an active SSH
+            // session without its foreground protection until the next UI
+            // resume. Explicit stopService() clears the requested flag first,
+            // so this does not resurrect an intentionally idle service.
+            mainHandler.post { if (needsBackgroundProtection()) updateBackgroundProtection() }
+        }
     }
 
     internal fun traceService(event: BridgeSshTraceEvent, error: Throwable? = null) {
@@ -390,6 +413,8 @@ internal class BridgeSshAppTerminalTransport(
     private val failed = AtomicBoolean(false)
     private val jobs = mutableListOf<Job>()
     private val writeMutex = Mutex()
+    private val writeQueue = Channel<ByteArray>(TERMINAL_WRITE_QUEUE_CAPACITY)
+    private val outputMatchers = CopyOnWriteArrayList<BridgeSshOutputMatcher>()
 
     override val initialState: BridgeSshConnectionState = BridgeSshConnectionState.CONNECTED
     val isLive: Boolean get() = !closed.get() && !failed.get()
@@ -409,6 +434,21 @@ internal class BridgeSshAppTerminalTransport(
         }
         jobs += scope.launch(Dispatchers.IO) { read(shell.stdout, isStdout = true) }
         jobs += scope.launch(Dispatchers.IO) { read(shell.stderr, isStdout = false) }
+        jobs += scope.launch(Dispatchers.IO) {
+            for (copy in writeQueue) {
+                try {
+                    writeSerialized(copy)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    trace(BridgeSshTraceEvent.TERMINAL_WRITE_FAILED, BridgeSshTraceDetail.WRITE, error)
+                    fail("SSH 终端输入中断", BridgeSshTraceDetail.WRITE, error)
+                    break
+                } finally {
+                    copy.fill(0)
+                }
+            }
+        }
         jobs += scope.launch(Dispatchers.IO) {
             BridgeSshKeepAlive(
                 probe = { transport.keepAlive(shell) { method, error -> trace(BridgeSshTraceEvent.KEEPALIVE_METHOD, method, error) } },
@@ -443,6 +483,7 @@ internal class BridgeSshAppTerminalTransport(
             for (chunk in channel) {
                 if (closed.get()) return
                 onDiagnostic("output", chunk.size)
+                outputMatchers.forEach { it.offer(chunk) }
                 listener?.onSshOutput(chunk, 0, chunk.size)
             }
             if (isStdout) {
@@ -462,17 +503,9 @@ internal class BridgeSshAppTerminalTransport(
         if (closed.get() || failed.get() || length == 0) return
         val copy = bytes.copyOfRange(offset, offset + length)
         onDiagnostic("input", length)
-        scope.launch(Dispatchers.IO) {
-            try {
-                writeSerialized(copy)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                trace(BridgeSshTraceEvent.TERMINAL_WRITE_FAILED, BridgeSshTraceDetail.WRITE, error)
-                fail("SSH 终端输入中断", BridgeSshTraceDetail.WRITE, error)
-            } finally {
-                copy.fill(0)
-            }
+        if (writeQueue.trySend(copy).isFailure) {
+            copy.fill(0)
+            fail("SSH 输入队列已满，请稍后重试", BridgeSshTraceDetail.WRITE)
         }
     }
 
@@ -526,14 +559,22 @@ internal class BridgeSshAppTerminalTransport(
         }
         var started = false
         val attachBytes = BridgeSshCommandEncoding.bracketedPaste(attachCommand)
+        val detached = BridgeSshOutputMatcher(::bridgeSshTmuxDetachConfirmed)
+        outputMatchers += detached
         try {
             writeMutex.withLock {
                 if (closed.get() || failed.get()) return@withLock BridgeSshCommandSendResult.NotSent
                 started = true
                 shell.write(detachSequence)
-                // Give tmux time to restore the login shell prompt before the
-                // next command is pasted into it.
-                delay(180)
+                // Do not paste the next command into the old pane until tmux
+                // has emitted its detach acknowledgement. A fixed delay is
+                // unsafe when the prefix is customized or the remote host is
+                // under load.
+                val confirmed = withTimeoutOrNull(TMUX_DETACH_CONFIRMATION_TIMEOUT_MS) {
+                    detached.completed.await()
+                    true
+                } ?: false
+                if (!confirmed) return@withLock BridgeSshCommandSendResult.Unknown
                 shell.write(attachBytes)
                 delay(180)
                 shell.write(BridgeSshCommandEncoding.enter())
@@ -546,6 +587,7 @@ internal class BridgeSshAppTerminalTransport(
             fail("SSH 终端输入中断", BridgeSshTraceDetail.WRITE, error)
             if (started) BridgeSshCommandSendResult.Unknown else BridgeSshCommandSendResult.NotSent
         } finally {
+            outputMatchers.remove(detached)
             attachBytes.fill(0)
         }
     }
@@ -572,8 +614,39 @@ internal class BridgeSshAppTerminalTransport(
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        writeQueue.close()
+        while (true) {
+            val pending = writeQueue.tryReceive().getOrNull() ?: break
+            pending.fill(0)
+        }
         jobs.forEach { it.cancel() }
         shell.close()
         listener?.onClosed("SSH closed")
     }
+
+    private companion object {
+        const val TERMINAL_WRITE_QUEUE_CAPACITY = 128
+        const val TMUX_DETACH_CONFIRMATION_TIMEOUT_MS = 2_000L
+    }
 }
+
+/** Bounded, byte-oriented observation used only for tmux detach confirmation. */
+private class BridgeSshOutputMatcher(
+    private val predicate: (String) -> Boolean,
+) {
+    val completed = CompletableDeferred<Unit>()
+    private val tail = StringBuilder()
+
+    @Synchronized
+    fun offer(bytes: ByteArray) {
+        if (completed.isCompleted) return
+        tail.append(bytes.toString(Charsets.UTF_8))
+        if (tail.length > 1_024) tail.delete(0, tail.length - 1_024)
+        if (predicate(tail.toString())) completed.complete(Unit)
+    }
+}
+
+private val TMUX_DETACH_CONFIRMATION = Regex("""(?i)(?:^|[\[\s])detached(?:\s|\()""")
+
+internal fun bridgeSshTmuxDetachConfirmed(output: String): Boolean =
+    TMUX_DETACH_CONFIRMATION.containsMatchIn(output)

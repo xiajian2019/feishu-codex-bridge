@@ -44,6 +44,7 @@ import { getLocalDraftScope } from "./local-draft-scope.js";
 import { isMobileApp, shareMobileBlob } from "./mobile-runtime.js";
 import { useMobileBack } from "./use-mobile-back.js";
 import { uploadFileInChunks, type DownloadUploadPhase, type UploadMetric } from "./download-upload.js";
+import { imageSwipeDirection } from "./composer-image-swipe.js";
 
 const TmuxShortcutPalette = lazy(() => import("./TmuxShortcutPalette.js").then((module) => ({ default: module.TmuxShortcutPalette })));
 
@@ -215,11 +216,11 @@ async function fetchForwardImage(image: SessionFileForwardImage, signal: AbortSi
 }
 
 function useFileObjectUrl(file: File | null): string {
-  const [previewUrl, setPreviewUrl] = useState("");
+  const [preview, setPreview] = useState<{ file: File; url: string } | null>(null);
 
   useEffect(() => {
     if (!file) {
-      setPreviewUrl("");
+      setPreview(null);
       return;
     }
     const url = URL.createObjectURL(file);
@@ -228,11 +229,11 @@ function useFileObjectUrl(file: File | null): string {
       sizeBytes: file.size,
       sourceScheme: "blob",
     });
-    setPreviewUrl(url);
+    setPreview({ file, url });
     return () => URL.revokeObjectURL(url);
   }, [file]);
 
-  return previewUrl;
+  return preview?.file === file ? preview.url : "";
 }
 
 function logImagePreviewResult(
@@ -250,7 +251,7 @@ function logImagePreviewResult(
   });
 }
 
-function ImagePreview({ file, onOpen }: { file: File; onOpen: (file: File) => void }): ReactElement {
+function ImagePreview({ file, onOpen }: { file: File; onOpen: () => void }): ReactElement {
   const previewUrl = useFileObjectUrl(file);
   return (
     <button
@@ -258,7 +259,7 @@ function ImagePreview({ file, onOpen }: { file: File; onOpen: (file: File) => vo
       type="button"
       aria-label={"Preview " + file.name}
       title="点击放大预览"
-      onClick={() => onOpen(file)}
+      onClick={onOpen}
     >
       {previewUrl ? (
         <img
@@ -272,12 +273,27 @@ function ImagePreview({ file, onOpen }: { file: File; onOpen: (file: File) => vo
   );
 }
 
-function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): ReactElement {
+function ImageLightbox({ file, position, total, onNavigate, onClose }: {
+  file: File;
+  position: number;
+  total: number;
+  onNavigate: (direction: -1 | 1) => void;
+  onClose: () => void;
+}): ReactElement {
   useMobileBack(true, onClose, 500);
   const previewUrl = useFileObjectUrl(file);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const touchStartRef = useRef<{ id: number; x: number; y: number } | null>(null);
   const onCloseRef = useRef(onClose);
+  const onNavigateRef = useRef(onNavigate);
   onCloseRef.current = onClose;
+  onNavigateRef.current = onNavigate;
+
+  useEffect(() => {
+    if (contentRef.current) contentRef.current.scrollTop = 0;
+  }, [file]);
 
   useEffect(() => {
     const previousFocus = document.activeElement;
@@ -287,9 +303,17 @@ function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): 
         event.preventDefault();
         event.stopPropagation();
         onCloseRef.current();
-      } else if (event.key === "Tab") {
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
         event.preventDefault();
-        closeButtonRef.current?.focus({ preventScroll: true });
+        event.stopPropagation();
+        onNavigateRef.current(event.key === "ArrowLeft" ? -1 : 1);
+      } else if (event.key === "Tab") {
+        const buttons = [...(dialogRef.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [])];
+        const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+        if (index < 0 || (event.shiftKey && index === 0) || (!event.shiftKey && index === buttons.length - 1)) {
+          event.preventDefault();
+          (event.shiftKey ? buttons[buttons.length - 1] : buttons[0])?.focus({ preventScroll: true });
+        }
       }
     };
     document.addEventListener("keydown", onKeyDown);
@@ -301,6 +325,7 @@ function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): 
 
   return createPortal(
     <div
+      ref={dialogRef}
       className="dashboard-image-lightbox"
       role="dialog"
       aria-modal="true"
@@ -309,10 +334,40 @@ function ImageLightbox({ file, onClose }: { file: File; onClose: () => void }): 
         if (event.target === event.currentTarget) onClose();
       }}
     >
+      {total > 1 ? <div className="dashboard-image-lightbox-navigation">
+        <button type="button" aria-label="上一张图片" disabled={position === 0} onClick={() => onNavigate(-1)}>‹</button>
+        <span aria-live="polite">{position + 1} / {total}</span>
+        <button type="button" aria-label="下一张图片" disabled={position === total - 1} onClick={() => onNavigate(1)}>›</button>
+      </div> : null}
       <button ref={closeButtonRef} className="dashboard-image-lightbox-close" type="button" aria-label="关闭图片预览" onClick={onClose}>×</button>
-      <div className="dashboard-image-lightbox-content" onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}>
+      <div
+        ref={contentRef}
+        className="dashboard-image-lightbox-content"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) onClose();
+        }}
+        onTouchStart={(event) => {
+          const touch = event.touches[0];
+          touchStartRef.current = event.touches.length === 1 && touch && (window.visualViewport?.scale ?? 1) <= 1.01
+            ? { id: touch.identifier, x: touch.clientX, y: touch.clientY }
+            : null;
+        }}
+        onTouchMove={(event) => {
+          if (event.touches.length !== 1) touchStartRef.current = null;
+        }}
+        onTouchCancel={() => { touchStartRef.current = null; }}
+        onTouchEnd={(event) => {
+          const start = touchStartRef.current;
+          touchStartRef.current = null;
+          if (!start || event.touches.length !== 0 || (window.visualViewport?.scale ?? 1) > 1.01) return;
+          const touch = Array.from(event.changedTouches).find((item) => item.identifier === start.id);
+          if (!touch) return;
+          const direction = imageSwipeDirection(touch.clientX - start.x, touch.clientY - start.y);
+          if (direction === null) return;
+          if (event.cancelable) event.preventDefault();
+          onNavigate(direction);
+        }}
+      >
         {previewUrl ? (
           <img
             src={previewUrl}
@@ -351,7 +406,8 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [shortcutCategory, setShortcutCategory] = useState<ShortcutCategory>("favorites");
   const [shortcutStore, setShortcutStore] = useState<ShortcutStore>(() => readShortcutConfigCache() ?? { groups: [], shortcuts: [] });
-  const [previewFile, setPreviewFile] = useState<File | null>(null);
+  const [preview, setPreview] = useState<{ items: { id: string; file: File }[]; position: number } | null>(null);
+  useEffect(() => setPreview(null), [sessionId]);
   const [codexSkills, setCodexSkills] = useState<CodexSkillOption[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(false);
   const [skillsLoadError, setSkillsLoadError] = useState<string | null>(null);
@@ -946,7 +1002,13 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
                 key={attachment.id}
               >
                 {attachment.file?.type.startsWith("image/")
-                  ? <ImagePreview file={attachment.file} onOpen={setPreviewFile} />
+                  ? <ImagePreview file={attachment.file} onOpen={() => {
+                    const items = aui.composer.getState().attachments.flatMap((item) =>
+                      item.file?.type.startsWith("image/") ? [{ id: item.id, file: item.file }] : [],
+                    );
+                    const position = items.findIndex((item) => item.id === attachment.id);
+                    if (position !== -1) setPreview({ items, position });
+                  }} />
                   : <span className="dashboard-composer-file-name" title={attachment.name}>{attachment.name}</span>}
                 {progress ? <span className="dashboard-composer-upload-progress" role="status" aria-live="polite">
                   <progress max={progress.total || 1} value={Math.min(progress.bytes, progress.total || 1)} aria-label={`${attachment.name} 上传进度`} />
@@ -1110,7 +1172,16 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
           ><span className="dashboard-send-label">{sending || preparing ? "发送中…" : "发送"}</span><span aria-hidden="true">↑</span></ComposerPrimitive.Send>
         </div>
       </ComposerPrimitive.Root>
-      {previewFile ? <ImageLightbox file={previewFile} onClose={() => setPreviewFile(null)} /> : null}
+      {preview ? <ImageLightbox
+        file={preview.items[preview.position]!.file}
+        position={preview.position}
+        total={preview.items.length}
+        onNavigate={(direction) => setPreview((current) => current ? {
+          ...current,
+          position: Math.max(0, Math.min(current.items.length - 1, current.position + direction)),
+        } : null)}
+        onClose={() => setPreview(null)}
+      /> : null}
       <Suspense fallback={null}>
         <TmuxShortcutPalette
           open={shortcutsOpen}

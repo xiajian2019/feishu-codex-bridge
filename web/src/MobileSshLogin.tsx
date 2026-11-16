@@ -4,7 +4,7 @@ import {
   type SshOptions, type SshProfileOption,
 } from "./ssh-connectbot-native.js";
 import { getMobileConnection } from "./mobile-runtime.js";
-import { BRIDGE_GLOBAL_MAC_HOST } from "./bridge-global-config.js";
+import { getConfiguredGlobalMacHost } from "./bridge-global-config.js";
 
 const EMPTY_OPTIONS: SshOptions = { profiles: [], keys: [] };
 
@@ -18,7 +18,7 @@ function profileOptionLabel(profile: SshProfileOption): string {
 export default function MobileSshLogin(): ReactElement {
   const [options, setOptions] = useState<SshOptions>(EMPTY_OPTIONS);
   const [profileId, setProfileId] = useState("");
-  const [host, setHost] = useState(BRIDGE_GLOBAL_MAC_HOST);
+  const [host, setHost] = useState(getConfiguredGlobalMacHost);
   const [port, setPort] = useState("22");
   const [username, setUsername] = useState("");
   const [keyId, setKeyId] = useState("");
@@ -74,7 +74,7 @@ export default function MobileSshLogin(): ReactElement {
     setBusy(true); setError(null);
     try {
       await openNativeSshWorkspace({
-        defaultHost: BRIDGE_GLOBAL_MAC_HOST,
+        defaultHost: getConfiguredGlobalMacHost(),
         ...(getMobileConnection()?.server ? { bridgeServerOrigin: getMobileConnection()!.server } : {}),
         ...(mode ? { mode } : {}),
       });

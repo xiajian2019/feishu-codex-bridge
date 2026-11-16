@@ -1,12 +1,30 @@
 import { describe, expect, it } from "bun:test";
 import { createMobileFetch, normalizeBridgeServer, normalizeConfiguredBridgeServer, parseMobilePairingInput, type MobileConnection } from "../web/src/mobile-connection.js";
-import { BRIDGE_GLOBAL_MAC_HOST } from "../web/src/bridge-global-config.js";
+import {
+  BRIDGE_GLOBAL_MAC_HOST, bridgeOriginWithGlobalMacHost, normalizeGlobalMacHost,
+  readBridgeNetworkSettings, saveBridgeNetworkSettings,
+} from "../web/src/bridge-global-config.js";
 
 describe("mobile connection configuration", () => {
   it("uses the global Mac host for private Bridge endpoints while preserving ports", () => {
     expect(normalizeConfiguredBridgeServer("http://10.0.0.55:5173")).toBe(`http://${BRIDGE_GLOBAL_MAC_HOST}:5173`);
     expect(normalizeConfiguredBridgeServer("http://mac.local:7310")).toBe(`http://${BRIDGE_GLOBAL_MAC_HOST}:7310`);
     expect(normalizeConfiguredBridgeServer("http://127.0.0.1:17310")).toBe("http://127.0.0.1:17310");
+  });
+
+  it("validates and persists the configurable global target and Wi-Fi exemptions", () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+    } as Storage;
+    const settings = saveBridgeNetworkSettings({ globalMacHost: "10.15.53.99", vpnBypassWifiSsids: ["Office", "Office", " Home "] }, storage);
+    expect(settings).toEqual({ globalMacHost: "10.15.53.99", vpnBypassWifiSsids: ["Office", "Home"] });
+    expect(readBridgeNetworkSettings(storage)).toEqual(settings);
+    expect(bridgeOriginWithGlobalMacHost("http://10.0.0.17:17310", "10.15.53.99")).toBe("http://10.15.53.99:17310");
+    expect(bridgeOriginWithGlobalMacHost("http://10.0.0.17:17310", "2001:db8::17")).toBe("http://[2001:db8::17]:17310");
+    expect(normalizeGlobalMacHost("[2001:db8::17]")).toBe("2001:db8::17");
+    expect(() => normalizeGlobalMacHost("10.15.53.999")).toThrow();
   });
 
   it("accepts HTTPS and LAN HTTP, rejects public cleartext, credentials and subpaths", () => {

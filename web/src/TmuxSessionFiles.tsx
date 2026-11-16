@@ -18,10 +18,6 @@ const PREVIEW_HISTORY_LIMIT = 50;
 const FULL_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 const COMPACT_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, { month: "numeric", day: "numeric" });
 const IMAGE_EXTENSIONS = new Set(["apng", "avif", "bmp", "gif", "jpeg", "jpg", "png", "webp"]);
-const TEXT_EXTENSIONS = new Set([
-  "c", "cc", "conf", "cpp", "css", "csv", "go", "h", "hpp", "html", "ini", "java", "js", "json", "jsx",
-  "log", "lua", "md", "markdown", "mjs", "py", "rb", "rs", "sh", "sql", "svg", "toml", "ts", "tsx", "txt", "xml", "yaml", "yml",
-]);
 
 interface SessionFileEntry {
   name: string;
@@ -463,10 +459,8 @@ export function TmuxSessionFiles(): ReactElement {
         return false;
       }
     }
-    if (!TEXT_EXTENSIONS.has(extension)) {
-      setError("该文件类型暂不支持在线预览，请使用下载操作。");
-      return false;
-    }
+    // Remote files do not carry a reliable MIME type. Treat every non-image
+    // file as text so extensionless configs and scripts remain previewable.
     if (entry.size > PREVIEW_TEXT_LIMIT) {
       setError("文件超过 2 MB，请下载后查看。");
       return false;
@@ -691,7 +685,7 @@ export function TmuxSessionFiles(): ReactElement {
                 onClick={() => openEntry(entry)}
               />
               <div className="tmux-files-row-actions">
-                {entry.type === "file" && (IMAGE_EXTENSIONS.has(fileExtension(entry.name)) || TEXT_EXTENSIONS.has(fileExtension(entry.name))) ? (
+                {entry.type === "file" ? (
                   <button type="button" aria-label={`查看 ${entry.name}`} title="查看" onClick={() => void openPreview(entry)}>
                     <SessionFileActionIcon action="view" />
                   </button>

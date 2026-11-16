@@ -208,9 +208,14 @@ export function fetchCodexThreadDetail(
   homeId: string,
   threadId: string,
   signal?: AbortSignal,
+  options: { view?: "summary" | "full"; updatedAt?: number } = {},
 ): Promise<CodexHistoryDetailResponse> {
+  const params = new URLSearchParams({ turns: "1", view: options.view ?? "summary" });
+  if (typeof options.updatedAt === "number" && Number.isFinite(options.updatedAt)) {
+    params.set("updatedAt", String(options.updatedAt));
+  }
   return getJson<CodexHistoryDetailResponse>(
-    `/api/codex/threads/${encodeURIComponent(homeId)}/${encodeURIComponent(threadId)}?turns=1`,
+    `/api/codex/threads/${encodeURIComponent(homeId)}/${encodeURIComponent(threadId)}?${params.toString()}`,
     { signal },
   );
 }

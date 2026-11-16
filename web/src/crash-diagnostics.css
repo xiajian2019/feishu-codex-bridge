@@ -1,0 +1,24 @@
+.crash-diagnostics-panel {
+  box-sizing: border-box;
+  width: min(100%, 840px);
+  margin: 16px auto;
+  padding: 16px;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, currentColor 4%, transparent);
+}
+.crash-diagnostics-panel header, .crash-diagnostics-panel li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.crash-diagnostics-panel h2 { margin: 0; font-size: 18px; }
+.crash-diagnostics-panel p, .crash-diagnostics-panel small { line-height: 1.5; }
+.crash-diagnostics-panel button { min-height: 36px; padding: 6px 10px; }
+.crash-diagnostics-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.crash-diagnostics-panel ul { display: grid; gap: 10px; padding: 0; list-style: none; }
+.crash-diagnostics-panel li { padding: 8px 0; border-bottom: 1px solid color-mix(in srgb, currentColor 18%, transparent); }
+.crash-diagnostics-panel li > div:first-child { display: grid; gap: 4px; min-width: 0; }
+.crash-diagnostics-panel li span, .crash-diagnostics-panel small { font-size: 12px; overflow-wrap: anywhere; }
+.crash-diagnostics-panel pre { max-height: 320px; overflow: auto; padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; color: inherit; background: color-mix(in srgb, currentColor 8%, transparent); }

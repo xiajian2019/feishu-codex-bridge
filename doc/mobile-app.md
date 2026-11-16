@@ -4,6 +4,10 @@
 
 App 与浏览器的功能差异、已发现风险和分批优化建议见 [App 与浏览器差异化适配评审（2026-10-27）](app-browser-adaptation-review-2026-10-27.md)。该评审针对源码工作区，不等同于已部署版本或真机验收结果。
 
+当前 Android App 的整体架构、风险分级和整改顺序见 [Android App 架构与风险评审（2026-11-02）](android-app-architecture-review-2026-11-02.md)。该文档是实施建议和验收门槛，不代表风险已经修复。
+
+Web 工作台和 Android/iOS 原生 SSH 是长期并存的使用路径，三者均可独立增加功能。当前 Web tmux 经 Bridge WebSocket 访问 Bridge 主机，原生 SSH 经手机直连 SSH 主机；Web tmux 与原生 SSH 不是同一条传输链路。
+
 内置单配置 OpenVPN 的可行性、包体目标和实施计划见 [手机 App 内置 OpenVPN 评估](mobile-openvpn-feasibility-2026-11-01.md)；当前仅为方案，尚未实现。
 
 ## 构建与安装
@@ -18,9 +22,17 @@ bun run mobile:build
 
 `mobile:build` 生成 `dist/mobile` 并执行 Capacitor sync；原有 `bun run build:web` 仍输出 `dist/web`，不会替换已部署网页。只同步已有构建可用 `bun run mobile:sync`。`mobile:doctor` 只读检查工具，不安装 SDK，不启动或重启 Bridge；缺少工具时以非零状态退出。
 
+首次或网络受限时解析 iOS SwiftPM 依赖，可使用 `HTTP_PROXY` / `HTTPS_PROXY`（也接受小写变量）：
+
+```bash
+HTTP_PROXY=http://127.0.0.1:7897 HTTPS_PROXY=http://127.0.0.1:7897 bun run mobile:ios:resolve
+```
+
+脚本会把已提供的代理变量同步为大小写两套后传给 `xcodebuild`；不保存代理地址，也不会覆盖 `CapApp-SPM/Package.swift`。SwiftPM/Git 是否完全使用代理仍取决于本机 Xcode/SwiftPM 版本和网络环境。
+
 Android App 在配对后及回前台时比较更新包与实际安装的 versionCode；首次连接旧版本也会提示，点击“稍后”暂缓 30 分钟。已下载、打开安装器和已安装分别记录，取消安装或拒绝安装权限后仍可重试。更新状态按服务器隔离。已配对且 Bridge 可访问时，即使停留在原生 SSH 工作区也会检查更新并在顶部提供更新、下载和稍后操作；未配对或 Bridge 不可访问时无法从该来源检查或下载。环境切换弹窗的 App 区域提供“检查更新”和“手动下载 App”；主动检查会重新显示已暂缓的新版本，手动下载也支持当前版本。原连接维护中的下载入口继续保留。
 
-服务端读取 `android/app/build/outputs/apk/debug/app-debug.apk` 及同目录 Gradle 生成的 `output-metadata.json`；可用 `FEISHU_CODEX_BRIDGE_ANDROID_APK` 指定其他构建输出。首次检查时流式复制为同目录 `.bridge-updates/<SHA-256>.apk` 快照，返回带摘要的下载路径，源 APK 的字节替换不会改变该快照。但当前目录仍属于构建输出，本轮观察到重打包回收旧快照，跨构建持久留存仍待迁至独立目录；不能承诺旧 revision 一直可用。自定义路径必须同时提供对应构建元数据。更新接口始终要求 App Bearer。安装和“手动下载 APK”均先下载至缓存，原生侧校验大小、SHA-256、包名及预期版本，拒绝降级后才打开安装器或流式写入系统 Downloads。安装器仍负责系统签名与安装确认。APK 下载需要保持 App 在前台，普通文件仍使用系统 DownloadManager。
+服务端读取 `android/app/build/outputs/apk/debug/app-debug.apk` 及同目录 Gradle 生成的 `output-metadata.json`；可用 `FEISHU_CODEX_BRIDGE_ANDROID_APK` 指定其他构建输出。首次检查时流式复制为同目录 `.bridge-updates/<SHA-256>.apk` 快照，返回带摘要的下载路径，源 APK 的字节替换不会改变该快照。但当前目录仍属于构建输出，本轮观察到重打包回收旧快照，跨构建持久留存仍待迁至独立目录；不能承诺旧 revision 一直可用。自定义路径必须同时提供对应构建元数据。更新接口始终要求 App Bearer。安装和“手动下载 APK”均先下载至缓存，原生侧校验大小、SHA-256、包名、预期版本和签名摘要交集，拒绝降级后才打开安装器或流式写入系统 Downloads；系统安装器仍负责最终签名兼容判断与安装确认。APK 传输禁用重定向并需要保持 App 在前台；普通文件仍使用系统 DownloadManager，入队前校验初始 URL、origin 与本机对应凭据，其重定向目标尚未完成专项验证。
 
 旧版本若在下载 100% 后提示“更新校验信息无效”，原因是原生桥接把 Integer 数值误读为 Long；本轮已统一读取正安全整数，不取消任何更新校验。旧二进制本身无法由下载的新 APK 自动修正，需手动覆盖安装本次修复包一次；不要先卸载或清空数据。
 
@@ -31,9 +43,9 @@ Android 构建通过 `scripts/mobile-version.mjs` 分配构建号，使用被忽
 | 平台 | 构建环境 | 打开工程 | 安装方式 |
 | --- | --- | --- | --- |
 | iOS 15+ | macOS、完整 Xcode 26+、Apple 签名账号；依赖使用 Swift Package Manager | `bun run mobile:open:ios` | 在 Xcode 选择 App target、Signing & Capabilities 中的 Team 和手机，执行 Run；分发需另行签名、Archive/TestFlight |
-| Android 8+（API 26） | JDK 21+、Android SDK Platform 36、platform-tools；建议 Android Studio Otter 2025.2.1+ | `bun run mobile:open:android` | 本地 debug APK 固定生成 `arm64-v8a`；Android Studio Run；或在 `android` 目录执行 `./gradlew assembleDebug`，安装 `app/build/outputs/apk/debug/app-debug.apk` |
+| Android 8+（API 26） | JDK 21+、Android SDK compile SDK 37.2、platform-tools；Android target SDK 为 36 | `bun run mobile:open:android` | 本机打包：`bun run mobile:android:build`，实际逻辑位于项目 `scripts/build-apk.mjs`；生成固定为 `arm64-v8a` 的 debug APK，不会自动安装。APK 位于 `android/app/build/outputs/apk/debug/app-debug.apk` |
 
-JDK 不在默认路径时设置 `JAVA_HOME`；SDK 不在默认目录时设置 `ANDROID_HOME`，或通过 Android Studio 生成被忽略的 `android/local.properties`。首次 Android 构建需要下载 Gradle 和 Maven 依赖，首次 iOS 构建需要解析 Swift packages。
+JDK 不在默认路径时设置 `JAVA_HOME`；SDK 不在默认目录时设置 `ANDROID_HOME`，或通过 Android Studio 生成被忽略的 `android/local.properties`。首次 Android 构建需要下载 Gradle 和 Maven 依赖，首次 iOS 构建需要解析 Swift packages。当前 `mobile:doctor` 仍检查 Platform 36，不会确认 compile SDK 37.2 已安装；以实际 Gradle 构建为准。
 
 App 名称为 `Bridge`，应用标识为 `dev.feishu.codex.bridge`。正式发布前确认应用标识归属、签名、图标、版本号和隐私披露；当前工程没有配置分发凭据或商店发布任务。`mobile:build` 不是 APK/IPA 构建，不产生已签名安装包。
 
@@ -48,23 +60,112 @@ App 名称为 `Bridge`，应用标识为 `dev.feishu.codex.bridge`。正式发�
 
 推荐 HTTPS；证书必须受手机系统信任。自用 HTTP 连接限局域网、回环、链路本地地址与私有网络地址（含常见 VPN 的 `100.64.0.0/10`）。公网 HTTP 会在连接页被拒绝。LAN HTTP 不提供传输加密，请只在可信网络使用。
 
+## iOS 命令行构建与安装
+
+在 Xcode 中完成一次设备配对和自动签名配置后，可用以下命令构建最新前端、同步 iOS 资源和插件、编译签名并安装到已配对的 iPhone：
+
+```bash
+bun run mobile:ios:install
+```
+
+默认同时支持 USB 有线和 Wi-Fi / 局域网连接，脚本会根据设备当前的连接方式自动选择安装通道。设备完成一次有线配对后，可以拔线再运行 `bun run mobile:ios:install --check`，确认显示 `Wi-Fi / 局域网`；保留数据线时则会显示 `USB`。如果有多台设备，用 `--device "设备名称"` 指定；需要强制只走无线时加 `--wireless-only`。`--allow-usb` 仍作为旧命令兼容，但 USB 已默认支持。首次下载 Swift 包可能需要较长时间。
+
+`devicectl` 使用 CoreDevice 已知的设备名称、UDID 或 DNS 名称；单独知道 iPhone 的 Wi-Fi IP 不代表 CoreDevice 能发现它。无线安装前先拔掉 USB 并检查：
+
+```bash
+bun run mobile:ios:install -- --check
+bun run mobile:ios:install -- --device "设备 UDID" --wireless-only
+```
+
+仍可使用 `--ip` 或 `BRIDGE_IOS_DEVICE_IP`，但只有 CoreDevice 将该地址识别为设备时才可使用；脚本会在构建前检查，并在 `--wireless-only` 下核对实际连接方式。如果无法识别，请先检查 Xcode 的设备配对和网络发现，再改用 `--device`。
+
+`bun run mobile:ios:install --build-only` 只生成签名 App，不安装、不启用自动续签；未发现设备时使用通用 iOS 构建目标。手动构建默认使用现有签名配置；需要 Xcode 更新签名配置时，可显式加 `--allow-provisioning-updates`。脚本核对同步后的 Web 资源、Bundle ID 和签名，安装后再检查设备上是否存在 Bridge。设备必须保持可连接，必要时解锁并确认系统提示。
+
+成功安装后，脚本为该 checkout 和设备启用 macOS 用户级自动续签任务，并保存本次安装的 App 快照。它每小时检查一次主 App、分享扩展的描述文件以及实际签名证书，以最早到期时间为准；剩余不超过 24 小时时，通过 Xcode 已登录的账户申请新描述文件并重签快照，再覆盖安装到原设备。个人团队通常受限的是 7 天描述文件，不一定是签名证书本身。后台续签不会构建或安装工作区中后来修改的 App 代码；只有在确实取得更长有效期、团队、App 身份和签名权限一致时才安装。需要新描述文件时，脚本使用只用于申请签名的临时工程调用 Xcode，再用获得的描述文件重签快照。它不撤销证书，只临时移开与本 App 精确匹配的自动管理缓存；备份放在 Xcode 监听目录之外，操作结束后恢复，遇到同名新文件时保留备份。
+
+```bash
+bun run mobile:ios:install -- --renew-status        # 查看是否启用和已登记的最早到期时间
+bun run mobile:ios:install -- --renew-now           # 立即尝试续签已登记设备
+bun run mobile:ios:install -- --disable-auto-renew  # 停用自动续签，保留 App 和快照
+```
+
+定时任务需要 Mac 已开机且用户已登录、Xcode 账户和签名钥匙串可用、Mac 可连接 Apple 服务，并且 iPhone 已配对且可通过 USB 或局域网连接；可能需要解锁手机或在 Mac 确认钥匙串访问。指定 `--wireless-only` 安装时，后台也遵守无线限制。失败会写入 `--renew-status` 显示的日志、尝试发送 Mac 通知，并在下次整点重试；Mac 休眠期间错过的检查会在唤醒后合并执行，关机或长期离线无法保证及时续签。若检测到设备上的安装位置或版本改变，会暂停自动覆盖并要求重新运行安装命令；这些元数据不能证明其他工具从未替换过相同位置和版本的 App。状态显示的是本脚本上次成功登记的签名信息，不是从手机实时读取的到期时间。此前已安装的 App 需要重新运行一次安装命令才能登记和启用自动续签；不要删除或移动该 checkout，调度任务会从这里运行脚本。即使自动化已启用，Apple 账户授权、设备连接或签名服务出现问题仍可能导致过期，无法承诺永不中断。
+
+### iOS OTA 无线安装
+
+OTA 使用已签名的 App 生成 IPA，并提供独立的 Safari 安装页；系统读取 HTTPS manifest 后负责下载和安装。可以使用现有 VPN 的 Mac IPv4，也可以使用 Tailscale 私网 HTTPS。两种方式都要求 iPhone 能通过对应网络访问 Mac，且描述文件包含该设备；安装页请求成功或 IPA 下载完成都不代表 iOS 已安装成功。
+
+连接 VPN 后，以下命令构建当前 checkout 的手机前端及 iOS App、生成安装包并启动用户级 OTA 服务；VPN 有多个 IPv4 时用 `--vpn-ip` 指定 Mac 自己的地址：
+
+```bash
+bun run mobile:ios:ota -- --vpn-ip 10.0.0.42
+```
+
+VPN IP 直连需要可信 HTTPS。首次运行会在当前用户的 `Library/Application Support/Feishu Codex Bridge/ios-ota-tls` 下生成独立根证书和仅本机使用的私钥，在终端打印供 iPhone 安装的 `.cer` 文件及 SHA-256 指纹。通过 AirDrop 等可信方式把 **`.cer` 公钥证书**发送到 iPhone，在“设置 → 通用 → VPN 与设备管理”安装，再到“设置 → 通用 → 关于本机 → 证书信任设置”启用完全信任。此根证书会被 iPhone 全局信任，私钥应留在 Mac；不用时可在 iPhone 移除证书。如果已有受 iPhone 信任且包含该 IP 的证书，可用 `--tls-cert <证书> --tls-key <私钥>`，无需生成本地根证书。VPN IP 变化后需用新 IP 重启 OTA 服务；自动生成的服务证书会使用同一根证书更新。
+
+Tailscale 模式使用 Tailnet 的 HTTPS 证书，不需要把本地根证书装进 iPhone。Mac 和 iPhone 需要连接同一 Tailnet，并在 Tailscale 管理后台启用 HTTPS Certificates：
+
+```bash
+bun run mobile:ios:ota -- --check --tailscale
+bun run mobile:ios:ota -- --tailscale
+```
+
+脚本只配置自己的 Tailscale HTTPS 端口，默认 `18443`，本机服务默认 `18731`；发现已有其他服务占用时停止，不执行 `tailscale serve reset` 或覆盖其他路由。也可以用 `--base-url https://...` 指向已存在的可信 HTTPS 反向代理；此模式只启动本机回环 HTTP 服务，外部代理需由使用者自行配置。
+
+命令完成后会打印 24 小时内有效的安装链接及二维码，有效期不会超过签名到期时间。首次在 iPhone Safari 打开短时链接会为该浏览器建立 30 天的 OTA 授权；把输出的 HTTPS 首页添加到主屏幕后，可以在授权期内直接打开并安装最新已发布的包。该授权独立于 Bridge 配对，仅用于 OTA；不要把安装链接或根证书私钥发给他人。需要撤销 OTA 浏览器授权和全部未过期链接时运行 `bun run mobile:ios:ota -- --revoke-sessions`。之后可用 `bun run mobile:ios:ota -- --link` 生成新链接，`bun run mobile:ios:ota -- --stop` 停止 OTA 服务，安装包和证书保留。
+
+每次运行默认命令会重新构建并发布当前 checkout 的代码。若只想发布已经构建的签名 App，可用 `--app ios/App/build/DeviceDerivedData/Build/Products/Debug-iphoneos/App.app`；`--no-serve` 只生成包。签名剩余不超过 24 小时时，发布过程先申请新描述文件并重签快照。OTA 服务启动后还会每小时检查最新安装包：临近到期时自动重签并发布**相同 App 的新签名包**，无需 iPhone 当时被 Mac 发现；手机仍需打开安装页并确认系统安装，新签名才会在手机生效。续签失败会记录到 OTA 目录的 `refresh-error.log` 并尝试在 Mac 通知，下次整点重试。
+
+OTA 通过 iOS 系统安装，不会自动向现有 `mobile:ios:install` 续签任务登记安装成功；系统更换安装位置后，旧续签任务会按保护规则暂停。需要恢复 Mac 的自动覆盖续签时，重新连接设备并运行一次 `bun run mobile:ios:install`。不能因文件已下载就推断手机已安装，实际 Safari、证书信任和 iPhone 安装仍须真机验收。
+
+已配对 Bridge 的 iPhone App 可以从环境切换窗口打开 iOS 安装页；iPhone Safari 中也可在“系统管理 → 系统设置”查看安装包状态、打开安装页或触发 Mac 构建发布。Android 和桌面 Web 不显示 iOS 入口。安装链接通过已配对会话和操作令牌签发，链接最多有效 30 分钟；系统安装器不携带 Bridge 会话，未过期的链接与 Bridge 设备撤销独立，应避免转发。构建发布只生成并发布安装包，不代表手机已经安装。
+
+安装版 Bridge 启动目录不在源码 checkout 时，会尝试读取当前用户唯一的 OTA LaunchAgent 定位服务及源码；有多个服务或路径不同可设置 `FEISHU_CODEX_BRIDGE_IOS_OTA_DIR` 和 `FEISHU_CODEX_BRIDGE_IOS_OTA_SOURCE`，必要时用 `FEISHU_CODEX_BRIDGE_IOS_OTA_BUN` 指定 Bun。Bridge 必须能访问对应目录和源码，后台构建依赖 Mac 的 Xcode、签名账户及钥匙串。
+
+开发服务可以复用 iPhone 已信任的 OTA 根证书，为 Mac 当前 LAN IP 单独签发 5173 服务证书：
+
+```bash
+bun run dev:https:configure -- --ip 10.15.53.70  # 换成 Mac 当前 IPv4
+bun run dev:web:restart                          # 仅重启当前 checkout 的 Vite
+```
+
+配置后，同一个 5173 端口同时支持原有 HTTP 与 HTTPS；如 `https://10.15.53.70:5173/`。HTTPS 证书仅覆盖配置时指定的 IP、`127.0.0.1` 与 `localhost`，IP 变化后需重新配置并重启 Vite。该证书与 OTA 服务端证书分开，根证书不变；不改变 17310 API、7310 安装版服务或用户数据。HTTPS 需要手机能访问该 IP，并已在系统证书信任设置中完全信任根证书。
+
+无线连接排查可运行：
+
+```bash
+bun run network:ip-audit -- --ip 10.15.53.70 --target 10.15.64.113
+```
+
+脚本读取网卡的子网掩码、网关和到目标地址的路由，然后对本地网段做受控 ICMP/ARP 探测。输出中的“候选地址”只代表本次没有观察到响应，不能当作地址所有权确认；手动配置前应使用 DHCP 保留或让网络管理员确认。`--no-probe` 只读取路由，不发送探测包；`--json` 输出机器可读结果。
+
+## iOS 原生 SSH 工作区
+
+iOS App 的 `SSH / Mac` 入口会打开原生工作区：支持密码登录、未加密 Ed25519/ECDSA 私钥登录、首次主机密钥确认、交互式 PTY、终端 resize、连接后命令、主机配置保存，以及从 Tmux 页面打开全屏或半屏工作区。可在手机上生成 Ed25519 密钥，或通过系统文件选择器导入私钥；公钥可查看和复制，并需添加到 SSH 主机的 `~/.ssh/authorized_keys`。私钥材料与元数据分离保存到 `WhenUnlockedThisDeviceOnly` Keychain，不进入 WebView；RSA、加密私钥暂不支持。主机密钥显示稳定的 OpenSSH `SHA256:` 指纹，并按规范化主机和端口持久保存已确认的公钥；相同主机密钥自动信任，变化时才重新确认。密码只通过一次性原生调用进入连接对象，不写入 WebView 存储；主机配置只保存主机、端口、用户名、密钥 ID 和启动命令等非敏感元数据。普通进入工作区会自动载入最近保存且有可用私钥的主机并连接；管理模式才打开主机设置。主机设置默认不读取或展开 Bridge Session；可按需展开绑定，或从已选 Tmux Session 打开时自动读取。iOS 使用 Keychain 中的 Bridge token 校验绑定的 `bridgeOrigin + SSH host/port/user + sessionId + createdAt`，身份不一致则拒绝 API 绑定。
+
+当前 iOS 首阶段尚未接入 SFTP 预览/上传/下载/API fallback、Bridge API-first Session 的完整读写操作、Composer 附件删除/断点恢复或后台常驻重连；已接入一层只读 Session 文件列表、Composer 附件选择/分块上传和 scoped 引用，SFTP transport adapter 仍需真实主机验收，Composer 文本已支持 API-first 和结果未知提示，Session 列表/identity 仍是只读绑定层。原生 SSH 依赖的 SwiftTerm、SwiftNIO SSH 和固定 revision 的 NIOSFTP 已加入 Xcode App target；Xcode 依赖解析、编译、真实 Mac `sshd`/tmux 和 iPhone 触摸/软键盘验收必须分别完成，不能用浏览器或源码检查替代。
+
 ## Android SSH 工作区
 
-App 连接中心可在 Bridge 配对和 SSH / Mac 登录之间切换。SSH 不依赖 Bridge 服务或配对；在已配对的工作台中可通过“系统管理 → App 连接”返回连接中心。旧 `/ssh` 地址在移动端仍进入 SSH 登录。SSH 登录表单可选择原生保存的主机和密钥；已保存私钥按需从设备密钥库读取。密码或临时私钥只在活动 App 会话内存中保留以便重连，显式断开时清空，不写入主机配置。主机、密钥的原有管理功能继续保留。App 鉴权失效时返回此连接中心，可直接选择 SSH；浏览器仍使用原有配对页面。Android 启用摇一摇后，在前台大幅摇晃两下可打开环境选择；在 SSH 工作区取消选择会恢复原界面，转到 Bridge 时只关闭 SSH 界面而不主动断开其 App 会话。
+App 连接中心可在 Bridge 配对和 SSH / Mac 登录之间切换。SSH 不依赖 Bridge 服务或配对；在已配对的工作台中可通过“系统管理 → App 连接”返回连接中心。SSH 登录表单可选择原生保存的主机和密钥；已保存私钥按需从设备密钥库读取。密码或临时私钥只在活动 App 会话内存中保留以便重连，显式断开时清空，不写入主机配置。主机、密钥的原有管理功能继续保留。App 鉴权失效时返回此连接中心，可直接选择 SSH；浏览器仍使用原有配对页面。Android 启用摇一摇后，在前台大幅摇晃两下可打开环境选择；在 SSH 工作区取消选择会恢复原界面，转到 Bridge 时只关闭 SSH 界面而不主动断开其 App 会话。
 
-Android App 打开或回到前台时，会检查当前源码配置的 SSH 默认主机；若存在同主机的已保存配置，使用最近的该配置端口，否则使用 SSH 默认端口。以 TCP 端口是否可连接作为可达性判断：目标不可达时，尝试通过已安装的 **OpenVPN for Android**（`de.blinkt.openvpn`）连接已有配置。SSH 服务未启动也可能使 TCP 探测失败，并不等于电脑一定离线。
+Android App 启动、回到前台和网络变化时会检查已安装的 **OpenVPN for Android**（`de.blinkt.openvpn`）；顶层 Activity 存活期间还会每 30 秒检查一次。免 VPN Wi-Fi 可在连接中心的网络设置中配置，未配对和 SSH 模式也可打开。配置的免 VPN Wi-Fi 上跳过自动启动；如果有免 VPN 列表但无法识别当前 Wi-Fi，会请求精确位置权限。读取 SSID 还需要开启系统位置服务；仍无法识别时跳过自动连接。Bridge 只读取当前 Wi-Fi 的 SSID，不读取 GPS 坐标。其他可用网络上检查并启动或恢复所选 VPN，与 Bridge 是否配对、Bridge/SSH 的 IP 或端口是否可达无关。已有选中 VPN 正在连接或已连接时不重复启动，检测到其他活动 VPN 时不自动替换；认证失败时暂停自动重试，需检查 OpenVPN 配置后手动重试。免 VPN Wi-Fi 不会主动断开已连接的 VPN；在其他网络手动断开后，App 运行时会再次尝试连接。
 
-首次使用需要在 OpenVPN 客户端授权 Bridge 控制，并在系统要求时确认 VPN 权限；已有一个 VPN 配置时自动选用，存在多个配置时选择一次。配置、证书和密码继续由 OpenVPN 保管。目标本来可达时不启动 VPN；已有选中 VPN 正在连接或已连接时不重复启动，检测到其他活动 VPN 时不自动替换。关闭 Bridge 不会断开 VPN。连接请求发出后会短时重试目标端口；目标恢复后，如 Bridge 工作台之前连接失败，会重新检查连接。若 SSH 已先于 VPN 连接失败，可在 SSH 工作区重试；不会自动重放终端输入。此功能已在 Android 模拟器使用临时配置测试，华为真机和公司 VPN 仍需验收。
+摇一摇打开环境弹窗后，可点击当前地址旁的紧凑 VPN 按钮，主动检查当前网络和 VPN；结果在当前页面显示，不主动打开 OpenVPN 主界面。手动检查与自动检查都遵守免 VPN Wi-Fi 列表，匹配时提示已跳过连接；配置了例外但无法确认当前 Wi-Fi 时也不会启动 VPN。手动检查不受自动重试间隔限制，可主动再试一次认证失败的配置，但仍不会自动替换其他 VPN。检查通过并发起连接后，Bridge 会继续监听 OpenVPN 状态，确认收到连接成功状态后显示“VPN 连接成功”并自动清除；失败或超时则保留具体提示。
 
-认证成功后，App 进程内的全局 SSH 会话继续持有交互式 zsh、保活任务和当前 tmux 目标；原生终端嵌入 App 的现有 Activity，关闭终端界面只解除绑定，不会主动断开 SSH。Android 在连接建立及会话活动期间启动前台服务，并显示系统连接通知；所有连接和连接尝试均结束后停止服务。tmux 列表使用同一 SSH 连接上的临时命令通道，文件和附件按需使用同一连接上的 SFTP 通道。
+首次使用需要在 OpenVPN 客户端授权 Bridge 控制，并在系统要求时确认 VPN 权限；已有一个 VPN 配置时自动选用，存在多个配置时选择一次。若客户端需要输入密码，或系统需要授权，仍可能显示相应原生界面。配置、证书和密码继续由 OpenVPN 保管。关闭 Bridge 不会断开 VPN，但顶层 Activity 销毁或进程被系统终止后 Bridge 的定期检查也会停止，后台启动、系统省电策略及 VPN 自身重连仍受 Android 和客户端限制。Bridge API 网络不可达时另行探测当前 API 端口，最多重试 60 秒；端口恢复后通知工作台重试，端口不可达也可能只是 API 未启动。不会自动重放 SSH 终端输入。旧版目标不可达触发流程曾在模拟器使用临时配置测试；本次全局检查仍需华为真机和公司 VPN 验收。
 
-连接成功后先进入交互式 zsh，点击 tmux 打开 Session 列表；列表支持刷新、按名称/目录/ID 筛选和查看附着状态。第一次进入 Session 会在当前 zsh 中执行 attach；已经进入一个 Session 时，当前实现先发送 tmux detach 控制序列，再发送目标 attach。这个过程尚未确认 detach 已完成；如果 tmux 前缀被自定义或 detach 失败，attach 命令可能进入当前 Codex 输入区。修复前应避免在已 attach 的 Session 中使用列表直接切换。SSH 连接或终端中断后，App 级会话在前台和后台自动重试；工作区的重连按钮也直接重试当前连接。重连后按 Session ID 和创建时间核对并重新附加上次 tmux Session，不重放 Composer 或终端输入。目标不存在时提示重新选择；主机指纹变化时须手动确认。进程终止会清除内存凭据，重新打开时只有已保存私钥的主机可自动认证并恢复已记录的 tmux 目标。前台服务不能阻止系统强制停止进程、设备省电策略或网络切换造成断线，tmux 仍负责保留 Mac 上的 Codex 进程。
+认证成功后，App 进程内的全局 SSH 会话继续持有交互式 zsh、保活任务和当前 tmux 目标；原生终端嵌入 App 的现有 Activity，关闭终端界面只解除绑定，不会主动断开 SSH。Android 在连接建立及会话活动期间启动前台服务，并显示系统连接通知；所有连接和连接尝试均结束后停止服务。tmux 列表、Session 文件和 Composer 附件优先使用配对 Bridge API；符合回退条件时分别使用 SSH 临时命令或 SFTP。没有 tmux Session 身份的普通 SSH 文件、附件和技能发现继续使用 SSH/SFTP。
 
-原生 SSH 终端的“更多操作”提供当前 Session 的 Git 文件列表、搜索、Diff、文本预览和下载；操作通过 SSH 调用目标机的 Bridge `ssh-session` CLI，并复用 Web 的 Git、Codex 账号／用量和 Session 业务逻辑。Git 状态包含工作区、暂存区及未跟踪文件，Diff/文本预览沿用 Web 的大小限制；下载使用 SFTP。账号标记与 Web 共用，写入 tmux Session 的 `CODEX_HOME`，供用量查询和新建窗口、窗格继承，不会更改现有 shell 或已经运行的 Codex。检测当前账号需要系统允许读取目标 Codex 进程的环境；环境不可读时应手动选择。
+连接成功后先进入交互式 zsh，点击 tmux 打开 Session 列表；列表支持刷新、按名称/目录/ID 筛选和查看附着状态。第一次进入 Session 会在当前 zsh 中执行 attach；已进入一个 Session 时，当前实现发送 detach 控制序列并等待终端输出匹配 `detached`，超时不继续发送目标 attach。但该文本可能来自普通程序输出，匹配器也可能在 detach 发送前收到输出，因此并不能可靠证明 detach 完成；attach 的 `Written` 也不证明已经附着。切换结果不确定时，请先检查终端和 Session，再发送消息。SSH 连接或终端中断后，App 级会话在前台和后台自动重试；工作区的重连按钮也直接重试当前连接。重连后按 Session ID 和创建时间核对并重新附加上次 tmux Session，不重放 Composer 或终端输入。目标不存在时提示重新选择；主机指纹变化时须手动确认。进程终止会清除内存凭据，重新打开时只有已保存私钥的主机可自动认证并尝试恢复已记录的 tmux 目标。前台服务不能阻止系统强制停止进程、设备省电策略或网络切换造成断线，tmux 仍负责保留 Mac 上的 Codex 进程。
 
-目标机需要包含 `ssh-session` 命令的新版 Bridge，当前仅修改源码不会自动更新已安装版本。SSH 登录环境优先使用 `FEISHU_CODEX_BRIDGE_SSH_CLI` 指定的 Bridge 启动器，其次使用 PATH 中的 `feishu-codex-bridge`，最后查找默认便携安装位置。CLI 默认使用该 Bridge 安装根目录下的 `runtime/bridge.db`，源码运行时使用仓库的 `runtime/bridge.db`；自定义数据库或配置分别通过 `FEISHU_CODEX_BRIDGE_SSH_DB`、`FEISHU_CODEX_BRIDGE_SSH_CONFIG` 显式指定。在线调用会核对服务监听进程和数据库真实路径；默认检查开发端口 17310 和安装版端口 7310，自定义端口时使用 `FEISHU_CODEX_BRIDGE_SSH_PORT` 明确选择，不凭端口判定服务身份；若发现多个实例共用同一数据库，先停止其他实例以避免并发修改。
+原生 SSH 终端的“更多操作”提供当前 Session 的 Git 文件列表、搜索、Diff、文本预览和下载。账号列表、账号标记/检测、用量、Git 和 Session 快照/挂起/恢复/结束优先走配对 Bridge API，读取请求遇到网络或服务不可用等情况时回退目标 SSH 主机上的 `ssh-session` CLI；Session 文件及技能保留 SFTP/SSH 回退。文件列表不完整、旧版服务未提供截断标记或路径包含字面反斜杠时使用 SFTP。写入请求可能已执行但响应丢失时显示结果未知，先刷新核对，不自动重复写入。Composer 附件使用 API 分片上传并确认当前 SSH 主机可读，开始上传前 API 不可用时回退 SFTP；终端按键与 Composer 消息仍经 SSH PTY，不产生 Web Session 操作历史。Bridge 为原生 SSH API 请求记录脱敏路由、Session ID、状态和耗时，不记录令牌、文件内容或查询参数。
 
-挂起先保存所选 Session 的快照并停止其中的进程；SSH 和 Web 使用相同的数据库与快照记录，恢复入口位于 SSH 的 tmux 列表。恢复按 tmux-resurrect 的配置重建窗格和允许恢复的进程，不保证恢复进程的内存状态。目标机需要 tmux、tmux-resurrect、Git、Codex CLI 和 `lsof`。Bridge 服务未运行时，可在确认相关服务均已停止后显式设置 `FEISHU_CODEX_BRIDGE_SSH_OFFLINE=1`，CLI 会先检查数据库占用，再使用同一套逻辑离线操作；不会隐式创建新库。离线操作须串行执行，且操作期间不要启动 Bridge 服务：`lsof` 占用检查不是跨进程独占锁。存在同名挂起 Session 时，先恢复或改名，避免覆盖其快照。旧 Python 版本若曾在 `~/.feishu-codex-bridge/ssh-sessions/` 留下独立快照，这些文件不会被删除或自动并入 Web 数据库。手机界面、系统文件下载、实际 SSH 断线和真实主机恢复仍需设备验收。
+Git 状态包含工作区、暂存区及未跟踪文件，Diff/文本预览沿用 Web 的大小限制。账号标记写入所操作 tmux Session 的 `CODEX_HOME`，供用量查询和新建窗口、窗格继承，不会更改现有 shell 或已经运行的 Codex。默认 SSH 和私有 Bridge 目标复用同一个 Mac 主机配置，但已保存或手动选择的 SSH 主机、不同 Bridge 环境和不同数据库未自动绑定；切换目标后应核对当前环境和 Session。检测当前账号需要系统允许读取目标 Codex 进程的环境；环境不可读时应手动选择。
+
+目标机需要包含 `ssh-session` 命令的新版 Bridge，当前仅修改源码不会自动更新已安装版本。SSH 登录环境优先使用 `FEISHU_CODEX_BRIDGE_SSH_CLI` 指定的 Bridge 启动器，其次使用 PATH 中的 `feishu-codex-bridge`，最后查找默认便携安装位置。CLI 降级直接调用 tmux、Git 和 Codex app-server，不检查、打开或写入 Bridge SQLite；旧的 `--db`、`FEISHU_CODEX_BRIDGE_SSH_DB` 参数仍可传入但不再参与降级操作。`FEISHU_CODEX_BRIDGE_SSH_CONFIG` 仍可指定 Codex 配置。新 App 会传入 Session 的逻辑工作目录；旧 App 未提供时 Git 降级查看当前 tmux pane 目录。
+
+挂起先保存所选 Session 的快照并停止其中的进程。API 不可达时，CLI 在 tmux-resurrect 目录下的 `bridge-ssh-fallback` 中保存独立快照和身份元数据，不覆盖 Web 快照；恢复按 tmux-resurrect 的配置重建窗格和允许恢复的进程，不保证恢复进程的内存状态。Bridge API 恢复后，若两边配置同一快照目录，Web 和 Android 可看到降级快照，通过 API 恢复时重新关联已有 Session 记录。仅通过 CLI 恢复、终结或修改账号标记不会写入 Web 数据库，状态及账号可能需在 Web 重新核对；降级期间无法列出只存在于 Web 数据库中的旧挂起记录。目标机需要 tmux、tmux-resurrect、Git 和 Codex CLI；同一降级快照操作使用文件锁，异常退出留下锁时须先确认没有其他操作再处理。存在同名挂起快照时，先恢复或改名，避免覆盖。旧 Python 版本若曾在 `~/.feishu-codex-bridge/ssh-sessions/` 留下独立快照，这些文件不会被删除或自动并入 Web 数据库。手机界面、系统文件下载、实际 SSH 断线和真实主机恢复仍需设备验收。
 
 Android 原生 SSH Composer 的“调试日志”按钮首次点击开始记录，再次点击停止并直接复制 JSON；若断线后停在主机或连接设置页，可使用“停止并复制诊断日志”。原有“导出滚动日志”仍可保存文件。记录覆盖 Activity/工作区与系统文件选择器生命周期、SSH 连接与重连阶段、会话断开来源、心跳、前台服务及网络类型变化；进程重建后继续记录，并在系统提供时附上退出原因。报告包括设备型号、Android/App 版本和电池优化状态，不采集其他应用或系统全量 logcat、SSH 地址、用户名、命令、终端文本、密码或私钥，异常只保留类型和固定错误类别。Activity 事件最多保留最近 800 条，数据保存在 App 私有存储；开始新记录会覆盖上一次记录。
 
@@ -114,6 +215,11 @@ App 内置页面，不使用 Capacitor `server.url` 加载远端网页，也不�
 - 模拟系统图片选择器引发的同步 visibilitychange，扫码页保持存在并能继续配对；图片仍在解码时用系统返回退出，解码结束后不会在后台提交配对。配对码和设备 token 未写入浏览器存储。
 - 320/390/1280px 深浅主题无横向溢出，输入框保持 16px。仅重建 App 前端并同步原生工程，没有重新编译 APK/IPA、安装真机或部署服务；相机权限、系统相册和实际 Android/iOS WebView 行为仍需真机验收。
 
+2026-11-08 iOS SSH 阶段验证：
+
+- 使用 `HTTP_PROXY=http://127.0.0.1:7897 HTTPS_PROXY=http://127.0.0.1:7897 bun run mobile:ios:resolve` 解析 SwiftTerm `1.15.0`、SwiftNIO SSH `0.13.0` 与 SwiftNIO `2.81.0`；随后 `xcodebuild ... CODE_SIGNING_ALLOWED=NO build` 通过。
+- iOS 原生已覆盖密码/未加密 Ed25519/ECDSA 私钥、Session 列表只读选择、文本 Composer API-first、Composer 附件分块上传和 `bridgeOrigin + SSH host/port/user + sessionId + createdAt` identity 校验；未完成 SFTP 完整文件操作、签名安装和真机验收。
+
 2026-10-25 的开发机验证：
 
 - 完整测试 400 项通过，0 失败；前后端 TypeScript 检查通过。新增测试覆盖手机配对、Bearer/CORS、流票据、设备撤销、HTTP/1 文件请求体、连接切换与 SSE 生命周期；原浏览器鉴权和连接回归通过。
@@ -134,7 +240,7 @@ App 内置页面，不使用 Capacitor `server.url` 加载远端网页，也不�
 - [ ] 刘海/系统栏安全区、横竖屏、软键盘、系统返回键、后台返回和网络切换。
 - [ ] HTTPS 信任链与自用 LAN HTTP，iOS 首次局域网授权、拒绝权限后恢复。
 
-首版未接入 APNs/FCM 推送、后台常驻推送、应用商店分发或自动更新。Bridge WebSocket 进入后台后由系统管理；重新进入前台恢复工作台，不承诺后台 WebSocket 始终存活。Android SSH 的前台连接服务与 WebSocket 连接分别管理。
+首版未接入 APNs/FCM 推送、后台常驻推送、应用商店分发或静默安装更新；Android 已有检查、下载和手动打开系统安装器的更新流程。Bridge WebSocket 进入后台后由系统管理；重新进入前台恢复工作台，不承诺后台 WebSocket 始终存活。Android SSH 的前台连接服务与 WebSocket 连接分别管理。
 
 ## 官方资料
 

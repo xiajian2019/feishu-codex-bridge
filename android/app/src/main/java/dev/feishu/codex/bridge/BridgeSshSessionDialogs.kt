@@ -40,7 +40,10 @@ import org.json.JSONObject
 internal data class BridgeSshGitFile(val path: String, val status: String, val size: Long?)
 internal data class BridgeSshGitState(val root: String, val branch: String, val files: List<BridgeSshGitFile>)
 internal data class BridgeSshCodexHome(val id: String, val path: String, val label: String)
-internal data class BridgeSshSuspendedSession(val id: String, val createdAt: Long, val name: String, val cwd: String)
+internal data class BridgeSshSuspendedSession(
+    val id: String, val createdAt: Long, val name: String, val cwd: String,
+    val source: String = "", val uncertain: Boolean = false,
+)
 
 internal data class BridgeSshDiffLine(val text: String, val oldLine: Int?, val newLine: Int?)
 

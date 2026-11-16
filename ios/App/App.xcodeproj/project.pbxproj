@@ -7,12 +7,6 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A73101000000000000000001 /* BridgeShareInboxPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = A73101000000000000000011; };
-		A73101000000000000000002 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A73101000000000000000012; };
-		A73101000000000000000003 /* BridgeShare.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = A73101000000000000000013; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
-		B41D6E010000000000000001 /* BridgeCredentialsPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = B41D6E010000000000000011 /* BridgeCredentialsPlugin.swift */; };
-		B41D6E010000000000000002 /* BridgeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B41D6E010000000000000012 /* BridgeViewController.swift */; };
-		B41D6E010000000000000003 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = B41D6E010000000000000013 /* PrivacyInfo.xcprivacy */; };
 		2FAD9763203C412B000D30F8 /* config.xml in Resources */ = {isa = PBXBuildFile; fileRef = 2FAD9762203C412B000D30F8 /* config.xml */; };
 		4D22ABE92AF431CB00220026 /* CapApp-SPM in Frameworks */ = {isa = PBXBuildFile; productRef = 4D22ABE82AF431CB00220026 /* CapApp-SPM */; };
 		50379B232058CBB4000EE86E /* capacitor.config.json in Resources */ = {isa = PBXBuildFile; fileRef = 50379B222058CBB4000EE86E /* capacitor.config.json */; };
@@ -21,10 +15,121 @@
 		504EC30F1FED79650016851F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 504EC30E1FED79650016851F /* Assets.xcassets */; };
 		504EC3121FED79650016851F /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 504EC3101FED79650016851F /* LaunchScreen.storyboard */; };
 		50B271D11FEDC1A000F3C39B /* public in Resources */ = {isa = PBXBuildFile; fileRef = 50B271D01FEDC1A000F3C39B /* public */; };
+		517BF68930A6B6D5003D3AE2 /* BridgeCredentialsPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = B41D6E010000000000000011 /* BridgeCredentialsPlugin.swift */; };
+		517BF68A30A6B6D5003D3AE2 /* BridgeConnectBotSSHPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000011 /* BridgeConnectBotSSHPlugin.swift */; };
+		517BF68B30A6B6D5003D3AE2 /* BridgeIOSSHWorkspace.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000012 /* BridgeIOSSHWorkspace.swift */; };
+		517BF68C30A6B6D5003D3AE2 /* BridgeNativeThemePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000013 /* BridgeNativeThemePlugin.swift */; };
+		517BF68D30A6B6D5003D3AE2 /* BridgeIOSSHSessionAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000014 /* BridgeIOSSHSessionAPI.swift */; };
+		517BF68E30A6B6D5003D3AE2 /* BridgeIOSSHPrivateKeySupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000015 /* BridgeIOSSHPrivateKeySupport.swift */; };
+		517BF68F30A6B6D5003D3AE2 /* BridgeIOSSHKeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000016 /* BridgeIOSSHKeychainStore.swift */; };
+		517BF69030A6B6D5003D3AE2 /* BridgeIOSSHSFTPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000017 /* BridgeIOSSHSFTPClient.swift */; };
+		517BF69130A6B6D5003D3AE2 /* BridgeShareInboxPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = A73101000000000000000011 /* BridgeShareInboxPlugin.swift */; };
+		517BF69230A6B6D5003D3AE2 /* BridgeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B41D6E010000000000000012 /* BridgeViewController.swift */; };
+		517BF69330A6B6D5003D3AE2 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 504EC3071FED79650016851F /* AppDelegate.swift */; };
+		517BF69430A6B6D5003D3AE2 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9582B6822FE993A50072D4E8 /* SceneDelegate.swift */; };
+		517BF69530A6B6D5003D3AE2 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = B41D6E010000000000000013 /* PrivacyInfo.xcprivacy */; };
+		517BF69630A6B6D5003D3AE2 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 504EC3101FED79650016851F /* LaunchScreen.storyboard */; };
+		517BF69730A6B6D5003D3AE2 /* public in Resources */ = {isa = PBXBuildFile; fileRef = 50B271D01FEDC1A000F3C39B /* public */; };
+		517BF69830A6B6D5003D3AE2 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 504EC30E1FED79650016851F /* Assets.xcassets */; };
+		517BF69930A6B6D5003D3AE2 /* capacitor.config.json in Resources */ = {isa = PBXBuildFile; fileRef = 50379B222058CBB4000EE86E /* capacitor.config.json */; };
+		517BF69A30A6B6D5003D3AE2 /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 504EC30B1FED79650016851F /* Main.storyboard */; };
+		517BF69B30A6B6D5003D3AE2 /* config.xml in Resources */ = {isa = PBXBuildFile; fileRef = 2FAD9762203C412B000D30F8 /* config.xml */; };
+		67A295E21BD74A3485D654F6 /* TunnelKitOpenVPN in Frameworks */ = {isa = PBXBuildFile; productRef = B7C000000000000000000022 /* TunnelKitOpenVPN */; };
 		9582B6832FE993A70072D4E8 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9582B6822FE993A50072D4E8 /* SceneDelegate.swift */; };
+		A73101000000000000000001 /* BridgeShareInboxPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = A73101000000000000000011 /* BridgeShareInboxPlugin.swift */; };
+		A73101000000000000000002 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A73101000000000000000012 /* ShareViewController.swift */; };
+		A73101000000000000000003 /* BridgeShare.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = A73101000000000000000013 /* BridgeShare.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		B41D6E010000000000000001 /* BridgeCredentialsPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = B41D6E010000000000000011 /* BridgeCredentialsPlugin.swift */; };
+		B41D6E010000000000000002 /* BridgeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B41D6E010000000000000012 /* BridgeViewController.swift */; };
+		B41D6E010000000000000003 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = B41D6E010000000000000013 /* PrivacyInfo.xcprivacy */; };
+		B7C000000000000000000001 /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7C000000000000000000011 /* PacketTunnelProvider.swift */; };
+		B7C000000000000000000002 /* TunnelKitOpenVPNAppExtension in Frameworks */ = {isa = PBXBuildFile; productRef = B7C000000000000000000021 /* TunnelKitOpenVPNAppExtension */; };
+		B7C000000000000000000003 /* TunnelKitOpenVPN in Frameworks */ = {isa = PBXBuildFile; productRef = B7C000000000000000000022 /* TunnelKitOpenVPN */; };
+		B7C000000000000000000004 /* TunnelKitLZO in Frameworks */ = {isa = PBXBuildFile; productRef = B7C000000000000000000023 /* TunnelKitLZO */; };
+		B7C000000000000000000005 /* BridgePacketTunnel.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = B7C000000000000000000013 /* BridgePacketTunnel.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		B7C000000000000000000006 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B7C000000000000000000016 /* NetworkExtension.framework */; };
+		B7C000000000000000000007 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B7C000000000000000000016 /* NetworkExtension.framework */; };
+		B7C000000000000000000008 /* TunnelKit in Frameworks */ = {isa = PBXBuildFile; productRef = B7C00000000000000000002A /* TunnelKit */; };
+		B7C00000000000000000000B /* BridgeAutoVpnCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7C000000000000000000018 /* BridgeAutoVpnCoordinator.swift */; };
+		B7C00000000000000000000C /* BridgeAutoVpnPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7C000000000000000000019 /* BridgeAutoVpnPlugin.swift */; };
+		B7C00000000000000000000D /* BridgeVpnProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7C00000000000000000001A /* BridgeVpnProfileStore.swift */; };
+		B7C00000000000000000000E /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B7C000000000000000000017 /* Network.framework */; };
+		B7C00000000000000000000F /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B7C000000000000000000017 /* Network.framework */; };
+		B7C000000000000000000010 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B7C000000000000000000016 /* NetworkExtension.framework */; };
+		C1A000000000000000000001 /* BridgeConnectBotSSHPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000011 /* BridgeConnectBotSSHPlugin.swift */; };
+		C1A000000000000000000002 /* BridgeIOSSHWorkspace.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000012 /* BridgeIOSSHWorkspace.swift */; };
+		C1A000000000000000000003 /* BridgeNativeThemePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000013 /* BridgeNativeThemePlugin.swift */; };
+		C1A000000000000000000004 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000021 /* SwiftTerm */; };
+		C1A000000000000000000005 /* NIOSSH in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000022 /* NIOSSH */; };
+		C1A000000000000000000006 /* NIOCore in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000023 /* NIOCore */; };
+		C1A000000000000000000007 /* NIOPosix in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000024 /* NIOPosix */; };
+		C1A000000000000000000008 /* BridgeIOSSHSessionAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000014 /* BridgeIOSSHSessionAPI.swift */; };
+		C1A000000000000000000009 /* BridgeIOSSHPrivateKeySupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000015 /* BridgeIOSSHPrivateKeySupport.swift */; };
+		C1A00000000000000000000A /* BridgeIOSSHKeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000016 /* BridgeIOSSHKeychainStore.swift */; };
+		C1A00000000000000000000B /* NIOSFTP in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000025 /* NIOSFTP */; };
+		C1A00000000000000000000C /* BridgeIOSSHSFTPClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A000000000000000000017 /* BridgeIOSSHSFTPClient.swift */; };
+		D7A000000000000000000101 /* CapApp-SPM in Frameworks */ = {isa = PBXBuildFile; productRef = 4D22ABE82AF431CB00220026 /* CapApp-SPM */; };
+		D7A000000000000000000102 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000021 /* SwiftTerm */; };
+		D7A000000000000000000103 /* NIOSSH in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000022 /* NIOSSH */; };
+		D7A000000000000000000104 /* NIOCore in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000023 /* NIOCore */; };
+		D7A000000000000000000105 /* NIOPosix in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000024 /* NIOPosix */; };
+		D7A000000000000000000106 /* NIOSFTP in Frameworks */ = {isa = PBXBuildFile; productRef = C1A000000000000000000025 /* NIOSFTP */; };
+		E8A000000000000000000001 /* BridgeLwIP in Frameworks */ = {isa = PBXBuildFile; productRef = E8A000000000000000000021 /* BridgeLwIP */; };
+		E8A000000000000000000002 /* TunnelKitOpenVPNProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = B7C00000000000000000002B /* TunnelKitOpenVPNProtocol */; };
+		E8A000000000000000000003 /* BridgeAppOnlyVpnProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8A000000000000000000011 /* BridgeAppOnlyVpnProfileStore.swift */; };
+		E8A000000000000000000004 /* BridgeAppOnlyVpnCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8A000000000000000000012 /* BridgeAppOnlyVpnCore.swift */; };
+		E8A000000000000000000005 /* BridgeAppOnlyVpnPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8A000000000000000000013 /* BridgeAppOnlyVpnPlugin.swift */; };
+		E8A000000000000000000006 /* TunnelKitLZO in Frameworks */ = {isa = PBXBuildFile; productRef = B7C000000000000000000023 /* TunnelKitLZO */; };
+		F9C000000000000000000001 /* BridgeCrashDiagnosticsPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9C000000000000000000011 /* BridgeCrashDiagnosticsPlugin.swift */; };
+		F9C000000000000000000002 /* BridgeCrashDiagnosticsPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9C000000000000000000011 /* BridgeCrashDiagnosticsPlugin.swift */; };
+		F9C000000000000000000003 /* BridgeCrashDiagnostics in Frameworks */ = {isa = PBXBuildFile; productRef = F9C000000000000000000021 /* BridgeCrashDiagnostics */; };
+		F9C000000000000000000004 /* BridgeCrashDiagnostics in Frameworks */ = {isa = PBXBuildFile; productRef = F9C000000000000000000021 /* BridgeCrashDiagnostics */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		A73101000000000000000021 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 504EC2FC1FED79650016851F /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A73101000000000000000030;
+			remoteInfo = BridgeShare;
+		};
+		B7C000000000000000000020 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 504EC2FC1FED79650016851F /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B7C000000000000000000030;
+			remoteInfo = BridgePacketTunnel;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A73101000000000000000022 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				A73101000000000000000003 /* BridgeShare.appex in Embed App Extensions */,
+				B7C000000000000000000005 /* BridgePacketTunnel.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		2FAD9762203C412B000D30F8 /* config.xml */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = config.xml; sourceTree = "<group>"; };
+		50379B222058CBB4000EE86E /* capacitor.config.json */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.json; path = capacitor.config.json; sourceTree = "<group>"; };
+		504EC3041FED79650016851F /* AppVpn.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AppVpn.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		504EC3071FED79650016851F /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		504EC30C1FED79650016851F /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/Main.storyboard; sourceTree = "<group>"; };
+		504EC30E1FED79650016851F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		504EC3111FED79650016851F /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
+		504EC3131FED79650016851F /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		50B271D01FEDC1A000F3C39B /* public */ = {isa = PBXFileReference; lastKnownFileType = folder; path = public; sourceTree = "<group>"; };
+		9582B6822FE993A50072D4E8 /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneDelegate.swift; sourceTree = "<group>"; };
+		958DCC722DB07C7200EA8C5F /* debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = debug.xcconfig; path = ../debug.xcconfig; sourceTree = SOURCE_ROOT; };
 		A73101000000000000000011 /* BridgeShareInboxPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeShareInboxPlugin.swift; sourceTree = "<group>"; };
 		A73101000000000000000012 /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
 		A73101000000000000000013 /* BridgeShare.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = BridgeShare.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -34,44 +139,92 @@
 		B41D6E010000000000000011 /* BridgeCredentialsPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeCredentialsPlugin.swift; sourceTree = "<group>"; };
 		B41D6E010000000000000012 /* BridgeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeViewController.swift; sourceTree = "<group>"; };
 		B41D6E010000000000000013 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
-		2FAD9762203C412B000D30F8 /* config.xml */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = config.xml; sourceTree = "<group>"; };
-		50379B222058CBB4000EE86E /* capacitor.config.json */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.json; path = capacitor.config.json; sourceTree = "<group>"; };
-		504EC3041FED79650016851F /* App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = App.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		504EC3071FED79650016851F /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
-		504EC30C1FED79650016851F /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/Main.storyboard; sourceTree = "<group>"; };
-		504EC30E1FED79650016851F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		504EC3111FED79650016851F /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
-		504EC3131FED79650016851F /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		50B271D01FEDC1A000F3C39B /* public */ = {isa = PBXFileReference; lastKnownFileType = folder; path = public; sourceTree = "<group>"; };
-		9582B6822FE993A50072D4E8 /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneDelegate.swift; sourceTree = "<group>"; };
-		958DCC722DB07C7200EA8C5F /* debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = debug.xcconfig; path = ../debug.xcconfig; sourceTree = SOURCE_ROOT; };
+		B7C000000000000000000011 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
+		B7C000000000000000000012 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B7C000000000000000000013 /* BridgePacketTunnel.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = BridgePacketTunnel.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		B7C000000000000000000014 /* PacketTunnel.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PacketTunnel.entitlements; sourceTree = "<group>"; };
+		B7C000000000000000000016 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
+		B7C000000000000000000017 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
+		B7C000000000000000000018 /* BridgeAutoVpnCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeAutoVpnCoordinator.swift; sourceTree = "<group>"; };
+		B7C000000000000000000019 /* BridgeAutoVpnPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeAutoVpnPlugin.swift; sourceTree = "<group>"; };
+		B7C00000000000000000001A /* BridgeVpnProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeVpnProfileStore.swift; sourceTree = "<group>"; };
+		C1A000000000000000000011 /* BridgeConnectBotSSHPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeConnectBotSSHPlugin.swift; sourceTree = "<group>"; };
+		C1A000000000000000000012 /* BridgeIOSSHWorkspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeIOSSHWorkspace.swift; sourceTree = "<group>"; };
+		C1A000000000000000000013 /* BridgeNativeThemePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeNativeThemePlugin.swift; sourceTree = "<group>"; };
+		C1A000000000000000000014 /* BridgeIOSSHSessionAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeIOSSHSessionAPI.swift; sourceTree = "<group>"; };
+		C1A000000000000000000015 /* BridgeIOSSHPrivateKeySupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeIOSSHPrivateKeySupport.swift; sourceTree = "<group>"; };
+		C1A000000000000000000016 /* BridgeIOSSHKeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeIOSSHKeychainStore.swift; sourceTree = "<group>"; };
+		C1A000000000000000000017 /* BridgeIOSSHSFTPClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeIOSSHSFTPClient.swift; sourceTree = "<group>"; };
+		E8A000000000000000000011 /* BridgeAppOnlyVpnProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeAppOnlyVpnProfileStore.swift; sourceTree = "<group>"; };
+		E8A000000000000000000012 /* BridgeAppOnlyVpnCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeAppOnlyVpnCore.swift; sourceTree = "<group>"; };
+		E8A000000000000000000013 /* BridgeAppOnlyVpnPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeAppOnlyVpnPlugin.swift; sourceTree = "<group>"; };
+		D7A000000000000000000013 /* App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = App.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F9C000000000000000000011 /* BridgeCrashDiagnosticsPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeCrashDiagnosticsPlugin.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
-/* Begin PBXContainerItemProxy section */
-		A73101000000000000000021 = {isa = PBXContainerItemProxy; containerPortal = 504EC2FC1FED79650016851F; proxyType = 1; remoteGlobalIDString = A73101000000000000000030; remoteInfo = BridgeShare; };
-/* End PBXContainerItemProxy section */
-
-/* Begin PBXCopyFilesBuildPhase section */
-		A73101000000000000000022 /* Embed App Extensions */ = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 13; files = (A73101000000000000000003, ); name = "Embed App Extensions"; runOnlyForDeploymentPostprocessing = 0; };
-/* End PBXCopyFilesBuildPhase section */
-
 /* Begin PBXFrameworksBuildPhase section */
-		A73101000000000000000023 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		504EC3011FED79650016851F /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 				4D22ABE92AF431CB00220026 /* CapApp-SPM in Frameworks */,
+				67A295E21BD74A3485D654F6 /* TunnelKitOpenVPN in Frameworks */,
+				B7C000000000000000000007 /* NetworkExtension.framework in Frameworks */,
+				B7C00000000000000000000E /* Network.framework in Frameworks */,
+				B7C000000000000000000008 /* TunnelKit in Frameworks */,
+				C1A000000000000000000004 /* SwiftTerm in Frameworks */,
+				C1A000000000000000000005 /* NIOSSH in Frameworks */,
+				C1A000000000000000000006 /* NIOCore in Frameworks */,
+				C1A000000000000000000007 /* NIOPosix in Frameworks */,
+				C1A00000000000000000000B /* NIOSFTP in Frameworks */,
+				F9C000000000000000000003 /* BridgeCrashDiagnostics in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A73101000000000000000023 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B7C000000000000000000034 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B7C000000000000000000002 /* TunnelKitOpenVPNAppExtension in Frameworks */,
+				B7C000000000000000000003 /* TunnelKitOpenVPN in Frameworks */,
+				B7C000000000000000000004 /* TunnelKitLZO in Frameworks */,
+				B7C000000000000000000006 /* NetworkExtension.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D7A000000000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D7A000000000000000000101 /* CapApp-SPM in Frameworks */,
+				B7C00000000000000000000F /* Network.framework in Frameworks */,
+				B7C000000000000000000010 /* NetworkExtension.framework in Frameworks */,
+				D7A000000000000000000102 /* SwiftTerm in Frameworks */,
+				D7A000000000000000000103 /* NIOSSH in Frameworks */,
+				D7A000000000000000000104 /* NIOCore in Frameworks */,
+				D7A000000000000000000105 /* NIOPosix in Frameworks */,
+				D7A000000000000000000106 /* NIOSFTP in Frameworks */,
+				E8A000000000000000000001 /* BridgeLwIP in Frameworks */,
+				E8A000000000000000000002 /* TunnelKitOpenVPNProtocol in Frameworks */,
+				E8A000000000000000000006 /* TunnelKitLZO in Frameworks */,
+				F9C000000000000000000004 /* BridgeCrashDiagnostics in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		A73101000000000000000024 /* ShareExtension */ = {isa = PBXGroup; children = (A73101000000000000000012, A73101000000000000000014, A73101000000000000000015, ); path = ShareExtension; sourceTree = "<group>"; };
 		504EC2FB1FED79650016851F = {
 			isa = PBXGroup;
 			children = (
+				B7C000000000000000000024 /* PacketTunnel */,
 				958DCC722DB07C7200EA8C5F /* debug.xcconfig */,
 				A73101000000000000000024 /* ShareExtension */,
 				504EC3061FED79650016851F /* App */,
@@ -82,8 +235,10 @@
 		504EC3051FED79650016851F /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				504EC3041FED79650016851F /* App.app */,
+				504EC3041FED79650016851F /* AppVpn.app */,
+				D7A000000000000000000013 /* App.app */,
 				A73101000000000000000013 /* BridgeShare.appex */,
+				B7C000000000000000000013 /* BridgePacketTunnel.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -92,6 +247,21 @@
 			isa = PBXGroup;
 			children = (
 				B41D6E010000000000000011 /* BridgeCredentialsPlugin.swift */,
+				C1A000000000000000000011 /* BridgeConnectBotSSHPlugin.swift */,
+				C1A000000000000000000012 /* BridgeIOSSHWorkspace.swift */,
+				C1A000000000000000000013 /* BridgeNativeThemePlugin.swift */,
+				C1A000000000000000000014 /* BridgeIOSSHSessionAPI.swift */,
+				C1A000000000000000000015 /* BridgeIOSSHPrivateKeySupport.swift */,
+				C1A000000000000000000016 /* BridgeIOSSHKeychainStore.swift */,
+				C1A000000000000000000017 /* BridgeIOSSHSFTPClient.swift */,
+				B7C000000000000000000018 /* BridgeAutoVpnCoordinator.swift */,
+				B7C000000000000000000019 /* BridgeAutoVpnPlugin.swift */,
+				B7C00000000000000000001A /* BridgeVpnProfileStore.swift */,
+				E8A000000000000000000011 /* BridgeAppOnlyVpnProfileStore.swift */,
+				E8A000000000000000000012 /* BridgeAppOnlyVpnCore.swift */,
+				E8A000000000000000000013 /* BridgeAppOnlyVpnPlugin.swift */,
+				F9C000000000000000000011 /* BridgeCrashDiagnosticsPlugin.swift */,
+				B7C000000000000000000017 /* Network.framework */,
 				A73101000000000000000011 /* BridgeShareInboxPlugin.swift */,
 				A73101000000000000000016 /* App.entitlements */,
 				B41D6E010000000000000012 /* BridgeViewController.swift */,
@@ -109,13 +279,33 @@
 			path = App;
 			sourceTree = "<group>";
 		};
+		A73101000000000000000024 /* ShareExtension */ = {
+			isa = PBXGroup;
+			children = (
+				A73101000000000000000012 /* ShareViewController.swift */,
+				A73101000000000000000014 /* Info.plist */,
+				A73101000000000000000015 /* ShareExtension.entitlements */,
+			);
+			path = ShareExtension;
+			sourceTree = "<group>";
+		};
+		B7C000000000000000000024 /* PacketTunnel */ = {
+			isa = PBXGroup;
+			children = (
+				B7C000000000000000000011 /* PacketTunnelProvider.swift */,
+				B7C000000000000000000012 /* Info.plist */,
+				B7C000000000000000000014 /* PacketTunnel.entitlements */,
+				B7C000000000000000000016 /* NetworkExtension.framework */,
+			);
+			path = PacketTunnel;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		A73101000000000000000030 /* BridgeShare */ = {isa = PBXNativeTarget; buildConfigurationList = A73101000000000000000040; buildPhases = (A73101000000000000000031, A73101000000000000000023, A73101000000000000000032, ); buildRules = (); dependencies = (); name = BridgeShare; productName = BridgeShare; productReference = A73101000000000000000013; productType = "com.apple.product-type.app-extension"; };
-		504EC3031FED79650016851F /* App */ = {
+		504EC3031FED79650016851F /* AppVpn */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 504EC3161FED79650016851F /* Build configuration list for PBXNativeTarget "App" */;
+			buildConfigurationList = 504EC3161FED79650016851F /* Build configuration list for PBXNativeTarget "AppVpn" */;
 			buildPhases = (
 				504EC3001FED79650016851F /* Sources */,
 				A73101000000000000000022 /* Embed App Extensions */,
@@ -125,14 +315,91 @@
 			buildRules = (
 			);
 			dependencies = (
-				A73101000000000000000033,
+				A73101000000000000000033 /* PBXTargetDependency */,
+				B7C000000000000000000033 /* PBXTargetDependency */,
+			);
+			name = AppVpn;
+			packageProductDependencies = (
+				4D22ABE82AF431CB00220026 /* CapApp-SPM */,
+				C1A000000000000000000021 /* SwiftTerm */,
+				C1A000000000000000000022 /* NIOSSH */,
+				C1A000000000000000000023 /* NIOCore */,
+				C1A000000000000000000024 /* NIOPosix */,
+				C1A000000000000000000025 /* NIOSFTP */,
+				B7C000000000000000000022 /* TunnelKitOpenVPN */,
+				B7C00000000000000000002A /* TunnelKit */,
+				F9C000000000000000000021 /* BridgeCrashDiagnostics */,
+			);
+			productName = AppVpn;
+			productReference = 504EC3041FED79650016851F /* AppVpn.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A73101000000000000000030 /* BridgeShare */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A73101000000000000000040 /* Build configuration list for PBXNativeTarget "BridgeShare" */;
+			buildPhases = (
+				A73101000000000000000031 /* Sources */,
+				A73101000000000000000023 /* Frameworks */,
+				A73101000000000000000032 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = BridgeShare;
+			productName = BridgeShare;
+			productReference = A73101000000000000000013 /* BridgeShare.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		B7C000000000000000000030 /* BridgePacketTunnel */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B7C000000000000000000040 /* Build configuration list for PBXNativeTarget "BridgePacketTunnel" */;
+			buildPhases = (
+				B7C000000000000000000035 /* Sources */,
+				B7C000000000000000000034 /* Frameworks */,
+				B7C000000000000000000032 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = BridgePacketTunnel;
+			packageProductDependencies = (
+				B7C000000000000000000021 /* TunnelKitOpenVPNAppExtension */,
+				B7C000000000000000000022 /* TunnelKitOpenVPN */,
+				B7C000000000000000000023 /* TunnelKitLZO */,
+			);
+			productName = BridgePacketTunnel;
+			productReference = B7C000000000000000000013 /* BridgePacketTunnel.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		D7A000000000000000000030 /* App */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D7A000000000000000000040 /* Build configuration list for PBXNativeTarget "App" */;
+			buildPhases = (
+				D7A000000000000000000003 /* Sources */,
+				D7A000000000000000000002 /* Frameworks */,
+				D7A000000000000000000004 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
 			);
 			name = App;
 			packageProductDependencies = (
 				4D22ABE82AF431CB00220026 /* CapApp-SPM */,
+				C1A000000000000000000021 /* SwiftTerm */,
+				C1A000000000000000000022 /* NIOSSH */,
+				C1A000000000000000000023 /* NIOCore */,
+				C1A000000000000000000024 /* NIOPosix */,
+				C1A000000000000000000025 /* NIOSFTP */,
+				B7C00000000000000000002B /* TunnelKitOpenVPNProtocol */,
+				B7C000000000000000000023 /* TunnelKitLZO */,
+				E8A000000000000000000021 /* BridgeLwIP */,
+				F9C000000000000000000021 /* BridgeCrashDiagnostics */,
 			);
 			productName = App;
-			productReference = 504EC3041FED79650016851F /* App.app */;
+			productReference = D7A000000000000000000013 /* App.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -144,10 +411,31 @@
 				LastSwiftUpdateCheck = 0920;
 				LastUpgradeCheck = 0920;
 				TargetAttributes = {
-					A73101000000000000000030 = {CreatedOnToolsVersion = 26.0; ProvisioningStyle = Automatic; SystemCapabilities = {com.apple.ApplicationGroups.iOS = {enabled = 1; }; }; };
 					504EC3031FED79650016851F = {
 						CreatedOnToolsVersion = 9.2;
 						LastSwiftMigration = 1100;
+						ProvisioningStyle = Automatic;
+					};
+					A73101000000000000000030 = {
+						CreatedOnToolsVersion = 26.0;
+						ProvisioningStyle = Automatic;
+						SystemCapabilities = {
+							com.apple.ApplicationGroups.iOS = {
+								enabled = 1;
+							};
+						};
+					};
+					B7C000000000000000000030 = {
+						CreatedOnToolsVersion = 27.0;
+						ProvisioningStyle = Automatic;
+						SystemCapabilities = {
+							com.apple.NetworkExtensions = {
+								enabled = 1;
+							};
+						};
+					};
+					D7A000000000000000000030 = {
+						CreatedOnToolsVersion = 27.0;
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -163,19 +451,27 @@
 			mainGroup = 504EC2FB1FED79650016851F;
 			packageReferences = (
 				D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */,
+				B7C000000000000000000031 /* XCLocalSwiftPackageReference "Packages/TunnelKitOpenVPN" */,
+				E8A000000000000000000031 /* XCLocalSwiftPackageReference "Packages/BridgeLwIP" */,
+				F9C000000000000000000031 /* XCLocalSwiftPackageReference "Packages/BridgeCrashDiagnostics" */,
+				C1A000000000000000000031 /* XCRemoteSwiftPackageReference "SwiftTerm" */,
+				C1A000000000000000000032 /* XCRemoteSwiftPackageReference "swift-nio-ssh" */,
+				C1A000000000000000000033 /* XCRemoteSwiftPackageReference "swift-nio" */,
+				C1A000000000000000000034 /* XCRemoteSwiftPackageReference "swift-nio-sftp" */,
 			);
 			productRefGroup = 504EC3051FED79650016851F /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				504EC3031FED79650016851F /* App */,
+				D7A000000000000000000030 /* App */,
+				504EC3031FED79650016851F /* AppVpn */,
 				A73101000000000000000030 /* BridgeShare */,
+				B7C000000000000000000030 /* BridgePacketTunnel */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		A73101000000000000000032 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		504EC3021FED79650016851F /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -190,26 +486,112 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A73101000000000000000032 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B7C000000000000000000032 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D7A000000000000000000004 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				517BF69530A6B6D5003D3AE2 /* PrivacyInfo.xcprivacy in Resources */,
+				517BF69630A6B6D5003D3AE2 /* LaunchScreen.storyboard in Resources */,
+				517BF69730A6B6D5003D3AE2 /* public in Resources */,
+				517BF69830A6B6D5003D3AE2 /* Assets.xcassets in Resources */,
+				517BF69930A6B6D5003D3AE2 /* capacitor.config.json in Resources */,
+				517BF69A30A6B6D5003D3AE2 /* Main.storyboard in Resources */,
+				517BF69B30A6B6D5003D3AE2 /* config.xml in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		A73101000000000000000031 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A73101000000000000000002, ); runOnlyForDeploymentPostprocessing = 0; };
 		504EC3001FED79650016851F /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 				B41D6E010000000000000001 /* BridgeCredentialsPlugin.swift in Sources */,
+				C1A000000000000000000001 /* BridgeConnectBotSSHPlugin.swift in Sources */,
+				C1A000000000000000000002 /* BridgeIOSSHWorkspace.swift in Sources */,
+				C1A000000000000000000003 /* BridgeNativeThemePlugin.swift in Sources */,
+				C1A000000000000000000008 /* BridgeIOSSHSessionAPI.swift in Sources */,
+				C1A000000000000000000009 /* BridgeIOSSHPrivateKeySupport.swift in Sources */,
+				C1A00000000000000000000A /* BridgeIOSSHKeychainStore.swift in Sources */,
+				C1A00000000000000000000C /* BridgeIOSSHSFTPClient.swift in Sources */,
+				B7C00000000000000000000B /* BridgeAutoVpnCoordinator.swift in Sources */,
+				B7C00000000000000000000C /* BridgeAutoVpnPlugin.swift in Sources */,
+				B7C00000000000000000000D /* BridgeVpnProfileStore.swift in Sources */,
 				A73101000000000000000001 /* BridgeShareInboxPlugin.swift in Sources */,
 				B41D6E010000000000000002 /* BridgeViewController.swift in Sources */,
+				F9C000000000000000000001 /* BridgeCrashDiagnosticsPlugin.swift in Sources */,
 				504EC3081FED79650016851F /* AppDelegate.swift in Sources */,
 				9582B6832FE993A70072D4E8 /* SceneDelegate.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A73101000000000000000031 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A73101000000000000000002 /* ShareViewController.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B7C000000000000000000035 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B7C000000000000000000001 /* PacketTunnelProvider.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D7A000000000000000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				517BF68930A6B6D5003D3AE2 /* BridgeCredentialsPlugin.swift in Sources */,
+				517BF68A30A6B6D5003D3AE2 /* BridgeConnectBotSSHPlugin.swift in Sources */,
+				517BF68B30A6B6D5003D3AE2 /* BridgeIOSSHWorkspace.swift in Sources */,
+				517BF68C30A6B6D5003D3AE2 /* BridgeNativeThemePlugin.swift in Sources */,
+				517BF68D30A6B6D5003D3AE2 /* BridgeIOSSHSessionAPI.swift in Sources */,
+				517BF68E30A6B6D5003D3AE2 /* BridgeIOSSHPrivateKeySupport.swift in Sources */,
+				517BF68F30A6B6D5003D3AE2 /* BridgeIOSSHKeychainStore.swift in Sources */,
+				517BF69030A6B6D5003D3AE2 /* BridgeIOSSHSFTPClient.swift in Sources */,
+				517BF69130A6B6D5003D3AE2 /* BridgeShareInboxPlugin.swift in Sources */,
+				517BF69230A6B6D5003D3AE2 /* BridgeViewController.swift in Sources */,
+				F9C000000000000000000002 /* BridgeCrashDiagnosticsPlugin.swift in Sources */,
+				E8A000000000000000000003 /* BridgeAppOnlyVpnProfileStore.swift in Sources */,
+				E8A000000000000000000004 /* BridgeAppOnlyVpnCore.swift in Sources */,
+				E8A000000000000000000005 /* BridgeAppOnlyVpnPlugin.swift in Sources */,
+				517BF69330A6B6D5003D3AE2 /* AppDelegate.swift in Sources */,
+				517BF69430A6B6D5003D3AE2 /* SceneDelegate.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
-		A73101000000000000000033 = {isa = PBXTargetDependency; target = A73101000000000000000030; targetProxy = A73101000000000000000021; };
+		A73101000000000000000033 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A73101000000000000000030 /* BridgeShare */;
+			targetProxy = A73101000000000000000021 /* PBXContainerItemProxy */;
+		};
+		B7C000000000000000000033 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B7C000000000000000000030 /* BridgePacketTunnel */;
+			targetProxy = B7C000000000000000000020 /* PBXContainerItemProxy */;
+		};
 /* End PBXTargetDependency section */
 
 /* Begin PBXVariantGroup section */
@@ -232,8 +614,6 @@
 /* End PBXVariantGroup section */
 
 /* Begin XCBuildConfiguration section */
-		A73101000000000000000041 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; BRIDGE_SHARE_APP_GROUP = group.dev.feishu.codex.bridge; CODE_SIGN_ENTITLEMENTS = ShareExtension/ShareExtension.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = ShareExtension/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 15.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = dev.feishu.codex.bridge.share; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
-		A73101000000000000000042 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; BRIDGE_SHARE_APP_GROUP = group.dev.feishu.codex.bridge; CODE_SIGN_ENTITLEMENTS = ShareExtension/ShareExtension.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = ShareExtension/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 15.0; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = dev.feishu.codex.bridge.share; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SKIP_INSTALL = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
 		504EC3141FED79650016851F /* Debug */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = 958DCC722DB07C7200EA8C5F /* debug.xcconfig */;
@@ -348,10 +728,13 @@
 			baseConfigurationReference = 958DCC722DB07C7200EA8C5F /* debug.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				BRIDGE_PACKET_TUNNEL_BUNDLE_IDENTIFIER = "dev.feishu.codex.bridge.packet-tunnel";
 				BRIDGE_SHARE_APP_GROUP = group.dev.feishu.codex.bridge;
+				BRIDGE_VPN_KEYCHAIN_GROUP = "$(AppIdentifierPrefix)dev.feishu.codex.bridge.vpn";
 				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = USJ2SBK8PH;
 				INFOPLIST_FILE = App/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -362,7 +745,7 @@
 				OTHER_SWIFT_FLAGS = "$(inherited) \"-D\" \"COCOAPODS\" \"-DDEBUG\"";
 				PRODUCT_BUNDLE_IDENTIFIER = dev.feishu.codex.bridge;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG BRIDGE_TUNNELKIT";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -372,10 +755,13 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				BRIDGE_PACKET_TUNNEL_BUNDLE_IDENTIFIER = "dev.feishu.codex.bridge.packet-tunnel";
 				BRIDGE_SHARE_APP_GROUP = group.dev.feishu.codex.bridge;
+				BRIDGE_VPN_KEYCHAIN_GROUP = "$(AppIdentifierPrefix)dev.feishu.codex.bridge.vpn";
 				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = USJ2SBK8PH;
 				INFOPLIST_FILE = App/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -385,48 +771,446 @@
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.feishu.codex.bridge;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = BRIDGE_TUNNELKIT;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Release;
 		};
+		517BF69C30A6B6D6003D3AE2 /* PersonalDebug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_BUNDLE_IDENTIFIER = dev.feishu.codex.bridge;
+				PRODUCT_NAME = AppVpn;
+			};
+			name = PersonalDebug;
+		};
+		517BF69D30A6B6D6003D3AE2 /* PersonalRelease */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_NAME = AppVpn;
+			};
+			name = PersonalRelease;
+		};
+		517BF69E30A6B6D6003D3AE2 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COPY_PHASE_STRIP = NO;
+				DEVELOPMENT_TEAM = USJ2SBK8PH;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.feishu.codex.bridge;
+				PRODUCT_NAME = App;
+			};
+			name = Debug;
+		};
+		517BF69F30A6B6D6003D3AE2 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COPY_PHASE_STRIP = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = USJ2SBK8PH;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.feishu.codex.bridge;
+				PRODUCT_NAME = App;
+			};
+			name = Release;
+		};
+		517BF6A030A6B6D7003D3AE2 /* PersonalDebug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_NAME = BridgeShare;
+			};
+			name = PersonalDebug;
+		};
+		517BF6A130A6B6D7003D3AE2 /* PersonalRelease */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_NAME = BridgeShare;
+			};
+			name = PersonalRelease;
+		};
+		517BF6A230A6B6D7003D3AE2 /* PersonalDebug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				DEVELOPMENT_TEAM = USJ2SBK8PH;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphoneos*]" = dev.feishu.codex.bridge;
+				PRODUCT_NAME = BridgePacketTunnel;
+			};
+			name = PersonalDebug;
+		};
+		517BF6A330A6B6D7003D3AE2 /* PersonalRelease */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_NAME = BridgePacketTunnel;
+			};
+			name = PersonalRelease;
+		};
+		A73101000000000000000041 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				BRIDGE_SHARE_APP_GROUP = group.dev.feishu.codex.bridge;
+				CODE_SIGN_ENTITLEMENTS = ShareExtension/ShareExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = USJ2SBK8PH;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.feishu.codex.bridge.share;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A73101000000000000000042 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				BRIDGE_SHARE_APP_GROUP = group.dev.feishu.codex.bridge;
+				CODE_SIGN_ENTITLEMENTS = ShareExtension/ShareExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.feishu.codex.bridge.share;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		B7C000000000000000000041 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				BRIDGE_SHARE_APP_GROUP = group.dev.feishu.codex.bridge;
+				BRIDGE_VPN_KEYCHAIN_GROUP = "$(AppIdentifierPrefix)dev.feishu.codex.bridge.vpn";
+				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = USJ2SBK8PH;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = PacketTunnel/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "dev.feishu.codex.bridge.packet-tunnel";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		B7C000000000000000000042 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				BRIDGE_SHARE_APP_GROUP = group.dev.feishu.codex.bridge;
+				BRIDGE_VPN_KEYCHAIN_GROUP = "$(AppIdentifierPrefix)dev.feishu.codex.bridge.vpn";
+				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = USJ2SBK8PH;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = PacketTunnel/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "dev.feishu.codex.bridge.packet-tunnel";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		D7A000000000000000000041 /* PersonalDebug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				BRIDGE_PACKET_TUNNEL_BUNDLE_IDENTIFIER = "";
+				BRIDGE_SHARE_APP_GROUP = "";
+				BRIDGE_VPN_KEYCHAIN_GROUP = "";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = USJ2SBK8PH;
+				INFOPLIST_FILE = App/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_SWIFT_FLAGS = "$(inherited) \"-D\" \"COCOAPODS\" \"-DDEBUG\"";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.feishu.codex.bridge;
+				PRODUCT_NAME = App;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "PERSONAL_TEAM BRIDGE_APP_ONLY_VPN_POC";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = PersonalDebug;
+		};
+		D7A000000000000000000042 /* PersonalRelease */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				BRIDGE_PACKET_TUNNEL_BUNDLE_IDENTIFIER = "";
+				BRIDGE_SHARE_APP_GROUP = "";
+				BRIDGE_VPN_KEYCHAIN_GROUP = "";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = USJ2SBK8PH;
+				INFOPLIST_FILE = App/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.feishu.codex.bridge;
+				PRODUCT_NAME = App;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "PERSONAL_TEAM BRIDGE_APP_ONLY_VPN_POC";
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = PersonalRelease;
+		};
+		D7A000000000000000000051 /* PersonalDebug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 958DCC722DB07C7200EA8C5F /* debug.xcconfig */;
+			buildSettings = {
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = PERSONAL_TEAM;
+			};
+			name = PersonalDebug;
+		};
+		D7A000000000000000000052 /* PersonalRelease */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = PERSONAL_TEAM;
+			};
+			name = PersonalRelease;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		A73101000000000000000040 = {isa = XCConfigurationList; buildConfigurations = (A73101000000000000000041, A73101000000000000000042, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
 		504EC2FF1FED79650016851F /* Build configuration list for PBXProject "App" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				504EC3141FED79650016851F /* Debug */,
 				504EC3151FED79650016851F /* Release */,
+				D7A000000000000000000051 /* PersonalDebug */,
+				D7A000000000000000000052 /* PersonalRelease */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		504EC3161FED79650016851F /* Build configuration list for PBXNativeTarget "App" */ = {
+		504EC3161FED79650016851F /* Build configuration list for PBXNativeTarget "AppVpn" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				504EC3171FED79650016851F /* Debug */,
 				504EC3181FED79650016851F /* Release */,
+				517BF69C30A6B6D6003D3AE2 /* PersonalDebug */,
+				517BF69D30A6B6D6003D3AE2 /* PersonalRelease */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		A73101000000000000000040 /* Build configuration list for PBXNativeTarget "BridgeShare" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A73101000000000000000041 /* Debug */,
+				A73101000000000000000042 /* Release */,
+				517BF6A030A6B6D7003D3AE2 /* PersonalDebug */,
+				517BF6A130A6B6D7003D3AE2 /* PersonalRelease */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B7C000000000000000000040 /* Build configuration list for PBXNativeTarget "BridgePacketTunnel" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B7C000000000000000000041 /* Debug */,
+				B7C000000000000000000042 /* Release */,
+				517BF6A230A6B6D7003D3AE2 /* PersonalDebug */,
+				517BF6A330A6B6D7003D3AE2 /* PersonalRelease */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D7A000000000000000000040 /* Build configuration list for PBXNativeTarget "App" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D7A000000000000000000041 /* PersonalDebug */,
+				D7A000000000000000000042 /* PersonalRelease */,
+				517BF69E30A6B6D6003D3AE2 /* Debug */,
+				517BF69F30A6B6D6003D3AE2 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = PersonalRelease;
+		};
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
+		E8A000000000000000000031 /* XCLocalSwiftPackageReference "Packages/BridgeLwIP" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/BridgeLwIP;
+		};
+		B7C000000000000000000031 /* XCLocalSwiftPackageReference "Packages/TunnelKitOpenVPN" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/TunnelKitOpenVPN;
+		};
 		D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = "CapApp-SPM";
 		};
+		F9C000000000000000000031 /* XCLocalSwiftPackageReference "Packages/BridgeCrashDiagnostics" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/BridgeCrashDiagnostics;
+		};
 /* End XCLocalSwiftPackageReference section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		C1A000000000000000000031 /* XCRemoteSwiftPackageReference "SwiftTerm" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/migueldeicaza/SwiftTerm.git";
+			requirement = {
+				kind = exactVersion;
+				version = 1.15.0;
+			};
+		};
+		C1A000000000000000000032 /* XCRemoteSwiftPackageReference "swift-nio-ssh" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-nio-ssh.git";
+			requirement = {
+				kind = exactVersion;
+				version = 0.13.0;
+			};
+		};
+		C1A000000000000000000033 /* XCRemoteSwiftPackageReference "swift-nio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-nio.git";
+			requirement = {
+				kind = exactVersion;
+				version = 2.81.0;
+			};
+		};
+		C1A000000000000000000034 /* XCRemoteSwiftPackageReference "swift-nio-sftp" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/EkkoG/swift-nio-sftp.git";
+			requirement = {
+				kind = revision;
+				revision = 748e88568638463370816dbaaaf9684237258501;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
 		4D22ABE82AF431CB00220026 /* CapApp-SPM */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */;
 			productName = "CapApp-SPM";
+		};
+		B7C000000000000000000021 /* TunnelKitOpenVPNAppExtension */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B7C000000000000000000031 /* XCLocalSwiftPackageReference "Packages/TunnelKitOpenVPN" */;
+			productName = TunnelKitOpenVPNAppExtension;
+		};
+		B7C000000000000000000022 /* TunnelKitOpenVPN */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B7C000000000000000000031 /* XCLocalSwiftPackageReference "Packages/TunnelKitOpenVPN" */;
+			productName = TunnelKitOpenVPN;
+		};
+		B7C000000000000000000023 /* TunnelKitLZO */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B7C000000000000000000031 /* XCLocalSwiftPackageReference "Packages/TunnelKitOpenVPN" */;
+			productName = TunnelKitLZO;
+		};
+		B7C00000000000000000002A /* TunnelKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B7C000000000000000000031 /* XCLocalSwiftPackageReference "Packages/TunnelKitOpenVPN" */;
+			productName = TunnelKit;
+		};
+		B7C00000000000000000002B /* TunnelKitOpenVPNProtocol */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B7C000000000000000000031 /* XCLocalSwiftPackageReference "Packages/TunnelKitOpenVPN" */;
+			productName = TunnelKitOpenVPNProtocol;
+		};
+		E8A000000000000000000021 /* BridgeLwIP */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = E8A000000000000000000031 /* XCLocalSwiftPackageReference "Packages/BridgeLwIP" */;
+			productName = BridgeLwIP;
+		};
+		C1A000000000000000000021 /* SwiftTerm */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C1A000000000000000000031 /* XCRemoteSwiftPackageReference "SwiftTerm" */;
+			productName = SwiftTerm;
+		};
+		C1A000000000000000000022 /* NIOSSH */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C1A000000000000000000032 /* XCRemoteSwiftPackageReference "swift-nio-ssh" */;
+			productName = NIOSSH;
+		};
+		C1A000000000000000000023 /* NIOCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C1A000000000000000000033 /* XCRemoteSwiftPackageReference "swift-nio" */;
+			productName = NIOCore;
+		};
+		C1A000000000000000000024 /* NIOPosix */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C1A000000000000000000033 /* XCRemoteSwiftPackageReference "swift-nio" */;
+			productName = NIOPosix;
+		};
+		C1A000000000000000000025 /* NIOSFTP */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C1A000000000000000000034 /* XCRemoteSwiftPackageReference "swift-nio-sftp" */;
+			productName = NIOSFTP;
+		};
+		F9C000000000000000000021 /* BridgeCrashDiagnostics */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = F9C000000000000000000031 /* XCLocalSwiftPackageReference "Packages/BridgeCrashDiagnostics" */;
+			productName = BridgeCrashDiagnostics;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

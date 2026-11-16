@@ -15,7 +15,11 @@ function cellPosition(terminal: Terminal, element: HTMLElement, clientX: number,
 type BufferCell = { column: number; row: number };
 type BufferRange = { start: number; end: number };
 export type TerminalSelectionDisplay = { text: string; left: number; top: number };
-type TerminalTouchOptions = { enableDesktopSelection?: boolean };
+type TerminalTouchOptions = {
+  enableDesktopSelection?: boolean;
+  scrollTerminal?: (lines: number) => Terminal;
+  onScrollApplied?: (terminal: Terminal, lines: number) => void;
+};
 const LONG_PRESS_DELAY_MS = 1_500;
 const LONG_PRESS_MOVE_CANCEL_PX = 20;
 const TOUCH_SCROLL_PIXELS_PER_LINE = 10;
@@ -267,6 +271,16 @@ export function bindMobileTerminalTouch(
   let wheelPixelRemainder = 0;
   let lastViewportSampleAt = 0;
   let lastObservedViewportY = terminal.buffer.active.viewportY;
+  let lastScrollTerminal = terminal;
+  const scrollLines = (lines: number): { terminal: Terminal; before: number; after: number } => {
+    const target = options.scrollTerminal?.(lines) ?? terminal;
+    lastScrollTerminal = target;
+    const before = target.buffer.active.viewportY;
+    target.scrollLines(lines);
+    const after = target.buffer.active.viewportY;
+    options.onScrollApplied?.(target, lines);
+    return { terminal: target, before, after };
+  };
   let pendingScrollRender: PendingScrollRender | null = null;
   const renderListener = terminal.onRender(({ start, end }) => {
     const pending = pendingScrollRender;
@@ -328,13 +342,12 @@ export function bindMobileTerminalTouch(
     const maxLines = Math.max(12, Math.min(120, terminal.rows * 3));
     const lines = Math.max(-maxLines, Math.min(maxLines, requestedLines));
     wheelPixelRemainder = accumulatedPixels - requestedLines * pixelsPerLine;
-    const beforeViewportY = buffer.viewportY;
     const startedAt = performance.now();
     watchScrollRender("wheel", position, event.deltaY, lines, event.target);
-    terminal.scrollLines(lines);
+    const scrolled = scrollLines(lines);
     const handlerMs = performance.now() - startedAt;
-    const afterViewportY = terminal.buffer.active.viewportY;
-    const movedRows = afterViewportY - beforeViewportY;
+    const afterViewportY = scrolled.after;
+    const movedRows = afterViewportY - scrolled.before;
     if (movedRows === 0) wheelPixelRemainder = 0;
     if (now - lastWheelSampleAt >= 120 || movedRows === 0 || handlerMs >= 16) {
       lastWheelSampleAt = now;
@@ -349,9 +362,9 @@ export function bindMobileTerminalTouch(
         appliedLines: lines,
         movedRows,
         handlerMs: Number(handlerMs.toFixed(2)),
-        buffer: terminal.buffer.active.type,
+        buffer: scrolled.terminal.buffer.active.type,
         viewportY: afterViewportY,
-        baseY: terminal.buffer.active.baseY,
+        baseY: scrolled.terminal.buffer.active.baseY,
         mouseTrackingMode: terminal.modes.mouseTrackingMode,
         target: touchTargetName(event.target),
       });
@@ -418,8 +431,8 @@ export function bindMobileTerminalTouch(
         durationMs: Number((now - startedAt).toFixed(1)),
         movedRows,
         maxFrameGapMs: Number(maxFrameGapMs.toFixed(1)),
-        viewportY: terminal.buffer.active.viewportY,
-        baseY: terminal.buffer.active.baseY,
+        viewportY: lastScrollTerminal.buffer.active.viewportY,
+        baseY: lastScrollTerminal.buffer.active.baseY,
       });
     };
 
@@ -435,10 +448,9 @@ export function bindMobileTerminalTouch(
       const requestedLines = Math.trunc(pixelRemainder / TOUCH_SCROLL_PIXELS_PER_LINE);
       if (requestedLines !== 0) {
         const lines = Math.max(-12, Math.min(12, requestedLines));
-        const beforeViewportY = terminal.buffer.active.viewportY;
         watchScrollRender("inertia", position, scrollPixels, lines, target);
-        terminal.scrollLines(lines);
-        const actualLines = terminal.buffer.active.viewportY - beforeViewportY;
+        const scrolled = scrollLines(lines);
+        const actualLines = scrolled.after - scrolled.before;
         pixelRemainder -= actualLines * TOUCH_SCROLL_PIXELS_PER_LINE;
         movedRows += Math.abs(actualLines);
         if (actualLines === 0) {
@@ -764,13 +776,13 @@ export function bindMobileTerminalTouch(
     if (Math.abs(delta) < 8) return;
     const lines = Math.min(12, Math.max(1, Math.round(Math.abs(delta) / TOUCH_SCROLL_PIXELS_PER_LINE)));
     const direction = delta > 0 ? 1 : -1;
-    const beforeViewportY = terminal.buffer.active.viewportY;
     const cell = cellPosition(terminal, host, touch.clientX, touch.clientY);
     const handlerStartedAt = performance.now();
     watchScrollRender("touch", cell, delta, lines, event.target);
-    terminal.scrollLines(direction * lines);
+    const scrolled = scrollLines(direction * lines);
     const handlerMs = performance.now() - handlerStartedAt;
-    const afterViewportY = terminal.buffer.active.viewportY;
+    const beforeViewportY = scrolled.before;
+    const afterViewportY = scrolled.after;
     if (scrollTrace) {
       if (scrollTrace.moves === 0) {
         logScrollDiagnostic("touch-start", {
@@ -805,9 +817,9 @@ export function bindMobileTerminalTouch(
           requestedLines: lines,
           movedRows: afterViewportY - beforeViewportY,
           handlerMs: Number(handlerMs.toFixed(2)),
-          buffer: terminal.buffer.active.type,
+          buffer: scrolled.terminal.buffer.active.type,
           viewportY: afterViewportY,
-          baseY: terminal.buffer.active.baseY,
+          baseY: scrolled.terminal.buffer.active.baseY,
           pageScrollY: window.scrollY,
           documentScrollTop: host.ownerDocument.documentElement.scrollTop,
           defaultPrevented: event.defaultPrevented,

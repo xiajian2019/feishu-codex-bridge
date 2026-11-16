@@ -1,14 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import {
   executeBridgeSshSessionRequest,
-  ReadOnlyCodexBridgeSshBackend,
   type BridgeSshBackend,
-  type BridgeSshCliOptions,
 } from "../src/ssh-session-cli.js";
-import { StateDatabase } from "../src/db.js";
 import { parseCodexHomeEnvironment } from "../src/tmux-dashboard.js";
 
 type Call = { method: string; path: string; body?: Record<string, unknown>; createdAt?: number };
@@ -105,12 +102,36 @@ describe("Bridge SSH Session CLI contract", () => {
     await expect(executeBridgeSshSessionRequest({ action: "end", id: "name;kill", createdAt: 42 }, backend)).rejects.toThrow("Session 标识无效");
   });
 
-  it("falls back to read-only Codex app-server queries while the Bridge database is open", async () => {
+  it("reads and marks accounts through tmux and Codex without a Bridge database", async () => {
     const directory = mkdtempSync(join(tmpdir(), "bridge-ssh-codex-fallback-"));
     const home = join(directory, "codex-home");
     const fakeCodex = join(directory, "fake-codex");
+    const bin = join(directory, "bin");
+    const marker = join(directory, "tmux-home");
     mkdirSync(home);
-    writeFileSync(join(home, "state_1.sqlite"), "");
+    mkdirSync(bin);
+    const fakeTmux = join(bin, "tmux");
+    writeFileSync(fakeTmux, `#!/bin/sh
+case "$1" in
+  list-sessions) printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' '$7' alpha 1 0 "$HOME" 42 ;;
+  display-message) printf '999998\\n' ;;
+  show-environment) if [ -f "$BRIDGE_TEST_MARKER" ]; then printf 'CODEX_HOME=%s\\n' "$(cat "$BRIDGE_TEST_MARKER")"; else echo 'unknown variable: CODEX_HOME' >&2; exit 1; fi ;;
+  set-environment) printf '%s' "$5" > "$BRIDGE_TEST_MARKER" ;;
+  *) exit 1 ;;
+esac
+`);
+    chmodSync(fakeTmux, 0o700);
+    const fakePs = join(bin, "ps");
+    writeFileSync(fakePs, `#!/bin/sh
+case "$*" in
+  '-axo pid=,ppid=') printf '999998 1\\n999999 999998\\n' ;;
+  '-ww -p 999999 -o command=') printf '/usr/bin/codex\\n' ;;
+  '-ww -p 999998 -o command=') printf 'zsh\\n' ;;
+  'eww -p 999999 -o command=') printf 'codex HOME=%s CODEX_HOME=%s PATH=/usr/bin\\n' "$HOME" "$CODEX_HOME" ;;
+  *) exit 1 ;;
+esac
+`);
+    chmodSync(fakePs, 0o700);
     writeFileSync(fakeCodex, `#!/usr/bin/env node
 const readline = require("node:readline");
 const output = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
@@ -123,34 +144,32 @@ rl.on("line", (line) => {
 });
 `);
     chmodSync(fakeCodex, 0o700);
-    const dbPath = join(directory, "bridge.db");
-    const db = new StateDatabase(dbPath);
-    db.recordTmuxSession({ id: "$7", name: "alpha", cwd: directory, createdAt: 42, windows: 1, attachedClients: 0 });
-    const previousCodexPath = process.env.CODEX_PATH;
-    const previousCodexHome = process.env.CODEX_HOME;
-    process.env.CODEX_PATH = fakeCodex;
-    process.env.CODEX_HOME = home;
-    const options: BridgeSshCliOptions = {
-      request: { action: "accounts", id: "$7", createdAt: 42 },
-      databasePath: dbPath,
-      configPath: join(directory, "missing-config.json"),
-      ports: [],
-      offline: false,
-    };
-    const backend = new ReadOnlyCodexBridgeSshBackend(options);
+    const dbPath = join(directory, "does-not-exist.db");
+    const env = { ...process.env, HOME: directory, CODEX_PATH: fakeCodex, CODEX_HOME: home,
+      PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, BRIDGE_TEST_MARKER: marker };
+    async function call(request: Record<string, unknown>) {
+      const encoded = Buffer.from(JSON.stringify(request)).toString("base64");
+      const child = Bun.spawn([process.execPath, resolve("src/ssh-session-cli.ts"), "--offline", "--db", dbPath,
+        "--config", join(directory, "missing-config.json"), "--request", encoded], { env, stdout: "pipe", stderr: "pipe" });
+      const [stdout, stderr, status] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect({ status, stderr }).toEqual({ status: 0, stderr: "" });
+      const line = stdout.split("\n").find((candidate) => candidate.startsWith("BRIDGE_SSH_RESULT:"));
+      expect(line).toBeTruthy();
+      return JSON.parse(line!.slice("BRIDGE_SSH_RESULT:".length)) as { ok: boolean; result?: Record<string, unknown>; error?: string };
+    }
     try {
-      const accounts = await executeBridgeSshSessionRequest(options.request, backend);
-      expect(accounts.homes).toHaveLength(1);
-      const homeId = (accounts.homes as Array<{ id: string }>)[0]!.id;
-      db.setTmuxSessionCodexHome("$7", homeId);
-      const usage = await executeBridgeSshSessionRequest({ action: "usage", id: "$7", createdAt: 42, home: homeId }, backend);
-      expect(usage).toMatchObject({ rateLimitsByLimitId: { codex: { primary: { usedPercent: 16 } } } });
+      const accounts = await call({ action: "accounts", ...identity });
+      expect(accounts.ok).toBe(true);
+      expect(accounts.result?.homes).toHaveLength(1);
+      expect(accounts.result?.selected).toBe("");
+      const homeId = (accounts.result!.homes as Array<{ id: string }>)[0]!.id;
+      expect(await call({ action: "refresh_account", ...identity })).toMatchObject({ ok: true, result: { selected: homeId, source: "ssh-fallback" } });
+      expect(await call({ action: "mark_account", ...identity, home: homeId })).toMatchObject({ ok: true, result: { selected: homeId, source: "ssh-fallback" } });
+      const usage = await call({ action: "usage", ...identity, home: homeId });
+      expect(usage).toMatchObject({ ok: true, result: { rateLimitsByLimitId: { codex: { primary: { usedPercent: 16 } } } } });
+      expect(existsSync(dbPath)).toBe(false);
     } finally {
-      await backend.close?.();
-      db.close();
-      if (previousCodexPath === undefined) delete process.env.CODEX_PATH; else process.env.CODEX_PATH = previousCodexPath;
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previousCodexHome;
       rmSync(directory, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });

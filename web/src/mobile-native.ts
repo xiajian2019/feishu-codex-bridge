@@ -16,8 +16,12 @@ import { setAppForeground } from "./foreground-polling.js";
 import { MOBILE_SHAKE_PREFERENCE_EVENT, readMobileShakeEnabled, writeMobileShakeEnabled } from "./app-settings.js";
 import {
   failMobileDownload, hasAndroidMobileDownloads, refreshAndroidMobileDownloads, startMobileDownload,
-  trackAndroidMobileDownload, updateMobileDownload, subscribeMobileDownloads, getMobileDownloads, cancelAndroidMobileDownload, type NativeDownloadStatus,
+  trackAndroidMobileDownload, updateMobileDownload, subscribeMobileDownloads, getMobileDownloads, cancelAndroidMobileDownload, dismissMobileDownload, type NativeDownloadStatus,
 } from "./mobile-download-manager.js";
+import {
+  classifyMobileVpnPlatform, mobileVpnUnavailableMessage, normalizeMobileVpnProfileSelection,
+  type MobileVpnCapability, type MobileVpnProfileSelection,
+} from "./mobile-vpn-contract.js";
 
 interface TransferProgress {
   type: "download" | "upload";
@@ -31,6 +35,38 @@ interface CredentialPlugin {
   set(options: { server: string; token: string }): Promise<void>;
   remove(options: { server: string }): Promise<void>;
 }
+interface BridgeAutoVpnPlugin {
+  configure(options: { bypassWifiSsids: string[] }): Promise<{ accepted: boolean }>;
+  requestRecovery(options: { host: string; port: number; bypassWifiSsids?: string[] }): Promise<{ accepted: boolean }>;
+  checkAndConnect(options: { bypassWifiSsids: string[] }): Promise<{ message: string }>;
+  getCurrentWifi(): Promise<{ ssid?: string | null }>;
+  /** Native keeps the selected profile URL and contents outside the WebView. */
+  pickProfile?: () => Promise<MobileVpnProfileSelection | null>;
+  importProfile?: (options: { selectionId: string }) => Promise<{ accepted: boolean; profileName?: string }>;
+}
+interface BridgeOpenVPNConnectPlugin {
+  status(): Promise<{ installed: boolean; scheme?: string | null }>;
+  open(): Promise<{ installed: boolean; launched: boolean; scheme?: string | null }>;
+  startRecoveryMonitor(options: { server: string; bypassWifiSsids?: string[] }): Promise<{ accepted: boolean }>;
+  stopRecoveryMonitor(): Promise<{ accepted: boolean }>;
+}
+interface BridgeAppOnlyVpnPlugin {
+  getStatus(): Promise<Record<string, unknown>>;
+  pickProfile(): Promise<{ selectionId: string; fileName?: string }>;
+  importProfile(options: { selectionId: string }): Promise<Record<string, unknown>>;
+  connect(): Promise<Record<string, unknown>>;
+  disconnect(): Promise<Record<string, unknown>>;
+  probeHttp(options: { address: string; port: number; path: string }): Promise<{
+    ok: boolean;
+    bytes?: number;
+    bodyUtf8?: string;
+  }>;
+  openTmuxWebView(options: { address: string; port: number; path: string; credentialServer: string }): Promise<{
+    opened: boolean;
+    target?: string;
+  }>;
+  clearProfile(): Promise<{ accepted: boolean }>;
+}
 type ApkVerification = Pick<MobileApkUpdate, "sha256" | "size" | "packageName" | "versionCode" | "versionName"> & { uri: string };
 interface UpdaterPlugin {
   verifyApk(options: ApkVerification): Promise<void>;
@@ -40,30 +76,88 @@ interface UpdaterPlugin {
   openDownloads(): Promise<void>;
   cancelDownload(options: { id: number }): Promise<{ cancelled: boolean }>;
   openDownloadedFile(options: { id: number }): Promise<void>;
-  download(options: { url: string; token: string; fileName: string; mimeType?: string; userAgent: string }): Promise<{ id: number; fileName: string }>;
+  download(options: { url: string; serverOrigin: string; token: string; fileName: string; mimeType?: string; userAgent: string }): Promise<{ id: number; fileName: string }>;
   save(options: { data: string; fileName: string; mimeType?: string }): Promise<{ fileName: string; size: number }>;
   saveFile(options: { uri: string; fileName: string; mimeType?: string }): Promise<{ fileName: string; size: number }>;
   copyImage(options: { uri: string }): Promise<void>;
 }
 const Credentials = registerPlugin<CredentialPlugin>("BridgeCredentials");
 const Updater = registerPlugin<UpdaterPlugin>("BridgeUpdater");
+const IOSOta = registerPlugin<{ open(options: { url: string }): Promise<void> }>("BridgeIOSOta");
 const ShareInbox = registerPlugin<{
   listShares(): Promise<{ shares: MobileShare[] }>;
   getFile(options: { shareId: string; fileId: string }): Promise<{ uri: string }>;
   addListener(event: "shareReceived", handler: (event: { id?: string; error?: string; state?: string }) => void): Promise<PluginListenerHandle>;
 }>("BridgeShareInbox");
+const OpenVPNConnect = registerPlugin<BridgeOpenVPNConnectPlugin>("BridgeOpenVPNConnect");
+const AppOnlyVpn = registerPlugin<BridgeAppOnlyVpnPlugin>("BridgeAppOnlyVpn");
+const CrashDiagnostics = registerPlugin<{
+  getStatus(): Promise<import("./mobile-crash-diagnostics.js").MobileCrashReportStatus>;
+  readReport(options: { id: string }): Promise<{ text: string }>;
+  captureSnapshot(): Promise<{ id: string }>;
+  shareReport(options: { id: string }): Promise<{ opened: boolean }>;
+}>("BridgeCrashDiagnostics");
 const Motion = registerPlugin<{
   setEnabled(options: { enabled: boolean }): Promise<{ available: boolean }>;
   addListener(event: "motion", handler: (sample: { x: number; y: number; z: number; timestampMs: number }) => void): Promise<PluginListenerHandle>;
 }>("BridgeMotion");
-const AutoVpn = registerPlugin<{
-  requestRecovery(options: { host: string; port: number }): Promise<{ accepted: boolean }>;
-}>("BridgeAutoVpn");
+const AutoVpn = registerPlugin<BridgeAutoVpnPlugin>("BridgeAutoVpn");
 // Browser preview uses memory only; tokens are never persisted in browser storage.
 const previewCredentials = new Map<string, string>();
 let lifecycle: Promise<void> | null = null;
 let shakeCleanup: (() => void) | null = null;
 let nativeMotionAvailable = false;
+
+export function appOnlyVpnPocAvailable(): boolean {
+  return Capacitor.getPlatform() === "ios" && Capacitor.isPluginAvailable("BridgeAppOnlyVpn");
+}
+
+export async function getAppOnlyVpnPocStatus(): Promise<Record<string, unknown>> {
+  if (!appOnlyVpnPocAvailable()) throw new Error("当前构建未启用 App-only VPN 实验插件。");
+  return AppOnlyVpn.getStatus();
+}
+
+export async function pickAppOnlyVpnProfile(): Promise<{ selectionId: string; fileName?: string }> {
+  if (!appOnlyVpnPocAvailable()) throw new Error("当前构建未启用 App-only VPN 实验插件。");
+  return AppOnlyVpn.pickProfile();
+}
+
+export async function importAppOnlyVpnProfile(selectionId: string): Promise<Record<string, unknown>> {
+  if (!appOnlyVpnPocAvailable()) throw new Error("当前构建未启用 App-only VPN 实验插件。");
+  return AppOnlyVpn.importProfile({ selectionId });
+}
+
+export async function connectAppOnlyVpn(): Promise<Record<string, unknown>> {
+  if (!appOnlyVpnPocAvailable()) throw new Error("当前构建未启用 App-only VPN 实验插件。");
+  return AppOnlyVpn.connect();
+}
+
+export async function disconnectAppOnlyVpn(): Promise<Record<string, unknown>> {
+  if (!appOnlyVpnPocAvailable()) throw new Error("当前构建未启用 App-only VPN 实验插件。");
+  return AppOnlyVpn.disconnect();
+}
+
+export async function probeAppOnlyVpnHttp(options: { address: string; port: number; path: string }): Promise<{
+  ok: boolean;
+  bytes?: number;
+  bodyUtf8?: string;
+}> {
+  if (!appOnlyVpnPocAvailable()) throw new Error("当前构建未启用 App-only VPN 实验插件。");
+  return AppOnlyVpn.probeHttp(options);
+}
+
+export async function openAppOnlyTmuxWebView(options: { address: string; port: number; path: string; credentialServer: string }): Promise<{
+  opened: boolean;
+  target?: string;
+}> {
+  if (!appOnlyVpnPocAvailable()) throw new Error("当前构建未启用 App-only VPN 实验插件。");
+  return AppOnlyVpn.openTmuxWebView(options);
+}
+
+export async function clearAppOnlyVpnProfile(): Promise<void> {
+  if (!appOnlyVpnPocAvailable()) throw new Error("当前构建未启用 App-only VPN 实验插件。");
+  await AppOnlyVpn.clearProfile();
+}
 
 export async function getCredential(server: string): Promise<string | null> {
   return Capacitor.isNativePlatform() ? (await Credentials.get({ server })).token : previewCredentials.get(server) ?? null;
@@ -81,8 +175,58 @@ export function isAndroidPlatform(): boolean {
   return Capacitor.getPlatform() === "android";
 }
 
-export async function requestMobileVpnRecovery(target: { host: string; port: number }): Promise<boolean> {
-  if (!isAndroidPlatform() || !Capacitor.isPluginAvailable("BridgeAutoVpn")) return false;
+export function getMobileVpnCapability(): MobileVpnCapability {
+  return classifyMobileVpnPlatform(
+    Capacitor.getPlatform(),
+    Capacitor.isPluginAvailable("BridgeAutoVpn"),
+    Capacitor.getPlatform() === "ios" && Capacitor.isPluginAvailable("BridgeOpenVPNConnect"),
+  );
+}
+
+/** Opens the App Store OpenVPN client; iOS does not expose a public API to select or connect a profile. */
+export async function openExternalOpenVPNConnect(): Promise<boolean> {
+  if (Capacitor.getPlatform() !== "ios" || !Capacitor.isPluginAvailable("BridgeOpenVPNConnect")) return false;
+  try {
+    return (await OpenVPNConnect.open()).launched === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Arm the native foreground-only Bridge reachability monitor. */
+export async function startOpenVPNConnectRecoveryMonitor(server: string, bypassWifiSsids: string[] = []): Promise<boolean> {
+  if (Capacitor.getPlatform() !== "ios" || !Capacitor.isPluginAvailable("BridgeOpenVPNConnect")) return false;
+  try {
+    return (await OpenVPNConnect.startRecoveryMonitor({ server, bypassWifiSsids })).accepted === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Disarm the native Bridge reachability monitor when the Bridge page closes. */
+export async function stopOpenVPNConnectRecoveryMonitor(): Promise<boolean> {
+  if (Capacitor.getPlatform() !== "ios" || !Capacitor.isPluginAvailable("BridgeOpenVPNConnect")) return false;
+  try {
+    return (await OpenVPNConnect.stopRecoveryMonitor()).accepted === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Sync the Wi-Fi exceptions even when no Bridge connection is paired. */
+export async function configureMobileAutoVpn(bypassWifiSsids: string[]): Promise<boolean> {
+  const capability = getMobileVpnCapability();
+  if (capability.platform !== "android" && capability.platform !== "ios") return true;
+  if (!capability.enabled) return false;
+  try {
+    return (await AutoVpn.configure({ bypassWifiSsids })).accepted === true;
+  } catch {
+    return false;
+  }
+}
+
+export async function requestMobileVpnRecovery(target: { host: string; port: number; bypassWifiSsids?: string[] }): Promise<boolean> {
+  if (!getMobileVpnCapability().enabled) return false;
   try {
     const result = await AutoVpn.requestRecovery(target);
     return result.accepted === true;
@@ -91,6 +235,65 @@ export async function requestMobileVpnRecovery(target: { host: string; port: num
     return false;
   }
 }
+
+export async function checkAndConnectMobileVpn(bypassWifiSsids: string[]): Promise<string> {
+  const capability = getMobileVpnCapability();
+  if (!capability.enabled) {
+    if (capability.externalOpenVPNConnect) {
+      if (await openExternalOpenVPNConnect()) {
+        return "已打开 OpenVPN Connect；请在其中选择已导入的配置并连接。";
+      }
+      throw new Error("未安装 OpenVPN Connect，请先从 App Store 安装。");
+    }
+    throw new Error(mobileVpnUnavailableMessage(capability.platform, "connect"));
+  }
+  const result = await AutoVpn.checkAndConnect({ bypassWifiSsids });
+  return result.message || "VPN 检查已完成。";
+}
+
+export async function readCurrentWifiSsid(): Promise<string | null> {
+  const capability = getMobileVpnCapability();
+  if (!capability.enabled) {
+    throw new Error(mobileVpnUnavailableMessage(capability.platform, "wifi"));
+  }
+  try {
+    const result = await AutoVpn.getCurrentWifi();
+    const ssid = result.ssid?.trim();
+    return ssid || null;
+  } catch {
+    if (capability.platform === "android") {
+      throw new Error("无法读取当前 Wi‑Fi 名称，请确认已连接 Wi‑Fi、开启系统位置服务，并允许应用使用精确位置。");
+    }
+    throw new Error(mobileVpnUnavailableMessage(capability.platform, "wifi"));
+  }
+}
+
+/** Import an OpenVPN profile without exposing its contents to the WebView. */
+export async function importMobileVpnProfile(): Promise<string> {
+  const capability = getMobileVpnCapability();
+  if (!capability.profileImport || capability.platform !== "ios") {
+    throw new Error(mobileVpnUnavailableMessage(capability.platform, "import"));
+  }
+  if (typeof AutoVpn.pickProfile !== "function" || typeof AutoVpn.importProfile !== "function") {
+    throw new Error(mobileVpnUnavailableMessage("ios", "import"));
+  }
+  const picked = await AutoVpn.pickProfile();
+  if (!picked) throw new Error("未选择 .ovpn 配置，VPN 设置未改变。");
+  const selection = normalizeMobileVpnProfileSelection(picked);
+  const result = await AutoVpn.importProfile({ selectionId: selection.selectionId });
+  if (result?.accepted !== true) throw new Error("VPN 配置未导入，当前配置未改变。");
+  return "OpenVPN 配置已导入；配置内容和密钥不会显示在 Bridge 页面。";
+}
+
+export function isMobileCrashDiagnosticsAvailable(): boolean {
+  return Capacitor.getPlatform() === "ios" && Capacitor.isPluginAvailable("BridgeCrashDiagnostics");
+}
+export async function getMobileCrashReportStatus(): Promise<import("./mobile-crash-diagnostics.js").MobileCrashReportStatus> {
+  return CrashDiagnostics.getStatus();
+}
+export async function readMobileCrashReport(id: string): Promise<string> { return (await CrashDiagnostics.readReport({ id })).text; }
+export async function captureMobileThreadSnapshot(): Promise<string> { return (await CrashDiagnostics.captureSnapshot()).id; }
+export async function shareMobileCrashReport(id: string): Promise<void> { await CrashDiagnostics.shareReport({ id }); }
 
 export async function nativeAppVersion(): Promise<string> {
   if (!Capacitor.isNativePlatform()) return "浏览器预览";
@@ -311,7 +514,10 @@ export async function prepareApkUpdate(update: MobileApkUpdate, token: string, i
     if (install) {
       await Updater.install(options);
       onPhase?.("installer-opened", uri);
+      // The system installer now owns the flow. Keeping this row would show a
+      // misleading 100% download panel after the user has installed the App.
       updateMobileDownload(task, { state: "done", message: "已校验并打开 Android 安装器；请按系统提示完成安装。" });
+      dismissMobileDownload(task);
     } else {
       const saved = await Updater.saveApk(options);
       updateMobileDownload(task, { state: "done", savedName: saved.fileName, message: "更新包已校验并保存到 Downloads，可手动安装。" });
@@ -326,11 +532,11 @@ export async function prepareApkUpdate(update: MobileApkUpdate, token: string, i
   }
 }
 
-export async function downloadFile(url: string, fileName: string, token: string): Promise<void> {
+export async function downloadFile(url: string, fileName: string, token: string, serverOrigin = new URL(url).origin): Promise<void> {
   if (!isAndroidPlatform()) throw new Error("系统下载仅支持 Android App。");
   const task = startMobileDownload(fileName, "downloads");
   try {
-    const result = await Updater.download({ url, token, fileName, mimeType: mimeTypeForFileName(fileName), userAgent: navigator.userAgent });
+    const result = await Updater.download({ url, serverOrigin, token, fileName, mimeType: mimeTypeForFileName(fileName), userAgent: navigator.userAgent });
     if (!Number.isSafeInteger(result.id) || result.id <= 0) throw new Error("系统未返回有效的下载任务，请重试。");
     trackAndroidMobileDownload(task, result.id, result.fileName);
     watchAndroidDownloads();
@@ -392,6 +598,11 @@ export async function openDownloadedFile(id: string): Promise<void> {
   await Updater.openDownloadedFile({ id: task.nativeId });
 }
 
+export async function openIosOtaPage(url: string): Promise<void> {
+  if (Capacitor.getPlatform() !== "ios" || !Capacitor.isPluginAvailable("BridgeIOSOta")) throw new Error("当前 iOS App 版本不支持直接打开安装页，请使用 Safari。");
+  await IOSOta.open({ url });
+}
+
 export async function openExternal(url: string): Promise<void> {
   if (Capacitor.isNativePlatform()) await Browser.open({ url });
   else window.open(url, "_blank", "noopener,noreferrer");
@@ -429,11 +640,11 @@ function downloadName(suppliedName: string): string {
   return suppliedName.replace(/[/\\\u0000-\u001f\u007f]/g, "_").slice(0, 160) || "bridge-file";
 }
 
-export async function shareFile(url: string, suppliedName: string, token: string | null): Promise<void> {
+export async function shareFile(url: string, suppliedName: string, token: string | null, serverOrigin = new URL(url).origin): Promise<void> {
   const name = downloadName(suppliedName);
   if (Capacitor.isNativePlatform() && isAndroidPlatform()) {
     if (!token) throw new Error("请先配对 Bridge。");
-    await downloadFile(url, name, token);
+    await downloadFile(url, name, token, serverOrigin);
     return;
   }
   const native = Capacitor.isNativePlatform();
@@ -477,8 +688,8 @@ export async function shareFile(url: string, suppliedName: string, token: string
 }
 
 // Every authenticated download from the App uses the same global status store.
-export async function downloadBridgeFile(url: string, suppliedName: string, token: string | null): Promise<void> {
-  await shareFile(url, suppliedName, token);
+export async function downloadBridgeFile(url: string, suppliedName: string, token: string | null, serverOrigin = new URL(url).origin): Promise<void> {
+  await shareFile(url, suppliedName, token, serverOrigin);
 }
 
 function mimeTypeForFileName(fileName: string): string {

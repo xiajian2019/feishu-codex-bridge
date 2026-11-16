@@ -57,15 +57,10 @@ dependencies {
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
     implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
     implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
-    // Direct Android SSH transport. 0.39.0 is Java 8 compatible and includes
-    // the Terrapin mitigation; BC is pinned explicitly for Android crypto
-    // provider registration and modern OpenSSH host keys.
-    implementation 'com.hierynomus:sshj:0.39.0'
-    implementation 'org.bouncycastle:bcprov-jdk18on:1.78.1'
-    implementation 'org.bouncycastle:bcpkix-jdk18on:1.78.1'
-    // ConnectBot's embeddable SSH/PTY transport. The old sshj path remains
-    // available as an explicit fallback while native migration is verified.
+    // ConnectBot's active SSH/PTY transport and native terminal integration.
     implementation 'org.connectbot.sshlib:sshlib:0.5.0'
+    // cbssh already uses Tink at runtime; the SSH Ed25519 JCA adapter uses it directly.
+    implementation 'com.google.crypto.tink:tink:1.23.0'
     implementation 'org.connectbot:termlib:0.3.13'
     implementation platform('androidx.compose:compose-bom:2026.09.00')
     implementation 'androidx.compose.ui:ui'

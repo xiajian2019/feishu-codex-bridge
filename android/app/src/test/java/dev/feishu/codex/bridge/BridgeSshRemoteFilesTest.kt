@@ -15,6 +15,8 @@ import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 
 class BridgeSshRemoteFilesTest {
     @Test
@@ -70,6 +72,122 @@ class BridgeSshRemoteFilesTest {
         assertTrue(runCatching { browser.upload("", "partial.bin", ByteArrayInputStream(content)) }.isFailure)
         assertFalse(fake.files.containsKey("/repo/partial.bin"))
         assertTrue(fake.files.containsKey("/repo/existing.txt"))
+    }
+
+    @Test
+    fun sessionFilesPreferApiAndKeepTheSessionAndRootBoundForTransfers() = runBlocking {
+        val target = BridgeSshTmuxSession("\$7", "alpha", 1, false, "/repo", 42)
+        val requests = mutableListOf<String>()
+        val transport = BridgeSshApiTransport { _, url, _, _ ->
+            requests.add(url)
+            if (url.endsWith("/api/session")) BridgeSshHttpResponse(200, """{"actionToken":"action-token"}""")
+            else BridgeSshHttpResponse(200, """{"root":"/repo","path":"","truncated":false,"entries":[{"name":"hello.txt","type":"file","size":5,"modifiedAt":1730000000000}]}""")
+        }
+        val downloads = mutableListOf<Pair<String, Map<String, String>>>()
+        val uploads = mutableListOf<Pair<String, ByteArray>>()
+        val files = object : BridgeSshApiFileTransport {
+            override suspend fun download(url: String, headers: Map<String, String>, output: OutputStream, maxBytes: Long?): Boolean {
+                downloads.add(url to headers)
+                output.write("hello".toByteArray())
+                return false
+            }
+            override suspend fun upload(url: String, headers: Map<String, String>, input: InputStream) {
+                assertEquals("42", headers["X-Bridge-Session-Created-At"])
+                assertEquals("new%20file.txt", headers["X-File-Name"])
+                uploads.add(url to input.readBytes())
+            }
+        }
+        val api = BridgeSshApiClient("https://bridge.example", "bridge-token", transport, files)
+        val browser = BridgeSshRemoteFiles({ error("SFTP root should not be used") }, { error("SFTP should not be used") }, api, target)
+        val (root, entries) = browser.list("")
+        assertEquals("/repo", root)
+        assertEquals("hello.txt", entries.single().relativePath)
+        assertEquals(1_730_000_000L, entries.single().modifiedAtSeconds)
+        assertEquals("hello", browser.preview("hello.txt").first)
+        assertEquals("/repo/hello.txt", browser.absolutePath("hello.txt"))
+        val output = ByteArrayOutputStream()
+        browser.download("hello.txt", output)
+        assertEquals("hello", output.toString("UTF-8"))
+        browser.upload("", "new file.txt", ByteArrayInputStream("new".toByteArray()))
+        assertEquals("new", uploads.single().second.toString(Charsets.UTF_8))
+        assertTrue(uploads.single().first.contains("expectedRoot=%2Frepo"))
+        assertTrue(downloads.all { it.first.contains("expectedRoot=%2Frepo") && it.second["X-Bridge-Session-Created-At"] == "42" })
+        assertTrue(runCatching { browser.download("../secret", ByteArrayOutputStream()) }.isFailure)
+        assertTrue(requests.any { it.contains("/sessions/%247/files") })
+    }
+
+    @Test
+    fun unavailableOrTruncatedApiListingRetainsSftpFallback() = runBlocking {
+        val fake = FakeSftp().apply { directories.add("/repo"); files["/repo/hello.txt"] = "hello".toByteArray() }
+        val target = BridgeSshTmuxSession("\$7", "alpha", 1, false, "/repo", 42)
+        for (payload in listOf("""{"root":"/repo","entries":[],"truncated":true}""", """{"root":"/repo","entries":[]}""", """{"root":"/repo","entries":[],"truncated":null}""")) {
+            val api = BridgeSshApiClient("https://bridge.example", "bridge-token", BridgeSshApiTransport { _, url, _, _ ->
+                if (url.endsWith("/api/session")) BridgeSshHttpResponse(200, """{"actionToken":"a"}""") else BridgeSshHttpResponse(200, payload)
+            })
+            val browser = BridgeSshRemoteFiles({ "/repo" }, { fake }, api, target)
+            assertEquals("hello.txt", browser.list("").second.single().name)
+            assertEquals("hello", browser.preview("hello.txt").first)
+        }
+    }
+
+    @Test
+    fun uncertainApiTransfersDoNotRepeatOrAppendViaSftp() = runBlocking {
+        val target = BridgeSshTmuxSession("\$7", "alpha", 1, false, "/repo", 42)
+        val api = BridgeSshApiClient("https://bridge.example", "bridge-token", BridgeSshApiTransport { _, url, _, _ ->
+            if (url.endsWith("/api/session")) BridgeSshHttpResponse(200, """{"actionToken":"a"}""")
+            else BridgeSshHttpResponse(200, """{"root":"/repo","entries":[],"truncated":false}""")
+        }, object : BridgeSshApiFileTransport {
+            override suspend fun download(url: String, headers: Map<String, String>, output: OutputStream, maxBytes: Long?): Boolean {
+                output.write("partial".toByteArray())
+                throw BridgeSshApiRequestException("下载中断")
+            }
+            override suspend fun upload(url: String, headers: Map<String, String>, input: InputStream) {
+                throw BridgeSshApiRequestException("上传结果未知")
+            }
+        })
+        var sftpCalls = 0
+        val browser = BridgeSshRemoteFiles({ "/repo" }, { sftpCalls += 1; error("must not retry") }, api, target)
+        val output = ByteArrayOutputStream()
+        assertTrue(runCatching { browser.download("hello.txt", output) }.isFailure)
+        assertEquals("partial", output.toString("UTF-8"))
+        assertTrue(runCatching { browser.upload("", "new.txt", ByteArrayInputStream("new".toByteArray())) }.isFailure)
+        assertEquals(0, sftpCalls)
+    }
+
+    @Test
+    fun forwardingApiFileRequiresTheSshHostToReadTheSamePath() = runBlocking {
+        val target = BridgeSshTmuxSession("\$7", "alpha", 1, false, "/repo", 42)
+        val api = BridgeSshApiClient("https://bridge.example", "bridge-token", BridgeSshApiTransport { _, url, _, _ ->
+            if (url.endsWith("/api/session")) BridgeSshHttpResponse(200, """{"actionToken":"a"}""")
+            else BridgeSshHttpResponse(200, """{"root":"/repo","entries":[{"name":"hello.txt","type":"file"}],"truncated":false}""")
+        })
+        val browser = BridgeSshRemoteFiles({ error("not used") }, { error("not used") }, api, target, { false })
+        val error = runCatching { browser.absolutePath("hello.txt") }.exceptionOrNull()
+        assertTrue(error?.message.orEmpty().contains("SSH 主机无法读取"))
+    }
+
+    @Test
+    fun literalBackslashesKeepTheirSftpFilenameInsteadOfBecomingApiSeparators() = runBlocking {
+        val fake = FakeSftp().apply {
+            directories.addAll(listOf("/repo", "/repo/folder\\name"))
+            files["/repo/a\\b.txt"] = "original".toByteArray()
+            files["/repo/folder\\name/inside.txt"] = "inside".toByteArray()
+        }
+        val target = BridgeSshTmuxSession("\$7", "alpha", 1, false, "/repo", 42)
+        val requests = mutableListOf<String>()
+        val api = BridgeSshApiClient("https://bridge.example", "bridge-token", BridgeSshApiTransport { _, url, _, _ ->
+            requests.add(url)
+            if (url.endsWith("/api/session")) BridgeSshHttpResponse(200, """{"actionToken":"a"}""")
+            else BridgeSshHttpResponse(200, """{"root":"/repo","entries":[],"truncated":false}""")
+        })
+        val browser = BridgeSshRemoteFiles({ "/repo" }, { fake }, api, target)
+        assertEquals("inside.txt", browser.list("folder\\name").second.single().name)
+        val output = ByteArrayOutputStream()
+        browser.download("a\\b.txt", output)
+        assertEquals("original", output.toString("UTF-8"))
+        browser.upload("", "new\\file.txt", ByteArrayInputStream("new".toByteArray()))
+        assertEquals("new", fake.files["/repo/new\\file.txt"]!!.toString(Charsets.UTF_8))
+        assertTrue(requests.none { it.contains("folder%5Cname") || it.contains("a%5Cb.txt") })
     }
 
     private class FakeSftp : SftpClient {

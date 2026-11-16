@@ -87,6 +87,19 @@ export interface CodexThreadReadResponse {
   thread: CodexThread;
 }
 
+export interface CodexThreadTurnsListParams {
+  cursor?: string | null;
+  limit?: number | null;
+  sortDirection?: "asc" | "desc" | null;
+  itemsView?: "full" | "summary" | "notLoaded" | null;
+}
+
+export interface CodexThreadTurnsListResponse {
+  data: unknown[];
+  nextCursor: string | null;
+  backwardsCursor: string | null;
+}
+
 export interface CodexModelReasoningEffortOption {
   reasoningEffort: string;
   description: string;
@@ -105,21 +118,6 @@ export interface CodexModelCatalogEntry {
 export interface CodexModelListResponse {
   data: CodexModelCatalogEntry[];
   nextCursor: string | null;
-}
-
-export interface CodexThreadTokenUsageBreakdown {
-  inputTokens: number;
-  cachedInputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-  reasoningOutputTokens?: number;
-}
-
-export interface CodexThreadTokenUsageSnapshot {
-  threadId: string;
-  turnId: string;
-  last: CodexThreadTokenUsageBreakdown;
-  total: CodexThreadTokenUsageBreakdown;
 }
 
 export interface CodexAccountRateLimitWindow {
@@ -207,8 +205,8 @@ export interface CodexAppServerClientOptions {
 export interface CodexAppServerQueryClient {
   listThreads(params?: CodexThreadListParams): Promise<CodexThreadListResponse>;
   readThread?(threadId: string, includeTurns?: boolean): Promise<CodexThreadReadResponse>;
+  listThreadTurns?(threadId: string, params?: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResponse>;
   listModels?(): Promise<CodexModelListResponse>;
-  readThreadTokenUsage?(threadId: string): Promise<CodexThreadTokenUsageSnapshot | null>;
   readAccountRateLimits?(): Promise<CodexAccountRateLimitsResponse>;
   readAccountTokenUsage?(): Promise<CodexAccountTokenUsageResponse>;
   close(): Promise<void>;
@@ -283,7 +281,6 @@ export class CodexAppServerClient implements CodexAppServerQueryClient {
     version: string;
   };
   private readonly pending = new Map<number | string, PendingRequest>();
-  private readonly threadTokenUsageWaiters = new Map<string, Set<(usage: CodexThreadTokenUsageSnapshot) => void>>();
   private nextRequestId = 1;
   private stderr = "";
   private processError: Error | null = null;
@@ -369,39 +366,23 @@ export class CodexAppServerClient implements CodexAppServerQueryClient {
     return { thread: thread as CodexThread };
   }
 
-  public async listModels(): Promise<CodexModelListResponse> {
-    await this.initialize();
-    return parseModelListResponse(await this.request("model/list", { limit: 100, includeHidden: false }));
-  }
-
-  public async readThreadTokenUsage(threadId: string): Promise<CodexThreadTokenUsageSnapshot | null> {
+  public async listThreadTurns(
+    threadId: string,
+    params: CodexThreadTurnsListParams = {},
+  ): Promise<CodexThreadTurnsListResponse> {
     const normalizedThreadId = threadId.trim();
     if (!normalizedThreadId) throw new Error("threadId is required");
     await this.initialize();
-
-    let resolveUsage: ((usage: CodexThreadTokenUsageSnapshot) => void) | undefined;
-    const usageNotification = new Promise<CodexThreadTokenUsageSnapshot>((resolvePromise) => {
-      resolveUsage = resolvePromise;
+    const raw = await this.request("thread/turns/list", {
+      threadId: normalizedThreadId,
+      ...params,
     });
-    const waiters = this.threadTokenUsageWaiters.get(normalizedThreadId)
-      ?? new Set<(usage: CodexThreadTokenUsageSnapshot) => void>();
-    const waiter = (usage: CodexThreadTokenUsageSnapshot): void => resolveUsage?.(usage);
-    waiters.add(waiter);
-    this.threadTokenUsageWaiters.set(normalizedThreadId, waiters);
+    return parseThreadTurnsListResponse(raw);
+  }
 
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await this.request("thread/resume", { threadId: normalizedThreadId, excludeTurns: true });
-      const timeoutPromise = new Promise<null>((resolvePromise) => {
-        timeout = setTimeout(() => resolvePromise(null), 1_000);
-      });
-      return await Promise.race([usageNotification, timeoutPromise]);
-    } finally {
-      if (timeout) clearTimeout(timeout);
-      const currentWaiters = this.threadTokenUsageWaiters.get(normalizedThreadId);
-      currentWaiters?.delete(waiter);
-      if (currentWaiters?.size === 0) this.threadTokenUsageWaiters.delete(normalizedThreadId);
-    }
+  public async listModels(): Promise<CodexModelListResponse> {
+    await this.initialize();
+    return parseModelListResponse(await this.request("model/list", { limit: 100, includeHidden: false }));
   }
 
   public async readAccountRateLimits(): Promise<CodexAccountRateLimitsResponse> {
@@ -524,11 +505,6 @@ export class CodexAppServerClient implements CodexAppServerQueryClient {
             message: "This bridge client does not accept server-initiated requests.",
           },
         });
-      } else if (message.method === "thread/tokenUsage/updated") {
-        const usage = parseThreadTokenUsageNotification(message.params);
-        if (usage) {
-          for (const waiter of this.threadTokenUsageWaiters.get(usage.threadId) ?? []) waiter(usage);
-        }
       }
       return;
     }
@@ -613,6 +589,18 @@ function parseThreadListResponse(raw: unknown): CodexThreadListResponse {
   };
 }
 
+function parseThreadTurnsListResponse(raw: unknown): CodexThreadTurnsListResponse {
+  const result = asRecord(raw);
+  if (!Array.isArray(result.data)) {
+    throw new Error("Codex app-server returned an invalid thread/turns/list response");
+  }
+  return {
+    data: result.data,
+    nextCursor: nullableString(result.nextCursor),
+    backwardsCursor: nullableString(result.backwardsCursor),
+  };
+}
+
 function parseModelListResponse(raw: unknown): CodexModelListResponse {
   const result = asRecord(raw);
   if (!Array.isArray(result.data)) {
@@ -647,41 +635,6 @@ function parseModelListResponse(raw: unknown): CodexModelListResponse {
     }];
   });
   return { data, nextCursor: nullableString(result.nextCursor) };
-}
-
-function parseThreadTokenUsageNotification(raw: unknown): CodexThreadTokenUsageSnapshot | null {
-  const params = asRecord(raw);
-  const threadId = nullableString(params.threadId);
-  const turnId = nullableString(params.turnId);
-  const tokenUsage = asRecord(params.tokenUsage);
-  const last = parseThreadTokenUsageBreakdown(tokenUsage.last);
-  const total = parseThreadTokenUsageBreakdown(tokenUsage.total);
-  if (!threadId || !turnId || !last || !total) return null;
-  return { threadId, turnId, last, total };
-}
-
-function parseThreadTokenUsageBreakdown(raw: unknown): CodexThreadTokenUsageBreakdown | null {
-  const record = asRecord(raw);
-  const values = {
-    inputTokens: optionalNumber(record.inputTokens),
-    cachedInputTokens: optionalNumber(record.cachedInputTokens),
-    outputTokens: optionalNumber(record.outputTokens),
-    totalTokens: optionalNumber(record.totalTokens),
-    reasoningOutputTokens: optionalNumber(record.reasoningOutputTokens),
-  };
-  if ([values.inputTokens, values.cachedInputTokens, values.outputTokens, values.totalTokens].some((value) =>
-    value === undefined || !Number.isSafeInteger(value) || value < 0)) return null;
-  return {
-    inputTokens: values.inputTokens!,
-    cachedInputTokens: values.cachedInputTokens!,
-    outputTokens: values.outputTokens!,
-    totalTokens: values.totalTokens!,
-    ...(values.reasoningOutputTokens !== undefined
-      && Number.isSafeInteger(values.reasoningOutputTokens)
-      && values.reasoningOutputTokens >= 0
-      ? { reasoningOutputTokens: values.reasoningOutputTokens }
-      : {}),
-  };
 }
 
 function parseAccountRateLimitsResponse(raw: unknown): CodexAccountRateLimitsResponse {

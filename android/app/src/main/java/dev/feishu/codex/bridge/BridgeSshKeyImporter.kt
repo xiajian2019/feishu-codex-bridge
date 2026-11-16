@@ -1,12 +1,9 @@
 package dev.feishu.codex.bridge
 
 import java.nio.CharBuffer
-import java.security.PublicKey
 import java.util.Base64
-import net.schmizz.sshj.common.Buffer
-import net.schmizz.sshj.common.KeyType
-import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo
 import org.connectbot.sshlib.SshKeys
+import org.connectbot.sshlib.SshSigning
 
 internal data class BridgeSshImportedKeyMetadata(
     val nickname: String,
@@ -16,13 +13,18 @@ internal data class BridgeSshImportedKeyMetadata(
 
 internal class BridgeSshEncryptedImportException : Exception()
 
-/** Uses cbssh's public key decoder and sshj's public SSH wire encoder. */
+/** Uses ConnectBot's key decoder and public-key SSH wire encoder. */
 internal object BridgeSshKeyImporter {
     fun inspect(privateKey: CharArray, requestedName: String): BridgeSshImportedKeyMetadata {
         if (BridgeSshKeySupport.isEncrypted(privateKey)) throw BridgeSshEncryptedImportException()
+        // Import can happen before the first SSH connection, so install the same
+        // RSA compatibility selection before cbssh decodes a private key.
+        BridgeSshCrypto.install()
         // cbssh's public API accepts String input and uses the same decoder as authentication.
-        val publicKey = SshKeys.decodePemPrivateKey(privateKey.concatToString(), null).public
-        val (keyType, publicBlob) = encodePublicKey(publicKey)
+        val keyPair = SshKeys.decodePemPrivateKey(privateKey.concatToString(), null)
+        val publicKey = SshSigning.encodePublicKey(keyPair)
+        val keyType = publicKey.algorithmName
+        val publicBlob = publicKey.publicKeyBlob
         val nickname = requestedName.trim()
             .replace(Regex("[^A-Za-z0-9._-]"), "-")
             .trim('-')
@@ -37,23 +39,6 @@ internal object BridgeSshKeyImporter {
             },
             publicKeyLine = "$keyType ${Base64.getEncoder().encodeToString(publicBlob)} $nickname",
         )
-    }
-
-    private fun encodePublicKey(publicKey: PublicKey): Pair<String, ByteArray> {
-        val subjectPublicKeyInfo = SubjectPublicKeyInfo.getInstance(publicKey.encoded)
-        // cbssh returns its own Ed25519 JCA key class; sshj's encoder expects
-        // its unrelated EdDSA class. Decode the standard X.509 key instead.
-        if (subjectPublicKeyInfo.algorithm.algorithm.id == "1.3.101.112") {
-            val raw = subjectPublicKeyInfo.publicKeyData.bytes
-            require(raw.size == 32) { "Invalid Ed25519 public key" }
-            val blob = Buffer.PlainBuffer().putString("ssh-ed25519").putString(raw).compactData
-            return "ssh-ed25519" to blob
-        }
-        val type = KeyType.fromKey(publicKey)
-        require(type in setOf(KeyType.RSA, KeyType.ECDSA256, KeyType.ECDSA384, KeyType.ECDSA521)) {
-            "Unsupported SSH public key algorithm"
-        }
-        return type.toString() to Buffer.PlainBuffer().putPublicKey(publicKey).compactData
     }
 }
 

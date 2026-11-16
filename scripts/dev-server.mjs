@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { closeSync, openSync } from "node:fs";
+import { closeSync, existsSync, openSync } from "node:fs";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { networkInterfaces, tmpdir } from "node:os";
 import { request as httpRequest } from "node:http";
@@ -37,7 +37,9 @@ const SERVICES = [
     name: "Vite",
     port: 5173,
     probeUrl: "http://127.0.0.1:5173/api/auth/status",
-    args: ["run", "--bun", "vite", "--config", join(PROJECT_ROOT, "web", "vite.config.ts")],
+    args: existsSync(join(PROJECT_ROOT, "ios/App/build/dev-https/settings.json"))
+      ? [join(PROJECT_ROOT, "scripts/dev-vite-dual.mjs")]
+      : ["run", "--bun", "vite", "--config", join(PROJECT_ROOT, "web", "vite.config.ts")],
     environment: { BRIDGE_WEB_API_TARGET: "http://127.0.0.1:17310" },
   },
 ];
@@ -185,6 +187,10 @@ async function start() {
 
   console.log("Development services are detached; they remain running after this command exits.");
   console.log("Vite: http://0.0.0.0:5173/");
+  try {
+    const settings = JSON.parse(await readFile(join(PROJECT_ROOT, "ios/App/build/dev-https/settings.json"), "utf8"));
+    if (settings.schema === 1 && settings.ip) console.log(`HTTPS: https://${settings.ip}:5173/`);
+  } catch { /* HTTPS is optional. */ }
   for (const url of networkUrls(5173)) console.log(`LAN:  ${url}`);
   console.log(`API:  http://0.0.0.0:17310/`);
   console.log(`DB:   ${await realpath(PRODUCTION_DB).catch(() => PRODUCTION_DB)}`);
@@ -212,6 +218,10 @@ async function startWebOnly() {
 
   console.log("Vite is detached and remains running after this command exits.");
   console.log("Vite: http://0.0.0.0:5173/");
+  try {
+    const settings = JSON.parse(await readFile(join(PROJECT_ROOT, "ios/App/build/dev-https/settings.json"), "utf8"));
+    if (settings.schema === 1 && settings.ip) console.log(`HTTPS: https://${settings.ip}:5173/`);
+  } catch { /* HTTPS is optional. */ }
   for (const url of networkUrls(web.port)) console.log(`LAN:  ${url}`);
   console.log(`API:  http://127.0.0.1:${api.port}/`);
   console.log(`Logs: ${STATE_DIRECTORY}`);
@@ -233,6 +243,12 @@ async function main() {
   const command = process.argv[2] ?? "start";
   if (command === "start") return start();
   if (command === "web") return startWebOnly();
+  if (command === "web-restart") {
+    const web = SERVICES.find((service) => service.id === "web");
+    if (!web) throw new Error("Vite service is not configured.");
+    await stopService(web);
+    return startWebOnly();
+  }
   if (command === "stop") {
     for (const service of [...SERVICES].reverse()) await stopService(service);
     return;
@@ -243,7 +259,7 @@ async function main() {
   }
   if (command === "status") return status();
   if (command === "--help" || command === "-h" || command === "help") {
-    console.log("Usage: bun run dev:start [start|web|status|stop|restart]");
+    console.log("Usage: bun run dev:start [start|web|web-restart|status|stop|restart]");
     return;
   }
   throw new Error(`Unknown command: ${command}`);

@@ -67,6 +67,12 @@ class BridgeSshCommandComposerTest {
     }
 
     @Test
+    fun tmuxSwitchOnlyTreatsAnExplicitDetachMessageAsConfirmation() {
+        assertTrue(bridgeSshTmuxDetachConfirmed("[detached (from session main)]"))
+        assertFalse(bridgeSshTmuxDetachConfirmed("codex is still running in the pane"))
+    }
+
+    @Test
     fun submitPreservesDraftUntilTransportWritesAndThenRecordsHistory() {
         val state = BridgeSshCommandComposerState(initialText = "echo 你好")
         var received: BridgeSshCommandSubmission? = null

@@ -112,6 +112,9 @@ internal object BridgeSshKeyStore {
         .mapNotNull(::toStoredKey)
         .sortedByDescending { it.createdAt }
 
+    fun metadata(context: Context, id: String): BridgeSshStoredKey =
+        list(context).firstOrNull { it.id == id } ?: error("SSH key not found")
+
     @Synchronized
     fun loadPrivateKey(context: Context, id: String): CharArray {
         val record = readRecords(context).firstOrNull { it.optString("id") == id }
