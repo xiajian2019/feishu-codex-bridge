@@ -5,6 +5,9 @@ release/
 tmp/
 .DS_Store
 .playwright-mcp/
+
+# Optional local machine guidance referenced by AGENTS.md.
+/AGENTS.local.md
 runtime/*
 !runtime/
 runtime/logs/*
