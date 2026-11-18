@@ -10,9 +10,12 @@ export const BRIDGE_NETWORK_SETTINGS_EVENT = "bridge:network-settings-changed";
 
 const BRIDGE_NETWORK_SETTINGS_KEY = "bridge.mobile.network-settings";
 
+export type IosVpnProvider = "external" | "tunnelkit";
+
 export interface BridgeNetworkSettings {
   globalMacHost: string;
   vpnBypassWifiSsids: string[];
+  iosVpnProvider?: IosVpnProvider;
 }
 
 const DEFAULT_NETWORK_SETTINGS: BridgeNetworkSettings = {
@@ -71,11 +74,13 @@ export function readBridgeNetworkSettings(storage: Storage | null = browserStora
   try {
     const raw = storage.getItem(BRIDGE_NETWORK_SETTINGS_KEY);
     if (!raw) return { ...DEFAULT_NETWORK_SETTINGS, vpnBypassWifiSsids: [] };
-    const parsed = JSON.parse(raw) as { globalMacHost?: unknown; vpnBypassWifiSsids?: unknown };
+    const parsed = JSON.parse(raw) as { globalMacHost?: unknown; vpnBypassWifiSsids?: unknown; iosVpnProvider?: unknown };
     const globalMacHost = typeof parsed.globalMacHost === "string"
       ? (() => { try { return normalizeGlobalMacHost(parsed.globalMacHost!); } catch { return DEFAULT_NETWORK_SETTINGS.globalMacHost; } })()
       : DEFAULT_NETWORK_SETTINGS.globalMacHost;
-    return { globalMacHost, vpnBypassWifiSsids: normalizeWifiSsids(parsed.vpnBypassWifiSsids) };
+    const iosVpnProvider = parsed.iosVpnProvider === "external" || parsed.iosVpnProvider === "tunnelkit"
+      ? parsed.iosVpnProvider : undefined;
+    return { globalMacHost, vpnBypassWifiSsids: normalizeWifiSsids(parsed.vpnBypassWifiSsids), ...(iosVpnProvider ? { iosVpnProvider } : {}) };
   } catch {
     return { ...DEFAULT_NETWORK_SETTINGS, vpnBypassWifiSsids: [] };
   }
@@ -86,12 +91,14 @@ export function getConfiguredGlobalMacHost(): string {
 }
 
 export function saveBridgeNetworkSettings(
-  input: { globalMacHost: string; vpnBypassWifiSsids: readonly string[] },
+  input: { globalMacHost: string; vpnBypassWifiSsids: readonly string[]; iosVpnProvider?: IosVpnProvider },
   storage: Storage | null = browserStorage(),
 ): BridgeNetworkSettings {
+  const iosVpnProvider = input.iosVpnProvider ?? readBridgeNetworkSettings(storage).iosVpnProvider;
   const settings: BridgeNetworkSettings = {
     globalMacHost: normalizeGlobalMacHost(input.globalMacHost),
     vpnBypassWifiSsids: normalizeWifiSsids(input.vpnBypassWifiSsids),
+    ...(iosVpnProvider ? { iosVpnProvider } : {}),
   };
   if (!storage) throw new Error("当前环境无法保存网络配置。");
   storage.setItem(BRIDGE_NETWORK_SETTINGS_KEY, JSON.stringify(settings));

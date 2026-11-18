@@ -44,6 +44,11 @@ ios/**/xcuserdata/
 ios/**/*.xcuserstate
 ios/**/.build/
 ios/**/Package.resolved
+
+# Upstream TunnelKit repository metadata; retain its license and test fixtures.
+/ios/App/Packages/TunnelKitOpenVPN/.github/
+/ios/App/Packages/TunnelKitOpenVPN/.ruby-version
+/ios/App/Packages/TunnelKitOpenVPN/CHANGELOG.md
 *.mobileprovision
 *.p12
 *.p8

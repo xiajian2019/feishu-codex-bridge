@@ -9,6 +9,13 @@ import { readMobileNotificationPreferences, updateMobileNotificationPreferences,
 import { getMobileNotificationPermission } from "./mobile-runtime.js";
 import { IOSOtaPanel, isIphoneOtaSurface } from "./IOSOtaPanel.js";
 import { CrashDiagnosticsPanel } from "./CrashDiagnosticsPanel.js";
+import {
+  getNativeSshDefaultProfile,
+  getNativeSshPlatform,
+  listNativeSshOptions,
+  setNativeSshDefaultProfile,
+  type SshProfileOption,
+} from "./ssh-connectbot-native.js";
 
 export function SystemSettings(): ReactElement {
   const { mode, setMode } = useTheme();
@@ -25,14 +32,43 @@ export function SystemSettings(): ReactElement {
   const [nativePermission, setNativePermission] = useState("读取中");
   const [nativeBusy, setNativeBusy] = useState(false);
   const [nativeError, setNativeError] = useState("");
+  const iosSshSettingsAvailable = isMobileApp() && getNativeSshPlatform() === "ios";
+  const [sshProfiles, setSshProfiles] = useState<SshProfileOption[]>([]);
+  const [defaultSshProfileId, setDefaultSshProfileId] = useState<string | null>(null);
+  const [sshSettingsLoading, setSshSettingsLoading] = useState(false);
+  const [sshSettingsSaving, setSshSettingsSaving] = useState(false);
+  const [sshSettingsError, setSshSettingsError] = useState("");
   useEffect(() => {
     if (isMobileApp()) void getMobileNotificationPermission().then(setNativePermission).catch(() => setNativePermission("暂不可读"));
   }, []);
+  useEffect(() => {
+    if (!iosSshSettingsAvailable) return;
+    let active = true;
+    setSshSettingsLoading(true);
+    setSshSettingsError("");
+    void Promise.all([listNativeSshOptions(), getNativeSshDefaultProfile()]).then(([options, profileId]) => {
+      if (!active) return;
+      setSshProfiles(options.profiles.filter((profile) => profile.keyId));
+      setDefaultSshProfileId(profileId);
+    }).catch((cause: unknown) => {
+      if (active) setSshSettingsError(cause instanceof Error ? cause.message : "无法读取默认 SSH 主机设置。");
+    }).finally(() => { if (active) setSshSettingsLoading(false); });
+    return () => { active = false; };
+  }, [iosSshSettingsAvailable]);
   const updateNative = (patch: Partial<Omit<MobileNotificationPreferences, "enabledAt">>): void => {
     if (nativeBusy) return;
     setNativeBusy(true); setNativeError("");
     void updateMobileNotificationPreferences(patch).then(setNativePreferences).then(() => getMobileNotificationPermission()).then(setNativePermission)
       .catch((cause: unknown) => setNativeError(cause instanceof Error ? cause.message : "原生通知设置失败。" )).finally(() => setNativeBusy(false));
+  };
+
+  const updateDefaultSshProfile = (profileId: string): void => {
+    if (sshSettingsSaving) return;
+    setSshSettingsSaving(true);
+    setSshSettingsError("");
+    void setNativeSshDefaultProfile(profileId || null).then(setDefaultSshProfileId)
+      .catch((cause: unknown) => setSshSettingsError(cause instanceof Error ? cause.message : "默认 SSH 主机保存失败。"))
+      .finally(() => setSshSettingsSaving(false));
   };
 
   const loadNotifications = useCallback(async (): Promise<void> => {
@@ -95,6 +131,24 @@ export function SystemSettings(): ReactElement {
             }).finally(() => setShakeBusy(false));
           }} /></label>
           {shakeError ? <p className="workbench-page-error" role="alert">{shakeError}</p> : null}
+        </> : null}
+        {iosSshSettingsAvailable ? <>
+          <label className="system-settings-row" htmlFor="system-settings-default-ssh-profile">
+            <span>默认 SSH 主机</span>
+            <select
+              id="system-settings-default-ssh-profile"
+              value={defaultSshProfileId ?? ""}
+              disabled={sshSettingsLoading || sshSettingsSaving || sshProfiles.length === 0}
+              onChange={(event) => updateDefaultSshProfile(event.currentTarget.value)}
+            >
+              <option value="">自动选择第一个可用主机</option>
+              {sshProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.label} · {profile.username}@{profile.host}:{profile.port}</option>)}
+            </select>
+          </label>
+          <p className="workbench-settings-note">Siri 的“打开远程终端”会使用此主机；SSH 私钥仍只保存在 iPhone 原生密钥库中。</p>
+          {sshSettingsLoading ? <p className="workbench-muted">正在读取 SSH 主机…</p> : null}
+          {!sshSettingsLoading && sshProfiles.length === 0 ? <p className="workbench-settings-note">尚未保存带私钥的 SSH 主机，请先进入“SSH / Mac”完成配置。</p> : null}
+          {sshSettingsError ? <p className="workbench-page-error" role="alert">{sshSettingsError}</p> : null}
         </> : null}
         <label className="system-settings-row" htmlFor="system-settings-theme-mode">
           <span>主题颜色</span>

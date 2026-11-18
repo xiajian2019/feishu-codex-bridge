@@ -72,7 +72,7 @@ function streamTarget(path: string): string | null {
   if (!path.startsWith("/") || path.startsWith("//") || path.includes("#")) return null;
   const url = new URL(path, "http://bridge.invalid");
   if (url.origin !== "http://bridge.invalid" || url.searchParams.has("bridgeTicket")) return null;
-  if (url.pathname !== "/api/events" && url.pathname !== "/tmux-dashboard/terminal") return null;
+  if (url.pathname !== "/api/events" && url.pathname !== "/tmux-dashboard/terminal" && url.pathname !== "/remote-desktop/stream") return null;
   const query = url.searchParams.toString();
   return url.pathname + (query ? `?${query}` : "");
 }

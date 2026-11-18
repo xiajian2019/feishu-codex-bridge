@@ -18,7 +18,7 @@
 | 0:00–0:45 | 展示 MacBook 上已有的 Codex session | “Codex 还在我的 Mac 上运行；我想离开工位时查看进度，必要时补一句提示。” |
 | 0:45–1:30 | 在 iPhone Safari 打开已配对的 Tmux Dashboard | 说明手机访问的是自己的 Bridge，不是远程桌面或云端 Codex。 |
 | 1:30–2:30 | 选中演示 session，观察现有输出 | 说明 Dashboard 连接的是 Bridge 主机的 tmux session。 |
-| 2:30–4:00 | 用 Composer 发送只读提示，展示 Codex 回复 | 明确这是发消息给选中的 Codex session，不是输入任意 shell 命令。 |
+| 2:30–4:00 | 用 Composer 发送只读提示，展示 Codex 回复 | 说明默认 Composer 向所选 Codex session 发消息；显式开启终端输入后，按键会直接进入 tmux。 |
 | 4:00–4:45 | 打开 session 文件页，预览示例 README | 说明文件范围由服务端绑定到该 session 的工作目录。 |
 | 4:45–5:45 | 展示架构图和配对边界 | Mac 和 Bridge 需保持运行；手机需要能访问 Bridge，并使用配对认证。 |
 | 5:45–7:00 | 邀请同事反馈 | 询问他们会在哪个时刻使用，以及是否愿意参加小范围试用。 |

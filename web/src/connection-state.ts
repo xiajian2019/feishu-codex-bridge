@@ -49,7 +49,7 @@ function installBrowserListeners(): void {
   });
   window.addEventListener("bridge:mobile-vpn-target-unreachable", () => {
     if (!snapshot.browserOnline) return;
-    publish({ ...snapshot, api: "unreachable", failureKind: "target-unreachable", target: "unreachable", lastError: "目标主机端口不可达，请检查网络和 VPN。" });
+    publish({ ...snapshot, api: "unreachable", failureKind: "target-unreachable", target: "unreachable", lastError: "主机探测暂未收到响应。" });
   });
   window.addEventListener("bridge:mobile-vpn-reachable", () => {
     publish({ ...snapshot, browserOnline: true, api: "checking", failureKind: null, target: "reachable", lastError: null });

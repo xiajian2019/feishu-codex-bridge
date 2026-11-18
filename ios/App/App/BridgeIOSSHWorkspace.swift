@@ -290,6 +290,13 @@ final class BridgeIOSSHWorkspaceViewController: UIViewController, UIAdaptivePres
         switch (launch, nextLaunch) {
         case (.manager(_, _, _, _, let current), .manager(_, _, _, _, let next)):
             return current == next
+        case (.terminal(let currentHost, let currentPort, let currentUsername, let currentPassword,
+                        let currentStartupCommand, let currentOrigin, let currentKeyId),
+              .terminal(let nextHost, let nextPort, let nextUsername, let nextPassword,
+                        let nextStartupCommand, let nextOrigin, let nextKeyId)):
+            return currentHost == nextHost && currentPort == nextPort && currentUsername == nextUsername
+                && currentPassword == nextPassword && currentStartupCommand == nextStartupCommand
+                && currentOrigin == nextOrigin && currentKeyId == nextKeyId
         default:
             return false
         }
@@ -326,6 +333,20 @@ enum BridgeIOSSHComposerState: Equatable {
     case sent
     case unknown(String)
     case failed(String)
+}
+
+private enum BridgeIOSSHComposerError: LocalizedError {
+    case sftpUnavailable
+    case disconnected
+    case pasteModeChanged
+
+    var errorDescription: String? {
+        switch self {
+        case .sftpUnavailable: return "SFTP 尚未准备好，无法上传附件。"
+        case .disconnected: return "SSH 连接已变化，内容未写入。"
+        case .pasteModeChanged: return "当前终端已关闭粘贴保护，无法安全发送多行内容。"
+        }
+    }
 }
 
 enum BridgeIOSSHFilesState: Equatable {
@@ -785,72 +806,91 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
     }
 
     func sendComposer() {
+        guard composerState != .sending else { return }
         guard let session, state == .connected else {
             composerState = .failed("SSH 尚未连接。")
             return
         }
-        let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else {
-            composerState = .failed("请输入要发送给 Codex 的内容。")
+        let text = composerText
+        let attachments = composerAttachments
+        let preview = BridgeIOSSHComposerEncoding.prompt(text: text, attachments: [])
+        guard !preview.isEmpty || !attachments.isEmpty else {
+            composerState = .failed("请输入内容或添加附件。")
             return
         }
         guard text.count <= 8_000 else {
             composerState = .failed("消息不能超过 8,000 个字符。")
             return
         }
+        if !session.bracketedPasteEnabled && (preview.contains("\n") || !attachments.isEmpty) {
+            composerState = .failed("当前终端未启用粘贴保护，无法安全发送多行内容或附件；草稿已保留。")
+            return
+        }
         composerState = .sending
-        let idempotencyKey = UUID().uuidString
-        let localAttachments = composerAttachments
-        if let context = boundContext, apiBindingState == .verified {
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                do {
-                    var uploaded: [BridgeIOSSHComposerAttachment] = []
-                    for attachment in localAttachments {
-                        let item = try await BridgeIOSSHSessionAPI.uploadComposerAttachment(
-                            context: context,
-                            fileURL: attachment.fileURL,
-                            fileName: attachment.name,
-                            contentType: attachment.contentType,
-                        )
-                        uploaded.append(item)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            var client: SFTPClient?
+            var transfer: BridgeIOSSHComposerSFTP?
+            var uploaded: [BridgeIOSSHComposerRemoteAttachment] = []
+            var writeAttempted = false
+            defer { client?.channel.close(promise: nil) }
+            do {
+                if !attachments.isEmpty {
+                    guard let future = session.openSFTPClient() else { throw BridgeIOSSHComposerError.sftpUnavailable }
+                    let opened = try await future.get()
+                    client = opened
+                    let uploader = BridgeIOSSHComposerSFTP(client: opened)
+                    transfer = uploader
+                    for attachment in attachments {
+                        guard self.session === session, self.state == .connected else { throw BridgeIOSSHComposerError.disconnected }
+                        let remote = try await uploader.upload(fileURL: attachment.fileURL, name: attachment.name,
+                                                               contentType: attachment.contentType)
+                        uploaded.append(remote)
                     }
-                    let result = try await BridgeIOSSHSessionAPI.sendComposer(
-                        context: context,
-                        idempotencyKey: idempotencyKey,
-                        text: text,
-                        attachments: uploaded,
-                    )
-                    if result.resultUnknown == true {
-                        self.composerState = .unknown(result.error ?? "Composer 结果未知，请先查看 Session。")
-                    } else if result.ok {
-                        self.composerText = ""
-                        self.clearComposerAttachments()
-                        self.composerState = .sent
-                    } else {
-                        self.composerState = .failed(result.error ?? "Composer 未发送。")
-                    }
-                } catch let error as BridgeIOSSHSessionAPIError {
-                    switch error {
-                    case .resultUnknown(let message):
-                        self.composerState = .unknown(message)
-                    case .unavailable:
-                        if localAttachments.isEmpty { self.sendComposerViaPTY(text, session: session) }
-                        else { self.composerState = .failed("附件需要 Bridge API，当前 API 不可用；附件草稿已保留。") }
-                    default:
-                        self.composerState = .failed(error.localizedDescription)
-                    }
-                } catch {
-                    self.composerState = .failed("Composer 发送失败，请重试。")
                 }
+                guard self.session === session, self.state == .connected else { throw BridgeIOSSHComposerError.disconnected }
+                let prompt = BridgeIOSSHComposerEncoding.prompt(text: text, attachments: uploaded)
+                let bracketed = session.bracketedPasteEnabled
+                guard bracketed || !prompt.contains("\n") else { throw BridgeIOSSHComposerError.pasteModeChanged }
+                let payload = BridgeIOSSHComposerEncoding.paste(prompt, bracketed: bracketed)
+                writeAttempted = true
+                let result: BridgeIOSSHInputResult = await withCheckedContinuation { continuation in
+                    session.sendComposer(payload) { continuation.resume(returning: $0) }
+                }
+                if result == .notSent {
+                    writeAttempted = false
+                    await transfer?.remove(uploaded)
+                }
+                guard self.session === session else { return }
+                switch result {
+                case .written:
+                    self.composerText = ""
+                    self.clearComposerAttachments()
+                    self.composerState = .sent
+                case .notSent:
+                    self.composerState = .failed("SSH 连接已断开，内容未写入；草稿已保留。")
+                case .unknown:
+                    self.composerState = .unknown("SSH 写入结果未知，请先检查当前终端；草稿已保留。")
+                }
+            } catch {
+                if !writeAttempted { await transfer?.remove(uploaded) }
+                guard self.session === session else { return }
+                self.composerState = .failed("\(error.localizedDescription) 草稿已保留。")
             }
-            return
         }
-        if !localAttachments.isEmpty {
-            composerState = .failed("附件需要已绑定的 Bridge API；附件草稿已保留。")
-            return
+    }
+
+    func sendTerminalKey(_ bytes: [UInt8]) {
+        guard state == .connected, let session else { return }
+        session.send(BridgeIOSSHComposerEncoding.terminalKey(bytes, applicationCursor: session.applicationCursorEnabled))
+    }
+
+    func composerEdited() {
+        switch composerState {
+        case .sending: break
+        case .sent where composerText.isEmpty: break
+        default: composerState = .idle
         }
-        sendComposerViaPTY(text, session: session)
     }
 
     func importComposerAttachments(from urls: [URL]) {
@@ -868,6 +908,7 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
                 imported.append(BridgeIOSSHLocalComposerAttachment(id: id, name: url.lastPathComponent, fileURL: destination, contentType: type))
             }
             composerAttachments = imported
+            composerState = .idle
         } catch {
             composerState = .failed("附件无法加入草稿：\(error.localizedDescription)")
         }
@@ -875,6 +916,7 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
 
     func removeComposerAttachment(_ attachment: BridgeIOSSHLocalComposerAttachment) {
         composerAttachments.removeAll { $0.id == attachment.id }
+        composerState = .idle
         try? FileManager.default.removeItem(at: attachment.fileURL)
     }
 
@@ -935,13 +977,6 @@ private final class BridgeIOSSHWorkspaceModel: ObservableObject {
         } catch { filesState = .failed(error.localizedDescription) }
     }
 
-    private func sendComposerViaPTY(_ text: String, session: BridgeIOSSHSession) {
-        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
-        session.send(Data(("\u{001B}[200~" + normalized + " \u{001B}[201~\r").utf8))
-        composerText = ""
-        composerState = .sent
-    }
-
     func saveProfile() {
         guard let parsedPort = Int(port), (1...65_535).contains(parsedPort), !host.isEmpty, !username.isEmpty else {
             state = .failed("请先填写有效的主机、端口和用户名。")
@@ -986,6 +1021,9 @@ private struct BridgeIOSSHWorkspaceView: View {
     @State private var isImportingComposerAttachment = false
     @State private var isShowingFiles = false
     @State private var isDiagnosticsCopied = false
+    @State private var composerHeight: CGFloat = 52
+    @State private var isShowingTerminalKeys = false
+    @Environment(\.colorScheme) private var colorScheme
 
     init(launch: BridgeIOSSHWorkspaceLaunch, onClose: @escaping (Bool) -> Void) {
         self.launch = launch
@@ -1154,63 +1192,123 @@ private struct BridgeIOSSHWorkspaceView: View {
     }
 
     private var composerView: some View {
-        VStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 6) {
             if !model.composerAttachments.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         ForEach(model.composerAttachments) { attachment in
-                            HStack(spacing: 4) {
+                            HStack(spacing: 5) {
                                 Image(systemName: attachment.contentType.hasPrefix("image/") ? "photo" : "doc")
                                 Text(attachment.name).lineLimit(1)
                                 Button { model.removeComposerAttachment(attachment) } label: {
                                     Image(systemName: "xmark.circle.fill")
                                 }
+                                .accessibilityLabel("移除附件 \(attachment.name)")
+                                .disabled(model.composerState == .sending)
                             }
-                            .font(.system(size: 11))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 5)
-                            .background(.white.opacity(0.14), in: Capsule())
+                            .font(.system(size: 12))
+                            .foregroundStyle(composerForeground)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 7)
+                            .background(composerForeground.opacity(0.09), in: RoundedRectangle(cornerRadius: 9))
                         }
                     }
                 }
             }
+            ZStack(alignment: .topLeading) {
+                if model.composerText.isEmpty {
+                    Text("输入内容，发送到当前 SSH 终端…")
+                        .font(.system(size: 16))
+                        .foregroundStyle(composerPlaceholder)
+                        .padding(.leading, 4)
+                        .padding(.top, 8)
+                        .allowsHitTesting(false)
+                }
+                BridgeIOSSHComposerTextView(text: $model.composerText, height: $composerHeight,
+                                            textColor: isLightComposer ? .black : .white,
+                                            editable: model.state == .connected && model.composerState != .sending)
+                    .frame(height: composerHeight)
+            }
+            HStack(spacing: 3) {
+                Button { isImportingComposerAttachment = true } label: {
+                    Image(systemName: "plus").font(.system(size: 18, weight: .medium))
+                        .frame(width: 36, height: 36).contentShape(Rectangle())
+                }
+                .accessibilityLabel("添加附件")
+                .disabled(model.state != .connected || model.composerState == .sending)
+                Button { isShowingTerminalKeys.toggle() } label: {
+                    Image(systemName: isShowingTerminalKeys ? "keyboard.chevron.compact.down" : "keyboard")
+                        .font(.system(size: 16)).frame(width: 36, height: 36).contentShape(Rectangle())
+                }
+                .accessibilityLabel(isShowingTerminalKeys ? "收起终端快捷键" : "展开终端快捷键")
+                if isShowingTerminalKeys {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 3) {
+                            terminalKey("Esc", bytes: [27])
+                            terminalKey("Tab", bytes: [9])
+                            terminalKey("↑", bytes: [27, 91, 65])
+                            terminalKey("↓", bytes: [27, 91, 66])
+                            terminalKey("←", bytes: [27, 91, 68])
+                            terminalKey("→", bytes: [27, 91, 67])
+                            terminalKey("Ctrl-C", bytes: [3])
+                            terminalKey("↵", bytes: [13])
+                        }
+                    }
+                } else {
+                    Spacer(minLength: 0)
+                }
+                Button { model.sendComposer() } label: {
+                    Group {
+                        if model.composerState == .sending {
+                            ProgressView().tint(SwiftUI.Color(red: 0.06, green: 0.1, blue: 0.08))
+                        } else {
+                            Image(systemName: "arrow.up").font(.system(size: 17, weight: .bold))
+                        }
+                    }
+                    .foregroundStyle(SwiftUI.Color(red: 0.06, green: 0.1, blue: 0.08))
+                    .frame(width: 40, height: 40)
+                    .background(SwiftUI.Color(red: 0.45, green: 0.84, blue: 0.63).opacity(composerSendDisabled ? 0.5 : 1), in: Circle())
+                }
+                .accessibilityLabel("发送到当前 SSH 终端")
+                .disabled(composerSendDisabled)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(composerForeground.opacity(0.72))
             if let message = composerStateMessage {
                 Text(message)
                     .font(.system(size: 11))
                     .foregroundStyle(composerStateColor)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .lineLimit(2)
-            }
-            HStack(spacing: 8) {
-                Button { isImportingComposerAttachment = true } label: {
-                    Image(systemName: "paperclip")
-                }
-                .frame(width: 34, height: 34)
-                .buttonStyle(.bordered)
-                .disabled(model.state != .connected || model.composerState == .sending)
-                TextField("发送消息给 Codex…", text: $model.composerText)
-                    .textFieldStyle(.roundedBorder)
-                    .submitLabel(.send)
-                    .onSubmit { model.sendComposer() }
-                Button {
-                    model.sendComposer()
-                } label: {
-                    if model.composerState == .sending {
-                        ProgressView().tint(.white)
-                    } else {
-                        Image(systemName: "arrow.up")
-                    }
-                }
-                .frame(width: 36, height: 36)
-                .buttonStyle(.borderedProminent)
-                .disabled(model.state != .connected || model.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.composerState == .sending)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .background(.black.opacity(0.88))
+        .background(composerBackground, in: RoundedRectangle(cornerRadius: 22))
+        .overlay(RoundedRectangle(cornerRadius: 22).stroke(composerBorder, lineWidth: 1))
+        .padding(.horizontal, 8)
+        .padding(.bottom, 4)
+        .onChange(of: model.composerText) { _ in model.composerEdited() }
     }
+
+    private func terminalKey(_ title: String, bytes: [UInt8]) -> some View {
+        Button { model.sendTerminalKey(bytes) } label: {
+            Text(title).font(.system(size: 12, weight: .medium))
+                .frame(minWidth: 34, minHeight: 36).contentShape(Rectangle())
+        }
+        .disabled(model.state != .connected || model.composerState == .sending)
+        .accessibilityLabel("发送终端按键 \(title)")
+    }
+
+    private var composerSendDisabled: Bool {
+        model.state != .connected || model.composerState == .sending ||
+            (model.composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model.composerAttachments.isEmpty)
+    }
+    private var isLightComposer: Bool { colorScheme == .light }
+    private var composerBackground: SwiftUI.Color { isLightComposer ? SwiftUI.Color(red: 0.97, green: 0.98, blue: 0.97) : SwiftUI.Color(red: 0.125, green: 0.13, blue: 0.14) }
+    private var composerBorder: SwiftUI.Color { isLightComposer ? SwiftUI.Color.black.opacity(0.15) : SwiftUI.Color(red: 0.24, green: 0.25, blue: 0.29) }
+    private var composerForeground: SwiftUI.Color { isLightComposer ? SwiftUI.Color(red: 0.09, green: 0.13, blue: 0.1) : SwiftUI.Color(red: 0.94, green: 0.95, blue: 0.96) }
+    private var composerPlaceholder: SwiftUI.Color { isLightComposer ? SwiftUI.Color(red: 0.41, green: 0.45, blue: 0.42) : SwiftUI.Color(red: 0.47, green: 0.52, blue: 0.58) }
 
     private var setupView: some View {
         ScrollView {
@@ -1582,8 +1680,8 @@ private struct BridgeIOSSHWorkspaceView: View {
     private var composerStateMessage: String? {
         switch model.composerState {
         case .idle: return nil
-        case .sending: return "正在发送 Composer…"
-        case .sent: return "已发送；终端仍可能需要时间开始处理。"
+        case .sending: return "正在发送到 SSH 终端…"
+        case .sent: return "已写入 SSH；请在终端查看处理结果。"
         case .unknown(let message): return message
         case .failed(let message): return message
         }
@@ -1591,10 +1689,10 @@ private struct BridgeIOSSHWorkspaceView: View {
 
     private var composerStateColor: SwiftUI.Color {
         switch model.composerState {
-        case .sent: return .green
-        case .sending: return .yellow
-        case .unknown, .failed: return .orange
-        case .idle: return .white.opacity(0.7)
+        case .sent: return isLightComposer ? SwiftUI.Color(red: 0.1, green: 0.42, blue: 0.25) : .green
+        case .sending: return isLightComposer ? .brown : .yellow
+        case .unknown, .failed: return isLightComposer ? SwiftUI.Color(red: 0.7, green: 0.28, blue: 0.08) : .orange
+        case .idle: return composerForeground.opacity(0.7)
         }
     }
 }
@@ -1680,6 +1778,53 @@ private struct BridgeIOSSHSecureField: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .textFieldStyle(.roundedBorder)
+        }
+    }
+}
+
+private struct BridgeIOSSHComposerTextView: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var height: CGFloat
+    let textColor: UIColor
+    let editable: Bool
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.delegate = context.coordinator
+        view.backgroundColor = .clear
+        view.font = .systemFont(ofSize: 16)
+        view.textContainerInset = UIEdgeInsets(top: 8, left: 4, bottom: 8, right: 4)
+        view.textContainer.lineFragmentPadding = 0
+        view.isScrollEnabled = true
+        view.accessibilityLabel = "当前 SSH 终端输入"
+        return view
+    }
+
+    func updateUIView(_ view: UITextView, context: Context) {
+        context.coordinator.parent = self
+        if view.text != text { view.text = text }
+        view.textColor = textColor
+        view.isEditable = editable
+        context.coordinator.updateHeight(view)
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: BridgeIOSSHComposerTextView
+        init(parent: BridgeIOSSHComposerTextView) { self.parent = parent }
+
+        func textViewDidChange(_ textView: UITextView) {
+            parent.text = textView.text
+            updateHeight(textView)
+        }
+
+        func updateHeight(_ textView: UITextView) {
+            guard textView.bounds.width > 0 else { return }
+            let proposed = textView.sizeThatFits(CGSize(width: textView.bounds.width, height: .greatestFiniteMagnitude)).height
+            let next = min(max(proposed, 52), 128)
+            guard abs(next - parent.height) > 0.5 else { return }
+            DispatchQueue.main.async { [weak self] in self?.parent.height = next }
         }
     }
 }
@@ -1919,6 +2064,7 @@ final class BridgeIOSSHSession {
     private var group: MultiThreadedEventLoopGroup?
     private var channel: Channel?
     private var sessionChannel: Channel?
+    private var inputQueue: BridgeIOSSHInputQueue?
     private var sshHandler: NIOSSHHandler?
     private var phase = "created"
 
@@ -2010,16 +2156,51 @@ final class BridgeIOSSHSession {
         }
     }
 
+    /// Accessed on the UI thread, where SwiftTerm processes terminal output.
+    var bracketedPasteEnabled: Bool { terminal?.getTerminal().bracketedPasteMode ?? false }
+    var applicationCursorEnabled: Bool { terminal?.getTerminal().applicationCursor ?? false }
+
     func send(_ data: Data) {
+        enqueueTerminalInput(data, composerCompletion: nil)
+    }
+
+    func sendComposer(_ data: Data, completion: @escaping (BridgeIOSSHInputResult) -> Void) {
+        enqueueTerminalInput(data, composerCompletion: completion)
+    }
+
+    private func enqueueTerminalInput(_ data: Data, composerCompletion: ((BridgeIOSSHInputResult) -> Void)?) {
         guard let sessionChannel else {
             BridgeIOSSHLog.error("[\(connectionID)] send ignored: no session channel bytes=\(data.count) phase=\(phase)")
+            composerCompletion?(.notSent)
             return
         }
-        BridgeIOSSHLog.debug("[\(connectionID)] sending terminal bytes=\(data.count)")
-        sessionChannel.eventLoop.execute {
-            var buffer = sessionChannel.allocator.buffer(capacity: data.count)
-            buffer.writeBytes(data)
-            sessionChannel.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(buffer)), promise: nil)
+        sessionChannel.eventLoop.execute { [weak self] in
+            guard let self else { composerCompletion?(.notSent); return }
+            if self.inputQueue == nil {
+                self.inputQueue = BridgeIOSSHInputQueue(
+                    active: { sessionChannel.isActive },
+                    write: { data, done in
+                        var buffer = sessionChannel.allocator.buffer(capacity: data.count)
+                        buffer.writeBytes(data)
+                        sessionChannel.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(buffer)))
+                            .whenComplete { result in
+                                switch result {
+                                case .success: done(true)
+                                case .failure: done(false)
+                                }
+                            }
+                    },
+                    schedule: { action in
+                        let scheduled = sessionChannel.eventLoop.scheduleTask(in: .milliseconds(180), action)
+                        // Closing the event loop can cancel the delay after paste was
+                        // written. Resolve that as unknown instead of leaving the
+                        // Composer permanently in its sending state.
+                        scheduled.futureResult.whenFailure { _ in action() }
+                    }
+                )
+            }
+            if let composerCompletion { self.inputQueue?.enqueueComposer(data, completion: composerCompletion) }
+            else { self.inputQueue?.enqueueRaw(data) }
         }
     }
 

@@ -9,7 +9,7 @@ import {
   type ChatModelAdapter,
   type ThreadUserMessage,
 } from "@assistant-ui/react";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type ReactElement } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore, type DragEvent, type FormEvent, type ReactElement } from "react";
 import { createPortal } from "react-dom";
 
 import {
@@ -407,6 +407,8 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
   const [shortcutCategory, setShortcutCategory] = useState<ShortcutCategory>("favorites");
   const [shortcutStore, setShortcutStore] = useState<ShortcutStore>(() => readShortcutConfigCache() ?? { groups: [], shortcuts: [] });
   const [preview, setPreview] = useState<{ items: { id: string; file: File }[]; position: number } | null>(null);
+  const [draggingFiles, setDraggingFiles] = useState(false);
+  const [addingDroppedFiles, setAddingDroppedFiles] = useState(false);
   useEffect(() => setPreview(null), [sessionId]);
   const [codexSkills, setCodexSkills] = useState<CodexSkillOption[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(false);
@@ -423,8 +425,11 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
   const [debugLogActive, setDebugLogActive] = useState(() => isDebugLogCaptureActive());
   const [debugLogBusy, setDebugLogBusy] = useState(false);
   const inputDisabled = disabled || sending || preparing || debugLogBusy;
-  const controlsDisabled = disabled || sendDisabled || sending || preparing || debugLogBusy;
+  const controlsDisabled = disabled || sendDisabled || sending || preparing || debugLogBusy || addingDroppedFiles;
   const debugLogControlsDisabled = sending || preparing || debugLogBusy || (disabled && !debugLogActive);
+  useEffect(() => {
+    if (controlsDisabled) setDraggingFiles(false);
+  }, [controlsDisabled]);
   const composerFormRef = useRef<HTMLFormElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const skillButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -973,11 +978,39 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
     setSkillsPickerOpen(true);
   };
 
+  const handleFileDrag = (event: DragEvent<HTMLFormElement>): void => {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = controlsDisabled ? "none" : "copy";
+    if (!controlsDisabled) setDraggingFiles(true);
+  };
+
   return (
     <>
       <ComposerPrimitive.Root
-        className="dashboard-composer"
+        className={"dashboard-composer" + (draggingFiles && !controlsDisabled ? " is-file-dragging" : "")}
         ref={composerFormRef}
+        onDragEnter={handleFileDrag}
+        onDragOver={handleFileDrag}
+        onDragLeave={(event) => {
+          const next = event.relatedTarget;
+          if (!(next instanceof Node) || !event.currentTarget.contains(next)) setDraggingFiles(false);
+        }}
+        onDrop={(event) => {
+          const files = Array.from(event.dataTransfer.files);
+          if (files.length === 0 && !Array.from(event.dataTransfer.types).includes("Files")) return;
+          event.preventDefault();
+          setDraggingFiles(false);
+          if (controlsDisabled || files.length === 0) return;
+          setAddingDroppedFiles(true);
+          void Promise.all(files.map(async (file) => {
+            try {
+              await aui.composer.addAttachment(file);
+            } catch (error) {
+              onAttachmentError(error instanceof Error ? error.message : "添加附件失败。");
+            }
+          })).finally(() => setAddingDroppedFiles(false));
+        }}
         onSubmit={(event: FormEvent<HTMLFormElement>) => {
           if (controlsDisabled) {
             event.preventDefault();
@@ -990,6 +1023,7 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
           onSendStart();
         }}
       >
+        {draggingFiles && !controlsDisabled ? <span className="dashboard-composer-drop-hint" aria-hidden="true">松开以添加附件</span> : null}
         <div className="dashboard-composer-images" aria-label="Attachments to send">
           <ComposerPrimitive.Attachments>
             {({ attachment }) => {
@@ -1034,7 +1068,7 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
             minRows={2}
             maxRows={6}
             disabled={inputDisabled}
-            submitMode={sendDisabled ? "none" : "enter"}
+            submitMode={controlsDisabled ? "none" : "enter"}
             unstable_insertNewlineOnTouchEnter
             unstable_focusOnRunStart={false}
             unstable_focusOnScrollToBottom={false}
@@ -1167,9 +1201,9 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
             className="dashboard-compose-send"
             type="button"
             disabled={controlsDisabled}
-            aria-label={sendDisabled ? "等待连接恢复后发送" : sending || preparing ? "正在发送" : "发送消息"}
+            aria-label={sendDisabled ? "等待连接恢复后发送" : addingDroppedFiles ? "正在添加附件" : sending || preparing ? "正在发送" : "发送消息"}
             title={sendDisabled ? "连接不可用，恢复后可发送" : undefined}
-          ><span className="dashboard-send-label">{sending || preparing ? "发送中…" : "发送"}</span><span aria-hidden="true">↑</span></ComposerPrimitive.Send>
+          ><span className="dashboard-send-label">{addingDroppedFiles ? "添加附件中…" : sending || preparing ? "发送中…" : "发送"}</span><span aria-hidden="true">↑</span></ComposerPrimitive.Send>
         </div>
       </ComposerPrimitive.Root>
       {preview ? <ImageLightbox

@@ -945,6 +945,8 @@ pre {
 .dashboard-shell-terminal-host .xterm-cursor-layer { display: block; }
 .dashboard-composer { position: relative; display: flex; flex: 0 0 auto; flex-direction: column; gap: 8px; margin: 8px 14px 10px; padding: 10px 12px; border: 1px solid #3c4149; border-radius: 22px; background: #202124; box-shadow: 0 12px 30px #0003; }
 .dashboard-composer:focus-within { border-color: #696e76; }
+.dashboard-composer.is-file-dragging { border-color: #72d6a1; }
+.dashboard-composer-drop-hint { position: absolute; z-index: 50; inset: 0; display: grid; place-items: center; border: 2px dashed #72d6a1; border-radius: inherit; color: #e0f5e9; background: rgb(21 37 29 / 92%); font-size: 14px; font-weight: 700; pointer-events: none; }
 .dashboard-composer-input { display: block; width: 100%; min-width: 0; min-height: 48px; max-height: 160px; padding: 7px 5px; resize: none; overflow-y: auto; border: 0; outline: 0; color: #f1f2f4; background: transparent; font: inherit; font-size: 16px; line-height: 1.45; }
 .dashboard-composer-input::placeholder { color: #788595; }
 .dashboard-composer-input:disabled { cursor: not-allowed; opacity: .65; }
@@ -1633,6 +1635,8 @@ pre {
 :root[data-theme="light"] .dashboard-empty-state p { color: #68726c; }
 :root[data-theme="light"] .dashboard-composer { border-color: var(--line); background: var(--paper); box-shadow: 0 12px 30px #17211b14; }
 :root[data-theme="light"] .dashboard-composer:focus-within { border-color: #7d9e87; }
+:root[data-theme="light"] .dashboard-composer.is-file-dragging { border-color: #27764e; }
+:root[data-theme="light"] .dashboard-composer-drop-hint { border-color: #27764e; color: #1e5131; background: rgb(237 247 240 / 95%); }
 :root[data-theme="light"] .dashboard-composer-input { color: #17211b; }
 :root[data-theme="light"] .dashboard-composer-input::placeholder { color: #68726c; }
 :root[data-theme="light"] .dashboard-shortcut-dialog { border-color: #cad4cc; color: #17211b; background: rgb(246 248 245 / .98); }
@@ -2430,12 +2434,30 @@ button.secondary,
 .codex-usage-account-heading { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
 .codex-usage-account-title { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 8px; }
 .codex-usage-account-title h2 { font-size: 20px; }
-.codex-usage-account-badges { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.codex-usage-status-with-renewal { display: inline-flex; min-width: 0; max-width: 100%; align-items: center; gap: 6px; }
 .codex-usage-plan, .codex-usage-status { padding: 3px 8px; border-radius: 999px; background: #eef2f0; font-size: 11px; font-weight: 800; }
 .codex-usage-plan { color: var(--accent); background: var(--accent-soft); }
 .codex-usage-status.is-available { color: #166534; background: #dcfce7; }
 .codex-usage-status.is-unavailable { color: #9f1239; background: #ffe4e6; }
 .codex-usage-status.is-unknown { color: var(--muted); }
+.codex-usage-renewal { display: inline-flex; min-width: 0; align-items: center; gap: 3px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.codex-usage-renewal-main { display: inline-flex; min-width: 0; align-items: center; gap: 4px; }
+.codex-usage-renewal-main time { color: var(--ink); font-weight: 700; }
+.codex-usage-renewal-countdown { color: var(--muted); }
+.codex-usage-renewal.is-urgent .codex-usage-renewal-countdown { color: #8a4b0a; font-weight: 700; }
+.codex-usage-renewal.is-overdue .codex-usage-renewal-countdown { color: #9f1239; }
+.codex-renewal-edit { display: inline-grid; width: 32px; height: 32px; flex: 0 0 auto; place-items: center; padding: 0; border: 0; border-radius: 6px; color: var(--accent); background: transparent; }
+.codex-renewal-edit svg { display: block; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.codex-renewal-edit:hover { background: transparent; }
+.codex-renewal-backdrop { z-index: 220; }
+.codex-renewal-modal { width: min(440px, 100%); }
+.codex-renewal-form { display: grid; min-width: 0; gap: 8px; padding: 15px 18px 18px; }
+.codex-renewal-form label { font-size: 12px; font-weight: 800; }
+.codex-renewal-form input { width: 100%; min-width: 0; min-height: 40px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--card); font-size: 16px; }
+.codex-renewal-form p { margin: 0; color: var(--muted); font-size: 11px; }
+.codex-renewal-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 2px; }
+.codex-renewal-actions button { min-height: 36px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--card); font-size: 12px; font-weight: 700; }
+.codex-renewal-actions .primary { border-color: var(--accent); color: white; background: var(--accent); }
 .codex-usage-section { padding-top: 15px; }
 .codex-usage-section + .codex-usage-section { margin-top: 15px; border-top: 1px solid var(--line); }
 .codex-usage-section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 9px; }
@@ -2508,6 +2530,10 @@ button.secondary,
 :root[data-theme="dark"] .codex-usage-line-point { fill: #65b989; }
 :root[data-theme="dark"] .codex-usage-line-point.is-selected { fill: var(--accent); }
 :root[data-theme="dark"] .codex-usage-status.is-available { color: #b9edcb; background: #1a3528; }
+:root[data-theme="dark"] .codex-usage-renewal.is-urgent .codex-usage-renewal-countdown { color: #f1d4a0; }
+:root[data-theme="dark"] .codex-usage-renewal.is-overdue .codex-usage-renewal-countdown { color: #f0c9c9; }
+:root[data-theme="dark"] .codex-renewal-actions button, :root[data-theme="dark"] .codex-renewal-form input { border-color: #303b48; color: var(--ink); background: #151b23; }
+:root[data-theme="dark"] .codex-renewal-actions .primary { border-color: var(--accent); color: white; background: var(--accent); }
 :root[data-theme="dark"] .codex-usage-status.is-unavailable { color: #f0c9c9; background: #2a1d20; }
 :root[data-theme="dark"] .codex-usage-stale { color: #e5c47b; }
 :root[data-theme="dark"] .codex-usage-error { border-color: #6b4144; color: #f0c9c9; background: #2a1d20; }

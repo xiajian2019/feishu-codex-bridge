@@ -16,6 +16,7 @@ export type TmuxTerminalControlMessage = {
 
 export type TmuxTerminalTransportEvent =
   | { type: "output"; data: string | Uint8Array; connectionId: number }
+  | { type: "socket-open"; connectionId: number }
   | { type: "replay-start" }
   | { type: "replay-end" }
   | { type: "history"; data: string; connectionId: number }
@@ -85,6 +86,7 @@ export class TmuxTerminalTransport {
     window.clearTimeout(this.releaseTimer);
     this.releaseTimer = 0;
     this.listeners.add(listener);
+    if (this.isOpen()) listener({ type: "socket-open", connectionId: this.connectionId });
     if (!this.replayComplete) {
       this.forceReconnect();
     } else {
@@ -176,7 +178,10 @@ export class TmuxTerminalTransport {
       nextSocket.binaryType = "arraybuffer";
       nextSocket.onopen = () => {
         if (this.disposed || this.socket !== nextSocket) nextSocket.close();
-        else this.reconnectAttempt = 0;
+        else {
+          this.reconnectAttempt = 0;
+          this.emit({ type: "socket-open", connectionId: this.connectionId });
+        }
       };
       nextSocket.onmessage = (event) => {
         if (this.disposed || this.socket !== nextSocket) return;

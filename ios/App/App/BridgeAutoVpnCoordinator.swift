@@ -10,6 +10,7 @@ enum BridgeAutoVpnError: LocalizedError {
     case currentWifiUnavailable
     case invalidManualWifi
     case invalidProfile
+    case invalidProvider
     case credentialsRequired
     case tunnelKitUnavailable
     case managerSaveFailed
@@ -22,6 +23,8 @@ enum BridgeAutoVpnError: LocalizedError {
             return "INVALID_WIFI_SSID"
         case .invalidProfile:
             return "INVALID_VPN_PROFILE"
+        case .invalidProvider:
+            return "INVALID_VPN_PROVIDER"
         case .credentialsRequired:
             return "VPN_CREDENTIALS_REQUIRED"
         case .tunnelKitUnavailable:
@@ -39,6 +42,8 @@ enum BridgeAutoVpnError: LocalizedError {
             return "手动提供的 Wi-Fi SSID 为空或无效。"
         case .invalidProfile:
             return "无法解析 OpenVPN 配置，请确认导入的是受支持的 .ovpn 文件。"
+        case .invalidProvider:
+            return "请选择有效的 VPN 连接方式。"
         case .credentialsRequired:
             return "此 OpenVPN 配置需要用户名和密码，请重新导入配置并同时提供凭据。"
         case .tunnelKitUnavailable:
@@ -76,6 +81,8 @@ final class BridgeAutoVpnCoordinator {
 
     private let profileStore: BridgeVpnProfileStore
     private let wifiProvider: BridgeCurrentWifiProviding
+    private var managerMutationLocked = false
+    private var managerMutationWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         profileStore: BridgeVpnProfileStore = BridgeVpnProfileStore(),
@@ -96,30 +103,42 @@ final class BridgeAutoVpnCoordinator {
     func startAutomaticCheck() {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            guard self.profileStore.hasProfile else { return }
+            guard self.profileStore.provider() == .tunnelkit, self.profileStore.hasProfile else { return }
 #if canImport(TunnelKitOpenVPN)
             // Arm only Bridge's own On Demand configuration first. If iOS does
             // not disclose the current SSID, the system still applies the
             // ssidMatch Ignore rule without the host app reading Wi-Fi data.
-            _ = try? await self.update(manager: try await self.matchingManager() ?? NETunnelProviderManager())
+            _ = try? await self.update()
 #endif
             _ = try? await self.checkAndConnect(manualWifiSsid: nil, reason: "startup")
         }
     }
 
-    func configure(bypassWifiSsids: [String]) async throws -> [String: Any] {
+    func configure(bypassWifiSsids: [String], provider value: String? = nil) async throws -> [String: Any] {
+        let provider: BridgeVpnProvider
+        if let value {
+            guard let selected = BridgeVpnProvider(rawValue: value) else { throw BridgeAutoVpnError.invalidProvider }
+            provider = selected
+        } else {
+            // Older AppVpn frontends did not send a provider.
+            provider = profileStore.provider(fallback: .tunnelkit)
+        }
         let normalized = try profileStore.saveBypassWifiSsids(bypassWifiSsids)
+        try profileStore.saveProvider(provider)
 
-        // If a Bridge profile already exists, apply only the matching manager's
-        // new rules. No unrelated VPN configuration is inspected for deletion.
+        // Only update Bridge's own VPN manager. Switching to the external app
+        // disables On Demand without explicitly stopping an active connection.
 #if canImport(TunnelKitOpenVPN)
-        if profileStore.hasProfile {
-            _ = try await update(manager: try await matchingManager() ?? NETunnelProviderManager())
+        if provider == .tunnelkit, profileStore.hasProfile {
+            _ = try await update()
+        } else if provider == .external {
+            try await disableOnDemandForExternalProvider()
         }
 #endif
         return [
             "accepted": true,
             "configured": profileStore.hasProfile,
+            "provider": provider.rawValue,
             "bypassWifiSsids": normalized,
             "packetTunnelBundleIdentifier": packetTunnelBundleIdentifier,
         ]
@@ -153,6 +172,9 @@ final class BridgeAutoVpnCoordinator {
             // lines or endpoint details supplied by the user.
             throw BridgeAutoVpnError.invalidProfile
         }
+        guard !(parsed.configuration.remotes?.isEmpty ?? true) else {
+            throw BridgeAutoVpnError.invalidProfile
+        }
         if parsed.configuration.authUserPass == true && (username == nil || password == nil) {
             throw BridgeAutoVpnError.credentialsRequired
         }
@@ -170,7 +192,7 @@ final class BridgeAutoVpnCoordinator {
         // Updating an existing Bridge manager is safe. It changes only the
         // manager whose providerBundleIdentifier is ours and never stops a
         // currently connected tunnel explicitly.
-        _ = try await update(manager: try await matchingManager() ?? NETunnelProviderManager())
+        _ = try await update()
 
         return [
             "accepted": true,
@@ -193,6 +215,13 @@ final class BridgeAutoVpnCoordinator {
 #endif
 
     func checkAndConnect(manualWifiSsid: String?, reason: String) async throws -> [String: Any] {
+        guard profileStore.provider(fallback: .tunnelkit) == .tunnelkit else {
+            var result = try await status()
+            result["accepted"] = false
+            result["decision"] = "externalSelected"
+            result["reason"] = reason
+            return result
+        }
         guard profileStore.hasProfile else {
             var result = try await status()
             result["accepted"] = false
@@ -231,7 +260,14 @@ final class BridgeAutoVpnCoordinator {
         guard let appGroup = profileStore.groupIdentifier, !appGroup.isEmpty else {
             throw BridgeVpnProfileStoreError.appGroupUnavailable
         }
-        let manager = try await update(manager: try await matchingManager() ?? NETunnelProviderManager())
+        let manager = try await update()
+        guard profileStore.provider(fallback: .tunnelkit) == .tunnelkit else {
+            var result = try await status()
+            result["accepted"] = false
+            result["decision"] = "externalSelected"
+            result["reason"] = reason
+            return result
+        }
         let existingStatus = manager.connection.status
         var startRequested = false
         switch existingStatus {
@@ -273,6 +309,7 @@ final class BridgeAutoVpnCoordinator {
     func status() async throws -> [String: Any] {
         var result: [String: Any] = [
             "configured": profileStore.hasProfile,
+            "provider": profileStore.provider(fallback: .tunnelkit).rawValue,
             "packetTunnelBundleIdentifier": packetTunnelBundleIdentifier,
             "onDemandBypassWifiSsids": profileStore.bypassWifiSsids(),
         ]
@@ -329,7 +366,40 @@ final class BridgeAutoVpnCoordinator {
         }
     }
 
-    private func update(manager: NETunnelProviderManager) async throws -> NETunnelProviderManager {
+    private func acquireManagerMutation() async {
+        if !managerMutationLocked {
+            managerMutationLocked = true
+            return
+        }
+        await withCheckedContinuation { managerMutationWaiters.append($0) }
+    }
+
+    private func releaseManagerMutation() {
+        if managerMutationWaiters.isEmpty {
+            managerMutationLocked = false
+        } else {
+            managerMutationWaiters.removeFirst().resume()
+        }
+    }
+
+    private func disableOnDemandForExternalProvider() async throws {
+        await acquireManagerMutation()
+        defer { releaseManagerMutation() }
+        guard profileStore.provider() == .external,
+              let manager = try await matchingManager(), manager.isOnDemandEnabled else { return }
+        manager.isOnDemandEnabled = false
+        do {
+            try await manager.saveToPreferences()
+            try await manager.loadFromPreferences()
+        } catch {
+            throw BridgeAutoVpnError.managerSaveFailed
+        }
+    }
+
+    private func update() async throws -> NETunnelProviderManager {
+        await acquireManagerMutation()
+        defer { releaseManagerMutation() }
+        let manager = try await matchingManager() ?? NETunnelProviderManager()
         let metadata = try profileStore.metadata()
         let configuration = try profileStore.loadConfiguration()
         let credentials = try profileStore.credentials()
@@ -337,26 +407,25 @@ final class BridgeAutoVpnCoordinator {
             throw BridgeAutoVpnError.credentialsRequired
         }
 
-        var provider = OpenVPN.ProviderConfiguration(
-            metadata.title,
-            appGroup: profileStore.groupIdentifier ?? "",
-            configuration: configuration
-        )
-        provider.username = credentials?.username
-
-        var extra = NetworkExtensionExtra()
-        extra.passwordReference = credentials?.passwordReference
-        extra.onDemandRules = onDemandRules()
-        extra.disconnectsOnSleep = false
-
-        let protocolConfiguration = try provider.asTunnelProtocol(
-            withBundleIdentifier: packetTunnelBundleIdentifier,
-            extra: extra
-        )
+        guard let firstRemote = configuration.remotes?.first else {
+            throw BridgeAutoVpnError.invalidProfile
+        }
+        // The extension reads the full profile from the shared Keychain;
+        // providerConfiguration contains only a marker and display title.
+        let protocolConfiguration = NETunnelProviderProtocol()
+        protocolConfiguration.providerBundleIdentifier = packetTunnelBundleIdentifier
+        protocolConfiguration.serverAddress = "\(firstRemote.address):\(firstRemote.proto.port)"
+        protocolConfiguration.username = credentials?.username
+        protocolConfiguration.passwordReference = credentials?.passwordReference
+        protocolConfiguration.disconnectOnSleep = false
+        protocolConfiguration.providerConfiguration = [
+            "bridgeKeychainProfileVersion": 1,
+            "title": metadata.title,
+        ]
         manager.localizedDescription = metadata.title
         manager.protocolConfiguration = protocolConfiguration
-        manager.onDemandRules = extra.onDemandRules
-        manager.isOnDemandEnabled = true
+        manager.onDemandRules = onDemandRules()
+        manager.isOnDemandEnabled = profileStore.provider(fallback: .tunnelkit) == .tunnelkit
         manager.isEnabled = true
 
         do {

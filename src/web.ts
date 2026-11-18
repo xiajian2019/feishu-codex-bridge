@@ -42,6 +42,8 @@ import { JjToolError, JjToolsService } from "./jj-tools.js";
 import { DownloadUploadError, DownloadUploadsService, DOWNLOAD_UPLOAD_CHUNK_BYTES } from "./download-uploads.js";
 import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import { isNativeAppOrigin, MobileStreamTickets, type MobileStreamAuthorization } from "./mobile-auth.js";
+import { RemoteDesktopProxy, type RemoteDesktopConnector } from "./remote-desktop-proxy.js";
+import { listRemoteDesktopDisplays, type RemoteDesktopDisplay } from "./remote-desktop-displays.js";
 import { MobileApkStore } from "./mobile-apk.js";
 import { DemoBrowserAccess } from "./demo-browser-access.js";
 import {
@@ -163,6 +165,10 @@ export interface DashboardServerOptions {
   webRoot?: string;
   auth?: WebPairingAuth;
   tmuxDashboard?: TmuxDashboardApi;
+  /** Injectable only by in-process tests; the default target is local Screen Sharing. */
+  remoteDesktopConnector?: RemoteDesktopConnector;
+  /** Injectable only by tests; production reads the local host display layout. */
+  remoteDesktopDisplays?: () => Promise<RemoteDesktopDisplay[]>;
   codexHistory?: CodexHistoryService;
   cleanupExpiredStagedAttachments?: boolean;
   actions?: DashboardActions;
@@ -192,6 +198,7 @@ export class DashboardServer {
   private readonly workbench: WorkbenchService;
   private readonly eventClients = new Map<ServerResponse, () => boolean>();
   private readonly mobileStreamTickets = new MobileStreamTickets();
+  private readonly remoteDesktop: RemoteDesktopProxy;
   private readonly demoBrowserAccess = new DemoBrowserAccess();
   private server: Server | null = null;
   private unsubscribeFromDatabase: (() => void) | null = null;
@@ -204,6 +211,7 @@ export class DashboardServer {
 
   constructor(options: DashboardServerOptions) {
     this.options = options;
+    this.remoteDesktop = new RemoteDesktopProxy(options.remoteDesktopConnector);
     this.auth = options.auth
       ?? new WebPairingAuth({ db: options.db, allowLocalRequests: true });
     this.webRoot = options.webRoot ?? findWebRoot();
@@ -298,6 +306,7 @@ export class DashboardServer {
     for (const client of this.eventClients.keys()) client.end();
     this.eventClients.clear();
     this.mobileStreamTickets.clear();
+    this.remoteDesktop.stop();
     await this.options.tmuxDashboard?.stop();
     for (const [id, child] of this.localDemoProcesses) {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
@@ -393,6 +402,18 @@ export class DashboardServer {
       }
       return;
     }
+    if (request.method === "POST" && url.pathname === "/api/remote-desktop/ticket") {
+      if (!this.requireAuthorization(request, response) || !this.requireActionAuthorization(request, response)) return;
+      try {
+        const authorization = { deviceId: this.auth.currentDeviceId(request) ?? "local", isAuthorized: this.auth.connectionAuthorization(request) };
+        response.setHeader("Cache-Control", "no-store");
+        sendJson(response, 200, this.mobileStreamTickets.issue("/remote-desktop/stream", authorization));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "could not create stream ticket";
+        sendJson(response, message === "too many pending stream tickets" ? 429 : 400, { error: message });
+      }
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/api/auth/status") {
       const status = this.auth.status(request);
       // An admin can extend another device. Refresh that device's own Cookie when
@@ -404,7 +425,7 @@ export class DashboardServer {
         ...(status.authenticated ? { client: {
           schemaVersion: 1, protocolVersion: 1, minimumClientProtocol: 1,
           version: await readBridgeVersion(),
-          features: ["download-uploads", "mobile-apk-update", "mobile-ios-ota", "backups",
+          features: ["download-uploads", "mobile-apk-update", "mobile-ios-ota", "backups", "remote-desktop",
             ...(this.options.tmuxDashboard ? ["tmux"] : []),
             ...(this.options.codexHistory ? ["codex-history"] : [])],
         } } : {}),
@@ -555,6 +576,13 @@ export class DashboardServer {
       response,
       publicWebRequest || url.pathname === "/healthz" || Boolean(scopedDemoAccess),
     )) return;
+    if (request.method === "GET" && url.pathname === "/api/remote-desktop/displays") {
+      response.setHeader("Cache-Control", "no-store");
+      const displays = await (this.options.remoteDesktopDisplays ?? listRemoteDesktopDisplays)();
+      if (!this.requireAuthorization(request, response)) return;
+      sendJson(response, 200, { displays });
+      return;
+    }
     if (url.pathname === "/api/mobile/ios-ota" || url.pathname.startsWith("/api/mobile/ios-ota/")) {
       response.setHeader("Cache-Control", "no-store");
       response.setHeader("Referrer-Policy", "no-referrer");
@@ -793,9 +821,68 @@ export class DashboardServer {
       }
       try {
         const homeId = url.searchParams.get("home")?.trim();
-        sendJson(response, 200, await this.options.codexHistory.readUsage(homeId || undefined));
+        const usage = await this.options.codexHistory.readUsage(homeId || undefined);
+        const renewals = new Map(this.options.db.listCodexAccountSubscriptionRenewals()
+          .map((renewal) => [renewal.homeId, renewal.renewalAt]));
+        sendJson(response, 200, {
+          ...usage,
+          accounts: usage.accounts.map((account) => ({
+            ...account,
+            renewalAt: renewals.get(account.homeId) ?? null,
+          })),
+        });
       } catch {
         sendJson(response, 502, { error: "Codex usage could not be loaded" });
+      }
+      return;
+    }
+    if (request.method === "PATCH" && url.pathname === "/api/codex/usage/renewal") {
+      const history = this.options.codexHistory;
+      if (!history) {
+        sendJson(response, 501, { error: "Codex usage is not configured" });
+        return;
+      }
+      if (!this.requireActionAuthorization(request, response)) return;
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonBody(request);
+      } catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+        return;
+      }
+      const homeId = typeof body.homeId === "string" ? body.homeId.trim() : "";
+      if (!homeId || homeId.length > 200) {
+        sendJson(response, 400, { error: "homeId is required" });
+        return;
+      }
+      if (!history.listHomes().some((home) => home.id === homeId)) {
+        sendJson(response, 404, { error: "Codex account not found" });
+        return;
+      }
+
+      const renewalAtInput = body.renewalAt;
+      let renewalAt: string | null;
+      if (renewalAtInput === null) {
+        renewalAt = null;
+      } else if (typeof renewalAtInput === "string") {
+        const parsed = new Date(renewalAtInput);
+        if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00\.000Z$/.test(renewalAtInput)
+          || Number.isNaN(parsed.getTime())
+          || parsed.toISOString() !== renewalAtInput) {
+          sendJson(response, 400, { error: "renewalAt must be a valid UTC date and time with minute precision" });
+          return;
+        }
+        renewalAt = renewalAtInput;
+      } else {
+        sendJson(response, 400, { error: "renewalAt must be a UTC date and time or null" });
+        return;
+      }
+
+      try {
+        this.options.db.setCodexAccountSubscriptionRenewal(homeId, renewalAt);
+        sendJson(response, 200, { homeId, renewalAt });
+      } catch {
+        sendJson(response, 500, { error: "续订时间保存失败。" });
       }
       return;
     }
@@ -3301,6 +3388,16 @@ export class DashboardServer {
       return;
     }
     const pathname = url.pathname;
+    if (pathname === "/remote-desktop/stream") {
+      const origin = request.headers.origin;
+      // A ticket requires an authenticated, action-token protected POST. It is
+      // one-use and bound to this path and the issuing device's live session.
+      if (!ticket || (origin && !isNativeAppOrigin(origin) && !this.isSameOrigin(origin, request))) {
+        socket.destroy(); return;
+      }
+      this.remoteDesktop.handleUpgrade(request, socket, head, isAuthorized);
+      return;
+    }
     if (pathname === "/tmux-dashboard/terminal" && this.options.tmuxDashboard) {
       void this.options.tmuxDashboard.handleUpgrade(
         request,
@@ -3379,6 +3476,7 @@ export class DashboardServer {
 
   private revalidateConnections(): void {
     this.options.tmuxDashboard?.revalidateClients();
+    this.remoteDesktop.revalidateClients();
     for (const [client, isAuthorized] of this.eventClients) {
       if (!isAuthorized()) {
         this.eventClients.delete(client);
@@ -3498,6 +3596,7 @@ function isSpaRoute(pathname: string): boolean {
     || pathname === "/codex-history"
     || /^\/codex-history\/[^/]+\/[^/]+$/.test(pathname)
     || pathname === "/demos"
+    || pathname === "/remote-desktop"
     || pathname === "/ssh"
     || pathname.startsWith("/ssh/")
     || pathname === "/link-tools"

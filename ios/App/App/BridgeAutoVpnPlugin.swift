@@ -5,7 +5,7 @@ import UIKit
 
 @MainActor
 @objc(BridgeAutoVpnPlugin)
-public final class BridgeAutoVpnPlugin: CAPPlugin, CAPBridgedPlugin, UIDocumentPickerDelegate {
+public final class BridgeAutoVpnPlugin: CAPPlugin, @preconcurrency CAPBridgedPlugin, UIDocumentPickerDelegate {
     public let identifier = "BridgeAutoVpnPlugin"
     public let jsName = "BridgeAutoVpn"
     public let pluginMethods: [CAPPluginMethod] = [
@@ -53,10 +53,11 @@ public final class BridgeAutoVpnPlugin: CAPPlugin, CAPBridgedPlugin, UIDocumentP
 
     @objc func configure(_ call: CAPPluginCall) {
         let values = call.getArray("bypassWifiSsids", String.self) ?? []
+        let provider = call.getString("provider")
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                var result = try await coordinator.configure(bypassWifiSsids: values)
+                var result = try await coordinator.configure(bypassWifiSsids: values, provider: provider)
                 result["accepted"] = true
                 call.resolve(result)
             } catch {
@@ -78,6 +79,8 @@ public final class BridgeAutoVpnPlugin: CAPPlugin, CAPBridgedPlugin, UIDocumentP
         let title = call.getString("title") ?? selected.title
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // The picker produces a temporary copy which may contain keys.
+            defer { try? FileManager.default.removeItem(at: url) }
             do {
                 var resolvedUsername = username
                 var resolvedPassword = password
@@ -280,7 +283,7 @@ public final class BridgeAutoVpnPlugin: CAPPlugin, CAPBridgedPlugin, UIDocumentP
     private func compatibilityStatus(_ result: [String: Any]) -> [String: Any] {
         var response = result
         let decision = result["decision"] as? String
-        let accepted = decision != "notConfigured" && decision != "manualWifiConfirmationRequired"
+        let accepted = decision != "notConfigured" && decision != "manualWifiConfirmationRequired" && decision != "externalSelected"
         response["accepted"] = accepted
         switch decision {
         case "connectRequested":
@@ -293,6 +296,8 @@ public final class BridgeAutoVpnPlugin: CAPPlugin, CAPBridgedPlugin, UIDocumentP
             response["message"] = "无法确认当前 Wi‑Fi，请手动输入 SSID 后重试。"
         case "notConfigured":
             response["message"] = "尚未导入 OpenVPN 配置。"
+        case "externalSelected":
+            response["message"] = "当前选择使用外部 OpenVPN Connect。"
         default:
             response["message"] = "VPN 检查已完成。"
         }

@@ -1,6 +1,6 @@
 # Feishu Codex Bridge
 
-一个个人维护的自托管开发工作台，把 Mac 上运行的 Codex 工作流连接到 iPhone 浏览器和飞书。
+一个个人维护的自托管开发工作台，把 Mac 上运行的 Codex 工作流连接到手机浏览器、手机 App 和飞书。
 
 **主要场景：** Codex 在 MacBook 上通过 tmux 工作时，人离开电脑也可以用 iPhone 查看会话、追加提示，并继续检查结果。Codex 仍运行在自己的 Mac 上；Bridge 不提供云端执行环境。
 
@@ -13,7 +13,8 @@
 | Tmux Dashboard | 从手机或浏览器查看 Bridge 主机上已有的 tmux session，向选中的 Codex session 发送消息，并浏览该 session 工作目录中的文件；可用 `tmux-resurrect` + `tmux-continuum` 按 Session 保存、挂起，并在重启后通过 CLI 手动恢复。 |
 | 飞书 Direct | 从飞书提交文字、图片或文件任务，查看执行状态、续问或取消任务。 |
 | Web Task Desk | 从浏览器为已登记项目创建 Codex 任务，查看运行记录、附加文件、续问和处理支持的重试/审核操作。 |
-| Codex History | 主要从 Codex state SQLite 搜索不同 Codex home 的会话；详情仍通过 app-server 读取，续聊通过 Codex SDK。 |
+| 远程桌面 | 使用已配对的浏览器或手机 App 连接 Bridge 主机的屏幕共享；使用前需在 Mac 上启用并配置屏幕共享。详见[远程桌面指南](doc/remote-desktop.md)。 |
+| Codex History | 搜索不同 Codex home 的会话；当前列表优先只读查询 Codex state SQLite，找不到兼容数据表时回退 app-server，详情通过 app-server 读取。普通续聊使用 Codex SDK，交互审批模式使用 app-server。 |
 | 本机 Demo | 从统一目录发现并打开 Bridge 主机上运行的本地模型/实验 Demo；入口通过 Bridge 代理，不要求手机直连 Demo 的 Python 端口。 |
 | 上传下载 | 系统管理 → 上传下载，支持多选上传、进度、取消和同名自动编号；也可提交链接，由 Mac 通过配置的 VPN/HTTP/SOCKS 代理预览或下载。文件保存到 `~/Downloads`。 |
 | 设备与运维 | 配对和撤销浏览器设备，查看运行状态；每天凌晨 1 点自动备份 SQLite，也可手动创建、校验和恢复。 |
@@ -44,7 +45,9 @@ flowchart LR
     WebState --> Browser
 ```
 
-手机接续 tmux、飞书 Direct 和 Web Task Desk 是不同入口。Direct 与 Web 任务保留各自的状态流程；图中的 Codex SDK 表示它们使用同一 SDK 执行器类型，不表示任务记录合并。Codex History 列表主要读取 Codex state SQLite，详情通过 Codex app-server 读取，续聊通过 Codex SDK 继续会话。
+手机接续 tmux、飞书 Direct 和 Web Task Desk 是不同入口。Direct 与 Web 任务保留各自的状态流程；图中的 Codex SDK 表示它们使用同一 SDK 执行器类型，不表示任务记录合并。Codex History 列表当前优先只读查询 Codex state SQLite，找不到兼容数据表时回退 app-server；详情通过 app-server 读取，普通续聊通过 Codex SDK，交互审批模式通过 app-server 继续会话。
+
+当前 History 列表直查依赖 Codex 内部数据库结构，与项目仅通过 app-server 访问历史的约定存在待解决的实现偏差。
 
 ## 使用前提
 
@@ -77,7 +80,7 @@ feishu-codex-bridge install
 2. 在 Mac 上运行 `feishu-codex-bridge web:pair`，按命令提示完成浏览器配对。
 3. 在 iPhone Safari 打开配对时显示的 Bridge 地址，并进入 `/tmux-dashboard`。
 
-配对后也可以进入 `/demos`，从“本机 Demo”目录启动或打开本机实验页面。当前目录包含食物拍照 Fast Path 和 OpenAI CLIP + SQLite-vec 两个 Demo；Bridge 通过固定代理目标访问，启动按钮只允许启动登记的本机脚本，不接受浏览器传入的任意命令。
+配对后也可以进入 `/demos`，从“本机 Demo”目录启动或打开本机实验页面。当前源码登记了食物拍照识别、OpenAI CLIP 食物检索、SQLite-vec 索引管理、食物实体与语义搜索四个入口；Bridge 通过固定代理目标访问，启动按钮只允许启动登记的本机脚本，不接受浏览器传入的任意命令。登记入口不代表对应 Demo 已安装或可访问。
 配对后进入“系统管理 → 上传下载”（`/system-management/uploads`），可上传本地文件或切换到“链接下载”预览与下载链接；旧 `/link-tools` 地址会跳转到链接下载标签。链接只处理 `http://` 和 `https://`，预览限制为图片、PDF 和文本类内容；HTML 以安全文本显示，不执行远程脚本。下载由 Mac 保存到 `~/Downloads`，优先使用 `codex.env.HTTP_PROXY/HTTPS_PROXY`，未配置时沿用 Bridge 进程的网络环境。
 
 文件上传使用可恢复的分块流：浏览器和 Composer 默认使用最多 3 个并发的 8 MiB 分片，服务端分别写入临时分片并在完成时按序合并；旧客户端仍可使用单 offset 分块协议。客户端会重试已提交但响应丢失的分片，并在完成接口超时后查询结果。Composer 会显示读取、上传、分块确认和保存阶段，上传失败会保留草稿并给出错误；这条链路不使用单请求 35 MiB 缓冲。
@@ -86,7 +89,7 @@ feishu-codex-bridge install
 
 Bridge 的生产服务默认只监听本机回环地址。若确实需要从局域网访问，必须显式启用 LAN 监听（`FEISHU_CODEX_BRIDGE_LAN_BIND=1`），同时仍需配对认证。不要将服务直接暴露到公网；按所在组织的网络和安全要求配置访问。
 
-### Android / iOS App（首版）
+### Android / iOS App
 
 App 使用 Capacitor，复用现有 React 工作台，并把页面资源放进安装包。手机配对后远程访问 Mac 上的 Bridge；Codex、tmux 和仓库继续在 Mac 上运行。
 
@@ -97,11 +100,11 @@ bun run mobile:open:ios
 # 或 bun run mobile:open:android
 ```
 
-`mobile:build` 构建手机前端并同步两个原生工程，不会生成已签名 APK/IPA。iOS 需要完整 Xcode 26+ 和签名，Android 需要 JDK 21、SDK 36，并要求 Android 8（API 26）或更高版本以支持扫码配对。Android App 会在 Bridge 上的 APK 被重新编译后提示更新，也可以从连接页手动下载 APK 保存后安装。当前已生成原生源码，安装包编译、签名安装和真机验收尚待具备环境后完成。首次连接、文件分享、扫码配对、App 更新、凭据存储和构建步骤见 [手机 App 指南](doc/mobile-app.md)。
+`mobile:build` 构建手机前端并同步两个原生工程，不会生成 APK 或 IPA。iOS 使用完整 Xcode 26+；模拟器编译、真机安装和 IPA 分发的签名要求不同。Android 要求 JDK 21、compile SDK 37.2，最低支持 Android 8（API 26），target SDK 为 36。`mobile:doctor` 当前检查的是 SDK Platform 36，不能代替 compile SDK 37.2 的构建检查。Android App 检测到可用更新时可提示安装，也可以从连接页手动下载 APK；iOS 另有需要签名和 HTTPS 的 OTA 安装入口。首次连接、文件分享、扫码配对、App 更新、凭据存储和构建步骤见 [手机 App 指南](doc/mobile-app.md)。模拟器编译、已签名安装包、真机安装和真机功能验证是不同阶段，需分别确认。
 
 如果 GitHub 依赖下载需要本机代理，可在当前 shell 中运行 `HTTP_PROXY=http://127.0.0.1:7897 HTTPS_PROXY=http://127.0.0.1:7897 bun run mobile:ios:resolve`。该命令只继承并镜像代理变量，不把本机代理地址写入仓库；解析完成后再运行 `bun run mobile:open:ios`。
 
-Android 原生 SSH 使用 ConnectBot/termlib；iOS 现已接入第一阶段原生 SSH 工作区，使用 SwiftTerm + SwiftNIO SSH，支持密码或未加密 Ed25519/ECDSA 私钥认证、主机密钥确认、PTY/resize、文本 Composer API-first、Composer 附件分块上传、主机配置保存和全屏/半屏入口。iOS SFTP 完整文件操作和真实设备验收仍单独跟进；Web tmux 工作台继续保留。
+Android 原生 SSH 使用 ConnectBot/termlib；iOS 原生 SSH 工作区使用 SwiftTerm + SwiftNIO SSH，支持密码或未加密 Ed25519/ECDSA 私钥认证、主机密钥确认、PTY/resize、主机配置保存和全屏/半屏入口。iOS Composer 将内容写入当前 SSH 终端，附件经 SFTP 上传到该 SSH 主机；多行内容和附件需要终端启用括号粘贴模式。iOS 已有通过 SFTP 读取绑定 Session 根目录列表的入口；完整文件操作及真实设备验收仍需跟进。Web tmux 工作台继续保留。
 
 ## 数据与安全边界
 

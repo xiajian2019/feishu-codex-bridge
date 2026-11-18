@@ -30,6 +30,7 @@
         "@larksuite/cli": "1.0.94",
         "@larksuiteoapi/node-sdk": "1.73.3",
         "@larktask/aamp-feishu-task-agent": "0.1.1-dev.8",
+        "@novnc/novnc": "1.7.0",
         "@openai/codex-sdk": "^0.104.0",
         "@xterm/addon-canvas": "0.7.0",
         "@xterm/addon-fit": "^0.10.0",
@@ -448,6 +449,8 @@
     "@napi-rs/lzma-linux-x64-gnu": ["@napi-rs/lzma-linux-x64-gnu@1.5.1", "https://registry.npmmirror.com/@napi-rs/lzma-linux-x64-gnu/-/lzma-linux-x64-gnu-1.5.1.tgz", { "os": "linux", "cpu": "x64" }, "sha512-oTXEIha4SsuXdTA4Iyskj0kpdx2yVXdhd75c2v3xGrHFfVMsbhTPZU/nMPL4sWKo4pBHm3aucLaqGlF696dTyQ=="],
 
     "@nicolo-ribaudo/chokidar-2": ["@nicolo-ribaudo/chokidar-2@2.1.8-no-fsevents.3", "", {}, "sha512-s88O1aVtXftvp5bCPB7WnmXc5IwOZZ7YPuwNPt+GtOOXpPvad1LfbmjYv+qII7zP6RU2QGnqve27dnLycEnyEQ=="],
+
+    "@novnc/novnc": ["@novnc/novnc@1.7.0", "", {}, "sha512-ucEJOx4T2avIRCleodk7YobZj5O2Ga2AeLfQ69A/yjG9HHba2+PDgwSkN3FttrmG+70ZGx21sElNFouK13RzyA=="],
 
     "@openai/codex": ["@openai/codex@0.104.0", "https://registry.npmmirror.com/@openai/codex/-/codex-0.104.0.tgz", { "optionalDependencies": { "@openai/codex-darwin-arm64": "npm:@openai/codex@0.104.0-darwin-arm64", "@openai/codex-darwin-x64": "npm:@openai/codex@0.104.0-darwin-x64", "@openai/codex-linux-arm64": "npm:@openai/codex@0.104.0-linux-arm64", "@openai/codex-linux-x64": "npm:@openai/codex@0.104.0-linux-x64", "@openai/codex-win32-arm64": "npm:@openai/codex@0.104.0-win32-arm64", "@openai/codex-win32-x64": "npm:@openai/codex@0.104.0-win32-x64" }, "bin": { "codex": "bin/codex.js" } }, "sha512-pPa2VGHozwjPsPOYAEXcH7nNt1QH7AZR8zV8jYx6BFi1LJlmJkan2rvIS4MYbPdi2O6cd5kWfPCAHE0fEV2ifA=="],
 

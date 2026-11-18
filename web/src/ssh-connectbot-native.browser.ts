@@ -16,6 +16,14 @@ export function listNativeSshOptions(): Promise<SshOptions> {
   return Promise.reject(new Error("原生 SSH 仅支持 Android/iOS App。"));
 }
 
+export function getNativeSshDefaultProfile(): Promise<string | null> {
+  return Promise.reject(new Error("原生 SSH 仅支持 Android/iOS App。"));
+}
+
+export function setNativeSshDefaultProfile(_profileId: string | null): Promise<string | null> {
+  return Promise.reject(new Error("原生 SSH 仅支持 Android/iOS App。"));
+}
+
 export function onNativeSshWorkspaceClosed(_listener: (event: SshWorkspaceClosedEvent) => void): Promise<PluginListenerHandle> {
   return Promise.reject(new Error("原生 SSH 仅支持 Android/iOS App。"));
 }
