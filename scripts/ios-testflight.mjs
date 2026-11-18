@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { renewalPaths } from "./ios-auto-renew.mjs";
+import { readIosDevelopmentTeam } from "./ios-signing-config.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const project = join(root, "ios/App/App.xcodeproj");
@@ -91,7 +92,7 @@ function settingValue(block, key) {
   return match?.[1]?.trim() ?? null;
 }
 
-export function readAppProjectSettings(source = readFileSync(projectFile, "utf8")) {
+export function readAppProjectSettings(source = readFileSync(projectFile, "utf8"), env = process.env) {
   const blocks = [...source.matchAll(/\/\*\s*PersonalRelease\s*\*\/\s*=\s*\{\s*isa = XCBuildConfiguration;\s*buildSettings = \{([\s\S]*?)\n\s*\};\s*name = PersonalRelease;\s*\};/g)];
   const block = blocks.map((match) => match[1]).find((value) =>
     settingValue(value, "INFOPLIST_FILE") === "App/Info.plist" && settingValue(value, "PRODUCT_NAME") === "App");
@@ -100,7 +101,7 @@ export function readAppProjectSettings(source = readFileSync(projectFile, "utf8"
     bundleId: settingValue(block, "PRODUCT_BUNDLE_IDENTIFIER"),
     buildNumber: settingValue(block, "CURRENT_PROJECT_VERSION"),
     marketingVersion: settingValue(block, "MARKETING_VERSION"),
-    teamId: settingValue(block, "DEVELOPMENT_TEAM"),
+    teamId: readIosDevelopmentTeam(env),
   };
 }
 
@@ -203,7 +204,7 @@ function assertProject() {
   if (!existsSync(projectFile)) throw new Error(`找不到 Xcode 工程配置：${projectFile}`);
   const settings = readAppProjectSettings();
   if (settings.bundleId !== bundleId) throw new Error(`App Bundle ID 应为 ${bundleId}，实际为 ${settings.bundleId ?? "空"}。`);
-  if (!settings.teamId) throw new Error("App 构建配置没有 DEVELOPMENT_TEAM，请先在 Xcode 的 Signing & Capabilities 中选择 Team。");
+  if (!settings.teamId) throw new Error("请在运行命令的环境中设置 BRIDGE_IOS_DEVELOPMENT_TEAM（Apple Team ID）。");
   if (!settings.marketingVersion || !settings.buildNumber) throw new Error("App 构建配置缺少版本号或构建号。");
   const schemeFile = join(project, "xcshareddata/xcschemes/App.xcscheme");
   if (!existsSync(schemeFile) || !readFileSync(schemeFile, "utf8").includes('buildConfiguration = "PersonalRelease"')) {
@@ -226,7 +227,7 @@ function assertMobileAssets() {
   }
 }
 
-function archiveArgs(options, archivePath, authentication) {
+function archiveArgs(options, archivePath, authentication, teamId) {
   const args = [
     "-project", project,
     "-scheme", scheme,
@@ -238,6 +239,7 @@ function archiveArgs(options, archivePath, authentication) {
   if (process.env.BRIDGE_IOS_SPM_CACHE) args.push("-clonedSourcePackagesDirPath", resolve(process.env.BRIDGE_IOS_SPM_CACHE));
   if (options.allowProvisioningUpdates) args.push("-allowProvisioningUpdates");
   if (options.buildNumber !== null) args.push(`CURRENT_PROJECT_VERSION=${options.buildNumber}`);
+  args.push(`DEVELOPMENT_TEAM=${teamId}`);
   args.push(...authenticationArguments(authentication), "archive");
   return args;
 }
@@ -320,7 +322,7 @@ function main() {
     mkdirSync(dirname(archivePath), { recursive: true, mode: 0o700 });
     if (options.skipMobileBuild) assertMobileAssets();
     else run(process.execPath, ["run", "mobile:build"], "[1/3] 构建并同步移动端资源");
-    run("xcodebuild", archiveArgs(options, archivePath, authentication), "[2/3] 归档并签名 iOS App");
+    run("xcodebuild", archiveArgs(options, archivePath, authentication, settings.teamId), "[2/3] 归档并签名 iOS App");
     validateArchive(archivePath, settings, options.buildNumber);
   }
   if (!options.archiveOnly) exportArchive(options, archivePath, settings, authentication);

@@ -49,7 +49,25 @@ ios/**/Package.resolved
 /ios/App/Packages/TunnelKitOpenVPN/.github/
 /ios/App/Packages/TunnelKitOpenVPN/.ruby-version
 /ios/App/Packages/TunnelKitOpenVPN/CHANGELOG.md
-*.mobileprovision
-*.p12
+# Private keys and signing material. Already tracked public certificates remain tracked.
+*.key
+*.key.*
+*.pem
 *.p8
+*.pk8
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.keychain
+*.keychain-db
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+id_ecdsa_sk
+id_ed25519_sk
+# OpenVPN profiles may embed private keys and credentials.
+*.ovpn
+*.mobileprovision
 ios/signing.xcconfig

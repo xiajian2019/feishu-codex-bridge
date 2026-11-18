@@ -10,16 +10,23 @@ import {
   readAppProjectSettings,
   resolveAuthentication,
 } from "../scripts/ios-testflight.mjs";
+import { readIosDevelopmentTeam } from "../scripts/ios-signing-config.mjs";
 
 describe("iOS TestFlight upload", () => {
   test("reads the App PersonalRelease identity from the current Xcode project", () => {
-    const { teamId, ...settings } = readAppProjectSettings();
+    const settings = readAppProjectSettings(undefined, { BRIDGE_IOS_DEVELOPMENT_TEAM: "TEAM123456" });
     expect(settings).toEqual({
       bundleId: "dev.feishu.codex.bridge",
       buildNumber: "1",
       marketingVersion: "1.0",
+      teamId: "TEAM123456",
     });
-    expect(teamId === null || /^[A-Z0-9]{10}$/.test(teamId)).toBe(true);
+  });
+
+  test("reads the signing team from the environment and rejects invalid values", () => {
+    expect(readIosDevelopmentTeam({})).toBeNull();
+    expect(readIosDevelopmentTeam({ BRIDGE_IOS_DEVELOPMENT_TEAM: " TEAM123456 " })).toBe("TEAM123456");
+    expect(() => readIosDevelopmentTeam({ BRIDGE_IOS_DEVELOPMENT_TEAM: "invalid" })).toThrow("BRIDGE_IOS_DEVELOPMENT_TEAM");
   });
 
   test("parses safe archive and upload options", () => {

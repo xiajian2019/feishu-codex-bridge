@@ -47,7 +47,48 @@ Android 构建通过 `scripts/mobile-version.mjs` 分配构建号，使用被忽
 
 JDK 不在默认路径时设置 `JAVA_HOME`；SDK 不在默认目录时设置 `ANDROID_HOME`，或通过 Android Studio 生成被忽略的 `android/local.properties`。首次 Android 构建需要下载 Gradle 和 Maven 依赖，首次 iOS 构建需要解析 Swift packages。当前 `mobile:doctor` 仍检查 Platform 36，不会确认 compile SDK 37.2 已安装；以实际 Gradle 构建为准。
 
-App 名称为 `Bridge`，应用标识为 `dev.feishu.codex.bridge`。正式发布前确认应用标识归属、签名、图标、版本号和隐私披露；当前工程没有配置分发凭据或商店发布任务。`mobile:build` 不是 APK/IPA 构建，不产生已签名安装包。
+`App` 与 `AppVpn` 都使用同一个 Bridge App 身份，Bundle ID 均为 `dev.feishu.codex.bridge`。默认 `App` 已包含系统 OpenVPN 隧道和原有的 App 内 VPN 实验入口；`AppVpn` 保留为兼容的旧构建入口。正式发布前确认应用标识归属、签名、图标、版本号、第三方许可和隐私披露；当前工程没有配置分发凭据或商店发布任务。`mobile:build` 不是 APK/IPA 构建，不产生已签名安装包。
+
+### iOS TestFlight 上传
+
+iOS 签名使用运行命令的进程环境中的 Apple Team ID，不在工程中写死。先在当前 shell 设置 `BRIDGE_IOS_DEVELOPMENT_TEAM`；通过 Bridge 服务触发构建时，需在该服务的环境中设置相同变量。直接调用 `xcodebuild` 时可传入 `"DEVELOPMENT_TEAM=$BRIDGE_IOS_DEVELOPMENT_TEAM"`。不要将个人 Team ID、签名私钥或描述文件提交到仓库。
+
+```bash
+export BRIDGE_IOS_DEVELOPMENT_TEAM="<10 位 Apple Team ID>"
+```
+
+TestFlight 需要付费 Apple Developer Program 团队、App Store Connect 中已创建的 iOS App 记录，以及与工程一致的 Bundle ID。首次上传前在 App Store Connect 创建 App，选择 `dev.feishu.codex.bridge`；脚本不会代替创建 App 记录、接受 Apple 协议或填写出口合规信息。
+
+脚本默认使用 `App` scheme 的 `PersonalRelease` 配置，先构建当前 checkout 的移动端资源，再归档、签名并上传到 App Store Connect。当前 App 包含分享扩展和 `BridgePacketTunnel.appex`，主 App 与扩展必须使用同一个具备对应能力的付费团队；免费 Personal Team 只能用于有限的本机开发安装，不能作为这条 TestFlight 分发链路的签名依据。
+
+```bash
+# 只检查 Xcode、Team、Bundle ID 和当前版本，不构建或上传
+bun run mobile:ios:testflight -- --check
+
+# 首次上传；当前工程默认版本为 1.0，构建号为 1
+bun run mobile:ios:testflight -- --build-number 1 --internal-only
+
+# 后续上传必须使用新的构建号
+bun run mobile:ios:testflight -- --build-number 2 --internal-only
+```
+
+默认允许 Xcode 自动更新签名配置；只使用已有描述文件时加 `--no-provisioning-updates`。如果前端资源已经构建并同步，可加 `--skip-mobile-build`。只归档或使用已有归档重试上传：
+
+```bash
+bun run mobile:ios:testflight -- --build-number 3 --archive-only
+bun run mobile:ios:testflight -- --upload-only --archive-path 'ios/App/build/testflight/Bridge-<时间>.xcarchive' --internal-only
+```
+
+也可以通过环境变量给 `xcodebuild` 提供 App Store Connect API Key；脚本只传递路径、Key ID 和 Issuer ID，不读取或保存 `.p8` 内容：
+
+```bash
+APP_STORE_CONNECT_API_KEY_PATH=/private/keys/AuthKey_ABC123.p8 \
+APP_STORE_CONNECT_API_KEY_ID=ABC123 \
+APP_STORE_CONNECT_API_ISSUER_ID=00000000-0000-0000-0000-000000000000 \
+bun run mobile:ios:testflight -- --build-number 4 --internal-only
+```
+
+上传命令成功只表示 Apple 已接收交付，仍需在 App Store Connect → TestFlight 等待 Processing 完成，处理可能出现的 Export Compliance，然后把构建加入 Internal Testing 组。`--internal-only` 适合本人验证，安装仍需在 iPhone 上安装 TestFlight 并用有权访问该 App Store Connect App 的 Apple Account 接受邀请。每次重编译都要递增 `CFBundleVersion`；不能用相同构建号重复上传。
 
 ## 首次连接
 
@@ -67,6 +108,14 @@ App 名称为 `Bridge`，应用标识为 `dev.feishu.codex.bridge`。正式发�
 ```bash
 bun run mobile:ios:install
 ```
+
+默认 `App` scheme 的产物为 `App.app`，包含 TunnelKit OpenVPN、`BridgePacketTunnel.appex` 和分享扩展。主 App 与 Packet Tunnel 扩展必须使用同一付费 Apple 开发者团队，并各自具备 `packet-tunnel-provider` entitlement 和有效的 provisioning profile；两者还共享 App Group 和 VPN Keychain 访问组。Xcode 自动签名可为可用的团队创建或更新这些描述文件。`--allow-provisioning-updates` 可让命令行构建更新签名；是否能更新取决于 Xcode 中的账号和团队权限。`--vpn` 保留原来的 `AppVpn` 兼容构建入口，不需要用它才能获得系统 VPN。
+
+在 App 的网络设置中选择并保存“外部 OpenVPN Connect”或“内置 TunnelKit”；该选择保存在本机，手动检查和专用 Bridge 连接探测失败后的自动恢复遵循此选择，默认沿用外部客户端。外部方式需要已安装 OpenVPN Connect，Bridge 只能打开它，实际配置选择和连接需在该客户端中完成。切换到外部方式时，Bridge 关闭自己 VPN 配置的 On Demand 自动连接；已建立的连接可能需要在系统设置中断开。
+
+选择内置方式后，可在网络设置中导入 `.ovpn` 文件并按需输入认证信息，首次创建 VPN 配置时应在 iPhone 上确认系统授权。VPN 使用系统 Packet Tunnel，实际设备流量、DNS 和路由由配置及服务器下发内容决定；免 VPN Wi-Fi 使用系统 On Demand 忽略规则。读取当前 SSID 还需要 Access Wi-Fi Information entitlement 和 Apple 所列的系统条件；不能读取时仍可手动填写免 VPN 网络。App 内 VPN 实验入口继续独立保留。新配置的主 App 与扩展通过共享 Keychain 读取完整配置和密码引用；系统 VPN 配置保留连接所需的服务器地址、用户名与显示名称。旧配置需在更新成功后才会迁移。真机仍需验证导入、授权、服务器兼容和网络切换。
+
+项目内的 TunnelKit 使用 GPLv3，所含 LZO 使用 GPLv2+；其作者也提供另行协商的商业许可。Apple 付费开发者资格和 Network Extension 签名不自动授予第三方库的商业许可，分发前需按实际许可证和分发方式核对义务。
 
 默认同时支持 USB 有线和 Wi-Fi / 局域网连接，脚本会根据设备当前的连接方式自动选择安装通道。设备完成一次有线配对后，可以拔线再运行 `bun run mobile:ios:install --check`，确认显示 `Wi-Fi / 局域网`；保留数据线时则会显示 `USB`。如果有多台设备，用 `--device "设备名称"` 指定；需要强制只走无线时加 `--wireless-only`。`--allow-usb` 仍作为旧命令兼容，但 USB 已默认支持。首次下载 Swift 包可能需要较长时间。
 
@@ -95,10 +144,18 @@ bun run mobile:ios:install -- --disable-auto-renew  # 停用自动续签，保�
 
 OTA 使用已签名的 App 生成 IPA，并提供独立的 Safari 安装页；系统读取 HTTPS manifest 后负责下载和安装。可以使用现有 VPN 的 Mac IPv4，也可以使用 Tailscale 私网 HTTPS。两种方式都要求 iPhone 能通过对应网络访问 Mac，且描述文件包含该设备；安装页请求成功或 IPA 下载完成都不代表 iOS 已安装成功。
 
-连接 VPN 后，以下命令构建当前 checkout 的手机前端及 iOS App、生成安装包并启动用户级 OTA 服务；VPN 有多个 IPv4 时用 `--vpn-ip` 指定 Mac 自己的地址：
+使用本机环境要求的、可从 iPhone 访问的 Mac IPv4 配置 HTTPS 安装入口。以下示例中的地址需要替换为实际环境地址；命令会构建当前 checkout 的手机前端及 iOS App、生成安装包并启动用户级 OTA 服务：
 
 ```bash
-bun run mobile:ios:ota -- --vpn-ip 10.0.0.42
+export BRIDGE_IOS_OTA_HOST="<Mac 的可达 IPv4>"
+export BRIDGE_IOS_OTA_BASE_URL="https://${BRIDGE_IOS_OTA_HOST}:5173/ios-ota"
+bun run mobile:ios:ota -- --base-url "$BRIDGE_IOS_OTA_BASE_URL"
+```
+
+OTA 默认构建同一 Bundle ID 的 `App`，包含系统 VPN 和 App 内 VPN 实验入口，并要求已配置 Network Extension 签名。`--vpn` 仍可选择原 `AppVpn` 兼容构建：
+
+```bash
+bun run mobile:ios:ota -- --vpn --base-url "$BRIDGE_IOS_OTA_BASE_URL"
 ```
 
 VPN IP 直连需要可信 HTTPS。首次运行会在当前用户的 `Library/Application Support/Feishu Codex Bridge/ios-ota-tls` 下生成独立根证书和仅本机使用的私钥，在终端打印供 iPhone 安装的 `.cer` 文件及 SHA-256 指纹。通过 AirDrop 等可信方式把 **`.cer` 公钥证书**发送到 iPhone，在“设置 → 通用 → VPN 与设备管理”安装，再到“设置 → 通用 → 关于本机 → 证书信任设置”启用完全信任。此根证书会被 iPhone 全局信任，私钥应留在 Mac；不用时可在 iPhone 移除证书。如果已有受 iPhone 信任且包含该 IP 的证书，可用 `--tls-cert <证书> --tls-key <私钥>`，无需生成本地根证书。VPN IP 变化后需用新 IP 重启 OTA 服务；自动生成的服务证书会使用同一根证书更新。
@@ -112,38 +169,55 @@ bun run mobile:ios:ota -- --tailscale
 
 脚本只配置自己的 Tailscale HTTPS 端口，默认 `18443`，本机服务默认 `18731`；发现已有其他服务占用时停止，不执行 `tailscale serve reset` 或覆盖其他路由。也可以用 `--base-url https://...` 指向已存在的可信 HTTPS 反向代理；此模式只启动本机回环 HTTP 服务，外部代理需由使用者自行配置。
 
-命令完成后会打印 24 小时内有效的安装链接及二维码，有效期不会超过签名到期时间。首次在 iPhone Safari 打开短时链接会为该浏览器建立 30 天的 OTA 授权；把输出的 HTTPS 首页添加到主屏幕后，可以在授权期内直接打开并安装最新已发布的包。该授权独立于 Bridge 配对，仅用于 OTA；不要把安装链接或根证书私钥发给他人。需要撤销 OTA 浏览器授权和全部未过期链接时运行 `bun run mobile:ios:ota -- --revoke-sessions`。之后可用 `bun run mobile:ios:ota -- --link` 生成新链接，`bun run mobile:ios:ota -- --stop` 停止 OTA 服务，安装包和证书保留。
+开发环境可让 OTA 安装页和 Vite 共用 `5173`：Vite 会把 `/ios-ota/` 代理到本机 OTA 服务。首次配置时使用上述 IPv4 生成证书，然后启动 OTA 服务和 Vite：
 
-每次运行默认命令会重新构建并发布当前 checkout 的代码。若只想发布已经构建的签名 App，可用 `--app ios/App/build/DeviceDerivedData/Build/Products/Debug-iphoneos/App.app`；`--no-serve` 只生成包。签名剩余不超过 24 小时时，发布过程先申请新描述文件并重签快照。OTA 服务启动后还会每小时检查最新安装包：临近到期时自动重签并发布**相同 App 的新签名包**，无需 iPhone 当时被 Mac 发现；手机仍需打开安装页并确认系统安装，新签名才会在手机生效。续签失败会记录到 OTA 目录的 `refresh-error.log` 并尝试在 Mac 通知，下次整点重试。
+```bash
+bun run mobile:ios:ota -- --stop
+bun run dev:https:configure -- --ip "$BRIDGE_IOS_OTA_HOST"
+bun run mobile:ios:ota -- --start --base-url "$BRIDGE_IOS_OTA_BASE_URL" --port 18731
+bun run dev:web:restart
+```
+
+之后安装链接会是 `https://<Mac 的 IPv4>:5173/ios-ota/<短时令牌>/`；iPhone 只需信任一次该 OTA 根证书。`5173` 仍同时提供普通 Web 页面，不能把 OTA 服务直接改为占用 5173。
+
+命令完成后会打印 24 小时内有效的安装链接及二维码，有效期不会超过签名到期时间。首次在 iPhone Safari 打开短时链接会为该浏览器建立 30 天的 OTA 授权；把输出的 HTTPS 首页添加到主屏幕后，可以在授权期内直接打开并安装最新已发布的包。该授权独立于 Bridge 配对，仅用于 OTA；不要把安装链接或根证书私钥发给他人。需要撤销 OTA 浏览器授权和全部未过期链接时运行 `bun run mobile:ios:ota -- --revoke-sessions`。之后可用 `bun run mobile:ios:ota -- --link --base-url "$BRIDGE_IOS_OTA_BASE_URL"` 生成新链接，`bun run mobile:ios:ota -- --stop` 停止 OTA 服务，安装包和证书保留。
+
+每次运行默认命令会重新构建并发布当前 checkout 的同一 Bundle ID `App`，其中包含系统 VPN，并自动使用高于已发布包的 `CFBundleVersion`，避免 iOS 把新 IPA 当成同一构建而拒绝覆盖。也可用 `--build-number <正整数>` 显式指定构建号；默认已构建产物位于 `ios/App/build/DeviceDerivedData/Build/Products/PersonalDebug-iphoneos/App.app`。兼容入口 `AppVpn` 的产物位于 `Debug-iphoneos/AppVpn.app`，可用 `--vpn` 让脚本构建；若只想发布已经构建的签名 App，可用 `--app <App.app 或 AppVpn.app>`，脚本会拒绝不高于已发布构建号的包；`--no-serve` 只生成包。签名剩余不超过 24 小时时，发布过程先申请新描述文件并重签快照。OTA 服务启动后还会每小时检查最新安装包：临近到期时自动重签并发布**相同 App 的新签名包**，无需 iPhone 当时被 Mac 发现；手机仍需打开安装页并确认系统安装，新签名才会在手机生效。续签失败会记录到 OTA 目录的 `refresh-error.log` 并尝试在 Mac 通知，下次整点重试。
 
 OTA 通过 iOS 系统安装，不会自动向现有 `mobile:ios:install` 续签任务登记安装成功；系统更换安装位置后，旧续签任务会按保护规则暂停。需要恢复 Mac 的自动覆盖续签时，重新连接设备并运行一次 `bun run mobile:ios:install`。不能因文件已下载就推断手机已安装，实际 Safari、证书信任和 iPhone 安装仍须真机验收。
 
-已配对 Bridge 的 iPhone App 可以从环境切换窗口打开 iOS 安装页；iPhone Safari 中也可在“系统管理 → 系统设置”查看安装包状态、打开安装页或触发 Mac 构建发布。Android 和桌面 Web 不显示 iOS 入口。安装链接通过已配对会话和操作令牌签发，链接最多有效 30 分钟；系统安装器不携带 Bridge 会话，未过期的链接与 Bridge 设备撤销独立，应避免转发。构建发布只生成并发布安装包，不代表手机已经安装。
+已配对 Bridge 的 iPhone App 可以从环境切换窗口打开 iOS 安装页；iPhone Safari 中也可在“系统管理 → 系统设置”查看安装包状态、打开安装页或触发 Mac 构建发布。App 页面会同时显示当前构建号和目标构建号；目标不高于当前 App 时会阻止无效安装并提示先发布新构建。Android 和桌面 Web 不显示 iOS 入口。安装链接通过已配对会话和操作令牌签发，链接最多有效 30 分钟；系统安装器不携带 Bridge 会话，未过期的链接与 Bridge 设备撤销独立，应避免转发。构建发布只生成并发布安装包，不代表手机已经安装。
 
 安装版 Bridge 启动目录不在源码 checkout 时，会尝试读取当前用户唯一的 OTA LaunchAgent 定位服务及源码；有多个服务或路径不同可设置 `FEISHU_CODEX_BRIDGE_IOS_OTA_DIR` 和 `FEISHU_CODEX_BRIDGE_IOS_OTA_SOURCE`，必要时用 `FEISHU_CODEX_BRIDGE_IOS_OTA_BUN` 指定 Bun。Bridge 必须能访问对应目录和源码，后台构建依赖 Mac 的 Xcode、签名账户及钥匙串。
 
 开发服务可以复用 iPhone 已信任的 OTA 根证书，为 Mac 当前 LAN IP 单独签发 5173 服务证书：
 
 ```bash
-bun run dev:https:configure -- --ip 10.15.53.70  # 换成 Mac 当前 IPv4
+bun run dev:https:configure -- --ip "$BRIDGE_IOS_OTA_HOST"  # 换成 Mac 当前 IPv4
 bun run dev:web:restart                          # 仅重启当前 checkout 的 Vite
 ```
 
-配置后，同一个 5173 端口同时支持原有 HTTP 与 HTTPS；如 `https://10.15.53.70:5173/`。HTTPS 证书仅覆盖配置时指定的 IP、`127.0.0.1` 与 `localhost`，IP 变化后需重新配置并重启 Vite。该证书与 OTA 服务端证书分开，根证书不变；不改变 17310 API、7310 安装版服务或用户数据。HTTPS 需要手机能访问该 IP，并已在系统证书信任设置中完全信任根证书。
+配置后，同一个 5173 端口同时支持原有 HTTP 与 HTTPS；如 `https://<Mac 的 IPv4>:5173/`。HTTPS 证书仅覆盖配置时指定的 IP、`127.0.0.1` 与 `localhost`，IP 变化后需重新配置并重启 Vite。该证书与 OTA 服务端证书分开，根证书不变；不改变 17310 API、7310 安装版服务或用户数据。HTTPS 需要手机能访问该 IP，并已在系统证书信任设置中完全信任根证书。
 
 无线连接排查可运行：
 
 ```bash
-bun run network:ip-audit -- --ip 10.15.53.70 --target 10.15.64.113
+bun run network:ip-audit -- --ip "$BRIDGE_IOS_OTA_HOST" --target "<目标 IPv4>"
 ```
 
 脚本读取网卡的子网掩码、网关和到目标地址的路由，然后对本地网段做受控 ICMP/ARP 探测。输出中的“候选地址”只代表本次没有观察到响应，不能当作地址所有权确认；手动配置前应使用 DHCP 保留或让网络管理员确认。`--no-probe` 只读取路由，不发送探测包；`--json` 输出机器可读结果。
+
+## iOS 本机崩溃诊断
+
+App 启动时订阅 Apple MetricKit 的系统崩溃诊断；诊断交付后保存到手机 App 私有目录 `Library/Application Support/BridgeCrashReports`。在“系统设置”或“App-only VPN 实验”中的“本机崩溃报告”可查看和主动分享报告。记录仅在用户主动分享时离开手机，包含系统返回的堆栈、信号和构建号；不会读取或附加 VPN 配置、用户名或密码。系统交付可能延迟，也可能没有可用报告，系统原有 `.ips` 仍是补充信息。
+
+“生成线程快照”使用 PLCrashReporter 1.12.2 采集运行中的线程状态，不会故意触发崩溃，也不会注册信号或异常处理器；快照与真实崩溃分别标记。堆栈可能需要与对应构建的 dSYM 配合符号化。该能力只对安装了新版本后的事件生效；iOS 真机上的崩溃交付和分享流程需要单独验收。
 
 ## iOS 原生 SSH 工作区
 
 iOS App 的 `SSH / Mac` 入口会打开原生工作区：支持密码登录、未加密 Ed25519/ECDSA 私钥登录、首次主机密钥确认、交互式 PTY、终端 resize、连接后命令、主机配置保存，以及从 Tmux 页面打开全屏或半屏工作区。可在手机上生成 Ed25519 密钥，或通过系统文件选择器导入私钥；公钥可查看和复制，并需添加到 SSH 主机的 `~/.ssh/authorized_keys`。私钥材料与元数据分离保存到 `WhenUnlockedThisDeviceOnly` Keychain，不进入 WebView；RSA、加密私钥暂不支持。主机密钥显示稳定的 OpenSSH `SHA256:` 指纹，并按规范化主机和端口持久保存已确认的公钥；相同主机密钥自动信任，变化时才重新确认。密码只通过一次性原生调用进入连接对象，不写入 WebView 存储；主机配置只保存主机、端口、用户名、密钥 ID 和启动命令等非敏感元数据。普通进入工作区会自动载入最近保存且有可用私钥的主机并连接；管理模式才打开主机设置。主机设置默认不读取或展开 Bridge Session；可按需展开绑定，或从已选 Tmux Session 打开时自动读取。iOS 使用 Keychain 中的 Bridge token 校验绑定的 `bridgeOrigin + SSH host/port/user + sessionId + createdAt`，身份不一致则拒绝 API 绑定。
 
-当前 iOS 首阶段尚未接入 SFTP 预览/上传/下载/API fallback、Bridge API-first Session 的完整读写操作、Composer 附件删除/断点恢复或后台常驻重连；已接入一层只读 Session 文件列表、Composer 附件选择/分块上传和 scoped 引用，SFTP transport adapter 仍需真实主机验收，Composer 文本已支持 API-first 和结果未知提示，Session 列表/identity 仍是只读绑定层。原生 SSH 依赖的 SwiftTerm、SwiftNIO SSH 和固定 revision 的 NIOSFTP 已加入 Xcode App target；Xcode 依赖解析、编译、真实 Mac `sshd`/tmux 和 iPhone 触摸/软键盘验收必须分别完成，不能用浏览器或源码检查替代。
+iOS Composer 将内容写入当前 SSH 终端；附件经 SFTP 分块上传到当前 SSH 主机，并在内容中附上远端路径。多行内容和附件需要终端启用括号粘贴模式；上传失败或写入结果未知时保留草稿并提示。Session 文件页目前提供只读目录列表，完整预览、上传和下载仍需跟进；Session 列表和 identity 校验仍是只读绑定层。原生 SSH 依赖的 SwiftTerm、SwiftNIO SSH 和固定 revision 的 NIOSFTP 已加入 Xcode App target；Xcode 依赖解析、编译、真实 Mac `sshd`/tmux 和 iPhone 触摸/软键盘验收必须分别完成，不能用浏览器或源码检查替代。
 
 ## Android SSH 工作区
 
