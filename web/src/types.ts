@@ -130,6 +130,7 @@ export interface CodexUsageAccount {
   label: string;
   available: boolean;
   checkedAt: string;
+  renewalAt?: string | null;
   quota?: {
     ordinaryUsageAllowed?: boolean | null;
     planType?: string | null;

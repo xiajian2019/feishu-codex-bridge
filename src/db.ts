@@ -355,6 +355,12 @@ CREATE TABLE IF NOT EXISTS codex_account_usage_daily_buckets (
 CREATE INDEX IF NOT EXISTS idx_codex_account_usage_daily_date
   ON codex_account_usage_daily_buckets(usage_date, home_id);
 
+CREATE TABLE IF NOT EXISTS codex_account_subscription_renewals (
+    home_id TEXT PRIMARY KEY,
+    renewal_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS codex_history_thread_home_preferences (
     thread_id TEXT PRIMARY KEY,
     preferred_home_id TEXT NOT NULL,
@@ -1357,6 +1363,26 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
        WHERE home_id = ? ORDER BY usage_date ASC`,
     ).all(homeId) as Array<{ usage_date: string; tokens: number }>;
     return rows.map((row) => ({ startDate: row.usage_date, tokens: Number(row.tokens) }));
+  }
+
+  public listCodexAccountSubscriptionRenewals(): Array<{ homeId: string; renewalAt: string }> {
+    const rows = this.db.prepare(
+      "SELECT home_id, renewal_at FROM codex_account_subscription_renewals",
+    ).all() as Array<{ home_id: string; renewal_at: string }>;
+    return rows.map((row) => ({ homeId: row.home_id, renewalAt: row.renewal_at }));
+  }
+
+  public setCodexAccountSubscriptionRenewal(homeId: string, renewalAt: string | null): string | null {
+    if (renewalAt === null) {
+      this.db.prepare("DELETE FROM codex_account_subscription_renewals WHERE home_id = ?").run(homeId);
+      return null;
+    }
+    this.db.prepare(
+      `INSERT INTO codex_account_subscription_renewals (home_id, renewal_at, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(home_id) DO UPDATE SET renewal_at = excluded.renewal_at, updated_at = excluded.updated_at`,
+    ).run(homeId, renewalAt, this.timestamp());
+    return renewalAt;
   }
 
   public listCodexHistoryRuns(limit: number): CodexHistoryStoredRun[] {

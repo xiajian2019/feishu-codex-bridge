@@ -10,6 +10,8 @@ public final class BridgeConnectBotSSHPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "openTerminal", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "openWorkspace", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "listOptions", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getDefaultProfile", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setDefaultProfile", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "listSessions", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setWorkspaceVisible", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "closeWorkspace", returnType: CAPPluginReturnPromise),
@@ -17,6 +19,135 @@ public final class BridgeConnectBotSSHPlugin: CAPPlugin, CAPBridgedPlugin {
     ]
 
     private weak var activeWorkspace: BridgeIOSSHWorkspaceViewController?
+    private static let defaultProfileKey = "bridge.ssh.default-profile-id.v1"
+    @MainActor private static var appIntentDeliveryInFlight = false
+    @MainActor private var canPresentAppIntent: Bool {
+        guard UIApplication.shared.applicationState == .active,
+              let presenter = bridge?.viewController,
+              presenter.viewIfLoaded?.window != nil else { return false }
+        return presenter.presentedViewController == nil || activeWorkspace != nil
+    }
+    @MainActor private static weak var appIntentHost: BridgeConnectBotSSHPlugin?
+
+    @MainActor
+    static func registerAppIntentHost(_ plugin: BridgeConnectBotSSHPlugin) {
+        appIntentHost = plugin
+        deliverPendingAppIntent()
+    }
+
+    @MainActor
+    static func requestAppIntent(profileID: String?) async throws {
+        guard let appIntentHost,
+              appIntentHost.canPresentAppIntent else {
+            guard BridgeSSHAppIntentHandoff.enqueue(profileID: profileID) else {
+                throw BridgeIOSSHAppIntentError.bridgeUnavailable
+            }
+            return
+        }
+        try await appIntentHost.connectSavedProfileFromAppIntent(profileID: profileID)
+    }
+
+    @MainActor
+    static func deliverPendingAppIntent() {
+        guard !appIntentDeliveryInFlight,
+              let request = BridgeSSHAppIntentHandoff.pending(),
+              let appIntentHost,
+              appIntentHost.canPresentAppIntent else { return }
+        appIntentDeliveryInFlight = true
+        Task { @MainActor in
+            defer { appIntentDeliveryInFlight = false }
+            do {
+                try await appIntentHost.connectSavedProfileFromAppIntent(profileID: request.profileID)
+            } catch {
+                // The intent already returned to Siri. Do not retry a failed target
+                // on every foreground transition.
+            }
+            BridgeSSHAppIntentHandoff.clear()
+        }
+    }
+
+    @MainActor
+    static func connectSavedProfileFromAppIntent(profileID: String?) async throws {
+        guard let appIntentHost else { throw BridgeIOSSHAppIntentError.bridgeUnavailable }
+        try await appIntentHost.connectSavedProfileFromAppIntent(profileID: profileID)
+    }
+
+    @MainActor
+    private func connectSavedProfileFromAppIntent(profileID: String?) async throws {
+        let profiles = BridgeIOSSHProfileStore.shared.list()
+        let profile: BridgeIOSSHProfile
+        if let profileID {
+            guard let savedProfile = profiles.first(where: { $0.id == profileID }) else {
+                throw BridgeIOSSHAppIntentError.profileNotFound
+            }
+            profile = savedProfile
+        } else {
+            guard !profiles.isEmpty else {
+                throw BridgeIOSSHAppIntentError.noSavedProfiles
+            }
+            let defaultProfile = Self.defaultProfileID().flatMap { id in
+                profiles.first(where: { $0.id == id && !$0.keyId.isEmpty })
+            }
+            guard let savedProfile = defaultProfile ?? profiles.first(where: { !$0.keyId.isEmpty }) else {
+                throw BridgeIOSSHAppIntentError.privateKeyRequired
+            }
+            profile = savedProfile
+        }
+
+        guard validHost(profile.host), validUsername(profile.username), (1...65_535).contains(profile.port) else {
+            throw BridgeIOSSHAppIntentError.invalidProfile
+        }
+        guard !profile.keyId.isEmpty else { throw BridgeIOSSHAppIntentError.privateKeyRequired }
+        do {
+            guard try BridgeIOSSHKeychainStore().metadata(for: profile.keyId) != nil else {
+                throw BridgeIOSSHAppIntentError.privateKeyUnavailable
+            }
+        } catch {
+            throw BridgeIOSSHAppIntentError.privateKeyUnavailable
+        }
+
+        let launch = BridgeIOSSHWorkspaceLaunch.terminal(
+            host: profile.host,
+            port: profile.port,
+            username: profile.username,
+            password: "",
+            startupCommand: profile.startupCommand,
+            bridgeServerOrigin: nil,
+            keyId: profile.keyId
+        )
+        try await presentWorkspaceFromAppIntent(launch: launch)
+    }
+
+    @MainActor
+    private func presentWorkspaceFromAppIntent(launch: BridgeIOSSHWorkspaceLaunch) async throws {
+        guard let presenter = bridge?.viewController, presenter.viewIfLoaded?.window != nil else {
+            throw BridgeIOSSHAppIntentError.bridgeUnavailable
+        }
+        if let activeWorkspace {
+            guard activeWorkspace.canReuse(for: launch) else {
+                throw BridgeIOSSHAppIntentError.workspaceAlreadyOpen
+            }
+            guard activeWorkspace.setWorkspaceVisible(true) else {
+                throw BridgeIOSSHAppIntentError.bridgeUnavailable
+            }
+            return
+        }
+        guard presenter.presentedViewController == nil else {
+            throw BridgeIOSSHAppIntentError.workspaceAlreadyOpen
+        }
+
+        let workspace = BridgeIOSSHWorkspaceViewController(launch: launch) { [weak self] returnToWorkbench in
+            self?.workspaceClosed(returnToWorkbench: returnToWorkbench)
+        }
+        activeWorkspace = workspace
+        workspace.modalPresentationStyle = .fullScreen
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            presenter.present(workspace, animated: true) {
+                workspace.presentationController?.delegate = workspace
+                continuation.resume(returning: ())
+            }
+        }
+    }
 
     @objc func listOptions(_ call: CAPPluginCall) {
         let profiles = BridgeIOSSHProfileStore.shared.list().map { profile in
@@ -38,6 +169,28 @@ public final class BridgeConnectBotSSHPlugin: CAPPlugin, CAPBridgedPlugin {
             ] as [String: Any]
         } ?? []
         call.resolve(["profiles": profiles, "keys": keys])
+    }
+
+    @objc func getDefaultProfile(_ call: CAPPluginCall) {
+        let profileID = Self.defaultProfileID()
+        call.resolve(["profileId": profileID ?? NSNull()])
+    }
+
+    @objc func setDefaultProfile(_ call: CAPPluginCall) {
+        let profileID = call.getString("profileId")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !profileID.isEmpty else {
+            Self.sharedDefaults?.removeObject(forKey: Self.defaultProfileKey)
+            call.resolve(["profileId": NSNull()])
+            return
+        }
+        guard let profile = BridgeIOSSHProfileStore.shared.list().first(where: { $0.id == profileID }),
+              !profile.keyId.isEmpty,
+              (try? BridgeIOSSHKeychainStore().metadata(for: profile.keyId)) != nil else {
+            call.reject("请选择一台已保存私钥的 SSH 主机。", "INVALID_DEFAULT_PROFILE")
+            return
+        }
+        Self.sharedDefaults?.set(profileID, forKey: Self.defaultProfileKey)
+        call.resolve(["profileId": profileID])
     }
 
     @objc func listSessions(_ call: CAPPluginCall) {
@@ -201,6 +354,16 @@ public final class BridgeConnectBotSSHPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    private static var sharedDefaults: UserDefaults? {
+        UserDefaults.standard
+    }
+
+    private static func defaultProfileID() -> String? {
+        guard let profileID = sharedDefaults?.string(forKey: defaultProfileKey),
+              BridgeIOSSHProfileStore.shared.list().contains(where: { $0.id == profileID && !$0.keyId.isEmpty }) else { return nil }
+        return profileID
+    }
+
     private func workspaceClosed(returnToWorkbench: Bool) {
         activeWorkspace = nil
         notifyListeners("workspaceClosed", data: ["returnToWorkbench": returnToWorkbench])
@@ -290,5 +453,27 @@ private extension URL {
         components.host = host
         components.port = port
         return components.string ?? absoluteString
+    }
+}
+
+private enum BridgeIOSSHAppIntentError: LocalizedError {
+    case bridgeUnavailable
+    case noSavedProfiles
+    case profileNotFound
+    case invalidProfile
+    case privateKeyRequired
+    case privateKeyUnavailable
+    case workspaceAlreadyOpen
+
+    var errorDescription: String? {
+        switch self {
+        case .bridgeUnavailable: return "Bridge 尚未准备好打开 SSH 工作区，请稍后重试。"
+        case .noSavedProfiles: return "请先在 Bridge 中保存 SSH 主机配置。"
+        case .profileNotFound: return "找不到这条 SSH 主机配置，请重新选择。"
+        case .invalidProfile: return "SSH 主机配置无效，请在 Bridge 中检查后重试。"
+        case .privateKeyRequired: return "此 Siri 操作需要已保存 SSH 私钥的主机配置。"
+        case .privateKeyUnavailable: return "找不到此主机使用的 SSH 私钥，请在 Bridge 中重新选择密钥。"
+        case .workspaceAlreadyOpen: return "请先关闭当前 SSH 工作区，再连接其他主机。"
+        }
     }
 }

@@ -44,6 +44,7 @@ it("replays cached queries without sending their replies and still handles live 
   const terminal = new Terminal();
   const forwarded: string[] = [];
   const events: string[] = [];
+  const firstEvents: string[] = [];
   const guard = new TmuxTerminalReplayGuard(terminal, () => {});
   const transport = new TmuxTerminalTransport("replay-fixture");
   let firstUnsubscribe: (() => void) | undefined;
@@ -51,8 +52,9 @@ it("replays cached queries without sending their replies and still handles live 
   terminal.onData((data) => { if (!guard.active) forwarded.push(data); });
   try {
     transport.setPathBuilder(() => "/terminal");
-    firstUnsubscribe = transport.subscribe(() => {});
+    firstUnsubscribe = transport.subscribe((event) => firstEvents.push(event.type));
     socket.open();
+    expect(firstEvents).toEqual(["status", "socket-open"]);
     socket.receive("\u001b[c");
     firstUnsubscribe();
     firstUnsubscribe = undefined;
@@ -66,7 +68,7 @@ it("replays cached queries without sending their replies and still handles live 
     // This is live output even though cached writes have not been parsed yet.
     socket.receive("\u001b[>c");
     await new Promise<void>((resolve) => terminal.write("", resolve));
-    expect(events).toEqual(["replay-start", "output", "replay-end", "output"]);
+    expect(events).toEqual(["socket-open", "replay-start", "output", "replay-end", "output"]);
     expect(forwarded).toEqual(["\u001b[>0;276;0c"]);
     terminal.input("x");
     expect(forwarded).toEqual(["\u001b[>0;276;0c", "x"]);

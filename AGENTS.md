@@ -1,6 +1,17 @@
 # Feishu Codex Bridge 项目约定
 
-本文只记录项目级的架构、行为和 UI 约定，用来补充适用的用户级 AGENTS，不复制个人工作流或凭据。Codex 历史 session 用于回溯用户决策，当前源码和配置是实现现状的依据；同一要求多次修订时采用用户最后确认的版本，及时修正文档中的旧约定。修改前检查当前分支和工作区，保留已有改动，不要覆盖无关内容，也不要把个人凭据或本机临时状态写入文档。下列规则包含验收要求，不代表实现已全部满足；当前缺口见 [2026-10-22 会话复盘与风险评审](doc/session-review-2026-10-22.md)。
+本文记录项目级的架构、行为和 UI 约定，用来补充适用的用户级 AGENTS，不包含个人凭据或本机临时状态。Codex 历史 session 用于回溯用户决策，当前源码和配置是实现现状的依据；同一要求多次修订时采用用户最后确认的版本，及时修正文档中的旧约定。修改前检查当前分支和工作区，保留已有改动，不要覆盖无关内容。下列规则包含验收要求，不代表实现已全部满足；2026-10-22 评审为历史基线，当前源码风险与验证边界见 [2026-11-11 项目复核](doc/project-review-2026-11-11.md)。
+
+## 本机环境补充
+
+如果仓库根目录存在 [AGENTS.local.md](AGENTS.local.md)，开始任务前读取并遵循其中的本机补充规则。该文件只供本机使用，已由 Git 忽略；如果不存在，继续遵循项目和用户级规则。
+
+## 网页改动的浏览器验收
+
+- 本项目的 Web 页面、布局或交互改动，完成前必须进行实际浏览器验证；这一要求适用于所有模型。先检查当前会话是否提供 Playwright MCP，优先直接使用 `mcp__playwright__browser_*` 工具打开当前改动对应的页面。CLI 任务同时遵循用户级的浏览器操作规则。
+- 使用 Playwright 实际点击、输入或操作本次修改涉及的入口，核对结果和相关回归；根据改动检查受影响的桌面/手机尺寸与主题。视觉调整需要查看浏览器截图，而不是只查看源码、DOM 快照或测试结果。
+- 每次网页验收至少使用一次 `mcp__playwright__browser_evaluate` 读取与改动相关的页面状态或布局数据，例如元素尺寸、可见性、溢出、滚动位置或控件状态；用户交互仍应通过 Playwright 的点击、输入等操作验证，不用脚本触发事件冒充真实交互。
+- 验证前确认页面由当前 checkout 的代码提供；涉及会修改数据的操作优先使用隔离 fixture 或模拟数据，不影响用户现有的设备、任务或数据库。Playwright MCP 不可用、调用失败或页面环境无法启动时，说明具体原因，在授权范围内尝试可用的替代验证，并明确报告尚未完成的浏览器验收；不得把构建、类型检查或模拟数据结果表述为真机验收。
 
 ## GitHub 发布约定
 
@@ -26,7 +37,7 @@
 | 原生直连 | `FeishuSqliteCodexRuntime` | `@larksuiteoapi/node-sdk` 接收 Feishu 事件，Bridge 用 SQLite 做去重、持久化任务/续问、附件状态、租约、恢复和 outbox；Codex 执行由 `@openai/codex-sdk` 完成。它不启动 AAMP、Relay、ACP 或 ACPX。`feishu-sqlite-acp` 是兼容配置别名，实际仍走 Codex SDK。 |
 | Web Task Desk | `Dispatcher`、`ChildWorkerRunner`、`codex-worker` | Web 新建任务使用 `tasks/runs/outbox` 状态机和 Codex SDK worker；这条链路与原生直连消息的 `bridge_tasks` 状态机分开。tmux Dashboard 不是 Task Desk 的执行后端。 |
 | 统一 Web 服务 | `DashboardServer`、`web/src/main.tsx` | 生产中由 Bridge 进程内托管；Task Desk、系统管理、Codex History 和 tmux Dashboard 共用一套 Web/API 服务与认证，不再拆成独立 verifier 服务。 |
-| Codex History | `CodexHistoryService`、`CodexAppServerClient` | 通过 Codex app-server 的 `thread/list`/`thread/read` 读取，通过 Codex SDK 恢复会话；不同 `CODEX_HOME` 独立查询。不要直接解析 `auth.json`、Codex SQLite 或 JSONL 代替官方接口。 |
+| Codex History | `CodexHistoryService`、`CodexAppServerClient` | 详情通过 app-server `thread/read`；续聊通过 Codex SDK，显式交互审批使用 app-server。当前列表优先只读查询 Codex SQLite，不可用时才回退 `thread/list`；这是实现与项目约定不一致的待修复偏差，不代表符合官方接口边界。不要新增直接解析 `auth.json`、Codex SQLite 或 JSONL 的实现；见 [项目复核](doc/project-review-2026-11-11.md)。 |
 | tmux Dashboard | `TmuxDashboardApi`、`web/src/TmuxDashboard.tsx` | 连接 Bridge 主机已有的默认 tmux server，默认只读输出，支持显式切换终端输入、composer 控制和 Session 文件页；不创建隔离 tmux server，也不代表 pane 内嵌套 SSH 的目标机。 |
 | 本机 Codex 通知 | `LocalCodexNotificationWatcher` / `LocalCodexNotificationInbox` | `poll` 轮询 Codex app-server，`hook` 接收 Codex 官方 notify hook。只通知本机 Codex CLI/App 的结束状态；Feishu/AAMP 任务已有卡片，不重复发本机通知。 |
 

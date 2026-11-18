@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { defineConfig, normalizePath } from "vite";
 import react from "@vitejs/plugin-react";
+import { noVncCompatibility } from "./novnc-compat.js";
 
 const webRoot = fileURLToPath(new URL(".", import.meta.url));
 const apiTarget = process.env.BRIDGE_WEB_API_TARGET ?? "http://127.0.0.1:17310";
@@ -37,8 +38,8 @@ export default defineConfig({
   cacheDir: join(tmpdir(), `feishu-codex-bridge-vite-${process.pid}`),
   // These are loaded lazily by the photo/live scanner and must be available
   // before a phone opens the pairing screen.
-  optimizeDeps: { include: ["jsqr", "qr-scanner"] },
-  plugins: [react()],
+  optimizeDeps: { include: ["jsqr", "qr-scanner"], exclude: ["@novnc/novnc"] },
+  plugins: [noVncCompatibility(), react()],
   resolve: {
     alias: [
       { find: /^\.\/mobile-runtime\.js$/, replacement: fileURLToPath(new URL("./src/mobile-runtime.browser.ts", import.meta.url)) },
@@ -97,6 +98,22 @@ export default defineConfig({
             const forwardedPort = Array.isArray(forwardedPortHeader) ? forwardedPortHeader[0] : forwardedPortHeader;
             if (forwardedPort) proxyRequest.setHeader("X-Forwarded-Port", forwardedPort.split(",", 1)[0]!.trim());
 
+            const address = clientAddress(request);
+            if (address) proxyRequest.setHeader("X-Forwarded-For", address);
+          });
+        },
+      },
+      "/remote-desktop/stream": {
+        target: apiTarget.replace(/^http/, "ws"),
+        ws: true,
+        configure: (proxy) => {
+          proxy.on("proxyReqWs", (proxyRequest, request) => {
+            const host = request.headers.host;
+            if (host) proxyRequest.setHeader("X-Forwarded-Host", host);
+            const forwarded = request.headers["x-forwarded-proto"];
+            const proto = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(",", 1)[0]?.trim();
+            const secure = Boolean((request.socket as typeof request.socket & { encrypted?: boolean }).encrypted);
+            proxyRequest.setHeader("X-Forwarded-Proto", proto || (secure ? "https" : "http"));
             const address = clientAddress(request);
             if (address) proxyRequest.setHeader("X-Forwarded-For", address);
           });

@@ -188,6 +188,21 @@ export function fetchCodexUsage(options: { homeId?: string; signal?: AbortSignal
   return getJson<CodexUsageResponse>(`/api/codex/usage${query ? `?${query}` : ""}`, { signal: options.signal });
 }
 
+export async function setCodexAccountRenewalDate(input: {
+  homeId: string;
+  renewalAt: string | null;
+}): Promise<{ homeId: string; renewalAt: string | null }> {
+  const token = await getActionToken();
+  return getJson<{ homeId: string; renewalAt: string | null }>("/api/codex/usage/renewal", {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Action-Token": token,
+    },
+    body: JSON.stringify(input),
+  });
+}
+
 export async function consumeCodexResetCredit(input: {
   homeId: string;
   creditId: string;

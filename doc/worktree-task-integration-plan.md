@@ -10,7 +10,7 @@
 
 首期限定在 Web Task Desk 的 `tasks/runs/outbox` 和 tmux session；Direct 的 `bridge_tasks`、AAMP 的 `aamp_tasks` 保持独立。Task Desk 新建表单默认沿用原执行目录，用户可为单个任务勾选独立 worktree；从 tmux 创建 Bridge 任务时自动创建独立 worktree。Composer 继续用于向当前 tmux 中的 Codex 会话发送 follow-up。
 
-## 当前系统基线
+## 评估时的系统基线（2026-10-11）
 
 - Web Task Desk 在 `Dispatcher.submitWebTask()` 中把登记项目路径保存为 `task.repo`。worker 要求它与项目登记路径一致，并以该路径启动 Codex SDK。显式重试和续问也验证项目路径；执行前后 Git 快照目前针对 `task.repo`。[任务提交](../src/dispatcher.ts#L181) [worker](../src/codex-worker.ts#L96) [快照](../src/dispatcher.ts#L524)
 - tmux 创建 API 只接收项目 key，并在项目根目录创建 session。`tmux_sessions` 保存项目、Codex Home、工作目录和 session 生命周期，没有任务/worktree 外键。[tmux API](../src/tmux-dashboard-api.ts#L583) [session 表](../src/db.ts#L505)

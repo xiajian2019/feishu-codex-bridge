@@ -48,6 +48,8 @@ interface BridgeConnectBotSSHPlugin {
   openTerminal(request: BridgeConnectBotSshOpenRequest): Promise<void>;
   openWorkspace(request: BridgeConnectBotSshWorkspaceRequest): Promise<void>;
   listOptions(): Promise<SshOptions>;
+  getDefaultProfile(): Promise<{ profileId: string | null }>;
+  setDefaultProfile(options: { profileId: string | null }): Promise<{ profileId: string | null }>;
   setWorkspaceVisible(options: { visible: boolean }): Promise<{ workspaceOpen: boolean }>;
   closeWorkspace(): Promise<void>;
   setUpdateBanner(options: NativeAppUpdateBanner): Promise<void>;
@@ -84,6 +86,14 @@ export function openNativeSshWorkspace(request: BridgeConnectBotSshWorkspaceRequ
 
 export function listNativeSshOptions(): Promise<SshOptions> {
   return NativeBridgeConnectBotSSH.listOptions();
+}
+
+export function getNativeSshDefaultProfile(): Promise<string | null> {
+  return NativeBridgeConnectBotSSH.getDefaultProfile().then(({ profileId }) => profileId ?? null);
+}
+
+export function setNativeSshDefaultProfile(profileId: string | null): Promise<string | null> {
+  return NativeBridgeConnectBotSSH.setDefaultProfile({ profileId }).then(({ profileId: saved }) => saved ?? null);
 }
 
 export function onNativeSshWorkspaceClosed(listener: (event: SshWorkspaceClosedEvent) => void): Promise<PluginListenerHandle> {

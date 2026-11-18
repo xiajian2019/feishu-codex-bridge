@@ -9,10 +9,15 @@ class BridgeViewController: CAPBridgeViewController {
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(BridgeCrashDiagnosticsPlugin())
         bridge?.registerPluginInstance(BridgeCredentialsPlugin())
+        bridge?.registerPluginInstance(BridgeAppIntentPlugin())
         bridge?.registerPluginInstance(BridgeIOSOtaPlugin())
         bridge?.registerPluginInstance(BridgeShareInboxPlugin())
         bridge?.registerPluginInstance(BridgeNativeThemePlugin())
-        bridge?.registerPluginInstance(BridgeConnectBotSSHPlugin())
+        if let bridge {
+            let sshPlugin = BridgeConnectBotSSHPlugin()
+            bridge.registerPluginInstance(sshPlugin)
+            BridgeConnectBotSSHPlugin.registerAppIntentHost(sshPlugin)
+        }
         bridge?.registerPluginInstance(BridgeOpenVPNConnectPlugin())
 
 #if BRIDGE_APP_ONLY_VPN_POC
@@ -34,6 +39,8 @@ class BridgeViewController: CAPBridgeViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        NotificationCenter.default.addObserver(self, selector: #selector(appDidBecomeActive),
+                                               name: UIApplication.didBecomeActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keyboardFrameChanged(_:)),
                                                name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillHide),
@@ -42,6 +49,15 @@ class BridgeViewController: CAPBridgeViewController {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        BridgeConnectBotSSHPlugin.deliverPendingAppIntent()
+    }
+
+    @objc private func appDidBecomeActive() {
+        BridgeConnectBotSSHPlugin.deliverPendingAppIntent()
     }
 
     @objc private func keyboardFrameChanged(_ notification: Notification) {

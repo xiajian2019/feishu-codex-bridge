@@ -101,3 +101,74 @@ final class BridgeIOSSHSFTPClient {
         return root == "/" ? "/\(suffix)" : "\(root)/\(suffix)"
     }
 }
+
+/// Uploads Composer attachments to the host of this SSH connection, independently
+/// of any Bridge Session binding. Each upload is streamed and exclusively created.
+final class BridgeIOSSHComposerSFTP {
+    private let client: SFTPClient
+    private let chunkSize = 64 * 1024
+
+    init(client: SFTPClient) { self.client = client }
+
+    func upload(fileURL: URL, name: String, contentType: String) async throws -> BridgeIOSSHComposerRemoteAttachment {
+        let home = try await client.realpath(".").get()
+        guard home.hasPrefix("/"), !home.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }),
+              !home.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }) else {
+            throw BridgeIOSSHSFTPError.invalidPath
+        }
+        let base = home.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let parent = "/" + (base.isEmpty ? "" : base + "/") + ".feishu-codex-bridge"
+        let directory = parent + "/ssh-attachments"
+        try await ensureDirectory(parent, privateOnly: false)
+        try await ensureDirectory(directory, privateOnly: true)
+
+        let ext = (name as NSString).pathExtension
+        let safeExtension = !ext.isEmpty && ext.count <= 12 && ext.unicodeScalars.allSatisfy {
+            (48...57).contains($0.value) || (65...90).contains($0.value) || (97...122).contains($0.value)
+        } ? "." + ext : ""
+        let remotePath = directory + "/" + UUID().uuidString + safeExtension
+        let input = try FileHandle(forReadingFrom: fileURL)
+        defer { try? input.close() }
+        let remote = try await client.openFile(path: remotePath, flags: [.write, .create, .exclusive],
+                                               attributes: SFTPAttributes(permissions: 0o600)).get()
+        do {
+            var offset: UInt64 = 0
+            while let chunk = try input.read(upToCount: chunkSize), !chunk.isEmpty {
+                var buffer = client.channel.allocator.buffer(capacity: chunk.count)
+                buffer.writeBytes(chunk)
+                try await client.write(file: remote, offset: offset, data: buffer).get()
+                offset += UInt64(chunk.count)
+            }
+            try await client.closeFile(remote).get()
+            return BridgeIOSSHComposerRemoteAttachment(name: name, contentType: contentType, path: remotePath)
+        } catch {
+            try? await client.closeFile(remote).get()
+            try? await client.remove(path: remotePath).get()
+            throw error
+        }
+    }
+
+    func remove(_ attachments: [BridgeIOSSHComposerRemoteAttachment]) async {
+        for attachment in attachments { try? await client.remove(path: attachment.path).get() }
+    }
+
+    private func ensureDirectory(_ path: String, privateOnly: Bool) async throws {
+        let attributes: SFTPAttributes
+        do {
+            attributes = try await client.lstat(path: path).get()
+        } catch SFTPError.status(let status) where status.code == .noSuchFile {
+            do {
+                try await client.mkdir(path: path, attributes: SFTPAttributes(permissions: 0o700)).get()
+            } catch {
+                // A concurrent transfer may have created it; verify below.
+                guard (try? await client.lstat(path: path).get()) != nil else { throw error }
+            }
+            attributes = try await client.lstat(path: path).get()
+        }
+        guard let mode = attributes.permissions, mode & 0o170000 == 0o040000,
+              mode & (privateOnly ? 0o077 : 0o022) == 0 else {
+            throw BridgeIOSSHSFTPError.unsupportedFile
+        }
+        guard try await client.realpath(path).get() == path else { throw BridgeIOSSHSFTPError.symbolicLink }
+    }
+}

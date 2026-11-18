@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type Fo
 import { normalizeConfiguredBridgeServer, parseMobilePairingInput } from "./mobile-connection.js";
 import {
   BRIDGE_NETWORK_SETTINGS_EVENT, bridgeOriginForPort, getConfiguredGlobalMacHost,
-  readBridgeNetworkSettings, saveBridgeNetworkSettings,
+  readBridgeNetworkSettings, saveBridgeNetworkSettings, type IosVpnProvider,
 } from "./bridge-global-config.js";
 import { createMobileVpnRetry } from "./mobile-vpn-retry.js";
 import {
@@ -642,6 +642,7 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
   const navigate = useNavigate();
   const [globalHost, setGlobalHost] = useState(getConfiguredGlobalMacHost);
   const [wifiSsids, setWifiSsids] = useState(() => readBridgeNetworkSettings().vpnBypassWifiSsids);
+  const [iosVpnProvider, setIosVpnProvider] = useState<IosVpnProvider>(() => readBridgeNetworkSettings().iosVpnProvider ?? "external");
   const [wifiInput, setWifiInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [wifiReadBusy, setWifiReadBusy] = useState(false);
@@ -664,6 +665,7 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
       const settings = readBridgeNetworkSettings();
       setGlobalHost(settings.globalMacHost);
       setWifiSsids(settings.vpnBypassWifiSsids);
+      setIosVpnProvider(settings.iosVpnProvider ?? "external");
       setWifiInput("");
     };
     window.addEventListener(BRIDGE_NETWORK_SETTINGS_EVENT, refresh);
@@ -681,6 +683,7 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
       const settings = saveBridgeNetworkSettings({
         globalMacHost: globalHost,
         vpnBypassWifiSsids: nextWifiSsids,
+        ...(vpnCapability?.platform === "ios" ? { iosVpnProvider } : {}),
       });
       try {
         await applyConfiguredBridgeNetworkSettings();
@@ -693,6 +696,7 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
       }
       setGlobalHost(settings.globalMacHost);
       setWifiSsids(settings.vpnBypassWifiSsids);
+      setIosVpnProvider(settings.iosVpnProvider ?? "external");
       setWifiInput("");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "网络配置保存失败，请重试。");
@@ -781,21 +785,35 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
           </li>)}
         </ul> : <small>尚未添加 Wi‑Fi。手机设置里显示的 Wi‑Fi 名称就是 SSID。</small>}
       </div>
+      {vpnCapability?.platform === "ios" ? <label className="mobile-connect-network-field" htmlFor="mobile-ios-vpn-provider">
+        <span>iOS VPN 连接方式</span>
+        <select id="mobile-ios-vpn-provider" value={iosVpnProvider} disabled={disabled || busy}
+          onChange={(event) => setIosVpnProvider(event.target.value as IosVpnProvider)}>
+          <option value="external">外部 OpenVPN Connect</option>
+          <option value="tunnelkit">内置 TunnelKit</option>
+        </select>
+        <small>保存后用于手动检查和自动恢复；切换到外部方式时，内置 VPN 停止按需自动连接，当前连接可能需要在系统设置中断开。</small>
+      </label> : null}
       {vpnCapability?.platform === "ios" ? <div className="mobile-connect-network-field">
         <span>OpenVPN 配置</span>
         {vpnCapability.profileImport ? <>
           <small>仅通过原生文件选择器导入 .ovpn；配置内容和密钥不会写入网页存储，也不会显示在页面中。</small>
+          <small>首次添加时 iOS 会请求系统 VPN 授权；连接后的设备流量和 DNS 遵循配置及服务器下发的路由。</small>
           <button type="button" className="mobile-connect-secondary mobile-connect-network-save" disabled={disabled || busy || vpnProfileBusy}
             onClick={() => { void importVpnProfile(); }}>
             {vpnProfileBusy ? "正在导入…" : "选择并导入 .ovpn"}
           </button>
-        </> : vpnCapability.externalOpenVPNConnect ? <>
-          <small role="status">当前构建未启用系统 Packet Tunnel；Bridge 不可达时会尝试打开 OpenVPN Connect，但需要你在其中选择已导入的配置并连接。</small>
+        </> : null}
+        {vpnCapability.externalOpenVPNConnect ? <>
+          <small role="status">{vpnCapability.profileImport
+            ? "也可打开已安装的 OpenVPN Connect，在其中选择已有配置并连接。"
+            : "当前构建未启用系统 Packet Tunnel；Bridge 不可达时会尝试打开 OpenVPN Connect，但需要你在其中选择已导入的配置并连接。"}</small>
           <button type="button" className="mobile-connect-secondary mobile-connect-network-save" disabled={disabled || busy || openVPNConnectBusy}
             onClick={() => { void openExternalVpn(); }}>
             {openVPNConnectBusy ? "正在打开…" : "打开 OpenVPN Connect"}
           </button>
-        </> : <small role="status">当前 iOS App 尚未配置 BridgeAutoVpn，自动 VPN 暂未启用；免 VPN Wi‑Fi 和手动输入仍可用，请更新 App 或完成原生 VPN 配置。</small>}
+        </> : null}
+        {!vpnCapability.profileImport && !vpnCapability.externalOpenVPNConnect ? <small role="status">当前 iOS App 尚未配置 BridgeAutoVpn，自动 VPN 暂未启用；免 VPN Wi‑Fi 和手动输入仍可用，请更新 App 或完成原生 VPN 配置。</small> : null}
         {vpnProfileMessage ? <p className="mobile-connect-network-message" role="status">{vpnProfileMessage}</p> : null}
         {vpnProfileError ? <p className="mobile-connect-error" role="alert">{vpnProfileError}</p> : null}
       </div> : null}

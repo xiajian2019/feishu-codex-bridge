@@ -92,7 +92,8 @@ export async function startMobileVpnRecoveryMonitor(): Promise<boolean> {
   if (!selected?.token) return false;
   const native = await import("./mobile-native.js");
   if (selected !== connection) return false;
-  if (!native.getMobileVpnCapability().externalOpenVPNConnect) return false;
+  if (!native.getMobileVpnCapability().externalOpenVPNConnect ||
+      (readBridgeNetworkSettings().iosVpnProvider ?? "external") !== "external") return false;
   return native.startOpenVPNConnectRecoveryMonitor(selected.server, readBridgeNetworkSettings().vpnBypassWifiSsids);
 }
 
@@ -126,12 +127,21 @@ function persistCredential(action: () => Promise<void>): Promise<void> {
 
 const syncAutoVpnSettings = createMobileVpnSettingsSync(
   () => readBridgeNetworkSettings().vpnBypassWifiSsids,
-  async (bypassWifiSsids) => (await import("./mobile-native.js")).configureMobileAutoVpn(bypassWifiSsids),
+  async (bypassWifiSsids, provider) => (await import("./mobile-native.js")).configureMobileAutoVpn(bypassWifiSsids, provider),
+  () => readBridgeNetworkSettings().iosVpnProvider ?? "external",
 );
 
 function queueAutoVpnSettingsSync(): Promise<boolean> {
   autoVpnSettingsSync = syncAutoVpnSettings();
   return autoVpnSettingsSync;
+}
+
+async function awaitLatestVpnSettings(): Promise<boolean> {
+  for (;;) {
+    const pending = autoVpnSettingsSync ?? queueAutoVpnSettingsSync();
+    const applied = await pending;
+    if (pending === autoVpnSettingsSync) return applied;
+  }
 }
 
 export async function initializeMobileRuntime(): Promise<void> {
@@ -265,18 +275,19 @@ export async function requestMobileVpnRecovery(): Promise<boolean> {
   const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : url.protocol === "http:" ? 80 : Number.NaN;
   if (!url.hostname || !Number.isInteger(port) || port < 1 || port > 65535) return false;
   const native = await import("./mobile-native.js");
-  if (selected !== connection) return false;
+  if (!await awaitLatestVpnSettings() || selected !== connection || !isAppForeground()) return false;
   const capability = native.getMobileVpnCapability();
-  if (!capability.enabled && capability.externalOpenVPNConnect) {
-    // The iOS fallback is monitored by native code. This request only arms
-    // the monitor; it must not open another app immediately on a WebView
-    // transport error.
-    return native.startOpenVPNConnectRecoveryMonitor(selected.server, readBridgeNetworkSettings().vpnBypassWifiSsids);
+  const settings = readBridgeNetworkSettings();
+  if (capability.platform === "ios" && (settings.iosVpnProvider ?? "external") === "external") {
+    // Only the dedicated foreground Bridge probe arms the external client's
+    // native monitor; ordinary WebView failures must not open another app.
+    if (!capability.externalOpenVPNConnect || !isAppForeground()) return false;
+    return native.startOpenVPNConnectRecoveryMonitor(selected.server, settings.vpnBypassWifiSsids);
   }
   return native.requestMobileVpnRecovery({
     host: url.hostname,
     port,
-    bypassWifiSsids: readBridgeNetworkSettings().vpnBypassWifiSsids,
+    bypassWifiSsids: settings.vpnBypassWifiSsids,
   });
 }
 
@@ -290,8 +301,11 @@ export async function openExternalOpenVPNConnect(): Promise<boolean> {
 
 /** Explicitly check and start the selected native VPN without leaving Bridge. */
 export async function checkAndConnectMobileVpn(): Promise<string> {
-  await (autoVpnSettingsSync ?? queueAutoVpnSettingsSync());
-  return (await import("./mobile-native.js")).checkAndConnectMobileVpn(readBridgeNetworkSettings().vpnBypassWifiSsids);
+  const applied = await awaitLatestVpnSettings();
+  const native = await import("./mobile-native.js");
+  if (!applied) throw new Error(mobileVpnUnavailableMessage(native.getMobileVpnCapability().platform, "sync"));
+  const settings = readBridgeNetworkSettings();
+  return native.checkAndConnectMobileVpn(settings.vpnBypassWifiSsids, settings.iosVpnProvider ?? "external");
 }
 
 export async function readCurrentWifiSsid(): Promise<string | null> {

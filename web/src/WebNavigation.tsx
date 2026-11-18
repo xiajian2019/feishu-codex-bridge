@@ -6,6 +6,7 @@ import { isMobileApp, openMobileConnectionSettings } from "./mobile-runtime.js";
 
 const PAGES = [
   { to: "/tmux-dashboard", label: "Tmux", end: false },
+  { to: "/remote-desktop", label: "远程桌面", end: true },
   { to: "/demos", label: "Demo", end: true },
   { to: "/", label: "任务面板", end: true },
   { to: "/codex-history", label: "Codex 历史", end: true },

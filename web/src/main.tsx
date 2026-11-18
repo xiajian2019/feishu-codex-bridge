@@ -11,6 +11,7 @@ import { ThemeProvider } from "./theme.js";
 import { MobileConnectionBoundary } from "./mobile-entry.js";
 import { BridgeConnectionStatus } from "./BridgeConnectionStatus.js";
 import { BackendFeatureGate } from "./BackendFeatureGate.js";
+import { RemoteDesktopHost } from "./RemoteDesktopHost.js";
 import { UploadManagerProvider } from "./upload-manager.js";
 import "./styles.css";
 
@@ -206,6 +207,7 @@ async function mountApp(): Promise<void> {
                 <BridgeConnectionStatus />
                 <WebNavigation />
                 <WorkbenchNotifications />
+                <RemoteDesktopHost />
                 <Suspense fallback={<div className="route-loading">页面加载中…</div>}>
                   <Routes>
                   <Route path="/" element={<App />} />
@@ -215,6 +217,7 @@ async function mountApp(): Promise<void> {
                   <Route path="/codex-history" element={<BackendFeatureGate feature="codex-history"><CodexHistory /></BackendFeatureGate>} />
                   <Route path="/codex-history/:homeId/:threadId" element={<BackendFeatureGate feature="codex-history"><CodexHistory /></BackendFeatureGate>} />
                   <Route path="/demos" element={<DemoCatalog />} />
+                  <Route path="/remote-desktop" element={null} />
                   <Route path="/link-tools" element={<Navigate to="/system-management/uploads?tab=download" replace />} />
                   <Route path="/system-management/jj" element={<JjTools />} />
                   <Route path="/system-management/uploads" element={<UploadDownloads />} />

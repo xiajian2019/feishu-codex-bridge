@@ -32,6 +32,7 @@ import { getTmuxTerminalRenderTheme } from "./tmux-terminal-theme.js";
 import { failPendingTmuxSubmissionsOnDisconnect, type TerminalSubmissionResult } from "./tmux-terminal-utils.js";
 import { getTmuxTerminalTransport, type TmuxTerminalTransport, type TmuxTerminalTransportEvent } from "./tmux-terminal-runtime.js";
 import { terminalHistorySnapshot } from "./tmux-terminal-history.js";
+import { hasVisibleTerminalContent } from "./tmux-terminal-progress.js";
 import { isolateTmuxTerminalKeyboard } from "./tmux-terminal-keyboard.js";
 import { TmuxTerminalReplayGuard } from "./tmux-terminal-replay.js";
 import { clearTmuxWebShellState, loadTmuxWebShellState, saveTmuxWebShellState } from "./tmux-web-shell-store.js";
@@ -122,6 +123,7 @@ type Toast = { message: string; isError: boolean; durationMs?: number };
 type SubmissionResult = TerminalSubmissionResult;
 type SessionInspector = { kind: "history"; sessionId: string | null } | { kind: "git"; sessionId: string };
 type ShellTerminalState = { sessionId: string; sessionCreatedAt: number; visible: boolean };
+type TerminalConnectionPhase = "preparing" | "connecting" | "waiting-output" | "rendering" | "empty" | "ready";
 
 const MOBILE_VIEWPORT_QUERY = "(max-width: 760px), (pointer: coarse) and (max-width: 1024px)";
 
@@ -402,6 +404,7 @@ export function TmuxDashboard(): ReactElement {
   const [search, setSearch] = useState("");
   const [backendStatus, setBackendStatus] = useState<"connecting" | "online" | "offline">("connecting");
   const [terminalStatus, setTerminalStatus] = useState("IDLE");
+  const [terminalConnectionPhase, setTerminalConnectionPhase] = useState<TerminalConnectionPhase>("preparing");
   const [connectionBannerDismissed, setConnectionBannerDismissed] = useState(false);
   const [terminalEverAttached, setTerminalEverAttached] = useState(false);
   const [terminalInputEnabled, setTerminalInputEnabled] = useState(false);
@@ -931,6 +934,7 @@ export function TmuxDashboard(): ReactElement {
       setTerminalInputEnabled(false);
       setTerminalEverAttached(false);
       setTerminalStatus("CONNECTING");
+      setTerminalConnectionPhase("preparing");
     }
     setSelectedId(sessionId);
     if (isMobile) {
@@ -1025,6 +1029,7 @@ export function TmuxDashboard(): ReactElement {
     const historyHost = terminalHistoryHostRef.current;
     if (!selectedSession || !host || !historyHost || !terminalVisible) {
       setTerminalStatus("IDLE");
+      setTerminalConnectionPhase("preparing");
       setTerminalEverAttached(false);
       return;
     }
@@ -1034,6 +1039,7 @@ export function TmuxDashboard(): ReactElement {
     let cancelled = false;
     let disposeTerminal: (() => void) | undefined;
     setTerminalStatus("CONNECTING");
+    setTerminalConnectionPhase("preparing");
     setTerminalEverAttached(false);
     const initialize = async (): Promise<void> => {
       const [{ Terminal }, { FitAddon }, { CanvasAddon }] = await Promise.all([
@@ -1174,6 +1180,7 @@ export function TmuxDashboard(): ReactElement {
       let latestHistory: string | null = null;
       let renderedHistory: string | null = null;
       let pendingHistoryScroll: number | "top" | null = null;
+      let waitingForVisibleOutput = false;
 
       const requestHistory = (): void => {
         if (historyRequestOutstanding || latestHistory !== null) return;
@@ -1250,6 +1257,7 @@ export function TmuxDashboard(): ReactElement {
       const ensureConnection = (connectionId: number): void => {
         if (activeConnectionId === connectionId) return;
         activeConnectionId = connectionId;
+        waitingForVisibleOutput = false;
         historyProtocol = null;
         historyEpoch += 1;
         historyReady = false;
@@ -1313,15 +1321,20 @@ export function TmuxDashboard(): ReactElement {
       let lastTerminalRenderDiagnosticAt = 0;
       const writeTerminalOutput = (data: string | Uint8Array, connectionId: number): void => {
         const needsReady = paintedConnectionId !== connectionId;
-        if (!needsReady && !isDebugLogCaptureActive()) {
+        if (!needsReady && !waitingForVisibleOutput && !isDebugLogCaptureActive()) {
           terminal.write(data);
           return;
         }
         terminal.write(data, () => {
-          if (disposed || terminalInstanceRef.current !== terminal) return;
+          if (disposed || terminalInstanceRef.current !== terminal || activeConnectionId !== connectionId || !transport.isOpen()) return;
           if (paintedConnectionId !== connectionId) {
             paintedConnectionId = connectionId;
+            waitingForVisibleOutput = !hasVisibleTerminalContent(terminal);
+            setTerminalConnectionPhase(waitingForVisibleOutput ? "empty" : "ready");
             if (!replayGuard.active) markTerminalAttached();
+          } else if (waitingForVisibleOutput && hasVisibleTerminalContent(terminal)) {
+            waitingForVisibleOutput = false;
+            setTerminalConnectionPhase("ready");
           }
           if (!isDebugLogCaptureActive()) return;
           const now = Date.now();
@@ -1366,8 +1379,13 @@ export function TmuxDashboard(): ReactElement {
           replayGuard.finish();
           return;
         }
+        if (event.type === "socket-open") {
+          setTerminalConnectionPhase("waiting-output");
+          return;
+        }
         if (event.type === "output") {
           ensureConnection(event.connectionId);
+          if (paintedConnectionId !== event.connectionId) setTerminalConnectionPhase("rendering");
           if (historyProtocol === null) historyProtocol = false;
           writeTerminalOutput(event.data, event.connectionId);
           return;
@@ -1395,6 +1413,7 @@ export function TmuxDashboard(): ReactElement {
           return;
         }
         if (event.type === "status") {
+          if (event.status !== "OFFLINE") setTerminalConnectionPhase("connecting");
           setTerminalStatus(event.status);
           return;
         }
@@ -2115,17 +2134,23 @@ export function TmuxDashboard(): ReactElement {
     }
   };
 
+  const progressMessage: Record<TerminalConnectionPhase, string> = {
+    preparing: "正在准备终端…",
+    connecting: terminalStatus === "RECONNECTING" ? "正在重新连接 Session…" : "正在连接 Session…",
+    "waiting-output": "服务连接已建立，正在等待终端画面…",
+    rendering: "已收到终端数据，正在显示画面…",
+    empty: "终端已连接，当前画面为空；新内容会自动显示。",
+    ready: "正在连接 Session…",
+  };
   const connectionMessage = terminalStatus === "OFFLINE"
-    ? "当前网络不可用，消息不会发送，输入内容会保留。"
-    : terminalStatus === "CONNECTING"
-      ? "正在连接 Session WebSocket；如果 VPN 或 Bridge 不可用，请稍后重试。"
-    : terminalStatus === "RECONNECTING"
-      ? "Session 连接中断，正在自动重连；请等待连接恢复。"
+    ? "设备提示当前离线；消息暂不会发送，输入内容会保留。"
+    : terminalStatus === "CONNECTING" || terminalStatus === "RECONNECTING" || terminalStatus === "ATTACHED"
+      ? progressMessage[terminalConnectionPhase]
       : terminalStatus === "ERROR"
         ? "Session 连接发生错误，可以手动刷新连接。"
         : "Session 已断开，可以手动刷新连接。";
-  const showConnectionBanner = Boolean(selectedSession)
-    && terminalStatus !== "ATTACHED" && terminalStatus !== "IDLE" && !connectionBannerDismissed;
+  const showConnectionBanner = Boolean(selectedSession) && terminalStatus !== "IDLE" && !connectionBannerDismissed
+    && (terminalStatus !== "ATTACHED" || terminalConnectionPhase === "empty");
 
   return (
     <main className={`dashboard-page${mobileView === "terminal" ? " is-mobile-terminal" : ""}${navigationCollapsed ? " is-navigation-collapsed" : ""}`}>
@@ -2351,7 +2376,7 @@ export function TmuxDashboard(): ReactElement {
             ) : null}
           </div>
           {showConnectionBanner ? (
-            <div className={`dashboard-connection-banner is-${terminalStatus.toLowerCase()}`} role="alert">
+            <div className={`dashboard-connection-banner is-${terminalStatus.toLowerCase()}`} role={terminalStatus === "OFFLINE" || terminalStatus === "ERROR" ? "alert" : "status"}>
               <span>{connectionMessage}</span>
               <button
                 className="dashboard-fetch-button"

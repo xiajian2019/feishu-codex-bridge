@@ -8,10 +8,11 @@ import { Share } from "@capacitor/share";
 import { Clipboard } from "@capacitor/clipboard";
 import { CapacitorBarcodeScanner } from "@capacitor/barcode-scanner";
 import { LocalNotifications } from "@capacitor/local-notifications";
-import { queueMobileOpen, reportMobileOpenError, restoreMobileOpens, type MobileShare } from "./mobile-handoff.js";
+import { queueMobileAppIntentRoute, queueMobileOpen, reportMobileOpenError, restoreMobileOpens, type MobileShare } from "./mobile-handoff.js";
 import { MOBILE_BACK_EVENT, MOBILE_RESUME_EVENT, MOBILE_SHAKE_EVENT } from "./mobile-runtime.js";
 import { createShakeDetector } from "./mobile-shake.js";
 import type { MobileApkUpdate, ApkUpdatePhase } from "./mobile-apk-update.js";
+import type { IosVpnProvider } from "./bridge-global-config.js";
 import { setAppForeground } from "./foreground-polling.js";
 import { MOBILE_SHAKE_PREFERENCE_EVENT, readMobileShakeEnabled, writeMobileShakeEnabled } from "./app-settings.js";
 import {
@@ -36,7 +37,7 @@ interface CredentialPlugin {
   remove(options: { server: string }): Promise<void>;
 }
 interface BridgeAutoVpnPlugin {
-  configure(options: { bypassWifiSsids: string[] }): Promise<{ accepted: boolean }>;
+  configure(options: { bypassWifiSsids: string[]; provider?: IosVpnProvider }): Promise<{ accepted: boolean }>;
   requestRecovery(options: { host: string; port: number; bypassWifiSsids?: string[] }): Promise<{ accepted: boolean }>;
   checkAndConnect(options: { bypassWifiSsids: string[] }): Promise<{ message: string }>;
   getCurrentWifi(): Promise<{ ssid?: string | null }>;
@@ -89,6 +90,10 @@ const ShareInbox = registerPlugin<{
   getFile(options: { shareId: string; fileId: string }): Promise<{ uri: string }>;
   addListener(event: "shareReceived", handler: (event: { id?: string; error?: string; state?: string }) => void): Promise<PluginListenerHandle>;
 }>("BridgeShareInbox");
+const AppIntent = registerPlugin<{
+  getPendingRoute(): Promise<{ route?: string | null }>;
+  addListener(event: "routeRequested", handler: () => void): Promise<PluginListenerHandle>;
+}>("BridgeAppIntent");
 const OpenVPNConnect = registerPlugin<BridgeOpenVPNConnectPlugin>("BridgeOpenVPNConnect");
 const AppOnlyVpn = registerPlugin<BridgeAppOnlyVpnPlugin>("BridgeAppOnlyVpn");
 const CrashDiagnostics = registerPlugin<{
@@ -214,12 +219,14 @@ export async function stopOpenVPNConnectRecoveryMonitor(): Promise<boolean> {
 }
 
 /** Sync the Wi-Fi exceptions even when no Bridge connection is paired. */
-export async function configureMobileAutoVpn(bypassWifiSsids: string[]): Promise<boolean> {
+export async function configureMobileAutoVpn(bypassWifiSsids: string[], provider: IosVpnProvider = "external"): Promise<boolean> {
   const capability = getMobileVpnCapability();
   if (capability.platform !== "android" && capability.platform !== "ios") return true;
-  if (!capability.enabled) return false;
+  if (capability.platform === "ios" && provider === "tunnelkit") await stopOpenVPNConnectRecoveryMonitor();
+  if (!capability.enabled) return capability.platform === "ios" && provider === "external" && capability.externalOpenVPNConnect;
   try {
-    return (await AutoVpn.configure({ bypassWifiSsids })).accepted === true;
+    const options = capability.platform === "ios" ? { bypassWifiSsids, provider } : { bypassWifiSsids };
+    return (await AutoVpn.configure(options)).accepted === true;
   } catch {
     return false;
   }
@@ -236,17 +243,18 @@ export async function requestMobileVpnRecovery(target: { host: string; port: num
   }
 }
 
-export async function checkAndConnectMobileVpn(bypassWifiSsids: string[]): Promise<string> {
+export async function checkAndConnectMobileVpn(bypassWifiSsids: string[], provider: IosVpnProvider = "external"): Promise<string> {
   const capability = getMobileVpnCapability();
-  if (!capability.enabled) {
+  if (capability.platform === "ios" && provider === "external") {
     if (capability.externalOpenVPNConnect) {
       if (await openExternalOpenVPNConnect()) {
         return "已打开 OpenVPN Connect；请在其中选择已导入的配置并连接。";
       }
       throw new Error("未安装 OpenVPN Connect，请先从 App Store 安装。");
     }
-    throw new Error(mobileVpnUnavailableMessage(capability.platform, "connect"));
+    throw new Error("当前 iOS App 无法打开 OpenVPN Connect，请更新 App 后重试。");
   }
+  if (!capability.enabled) throw new Error(mobileVpnUnavailableMessage(capability.platform, "connect"));
   const result = await AutoVpn.checkAndConnect({ bypassWifiSsids });
   return result.message || "VPN 检查已完成。";
 }
@@ -302,6 +310,16 @@ export async function nativeAppVersion(): Promise<string> {
 }
 export async function nativeAppInfo(): Promise<{ id: string; build: string; version: string }> { return App.getInfo(); }
 
+async function forwardPendingAppIntentRoute(): Promise<void> {
+  if (!Capacitor.isPluginAvailable("BridgeAppIntent")) return;
+  try {
+    const result = await AppIntent.getPendingRoute();
+    if (typeof result.route === "string") queueMobileAppIntentRoute(result.route);
+  } catch {
+    // Older installed App builds may not expose App Intents yet.
+  }
+}
+
 export async function installNativeLifecycle(): Promise<void> {
   if (!Capacitor.isNativePlatform()) return;
   if (lifecycle) return lifecycle;
@@ -317,6 +335,9 @@ export async function installNativeLifecycle(): Promise<void> {
       }));
       handles.push(await App.addListener("appUrlOpen", ({ url }) => { if (url.startsWith("bridgecodex:")) queueMobileOpen(url); }));
       handles.push(await LocalNotifications.addListener("localNotificationActionPerformed", ({ notification }) => queueMobileOpen(notification.extra)));
+      if (Capacitor.isPluginAvailable("BridgeAppIntent")) {
+        handles.push(await AppIntent.addListener("routeRequested", () => { void forwardPendingAppIntentRoute(); }));
+      }
       handles.push(await ShareInbox.addListener("shareReceived", (event) => {
         if (event.error) reportMobileOpenError(event.error);
         window.dispatchEvent(new CustomEvent("bridge:mobile-share", { detail: event }));
@@ -347,6 +368,7 @@ export async function installNativeLifecycle(): Promise<void> {
         if (!alreadyHandled) queueMobileOpen(opened.url);
       }
     }
+    await forwardPendingAppIntentRoute();
     subscribeMobileDownloads(() => {
       if (isAndroidPlatform() && hasAndroidMobileDownloads() && !downloadPolling && downloadTimer === null) watchAndroidDownloads();
     });

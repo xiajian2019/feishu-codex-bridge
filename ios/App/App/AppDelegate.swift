@@ -9,6 +9,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         BridgeCrashDiagnostics.shared.start()
+        if #available(iOS 16.0, *) {
+            BridgeAppShortcuts.updateAppShortcutParameters()
+        }
         return true
     }
 

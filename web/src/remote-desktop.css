@@ -1,0 +1,40 @@
+.remote-desktop-page { width: min(1440px, 100%); margin: 0 auto; padding: 14px 20px 20px; }
+.remote-desktop-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.remote-desktop-header h1 { font-size: 22px; }
+.remote-desktop-header p { margin: 2px 0 0; color: var(--muted); }
+.remote-desktop-stage { position: relative; width: 100%; height: min(calc(100dvh - 310px), 850px); min-height: 260px; overflow: hidden; background: #111820; border: 1px solid var(--line); border-radius: 10px; }
+.remote-desktop-stage.is-auth { min-height: 320px; }
+.remote-desktop-screen { position: absolute; left: 0; top: 0; width: 100%; height: 100%; overflow: hidden; touch-action: none; }
+.remote-desktop-placeholder { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 24px; color: #c8d2dc; text-align: center; pointer-events: none; }
+.remote-desktop-placeholder strong { font-size: 18px; color: #edf3f6; }
+.remote-desktop-credentials { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(340px, calc(100% - 30px)); display: grid; gap: 10px; padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); box-shadow: 0 15px 40px #0005; }
+.remote-desktop-credentials h2 { font-size: 18px; }
+.remote-desktop-credentials label, .remote-desktop-clipboard label { display: grid; gap: 5px; font-weight: 600; }
+.remote-desktop-credentials p { margin: 0; color: var(--muted); font-size: 12px; }
+.remote-desktop-controls { display: grid; gap: 8px; margin-top: 10px; }
+.remote-desktop-control-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.remote-desktop-control-row button { min-height: 36px; padding: 5px 10px; }
+.remote-desktop-control-row button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.remote-desktop-display { display: inline-flex; align-items: center; gap: 5px; }
+.remote-desktop-display select { min-height: 36px; max-width: min(210px, 55vw); font-size: 16px; }
+.remote-desktop-zoom > button:nth-of-type(-n+2) { min-width: 38px; }
+.remote-desktop-zoom > span { min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; }
+.remote-desktop-keys button { min-width: 39px; }
+.remote-desktop-keyboard { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.remote-desktop-keyboard textarea { min-height: 40px; height: 40px; flex: 1; min-width: 0; resize: none; }
+.remote-desktop-hint, .remote-desktop-license { margin: 0; color: var(--muted); font-size: 12px; }
+.remote-desktop-license { margin-top: 12px; }
+.remote-desktop-license a { color: var(--accent); }
+.remote-desktop-clipboard { display: grid; gap: 8px; padding: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+.remote-desktop-clipboard textarea { width: 100%; min-height: 70px; }
+.remote-desktop-clipboard p { margin: 0; color: var(--muted); }
+.remote-desktop-error, .remote-desktop-warning { margin: 0 0 8px; padding: 8px 10px; border-radius: 8px; color: var(--danger); background: var(--card); border: 1px solid var(--line); }
+@media (max-width: 760px) {
+  .remote-desktop-page { padding: 10px 10px max(12px, env(safe-area-inset-bottom)); }
+  .remote-desktop-header h1 { font-size: 19px; }
+  .remote-desktop-header p { font-size: 12px; }
+  .remote-desktop-stage { height: min(48dvh, calc((100vw - 20px) * .75)); min-height: 180px; }
+  .remote-desktop-control-row { gap: 5px; }
+  .remote-desktop-control-row button { min-height: 36px; padding: 4px 8px; }
+  .remote-desktop-keys button { min-width: 34px; }
+}
