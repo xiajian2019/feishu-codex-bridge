@@ -1,5 +1,5 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { lstat, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -9,6 +9,7 @@ import type { Duplex } from "node:stream";
 
 import { StateDatabase } from "./db.js";
 import { MobileIosOta } from "./mobile-ios-ota.js";
+import { MobileIosTestflight } from "./mobile-ios-testflight.js";
 import { WorkbenchError, WorkbenchService } from "./workbench.js";
 import {
   checkBridgeBackupUpgradeCompatibility,
@@ -45,6 +46,7 @@ import { isNativeAppOrigin, MobileStreamTickets, type MobileStreamAuthorization 
 import { RemoteDesktopProxy, type RemoteDesktopConnector } from "./remote-desktop-proxy.js";
 import { listRemoteDesktopDisplays, type RemoteDesktopDisplay } from "./remote-desktop-displays.js";
 import { MobileApkStore } from "./mobile-apk.js";
+import { MobileIosDeviceInstall } from "./mobile-ios-device-install.js";
 import { DemoBrowserAccess } from "./demo-browser-access.js";
 import {
   WebTaskSubmissionConflictError,
@@ -73,6 +75,10 @@ import {
   type StoredWebTaskAttachment,
   type StoredTask,
   type StoredAampTask,
+  type StoredMobileApp,
+  type StoredMobileAppInput,
+  type StoredMobileIosConfig,
+  type StoredIosTestflightApp,
   type WebTaskSubmission,
 } from "./types.js";
 
@@ -192,6 +198,8 @@ export class DashboardServer {
   private readonly taskAttachmentsDirectory: string;
   private readonly mobileApks: MobileApkStore;
   private readonly mobileIosOta: MobileIosOta;
+  private readonly mobileIosTestflight: MobileIosTestflight;
+  private readonly mobileIosDeviceInstall: MobileIosDeviceInstall;
   private readonly linkTools: LinkToolsService;
   private readonly downloadUploads: DownloadUploadsService;
   private readonly jjTools: JjToolsService;
@@ -225,6 +233,8 @@ export class DashboardServer {
     );
     this.mobileApks = new MobileApkStore(mobileApkPath, join(dirname(mobileApkPath), ".bridge-updates"));
     this.mobileIosOta = new MobileIosOta({ directory: options.iosOtaDirectory, source: options.iosOtaSource });
+    this.mobileIosTestflight = new MobileIosTestflight();
+    this.mobileIosDeviceInstall = new MobileIosDeviceInstall();
     this.linkTools = new LinkToolsService({ proxy: options.linkToolProxy });
     this.downloadUploads = new DownloadUploadsService({ directory: options.downloadsDirectory });
     this.jjTools = options.jjTools ?? new JjToolsService();
@@ -306,6 +316,8 @@ export class DashboardServer {
     for (const client of this.eventClients.keys()) client.end();
     this.eventClients.clear();
     this.mobileStreamTickets.clear();
+    this.mobileIosTestflight.stop();
+    this.mobileIosDeviceInstall.stop();
     this.remoteDesktop.stop();
     await this.options.tmuxDashboard?.stop();
     for (const [id, child] of this.localDemoProcesses) {
@@ -425,7 +437,7 @@ export class DashboardServer {
         ...(status.authenticated ? { client: {
           schemaVersion: 1, protocolVersion: 1, minimumClientProtocol: 1,
           version: await readBridgeVersion(),
-          features: ["download-uploads", "mobile-apk-update", "mobile-ios-ota", "backups", "remote-desktop",
+          features: ["download-uploads", "mobile-apk-update", "mobile-ios-ota", "mobile-ios-testflight", "mobile-app-management", "backups", "remote-desktop",
             ...(this.options.tmuxDashboard ? ["tmux"] : []),
             ...(this.options.codexHistory ? ["codex-history"] : [])],
         } } : {}),
@@ -597,6 +609,108 @@ export class DashboardServer {
         } else sendJson(response, 404, { error: "iOS OTA 接口不存在。" });
       } catch (error) {
         sendJson(response, 409, { error: error instanceof Error ? error.message : "iOS OTA 操作失败。" });
+      }
+      return;
+    }
+    if (url.pathname === "/api/mobile/apps" || url.pathname.startsWith("/api/mobile/apps/")) {
+      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Referrer-Policy", "no-referrer");
+      const appMatch = /^\/api\/mobile\/apps\/([^/]+)$/.exec(url.pathname);
+      const androidDownloadMatch = /^\/api\/mobile\/apps\/([^/]+)\/android\/download$/.exec(url.pathname);
+      const appActionMatch = /^\/api\/mobile\/apps\/([^/]+)\/ios\/(testflight\/upload|install)$/.exec(url.pathname);
+      if (request.method === "GET" && androidDownloadMatch) {
+        const app = this.options.db.getMobileApp(decodeURIComponent(androidDownloadMatch[1]!));
+        if (!app?.android) { sendJson(response, 404, { error: "Android App 不存在或未配置 APK。" }); return; }
+        await this.downloadManagedMobileApk(app, url.searchParams.get("revision") ?? "", response);
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/mobile/apps") {
+        sendJson(response, 200, { apps: await Promise.all(this.options.db.listMobileApps().map((app) => this.mobileAppPayload(app))) });
+        return;
+      }
+      if (request.method === "GET" && appMatch) {
+        const app = this.options.db.getMobileApp(decodeURIComponent(appMatch[1]!));
+        if (!app) sendJson(response, 404, { error: "App 不存在。" });
+        else sendJson(response, 200, await this.mobileAppPayload(app));
+        return;
+      }
+      if (!this.requireActionAuthorization(request, response)) return;
+      try {
+        if (request.method === "POST" && url.pathname === "/api/mobile/apps") {
+          const app = this.options.db.createMobileApp(parseMobileAppInput(await readJsonBody(request)));
+          sendJson(response, 201, await this.mobileAppPayload(app));
+          return;
+        }
+        if (!appMatch && !appActionMatch) { sendJson(response, 404, { error: "App 管理接口不存在。" }); return; }
+        const app = this.options.db.getMobileApp(decodeURIComponent((appMatch ?? appActionMatch)![1]!));
+        if (!app) { sendJson(response, 404, { error: "App 不存在。" }); return; }
+        if (request.method === "GET") {
+          sendJson(response, 200, await this.mobileAppPayload(app));
+        } else if (request.method === "PATCH" && appMatch) {
+          const updated = this.options.db.updateMobileApp(app.id, parseMobileAppPatch(await readJsonBody(request)));
+          if (!updated) sendJson(response, 404, { error: "App 不存在。" });
+          else sendJson(response, 200, await this.mobileAppPayload(updated));
+        } else if (request.method === "POST" && url.pathname.endsWith("/ios/testflight/upload")) {
+          if (!app.ios) { sendJson(response, 409, { error: "该 App 未配置 iOS。" }); return; }
+          this.mobileIosTestflight.startUpload(toIosTestflightApp(app));
+          sendJson(response, 202, await this.mobileAppPayload(this.options.db.getMobileApp(app.id)!));
+        } else if (request.method === "POST" && url.pathname.endsWith("/ios/install")) {
+          if (!app.ios) { sendJson(response, 409, { error: "该 App 未配置 iOS。" }); return; }
+          const body = await readJsonBody(request);
+          this.mobileIosDeviceInstall.startInstall(app, body.device);
+          sendJson(response, 202, await this.mobileAppPayload(this.options.db.getMobileApp(app.id)!));
+        } else sendJson(response, 404, { error: "App 管理接口不存在。" });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "App 管理操作失败。";
+        sendJson(response, /正在进行中|等待内部群组|USB|安装正在|上传正在/.test(message) ? 409 : 422, { error: message });
+      }
+      return;
+    }
+    if (url.pathname === "/api/mobile/testflight/apps" || url.pathname.startsWith("/api/mobile/testflight/apps/")) {
+      response.setHeader("Cache-Control", "no-store");
+      if (request.method === "GET" && url.pathname === "/api/mobile/testflight/apps") {
+        sendJson(response, 200, { apps: this.options.db.listIosTestflightApps() });
+        return;
+      }
+      if (!this.requireActionAuthorization(request, response)) return;
+      try {
+        const body = await readJsonBody(request);
+        if (request.method === "POST" && url.pathname === "/api/mobile/testflight/apps") {
+          const app = this.options.db.createIosTestflightApp(parseIosTestflightAppInput(body));
+          sendJson(response, 201, { app });
+          return;
+        }
+        const match = /^\/api\/mobile\/testflight\/apps\/([^/]+)$/.exec(url.pathname);
+        if (request.method === "PATCH" && match) {
+          const app = this.options.db.updateIosTestflightApp(decodeURIComponent(match[1]), parseIosTestflightAppSettings(body));
+          if (!app) sendJson(response, 404, { error: "TestFlight App 不存在。" });
+          else sendJson(response, 200, { app });
+          return;
+        }
+        sendJson(response, 404, { error: "TestFlight App 接口不存在。" });
+      } catch (error) {
+        sendJson(response, 422, { error: error instanceof Error ? error.message : "TestFlight App 保存失败。" });
+      }
+      return;
+    }
+    if (url.pathname === "/api/mobile/testflight" || url.pathname.startsWith("/api/mobile/testflight/")) {
+      response.setHeader("Cache-Control", "no-store");
+      if (mutating && !this.requireActionAuthorization(request, response)) return;
+      try {
+        if (request.method === "GET" && url.pathname === "/api/mobile/testflight") {
+          const app = this.options.db.getIosTestflightApp(url.searchParams.get("appId")?.trim() ?? "");
+          if (!app) { sendJson(response, 404, { error: "请先选择一个 TestFlight App。" }); return; }
+          sendJson(response, 200, { appId: app.id, status: this.mobileIosTestflight.status(app) });
+        } else if (request.method === "POST" && url.pathname === "/api/mobile/testflight/upload") {
+          const body = await readJsonBody(request);
+          const appId = typeof body.appId === "string" ? body.appId.trim() : "";
+          const app = this.options.db.getIosTestflightApp(appId);
+          if (!app) { sendJson(response, 404, { error: "TestFlight App 不存在。" }); return; }
+          sendJson(response, 202, { appId: app.id, status: this.mobileIosTestflight.startUpload(app) });
+        } else sendJson(response, 404, { error: "TestFlight 接口不存在。" });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "TestFlight 操作失败。";
+        sendJson(response, /正在进行中|等待内部群组|已有/.test(message) ? 409 : 400, { error: message });
       }
       return;
     }
@@ -1387,6 +1501,47 @@ export class DashboardServer {
     response.setHeader("Content-Type", "application/vnd.android.package-archive");
     response.setHeader("Content-Length", String(artifact.metadata.size));
     response.setHeader("Content-Disposition", 'attachment; filename="bridge-update.apk"');
+    response.statusCode = 200;
+    const stream = createReadStream(artifact.path);
+    stream.once("error", (error) => response.destroy(error));
+    stream.pipe(response);
+  }
+
+  private managedMobileApkStore(app: StoredMobileApp): MobileApkStore {
+    if (!app.android) throw new Error("该 App 未配置 Android APK。");
+    return new MobileApkStore(app.android.apk_path, app.android.snapshot_directory, {
+      expectedPackageName: app.android.package_name,
+      downloadPath: `/api/mobile/apps/${encodeURIComponent(app.id)}/android/download`,
+    });
+  }
+
+  private async mobileAppPayload(app: StoredMobileApp): Promise<Record<string, unknown>> {
+    const ios = app.ios ? {
+      config: app.ios,
+      testflight: this.mobileIosTestflight.status(toIosTestflightApp(app)),
+      deviceInstall: this.mobileIosDeviceInstall.status(app),
+    } : null;
+    let android: Record<string, unknown> | null = null;
+    if (app.android) {
+      try {
+        android = { config: app.android, latest: await this.managedMobileApkStore(app).latest(), error: null };
+      } catch (error) {
+        this.options.logger?.warn("managed Android APK metadata is unavailable", { appId: app.id, error: error instanceof Error ? error.message : String(error) });
+        android = { config: app.android, latest: null, error: "APK 文件或 output-metadata.json 不可用，请检查 App 配置。" };
+      }
+    }
+    return { app, ios, android };
+  }
+
+  private async downloadManagedMobileApk(app: StoredMobileApp, revision: string, response: ServerResponse): Promise<void> {
+    if (!app.android) { sendJson(response, 404, { error: "Android App 不存在或未配置 APK。" }); return; }
+    const artifact = await this.managedMobileApkStore(app).revision(revision);
+    if (!artifact) { sendJson(response, 404, { error: "Android APK is not available." }); return; }
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Content-Type", "application/vnd.android.package-archive");
+    response.setHeader("Content-Length", String(artifact.metadata.size));
+    response.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(app.name)}.apk"`);
     response.statusCode = 200;
     const stream = createReadStream(artifact.path);
     stream.once("error", (error) => response.destroy(error));
@@ -3571,6 +3726,116 @@ export class DashboardServer {
   }
 }
 
+function parseIosTestflightAppInput(body: Record<string, unknown>): {
+  name: string;
+  app_store_name: string;
+  source_path: string;
+  project_path: string;
+  build_directory: string;
+  public_directory: string;
+  bundle_id: string;
+  team_id: string;
+  scheme: string;
+  configuration: string;
+  target_name: string;
+  info_plist_path: string;
+  enabled: boolean;
+  internal_only: boolean;
+} {
+  const text = (key: string): string => typeof body[key] === "string" ? body[key].trim() : "";
+  const projectPath = text("projectPath");
+  const targetName = text("targetName") || "App";
+  const projectDirectory = projectPath.endsWith(".xcodeproj") ? dirname(projectPath) : projectPath;
+  const infoPlistPath = deriveIosTestflightInfoPlist(projectPath, targetName, text("configuration") || "PersonalRelease") || join(targetName, "Info.plist");
+  const publicDirectory = join(projectDirectory, dirname(infoPlistPath), "public");
+  return {
+    name: text("name"),
+    app_store_name: text("appStoreName"),
+    source_path: text("sourcePath"),
+    project_path: projectPath,
+    build_directory: join(projectDirectory, "build", "testflight"),
+    public_directory: publicDirectory,
+    bundle_id: text("bundleId"),
+    team_id: text("teamId"),
+    scheme: text("scheme"),
+    configuration: text("configuration"),
+    target_name: targetName,
+    info_plist_path: infoPlistPath,
+    enabled: body.enabled !== false,
+    internal_only: body.internalOnly !== false,
+  };
+}
+
+function parseIosTestflightAppSettings(body: Record<string, unknown>): {
+  name: string;
+  enabled: boolean;
+  internal_only: boolean;
+} {
+  return {
+    name: typeof body.name === "string" ? body.name.trim() : "",
+    enabled: body.enabled !== false,
+    internal_only: body.internalOnly !== false,
+  };
+}
+
+function parseMobileAppInput(body: Record<string, unknown>): StoredMobileAppInput {
+  const text = (value: unknown): string => typeof value === "string" ? value.trim() : "";
+  const nested = (value: unknown): Record<string, unknown> | null => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  const iosBody = nested(body.ios);
+  const androidBody = nested(body.android);
+  const ios = iosBody ? parseMobileIosConfig(iosBody) : null;
+  const android = androidBody ? {
+    package_name: text(androidBody.packageName ?? androidBody.package_name),
+    apk_path: text(androidBody.apkPath ?? androidBody.apk_path),
+    snapshot_directory: text(androidBody.snapshotDirectory ?? androidBody.snapshot_directory),
+  } : null;
+  return {
+    name: text(body.name), enabled: body.enabled !== false, ios, android,
+  };
+}
+
+function parseMobileAppPatch(body: Record<string, unknown>): Partial<StoredMobileAppInput> {
+  return parseMobileAppInput(body);
+}
+
+function parseMobileIosConfig(body: Record<string, unknown>): StoredMobileIosConfig {
+  const text = (key: string): string => typeof body[key] === "string" ? String(body[key]).trim() : "";
+  const projectPath = text("projectPath") || text("project_path");
+  const targetName = text("targetName") || text("target_name") || "App";
+  const configuration = text("configuration") || "PersonalRelease";
+  const projectDirectory = projectPath.endsWith(".xcodeproj") || projectPath.endsWith(".xcworkspace") ? dirname(projectPath) : projectPath;
+  const infoPlistPath = text("infoPlistPath") || text("info_plist_path") || deriveIosTestflightInfoPlist(projectPath, targetName, configuration) || join(targetName, "Info.plist");
+  return {
+    app_store_name: text("appStoreName") || text("app_store_name"), source_path: text("sourcePath") || text("source_path"),
+    project_path: projectPath, build_directory: text("buildDirectory") || text("build_directory") || join(projectDirectory, "build", "testflight"),
+    public_directory: text("publicDirectory") || text("public_directory") || join(projectDirectory, dirname(infoPlistPath), "public"),
+    bundle_id: text("bundleId") || text("bundle_id"), team_id: text("teamId") || text("team_id"),
+    scheme: text("scheme") || "App", configuration, target_name: targetName, info_plist_path: infoPlistPath,
+    internal_only: body.internalOnly !== false && body.internal_only !== false,
+  };
+}
+
+function toIosTestflightApp(app: StoredMobileApp): StoredIosTestflightApp {
+  if (!app.ios) throw new Error("该 App 未配置 iOS。");
+  return {
+    id: app.id, name: app.name, ...app.ios, enabled: app.enabled,
+    created_at: app.created_at, updated_at: app.updated_at,
+  };
+}
+
+function deriveIosTestflightInfoPlist(projectPath: string, targetName: string, configuration: string): string | null {
+  try {
+    const project = readFileSync(join(projectPath, "project.pbxproj"), "utf8");
+    const escaped = configuration.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const blocks = [...project.matchAll(new RegExp(`\\/\\*\\s*${escaped}\\s*\\*\\/\\s*=\\s*\\{\\s*isa = XCBuildConfiguration;\\s*buildSettings = \\{([\\s\\S]*?)\\n\\s*\\};\\s*name = ${escaped};\\s*\\};`, "g"))];
+    const block = blocks.map((match) => match[1]).find((value) => value.includes(`PRODUCT_NAME = ${targetName};`));
+    const info = block?.match(/^\s*INFOPLIST_FILE\s*=\s*"?([^";\n]+)"?;/m)?.[1]?.trim();
+    return info || null;
+  } catch {
+    return null;
+  }
+}
+
 function linkToolErrorDetails(error: unknown): { status: number; message: string } {
   if (error instanceof LinkToolError) return { status: error.statusCode, message: error.message };
   return { status: 502, message: "链接访问失败，请检查链接、VPN 或代理设置。" };
@@ -3588,10 +3853,13 @@ function isSpaRoute(pathname: string): boolean {
     || pathname === "/system-management/backups"
     || pathname === "/system-management/workspaces"
     || pathname === "/system-management/settings"
+    || pathname === "/system-management/apps"
+    || pathname === "/system-management/testflight"
     || pathname === "/system-management/automations"
     || pathname === "/system-management/machines"
     || pathname === "/direct-tasks"
     || pathname === "/system-management/projects"
+    || pathname === "/tasks"
     || /^\/tasks\/(?:desk|direct|aamp)\/[^/]+$/.test(pathname)
     || pathname === "/codex-history"
     || /^\/codex-history\/[^/]+\/[^/]+$/.test(pathname)

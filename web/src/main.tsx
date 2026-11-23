@@ -12,10 +12,10 @@ import { MobileConnectionBoundary } from "./mobile-entry.js";
 import { BridgeConnectionStatus } from "./BridgeConnectionStatus.js";
 import { BackendFeatureGate } from "./BackendFeatureGate.js";
 import { RemoteDesktopHost } from "./RemoteDesktopHost.js";
+import { TmuxDashboardHost } from "./TmuxDashboardHost.js";
 import { UploadManagerProvider } from "./upload-manager.js";
 import "./styles.css";
 
-const TmuxDashboard = lazy(() => import("./TmuxDashboard.js").then((module) => ({ default: module.TmuxDashboard })));
 const TmuxSessionFiles = lazy(() => import("./TmuxSessionFiles.js").then((module) => ({ default: module.TmuxSessionFiles })));
 const TmuxSessionHistory = lazy(() => import("./TmuxSessionHistory.js").then((module) => ({ default: module.TmuxSessionHistory })));
 const TmuxGitChanges = lazy(() => import("./TmuxGitChanges.js").then((module) => ({ default: module.TmuxGitChanges })));
@@ -33,7 +33,10 @@ const ExecutionMachines = lazy(() => import("./ExecutionMachines.js").then((modu
 const DemoCatalog = lazy(() => import("./DemoCatalog.js").then((module) => ({ default: module.DemoCatalog })));
 const JjTools = lazy(() => import("./JjTools.js").then((module) => ({ default: module.JjTools })));
 const UploadDownloads = lazy(() => import("./UploadDownloads.js").then((module) => ({ default: module.UploadDownloads })));
+const TestFlight = lazy(() => import("./TestFlight.js").then((module) => ({ default: module.TestFlight })));
+const AppManagement = lazy(() => import("./AppManagement.js").then((module) => ({ default: module.AppManagement })));
 const MobileInboxPage = lazy(() => import("./MobileInboxPage.js").then((module) => ({ default: module.MobileInboxPage })));
+const NearbyTransferPage = lazy(() => import("./NearbyTransferPage.js").then((module) => ({ default: module.NearbyTransferPage })));
 const MobileAppOnlyVpnPocPage = lazy(() => import("./MobileAppOnlyVpnPocPage.js"));
 
 function LegacyDirectTasksRedirect() {
@@ -44,8 +47,16 @@ function LegacyDirectTasksRedirect() {
   if (oldParams.get("status")) params.set("state", oldParams.get("status")!);
   if (oldParams.get("offset")) params.set("offset", oldParams.get("offset")!);
   const taskId = oldParams.get("task");
-  if (taskId) return <Navigate to={`/tasks/direct/${encodeURIComponent(taskId)}`} state={{ returnTo: `/?${params.toString()}` }} replace />;
-  return <Navigate to={`/?${params.toString()}`} replace />;
+  if (taskId) return <Navigate to={`/tasks/direct/${encodeURIComponent(taskId)}`} state={{ returnTo: `/tasks?${params.toString()}` }} replace />;
+  return <Navigate to={`/tasks?${params.toString()}`} replace />;
+}
+
+function DefaultRoute() {
+  const location = useLocation();
+  if (location.search || location.state) {
+    return <Navigate to={`/tasks${location.search}${location.hash}`} state={location.state} replace />;
+  }
+  return <Navigate to="/tmux-dashboard" replace />;
 }
 
 function disableBrowserPullToRefresh(): void {
@@ -208,10 +219,13 @@ async function mountApp(): Promise<void> {
                 <WebNavigation />
                 <WorkbenchNotifications />
                 <RemoteDesktopHost />
+                <TmuxDashboardHost />
                 <Suspense fallback={<div className="route-loading">页面加载中…</div>}>
                   <Routes>
-                  <Route path="/" element={<App />} />
+                  <Route path="/" element={<DefaultRoute />} />
+                  <Route path="/tasks" element={<App />} />
                   <Route path="/mobile-inbox" element={<MobileInboxPage />} />
+                  <Route path="/nearby-transfer" element={<NearbyTransferPage />} />
                   <Route path="/tasks/:source/:taskId" element={<TaskDetailPage />} />
                   <Route path="/direct-tasks" element={<LegacyDirectTasksRedirect />} />
                   <Route path="/codex-history" element={<BackendFeatureGate feature="codex-history"><CodexHistory /></BackendFeatureGate>} />
@@ -221,10 +235,12 @@ async function mountApp(): Promise<void> {
                   <Route path="/link-tools" element={<Navigate to="/system-management/uploads?tab=download" replace />} />
                   <Route path="/system-management/jj" element={<JjTools />} />
                   <Route path="/system-management/uploads" element={<UploadDownloads />} />
+                  <Route path="/system-management/apps" element={<BackendFeatureGate feature="mobile-app-management"><AppManagement /></BackendFeatureGate>} />
+                  <Route path="/system-management/testflight" element={<BackendFeatureGate feature="mobile-ios-testflight"><TestFlight /></BackendFeatureGate>} />
                   <Route path="/tmux-dashboard/history" element={<BackendFeatureGate feature="tmux"><TmuxSessionHistory /></BackendFeatureGate>} />
                   <Route path="/tmux-dashboard/git-changes/:sessionId" element={<BackendFeatureGate feature="tmux"><TmuxGitChanges /></BackendFeatureGate>} />
                   <Route path="/tmux-dashboard/files/:sessionId" element={<BackendFeatureGate feature="tmux"><TmuxSessionFiles /></BackendFeatureGate>} />
-                  <Route path="/tmux-dashboard/*" element={<BackendFeatureGate feature="tmux"><TmuxDashboard /></BackendFeatureGate>} />
+                  <Route path="/tmux-dashboard/*" element={null} />
                   <Route path="/system-management" element={<Navigate to="/system-management/devices" replace />} />
                   <Route path="/system-management/devices" element={<PairingAdmin />} />
                   <Route path="/system-management/projects" element={<ProjectManagement />} />
@@ -238,7 +254,7 @@ async function mountApp(): Promise<void> {
                   <Route path="/system-management/automations" element={<Automations />} />
                   <Route path="/system-management/machines" element={<ExecutionMachines />} />
                   <Route path="/pair-admin" element={<Navigate to="/system-management/devices" replace />} />
-                  <Route path="*" element={<Navigate to="/" replace />} />
+                  <Route path="*" element={<Navigate to="/tmux-dashboard" replace />} />
                   </Routes>
                 </Suspense>
               </SystemNavigationProvider>

@@ -8,7 +8,7 @@ const PAGES = [
   { to: "/tmux-dashboard", label: "Tmux", end: false },
   { to: "/remote-desktop", label: "远程桌面", end: true },
   { to: "/demos", label: "Demo", end: true },
-  { to: "/", label: "任务面板", end: true },
+  { to: "/tasks", label: "任务面板", end: true },
   { to: "/codex-history", label: "Codex 历史", end: true },
 ] as const;
 
@@ -23,6 +23,7 @@ const SYSTEM_PAGES = [
   { to: "/system-management/automations", label: "自动化" },
   { to: "/system-management/machines", label: "执行机器" },
   { to: "/system-management/uploads", label: "上传下载" },
+  { to: "/system-management/apps", label: "App管理" },
   { to: "/system-management/jj", label: "JJ 工具" },
   { to: "/system-management/settings", label: "系统设置" },
 ] as const;
@@ -54,7 +55,7 @@ export function WebNavigation(): ReactElement {
   const location = useLocation();
   const pages = PAGES;
   const systemActive = location.pathname.startsWith("/system-management") || location.pathname === "/pair-admin"
-    || (isMobileApp() && ["/mobile-inbox", "/mobile-shares"].includes(location.pathname));
+    || (isMobileApp() && ["/mobile-inbox", "/mobile-shares", "/nearby-transfer"].includes(location.pathname));
   const [systemOpen, setSystemOpen] = useState(systemActive);
   useMobileBack(systemOpen, () => setSystemOpen(false), 1000);
   const [popoverPosition, setPopoverPosition] = useState<{ top: number; left: number } | null>(null);
@@ -165,6 +166,7 @@ export function WebNavigation(): ReactElement {
           >App 连接</button>
           <NavLink to="/mobile-inbox" role="menuitem" className={({ isActive }) => isActive ? "is-active" : undefined} onClick={closePopovers}>待处理</NavLink>
           <NavLink to="/mobile-shares" role="menuitem" className={({ isActive }) => isActive ? "is-active" : undefined} onClick={closePopovers}>分享收件箱</NavLink>
+          <NavLink to="/nearby-transfer" role="menuitem" className={({ isActive }) => isActive ? "is-active" : undefined} onClick={closePopovers}>附近传文件</NavLink>
         </> : null}
       </div>,
       document.body,

@@ -372,7 +372,7 @@ function summarizeUnicodeText(value: string): Record<string, number> {
   };
 }
 
-export function TmuxDashboard(): ReactElement {
+export function TmuxDashboard({ active = true }: { active?: boolean }): ReactElement {
   const location = useLocation();
   const navigate = useNavigate();
   const { resolvedTheme } = useTheme();
@@ -483,6 +483,7 @@ export function TmuxDashboard(): ReactElement {
   }, [sessionInspector]);
 
   useEffect(() => {
+    if (!active) return;
     const params = new URLSearchParams(location.search);
     if (selectedId) {
       params.set("session", selectedId);
@@ -496,7 +497,7 @@ export function TmuxDashboard(): ReactElement {
     const search = query ? `?${query}` : "";
     if (search === location.search) return;
     navigate({ pathname: location.pathname, search, hash: location.hash }, { replace: true, state: location.state });
-  }, [isMobile, location.hash, location.pathname, location.search, location.state, mobileView, navigate, selectedId]);
+  }, [active, isMobile, location.hash, location.pathname, location.search, location.state, mobileView, navigate, selectedId]);
 
   useEffect(() => {
     const state = location.state as { sessionFileForward?: unknown } | null;
@@ -514,9 +515,9 @@ export function TmuxDashboard(): ReactElement {
   useLayoutEffect(() => {
     const detailClass = "tmux-terminal-detail";
     const mobileDetailRequested = restoreSessionDetailRef.current && isMobile;
-    document.documentElement.classList.toggle(detailClass, mobileView === "terminal" || mobileDetailRequested);
+    document.documentElement.classList.toggle(detailClass, active && (mobileView === "terminal" || mobileDetailRequested));
     return () => document.documentElement.classList.remove(detailClass);
-  }, [isMobile, mobileView]);
+  }, [active, isMobile, mobileView]);
 
   const cancelSessionsRequest = useCallback((): void => {
     sessionsLoadSequenceRef.current += 1;

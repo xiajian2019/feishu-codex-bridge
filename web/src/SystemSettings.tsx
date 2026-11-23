@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState, type ReactElement } from "react";
 
 import { readVConsoleVisible, writeVConsoleVisible, readMobileShakeEnabled } from "./app-settings.js";
-import { isMobileApp, setMobileShakeEnabled } from "./mobile-runtime.js";
+import { readBridgeNetworkSettings, saveBridgeNetworkSettings } from "./bridge-global-config.js";
+import { applyConfiguredBridgeOrigin, isMobileApp, setMobileShakeEnabled } from "./mobile-runtime.js";
 import { useTheme, type ThemeMode } from "./theme.js";
 import { fetchWorkbenchSettings, updateWorkbenchSettings, type WorkbenchNotificationSettings } from "./workbench-api.js";
 import "./workbench.css";
@@ -28,6 +29,9 @@ export function SystemSettings(): ReactElement {
   const [shakeEnabled, setShakeEnabled] = useState(readMobileShakeEnabled);
   const [shakeBusy, setShakeBusy] = useState(false);
   const [shakeError, setShakeError] = useState("");
+  const [useHttps, setUseHttps] = useState(() => readBridgeNetworkSettings().useHttps);
+  const [httpsBusy, setHttpsBusy] = useState(false);
+  const [httpsError, setHttpsError] = useState("");
   const [nativePreferences, setNativePreferences] = useState<MobileNotificationPreferences>(readMobileNotificationPreferences);
   const [nativePermission, setNativePermission] = useState("读取中");
   const [nativeBusy, setNativeBusy] = useState(false);
@@ -60,6 +64,24 @@ export function SystemSettings(): ReactElement {
     setNativeBusy(true); setNativeError("");
     void updateMobileNotificationPreferences(patch).then(setNativePreferences).then(() => getMobileNotificationPermission()).then(setNativePermission)
       .catch((cause: unknown) => setNativeError(cause instanceof Error ? cause.message : "原生通知设置失败。" )).finally(() => setNativeBusy(false));
+  };
+
+  const updateHttps = (enabled: boolean): void => {
+    if (httpsBusy) return;
+    setHttpsBusy(true); setHttpsError("");
+    const current = readBridgeNetworkSettings();
+    try {
+      saveBridgeNetworkSettings({ ...current, useHttps: enabled });
+      void applyConfiguredBridgeOrigin().then(() => {
+        setUseHttps(enabled);
+      }).catch((cause: unknown) => {
+        setUseHttps(enabled);
+        setHttpsError(cause instanceof Error ? `HTTPS 配置已保存，但当前连接尚未切换：${cause.message}` : "HTTPS 配置已保存，但当前连接尚未切换。请重新打开 App 后重试。");
+      }).finally(() => setHttpsBusy(false));
+    } catch (cause) {
+      setHttpsError(cause instanceof Error ? cause.message : "HTTPS 配置保存失败。");
+      setHttpsBusy(false);
+    }
   };
 
   const updateDefaultSshProfile = (profileId: string): void => {
@@ -131,6 +153,12 @@ export function SystemSettings(): ReactElement {
             }).finally(() => setShakeBusy(false));
           }} /></label>
           {shakeError ? <p className="workbench-page-error" role="alert">{shakeError}</p> : null}
+          <label className="system-settings-row" htmlFor="system-settings-use-https">
+            <span>使用 HTTPS 连接 Bridge</span>
+            <input id="system-settings-use-https" type="checkbox" checked={useHttps} disabled={httpsBusy} onChange={(event) => updateHttps(event.currentTarget.checked)} />
+          </label>
+          <p className="workbench-settings-note">默认使用 HTTP；开启后会将局域网 Bridge 地址同步为 HTTPS，HTTPS 证书必须已在手机上受信任。</p>
+          {httpsError ? <p className="workbench-page-error" role="alert">{httpsError}</p> : null}
         </> : null}
         {iosSshSettingsAvailable ? <>
           <label className="system-settings-row" htmlFor="system-settings-default-ssh-profile">

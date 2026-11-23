@@ -5,6 +5,10 @@
 .remote-desktop-stage { position: relative; width: 100%; height: min(calc(100dvh - 310px), 850px); min-height: 260px; overflow: hidden; background: #111820; border: 1px solid var(--line); border-radius: 10px; }
 .remote-desktop-stage.is-auth { min-height: 320px; }
 .remote-desktop-screen { position: absolute; left: 0; top: 0; width: 100%; height: 100%; overflow: hidden; touch-action: none; }
+.remote-desktop-player { position: relative; }
+.remote-desktop-player-actions { position: absolute; top: 10px; right: 10px; z-index: 6; display: flex; gap: 6px; }
+.remote-desktop-player-actions .remote-desktop-icon-button { border-color: #ffffff36; color: #eef3f7; background: #111820cc; box-shadow: 0 4px 14px #0005; backdrop-filter: blur(8px); }
+.remote-desktop-player-actions .remote-desktop-icon-button:hover:not(:disabled) { border-color: #ffffff70; color: #fff; background: #202b36e8; }
 .remote-desktop-placeholder { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 24px; color: #c8d2dc; text-align: center; pointer-events: none; }
 .remote-desktop-placeholder strong { font-size: 18px; color: #edf3f6; }
 .remote-desktop-credentials { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(340px, calc(100% - 30px)); display: grid; gap: 10px; padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); box-shadow: 0 15px 40px #0005; }
@@ -12,29 +16,62 @@
 .remote-desktop-credentials label, .remote-desktop-clipboard label { display: grid; gap: 5px; font-weight: 600; }
 .remote-desktop-credentials p { margin: 0; color: var(--muted); font-size: 12px; }
 .remote-desktop-controls { display: grid; gap: 8px; margin-top: 10px; }
-.remote-desktop-control-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.remote-desktop-control-row button { min-height: 36px; padding: 5px 10px; }
-.remote-desktop-control-row button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
-.remote-desktop-display { display: inline-flex; align-items: center; gap: 5px; }
+.remote-desktop-player-controls { position: relative; }
+.remote-desktop-player-controls.is-fullscreen { position: absolute; right: 12px; bottom: 12px; left: 12px; z-index: 5; }
+.remote-desktop-player-controls.is-fullscreen .remote-desktop-controls { max-height: min(36vh, 360px); margin-top: 0; overflow: auto; padding: 8px; border: 1px solid #ffffff2b; border-radius: 15px; background: #0b1118dd; box-shadow: 0 12px 36px #0008; backdrop-filter: blur(12px); }
+.remote-desktop-player-controls .remote-desktop-controls.is-collapsed { display: none; }
+.remote-desktop-player:fullscreen,
+.remote-desktop-player.is-fallback-fullscreen { display: flex; width: 100vw; height: 100vh; flex-direction: column; background: #0b1118; }
+.remote-desktop-player:fullscreen .remote-desktop-stage,
+.remote-desktop-player.is-fallback-fullscreen .remote-desktop-stage { height: auto; min-height: 0; flex: 1 1 auto; border: 0; border-radius: 0; }
+.remote-desktop-player:fullscreen .remote-desktop-player-actions { top: max(12px, env(safe-area-inset-top)); right: max(12px, env(safe-area-inset-right)); }
+.remote-desktop-player.is-fallback-fullscreen { position: fixed; inset: 0; z-index: 1000; }
+.remote-desktop-player.is-fallback-fullscreen .remote-desktop-player-actions { top: max(12px, env(safe-area-inset-top)); right: max(12px, env(safe-area-inset-right)); }
+.remote-desktop-player.is-landscape-fallback { top: 50%; left: 50%; width: 100dvh; height: 100dvw; transform: translate(-50%, -50%) rotate(90deg); transform-origin: center; }
+.remote-desktop-player:fullscreen .remote-desktop-control-groups,
+.remote-desktop-player.is-fallback-fullscreen .remote-desktop-control-groups,
+.remote-desktop-player.is-landscape-fallback .remote-desktop-control-groups { grid-template-columns: minmax(0, 1.35fr) minmax(360px, 1fr); align-items: start; }
+.remote-desktop-player.is-landscape-fallback .remote-desktop-player-controls.is-fullscreen .remote-desktop-controls { max-height: min(58%, 230px); }
+.remote-desktop-control-groups { display: grid; gap: 8px; }
+.remote-desktop-control-group { display: grid; gap: 6px; padding: 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); }
+.remote-desktop-group-heading { display: flex; align-items: baseline; gap: 7px; color: var(--ink); font-size: 12px; font-weight: 800; }
+.remote-desktop-group-heading small { color: var(--muted); font-size: 10px; font-weight: 500; }
+.remote-desktop-control-row { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.remote-desktop-icon-button { display: inline-grid; width: 38px; min-width: 38px; height: 36px; min-height: 36px; place-items: center; padding: 0; border-radius: 9px; color: var(--muted); background: var(--paper); line-height: 1; }
+.remote-desktop-icon-button:hover:not(:disabled) { color: var(--ink); border-color: var(--accent); background: var(--accent-soft); }
+.remote-desktop-icon-button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.remote-desktop-icon { display: block; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.remote-desktop-icon-glyph { display: block; font-size: 19px; font-weight: 600; line-height: 1; }
+.remote-desktop-display { display: inline-flex; min-width: 0; align-items: center; gap: 5px; }
+.remote-desktop-display .remote-desktop-icon { flex: 0 0 18px; color: var(--muted); }
 .remote-desktop-display select { min-height: 36px; max-width: min(210px, 55vw); font-size: 16px; }
-.remote-desktop-zoom > button:nth-of-type(-n+2) { min-width: 38px; }
-.remote-desktop-zoom > span { min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; }
-.remote-desktop-keys button { min-width: 39px; }
-.remote-desktop-keyboard { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.remote-desktop-zoom { gap: 4px; }
+.remote-desktop-zoom > span { min-width: 44px; color: var(--muted); text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; }
+.remote-desktop-control-divider { width: 1px; height: 22px; margin: 0 2px; background: var(--line); }
+.remote-desktop-window-shortcut { color: var(--accent); }
+.remote-desktop-keys { gap: 5px; }
+.remote-desktop-keyboard { display: flex; align-items: center; gap: 8px; width: 100%; font-weight: 600; }
+.remote-desktop-keyboard-symbol { display: grid; width: 24px; min-width: 24px; height: 24px; place-items: center; color: var(--muted); font-size: 20px; line-height: 1; }
 .remote-desktop-keyboard textarea { min-height: 40px; height: 40px; flex: 1; min-width: 0; resize: none; }
+.remote-desktop-keyboard-send { min-width: 58px; height: 40px; padding: 0 12px; }
 .remote-desktop-hint, .remote-desktop-license { margin: 0; color: var(--muted); font-size: 12px; }
+.remote-desktop-shortcut-status { margin: 0; color: var(--accent); font-size: 12px; }
 .remote-desktop-license { margin-top: 12px; }
 .remote-desktop-license a { color: var(--accent); }
 .remote-desktop-clipboard { display: grid; gap: 8px; padding: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
 .remote-desktop-clipboard textarea { width: 100%; min-height: 70px; }
 .remote-desktop-clipboard p { margin: 0; color: var(--muted); }
 .remote-desktop-error, .remote-desktop-warning { margin: 0 0 8px; padding: 8px 10px; border-radius: 8px; color: var(--danger); background: var(--card); border: 1px solid var(--line); }
+@media (min-width: 1000px) {
+  .remote-desktop-control-groups { grid-template-columns: minmax(0, 1.35fr) minmax(360px, 1fr); align-items: start; }
+}
 @media (max-width: 760px) {
   .remote-desktop-page { padding: 10px 10px max(12px, env(safe-area-inset-bottom)); }
   .remote-desktop-header h1 { font-size: 19px; }
   .remote-desktop-header p { font-size: 12px; }
   .remote-desktop-stage { height: min(48dvh, calc((100vw - 20px) * .75)); min-height: 180px; }
-  .remote-desktop-control-row { gap: 5px; }
-  .remote-desktop-control-row button { min-height: 36px; padding: 4px 8px; }
-  .remote-desktop-keys button { min-width: 34px; }
+  .remote-desktop-control-group { padding: 7px; }
+  .remote-desktop-icon-button { width: 36px; min-width: 36px; height: 36px; }
+  .remote-desktop-display { flex: 1 1 150px; }
+  .remote-desktop-display select { width: 100%; max-width: none; }
 }

@@ -4,7 +4,7 @@ import { appendMobileShareText, assertMobileShareContext, clearMobileOpenError, 
 afterEach(() => { for (const item of getMobileOpens()) consumeMobileOpen(item.id); consumeMobileAppIntentRoute(); clearMobileOpenError(); });
 
 it("accepts only read/navigation routes and known parameters", () => {
-  for (const route of ["/", "/mobile-inbox", "/tasks/desk/task-1", "/codex-history/home/thread", "/tmux-dashboard?session=%241", "/tmux-dashboard/files/session-1"]) expect(safeMobileRoute(route)).toBe(route);
+  for (const route of ["/", "/tasks", "/mobile-inbox", "/nearby-transfer", "/tasks/desk/task-1", "/codex-history/home/thread", "/tmux-dashboard?session=%241", "/tmux-dashboard/files/session-1"]) expect(safeMobileRoute(route)).toBe(route);
   for (const route of ["https://evil.fixture/", "//evil.fixture/", "/api/auth/logout", "/system-management/backups?restore=1", "/tasks/desk/a/../b", "/tasks/desk/%2e%2e", "/tasks/desk/a%2fb", "/tmux-dashboard?bridgeTicket=secret", "/codex-history/home/thread#token=secret", "/tmux-dashboard?session=x\n"]) expect(safeMobileRoute(route)).toBeNull();
 });
 

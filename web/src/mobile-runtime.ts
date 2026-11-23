@@ -14,7 +14,15 @@ import type { MobileShare } from "./mobile-handoff.js";
 import { BridgeResponseError } from "./bridge-json.js";
 import { markBridgeRequestFailure, markBridgeRequestStart, markBridgeRequestSuccess, subscribeBridgeApiUnreachable } from "./connection-state.js";
 import { classifyMobileVpnPlatform, mobileVpnUnavailableMessage, type MobileVpnCapability } from "./mobile-vpn-contract.js";
+import type {
+  NearbyConnection, NearbyDiagnostic, NearbyError, NearbyFileOffer, NearbyFileProgress, NearbyFileSelection, NearbyListenerHandle,
+  NearbyNetworkInfo, NearbyPeer, NearbyReceivedFile, NearbyServerInfo,
+} from "./nearby-transfer-contract.js";
 export type { MobileApkUpdate } from "./mobile-apk-update.js";
+export type {
+  NearbyConnection, NearbyDiagnostic, NearbyError, NearbyFileOffer, NearbyFileProgress, NearbyFileSelection, NearbyListenerHandle,
+  NearbyNetworkInfo, NearbyPeer, NearbyReceivedFile, NearbyServerInfo,
+} from "./nearby-transfer-contract.js";
 
 export const MOBILE_RESUME_EVENT = "bridge:mobile-resume";
 export const MOBILE_CONNECTION_EVENT = "bridge:mobile-connection";
@@ -36,8 +44,76 @@ const connectionSwitch = createMobileConnectionSwitch();
 
 export function isMobileApp(): boolean { return import.meta.env.VITE_BRIDGE_MOBILE === "true"; }
 export function getMobileConnection(): MobileConnection | null { return connection; }
+export async function nearbyTransferAvailable(): Promise<boolean> {
+  return isMobileApp() && (await import("./mobile-native.js")).nearbyTransferAvailable();
+}
+export async function nearbyStartServer(displayName: string, port?: number): Promise<NearbyServerInfo> {
+  return (await import("./mobile-native.js")).nearbyStartServer(displayName, port);
+}
+export async function nearbyStopServer(): Promise<void> { await (await import("./mobile-native.js")).nearbyStopServer(); }
+export async function nearbyStartDiscovery(): Promise<void> { await (await import("./mobile-native.js")).nearbyStartDiscovery(); }
+export async function nearbyStopDiscovery(): Promise<void> { await (await import("./mobile-native.js")).nearbyStopDiscovery(); }
+export async function nearbyGetNetworkInfo(): Promise<NearbyNetworkInfo> { return (await import("./mobile-native.js")).nearbyGetNetworkInfo(); }
+export async function nearbyConnect(options: { peerId?: string; host?: string; port?: number; token?: string; name?: string; source?: "mdns" | "hotspot" }): Promise<{ connectionId: string }> {
+  return (await import("./mobile-native.js")).nearbyConnect(options);
+}
+export async function nearbyPickFile(): Promise<NearbyFileSelection> { return (await import("./mobile-native.js")).nearbyPickFile(); }
+export async function nearbyAcceptConnection(connectionId: string): Promise<void> { await (await import("./mobile-native.js")).nearbyAcceptConnection(connectionId); }
+export async function nearbyRejectConnection(connectionId: string): Promise<void> { await (await import("./mobile-native.js")).nearbyRejectConnection(connectionId); }
+export async function nearbyBeginFile(options: { connectionId: string; transferId: string; selectionId: string }): Promise<void> { await (await import("./mobile-native.js")).nearbyBeginFile(options); }
+export async function nearbySendFile(options: { connectionId: string; transferId: string; selectionId: string }): Promise<void> { await (await import("./mobile-native.js")).nearbySendFile(options); }
+export async function nearbySendChunk(options: { connectionId: string; transferId: string; dataBase64: string; final: boolean }): Promise<void> { await (await import("./mobile-native.js")).nearbySendChunk(options); }
+export async function nearbyAcceptFile(connectionId: string, transferId: string): Promise<void> { await (await import("./mobile-native.js")).nearbyAcceptFile(connectionId, transferId); }
+export async function nearbyRejectFile(connectionId: string, transferId: string): Promise<void> { await (await import("./mobile-native.js")).nearbyRejectFile(connectionId, transferId); }
+export async function nearbyListReceived(): Promise<NearbyReceivedFile[]> { return (await import("./mobile-native.js")).nearbyListReceived(); }
+export async function openNearbyReceived(file: NearbyReceivedFile): Promise<void> { await (await import("./mobile-native.js")).openNearbyReceived(file); }
+export async function nearbyDeleteReceived(id: string): Promise<void> { await (await import("./mobile-native.js")).nearbyDeleteReceived(id); }
+export async function shareNearbyReceived(file: NearbyReceivedFile): Promise<void> { await (await import("./mobile-native.js")).shareNearbyReceived(file); }
+export function nearbyAddListener(event: "peerFound", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "peerLost", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "connectionState", handler: (event: { connection: NearbyConnection }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "fileOffer", handler: (event: { offer: NearbyFileOffer }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "fileAccepted", handler: (event: { connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "fileProgress", handler: (event: { progress: NearbyFileProgress }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "fileReceived", handler: (event: { file: NearbyReceivedFile; connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "diagnostic", handler: (event: NearbyDiagnostic) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "error", handler: (event: NearbyError) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: string, handler: (event: never) => void): Promise<NearbyListenerHandle> {
+  return import("./mobile-native.js").then((native) => native.nearbyAddListener(event as never, handler as never));
+}
 export async function getMobileAppVersion(): Promise<string> { return (await import("./mobile-native.js")).nativeAppVersion(); }
 export async function getMobileAppBuild(): Promise<number> { return Number((await (await import("./mobile-native.js")).nativeAppInfo()).build); }
+export async function isNativeRemoteDesktopAvailable(): Promise<boolean> {
+  return isMobileApp() && (await import("./mobile-native.js")).nativeRemoteDesktopAvailable();
+}
+export async function getNativeRemoteDesktopPlatform(): Promise<"ios" | "android" | null> {
+  if (!isMobileApp()) return null;
+  return (await import("./mobile-native.js")).nativeRemoteDesktopPlatform();
+}
+export async function openNativeRemoteDesktop(url: string, title = "远程桌面"): Promise<void> {
+  if (!isMobileApp()) throw new Error("原生远程桌面仅支持手机 App。");
+  const native = await import("./mobile-native.js");
+  const platform = native.nativeRemoteDesktopPlatform();
+  let target = url;
+  if (platform === "android" && !target) {
+    const bridge = new URL(getBridgeOrigin());
+    const host = bridge.hostname.replace(/^\[|\]$/g, "");
+    if (!host || host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "0.0.0.0") {
+      throw new Error("Android 原生 VNC 不能连接 Bridge 的回环地址，请使用 Mac 的局域网或 VPN 地址。");
+    }
+    target = `vnc://${host.includes(":") ? `[${host}]` : host}:5900`;
+  }
+  await native.openNativeRemoteDesktop(target, title);
+}
+export async function closeNativeRemoteDesktop(): Promise<void> {
+  if (isMobileApp()) await (await import("./mobile-native.js")).closeNativeRemoteDesktop();
+}
+export async function onNativeRemoteDesktopClosed(listener: () => void): Promise<{ remove(): Promise<void> }> {
+  return (await import("./mobile-native.js")).onNativeRemoteDesktopClosed(listener);
+}
+export async function onNativeRemoteDesktopReconnect(listener: (event: { reason?: string }) => void): Promise<{ remove(): Promise<void> }> {
+  return (await import("./mobile-native.js")).onNativeRemoteDesktopReconnect(listener);
+}
 export async function isMobileCrashDiagnosticsAvailable(): Promise<boolean> {
   return isMobileApp() && (await import("./mobile-native.js")).isMobileCrashDiagnosticsAvailable();
 }
@@ -318,12 +394,9 @@ export async function importMobileVpnProfile(): Promise<string> {
 }
 
 /** Apply a changed global private-host setting to the live App connection. */
-export async function applyConfiguredBridgeNetworkSettings(): Promise<void> {
+async function applyConfiguredBridgeOriginInternal(): Promise<void> {
   if (!isMobileApp()) return;
   const native = await import("./mobile-native.js");
-  if (!await (autoVpnSettingsSync ?? queueAutoVpnSettingsSync())) throw new Error(
-    mobileVpnUnavailableMessage(native.getMobileVpnCapability().platform, "sync"),
-  );
   if (!connection) return;
   const selected = connection;
   const server = normalizeConfiguredBridgeServer(selected.server);
@@ -334,6 +407,22 @@ export async function applyConfiguredBridgeNetworkSettings(): Promise<void> {
   if (connection !== selected) throw new DOMException("Bridge connection changed", "AbortError");
   commitMobileConnection({ server, token });
   if (token) void persistCredential(() => native.removeCredential(selected.server)).catch(() => {});
+}
+
+/** Apply only the Bridge origin, independent of optional VPN integration. */
+export async function applyConfiguredBridgeOrigin(): Promise<void> {
+  await applyConfiguredBridgeOriginInternal();
+}
+
+/** Apply the global host and VPN settings to the live App connection. */
+export async function applyConfiguredBridgeNetworkSettings(): Promise<void> {
+  if (!isMobileApp()) return;
+  const native = await import("./mobile-native.js");
+  const vpnApplied = await (autoVpnSettingsSync ?? queueAutoVpnSettingsSync());
+  await applyConfiguredBridgeOriginInternal();
+  if (!vpnApplied) throw new Error(
+    mobileVpnUnavailableMessage(native.getMobileVpnCapability().platform, "sync"),
+  );
 }
 
 export async function pairMobileConnection(address: string, code: string): Promise<void> {

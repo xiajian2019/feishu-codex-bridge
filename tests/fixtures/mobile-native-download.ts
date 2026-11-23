@@ -72,7 +72,7 @@ Object.defineProperty(globalThis, "clearTimeout", { value: (id: number) => { tim
 
 mock.module("@capacitor/core", () => ({
   Capacitor: { isNativePlatform: () => true, getPlatform: () => android ? "android" : "ios",
-    isPluginAvailable: (name: string) => name === "BridgeMotion" && (scenario === "android-native-motion" || scenario === "android-native-motion-fallback"),
+    isPluginAvailable: (name: string) => name === "BridgeMotion" && (scenario === "android-native-motion" || scenario === "android-native-motion-fallback" || scenario === "ios-native-motion"),
     convertFileSrc: (uri: string) => "https://native.fixture/" + encodeURIComponent(uri) },
   registerPlugin: (name: string) => name === "BridgeMotion" ? {
     addListener: async (_event: string, callback: typeof nativeMotionListener) => {
@@ -314,7 +314,7 @@ if (scenario === "android-native-motion-fallback") {
   assert.equal(nativeMotionEnabled.at(-1), false);
   process.exit(0);
 }
-if (scenario === "android-native-motion") {
+if (scenario === "android-native-motion" || scenario === "ios-native-motion") {
   let clock = 0;
   let detected = 0;
   Object.defineProperty(performance, "now", { configurable: true, value: () => clock });

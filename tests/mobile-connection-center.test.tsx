@@ -18,6 +18,7 @@ describe("mobile connection center", () => {
     const html = renderConnectionCenter("/");
     expect(html).toContain("选择连接方式");
     expect(html).toContain("SSH / Mac");
+    expect(html).toContain(">VNC</button>");
     expect(html).toContain("正在恢复连接");
     expect(html).toContain("<summary>网络设置</summary>");
     expect(html).toContain("免 VPN 的 Wi‑Fi");
@@ -65,6 +66,8 @@ describe("mobile connection center", () => {
     const html = renderToStaticMarkup(createElement(MemoryRouter, null, createElement(MobileAutoVpnSettings)));
     expect(html).toContain("自动 VPN 网络设置");
     expect(html).toContain("全局 IP");
+    expect(html).toContain("Bridge 协议");
+    expect(html).toContain("HTTP（默认）");
     expect(html).toContain("免 VPN 的 Wi‑Fi");
     expect(html).toContain('aria-label="读取当前 Wi‑Fi"');
     expect(html).toContain("Bridge 只读取 SSID，不读取 GPS 坐标");

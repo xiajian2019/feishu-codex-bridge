@@ -21,13 +21,13 @@ export function safeMobileRoute(value: unknown): string | null {
     }
   } catch { return null; }
   const path = url.pathname;
-  const allowed = ["/", "/mobile-inbox", "/mobile-shares", "/codex-history", "/tmux-dashboard", "/tmux-dashboard/history"];
+  const allowed = ["/", "/tasks", "/mobile-inbox", "/mobile-shares", "/nearby-transfer", "/codex-history", "/tmux-dashboard", "/tmux-dashboard/history"];
   if (!allowed.includes(path) && !/^\/tasks\/(desk|direct|aamp)\/[^/]+$/.test(path)
     && !/^\/codex-history\/[^/]+\/[^/]+$/.test(path)
     && !/^\/tmux-dashboard\/(files|git-changes)\/[^/]+$/.test(path)) return null;
   const keys = path.startsWith("/tmux-dashboard") ? ["session"]
     : path.startsWith("/codex-history") ? ["home", "q", "archived", "status"]
-    : path === "/" ? ["source", "q", "state", "project", "offset"] : [];
+    : path === "/" || path === "/tasks" ? ["source", "q", "state", "project", "offset"] : [];
   for (const key of url.searchParams.keys()) if (!keys.includes(key)) return null;
   return path + url.search;
 }

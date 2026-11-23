@@ -45,7 +45,7 @@ export function TaskDetailPage(): ReactElement {
   const navigate = useNavigate();
   const location = useLocation();
   const returnTo = typeof location.state?.returnTo === "string" && location.state.returnTo.startsWith("/")
-    ? location.state.returnTo : "/";
+    ? location.state.returnTo : "/tasks";
   const [desk, setDesk] = useState<TaskDetailResponse | null>(null);
   const [direct, setDirect] = useState<DirectTaskDetailResponse | null>(null);
   const [aamp, setAamp] = useState<AampTaskDetailResponse | null>(null);
@@ -353,7 +353,7 @@ export function TaskDetailPage(): ReactElement {
         </> : null}
         {source === "desk" && deskTask && desk ? <>
           <div className="workbench-same-config-actions">
-            <button type="button" onClick={() => navigate("/", { state: { newTaskDraft: {
+            <button type="button" onClick={() => navigate("/tasks", { state: { newTaskDraft: {
               source: "task",
               projectKey: deskTask.project_key,
               mode: deskTask.mode,

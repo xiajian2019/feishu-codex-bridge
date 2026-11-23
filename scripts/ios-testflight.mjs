@@ -6,12 +6,17 @@ import { fileURLToPath } from "node:url";
 import { renewalPaths } from "./ios-auto-renew.mjs";
 import { readIosDevelopmentTeam } from "./ios-signing-config.mjs";
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const project = join(root, "ios/App/App.xcodeproj");
+const defaultRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const root = resolve(process.env.BRIDGE_IOS_TESTFLIGHT_SOURCE?.trim() || defaultRoot);
+const project = resolve(process.env.BRIDGE_IOS_TESTFLIGHT_PROJECT?.trim() || join(root, "ios/App/App.xcodeproj"));
 const projectFile = join(project, "project.pbxproj");
-const scheme = "App";
-const configuration = "PersonalRelease";
-const bundleId = "dev.feishu.codex.bridge";
+const scheme = process.env.BRIDGE_IOS_TESTFLIGHT_SCHEME?.trim() || "App";
+const configuration = process.env.BRIDGE_IOS_TESTFLIGHT_CONFIGURATION?.trim() || "PersonalRelease";
+const targetName = process.env.BRIDGE_IOS_TESTFLIGHT_TARGET?.trim() || "App";
+const infoPlistPath = process.env.BRIDGE_IOS_TESTFLIGHT_INFO_PLIST?.trim() || "App/Info.plist";
+const bundleId = process.env.BRIDGE_IOS_TESTFLIGHT_BUNDLE_ID?.trim() || "dev.feishu.codex.bridge";
+const buildDirectory = resolve(process.env.BRIDGE_IOS_TESTFLIGHT_BUILD_DIR?.trim() || join(root, "ios/App/build/testflight"));
+const appPublicDirectory = resolve(process.env.BRIDGE_IOS_TESTFLIGHT_PUBLIC_DIR?.trim() || join(root, "ios/App/App/public"));
 
 function requireValue(args, index, flag) {
   const value = args[index];
@@ -92,10 +97,15 @@ function settingValue(block, key) {
   return match?.[1]?.trim() ?? null;
 }
 
+function matchesTargetProductName(value, target) {
+  return value === target || value === "$(TARGET_NAME)" || value === "$(PRODUCT_NAME)";
+}
+
 export function readAppProjectSettings(source = readFileSync(projectFile, "utf8"), env = process.env) {
-  const blocks = [...source.matchAll(/\/\*\s*PersonalRelease\s*\*\/\s*=\s*\{\s*isa = XCBuildConfiguration;\s*buildSettings = \{([\s\S]*?)\n\s*\};\s*name = PersonalRelease;\s*\};/g)];
+  const escapedConfiguration = configuration.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const blocks = [...source.matchAll(new RegExp(`\\/\\*\\s*${escapedConfiguration}\\s*\\*\\/\\s*=\\s*\\{\\s*isa = XCBuildConfiguration;\\s*buildSettings = \\{([\\s\\S]*?)\\n\\s*\\};\\s*name = ${escapedConfiguration};\\s*\\};`, "g"))];
   const block = blocks.map((match) => match[1]).find((value) =>
-    settingValue(value, "INFOPLIST_FILE") === "App/Info.plist" && settingValue(value, "PRODUCT_NAME") === "App");
+    settingValue(value, "INFOPLIST_FILE") === infoPlistPath && matchesTargetProductName(settingValue(value, "PRODUCT_NAME"), targetName));
   if (!block) throw new Error(`找不到 ${scheme}/${configuration} 的 App 构建配置。`);
   return {
     bundleId: settingValue(block, "PRODUCT_BUNDLE_IDENTIFIER"),
@@ -187,11 +197,11 @@ function timestamp() {
 }
 
 function defaultArchivePath() {
-  return join(root, "ios/App/build/testflight", `Bridge-${timestamp()}.xcarchive`);
+  return join(buildDirectory, `Bridge-${timestamp()}.xcarchive`);
 }
 
 function archiveAppPath(archivePath) {
-  return join(archivePath, "Products/Applications/App.app");
+  return join(archivePath, "Products/Applications", `${targetName}.app`);
 }
 
 function readPlistValue(file, key) {
@@ -206,9 +216,9 @@ function assertProject() {
   if (settings.bundleId !== bundleId) throw new Error(`App Bundle ID 应为 ${bundleId}，实际为 ${settings.bundleId ?? "空"}。`);
   if (!settings.teamId) throw new Error("请在运行命令的环境中设置 BRIDGE_IOS_DEVELOPMENT_TEAM（Apple Team ID）。");
   if (!settings.marketingVersion || !settings.buildNumber) throw new Error("App 构建配置缺少版本号或构建号。");
-  const schemeFile = join(project, "xcshareddata/xcschemes/App.xcscheme");
-  if (!existsSync(schemeFile) || !readFileSync(schemeFile, "utf8").includes('buildConfiguration = "PersonalRelease"')) {
-    throw new Error("App scheme 没有使用 PersonalRelease 归档配置。");
+  const schemeFile = join(project, "xcshareddata/xcschemes", `${scheme}.xcscheme`);
+  if (!existsSync(schemeFile) || !readFileSync(schemeFile, "utf8").includes(`buildConfiguration = "${configuration}"`)) {
+    throw new Error(`${scheme} scheme 没有使用 ${configuration} 归档配置。`);
   }
   return settings;
 }
@@ -219,9 +229,14 @@ function checkTooling() {
   console.log(`Xcode：${version}（${developerDir}）`);
 }
 
+function hasMobileAssetProject() {
+  return existsSync(join(root, "package.json")) && existsSync(join(root, "scripts/mobile.mjs"));
+}
+
 function assertMobileAssets() {
+  if (!hasMobileAssetProject()) return;
   const source = join(root, "dist/mobile/index.html");
-  const destination = join(root, "ios/App/App/public/index.html");
+  const destination = join(appPublicDirectory, "index.html");
   if (!existsSync(source) || !existsSync(destination)) {
     throw new Error("找不到已同步的 iOS 前端资源；请先运行 mobile:build，或去掉 --skip-mobile-build。");
   }
@@ -246,7 +261,7 @@ function archiveArgs(options, archivePath, authentication, teamId) {
 
 function validateArchive(archivePath, settings, requestedBuildNumber = null) {
   const app = archiveAppPath(archivePath);
-  if (!existsSync(app)) throw new Error(`Archive 中找不到 App.app：${app}`);
+  if (!existsSync(app)) throw new Error(`Archive 中找不到 ${targetName}.app：${app}`);
   const actualBundleId = readPlistValue(join(app, "Info.plist"), "CFBundleIdentifier");
   const version = readPlistValue(join(app, "Info.plist"), "CFBundleShortVersionString");
   const build = readPlistValue(join(app, "Info.plist"), "CFBundleVersion");
@@ -321,7 +336,8 @@ function main() {
     if (existsSync(archivePath)) throw new Error(`Archive 已存在：${archivePath}；请换路径或使用 --upload-only。`);
     mkdirSync(dirname(archivePath), { recursive: true, mode: 0o700 });
     if (options.skipMobileBuild) assertMobileAssets();
-    else run(process.execPath, ["run", "mobile:build"], "[1/3] 构建并同步移动端资源");
+    else if (hasMobileAssetProject()) run(process.execPath, ["run", "mobile:build"], "[1/3] 构建并同步移动端资源");
+    else console.log("\n[1/3] 原生 Xcode 工程，跳过 Bridge 移动端资源构建");
     run("xcodebuild", archiveArgs(options, archivePath, authentication, settings.teamId), "[2/3] 归档并签名 iOS App");
     validateArchive(archivePath, settings, options.buildNumber);
   }

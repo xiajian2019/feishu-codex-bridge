@@ -23,6 +23,10 @@ import {
   classifyMobileVpnPlatform, mobileVpnUnavailableMessage, normalizeMobileVpnProfileSelection,
   type MobileVpnCapability, type MobileVpnProfileSelection,
 } from "./mobile-vpn-contract.js";
+import type {
+  NearbyConnection, NearbyDiagnostic, NearbyError, NearbyFileOffer, NearbyFileProgress, NearbyFileSelection, NearbyListenerHandle,
+  NearbyNetworkInfo, NearbyPeer, NearbyReceivedFile, NearbyServerInfo,
+} from "./nearby-transfer-contract.js";
 
 interface TransferProgress {
   type: "download" | "upload";
@@ -106,7 +110,43 @@ const Motion = registerPlugin<{
   setEnabled(options: { enabled: boolean }): Promise<{ available: boolean }>;
   addListener(event: "motion", handler: (sample: { x: number; y: number; z: number; timestampMs: number }) => void): Promise<PluginListenerHandle>;
 }>("BridgeMotion");
+interface BridgeRemoteDesktopPlugin {
+  open(options: { url: string; title: string }): Promise<void>;
+  close(): Promise<void>;
+  addListener(event: "workspaceClosed", handler: () => void): Promise<PluginListenerHandle>;
+  addListener(event: "reconnectRequested", handler: (event: { reason?: string }) => void): Promise<PluginListenerHandle>;
+}
+const RemoteDesktop = registerPlugin<BridgeRemoteDesktopPlugin>("BridgeRemoteDesktop");
 const AutoVpn = registerPlugin<BridgeAutoVpnPlugin>("BridgeAutoVpn");
+interface BridgeNearbyTransferPlugin {
+  startServer(options: { displayName: string; port?: number }): Promise<NearbyServerInfo>;
+  stopServer(): Promise<void>;
+  startDiscovery(): Promise<void>;
+  stopDiscovery(): Promise<void>;
+  getNetworkInfo(): Promise<NearbyNetworkInfo>;
+  connect(options: { peerId?: string; host?: string; port?: number; token?: string; name?: string; source?: "mdns" | "hotspot" }): Promise<{ connectionId: string }>;
+  pickFile(): Promise<NearbyFileSelection>;
+  acceptConnection(options: { connectionId: string }): Promise<void>;
+  rejectConnection(options: { connectionId: string }): Promise<void>;
+  beginFile(options: { connectionId: string; transferId: string; selectionId: string }): Promise<void>;
+  sendFile(options: { connectionId: string; transferId: string; selectionId: string }): Promise<void>;
+  sendChunk(options: { connectionId: string; transferId: string; dataBase64: string; final: boolean }): Promise<void>;
+  acceptFile(options: { connectionId: string; transferId: string }): Promise<void>;
+  rejectFile(options: { connectionId: string; transferId: string }): Promise<void>;
+  listReceived(): Promise<{ files: NearbyReceivedFile[] }>;
+  openReceived(options: { id: string }): Promise<void>;
+  deleteReceived(options: { id: string }): Promise<void>;
+  addListener(event: "peerFound", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
+  addListener(event: "peerLost", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
+  addListener(event: "connectionState", handler: (event: { connection: NearbyConnection }) => void): Promise<NearbyListenerHandle>;
+  addListener(event: "fileOffer", handler: (event: { offer: NearbyFileOffer }) => void): Promise<NearbyListenerHandle>;
+  addListener(event: "fileAccepted", handler: (event: { connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
+  addListener(event: "fileProgress", handler: (event: { progress: NearbyFileProgress }) => void): Promise<NearbyListenerHandle>;
+  addListener(event: "fileReceived", handler: (event: { file: NearbyReceivedFile; connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
+  addListener(event: "diagnostic", handler: (event: NearbyDiagnostic) => void): Promise<NearbyListenerHandle>;
+  addListener(event: "error", handler: (event: NearbyError) => void): Promise<NearbyListenerHandle>;
+}
+const NearbyTransfer = registerPlugin<BridgeNearbyTransferPlugin>("BridgeNearbyTransfer");
 // Browser preview uses memory only; tokens are never persisted in browser storage.
 const previewCredentials = new Map<string, string>();
 let lifecycle: Promise<void> | null = null;
@@ -178,6 +218,97 @@ export async function removeCredential(server: string): Promise<void> {
 
 export function isAndroidPlatform(): boolean {
   return Capacitor.getPlatform() === "android";
+}
+
+export function nearbyTransferAvailable(): boolean {
+  return Capacitor.isNativePlatform() && Capacitor.isPluginAvailable("BridgeNearbyTransfer");
+}
+
+export async function nearbyPickFile(): Promise<NearbyFileSelection> {
+  if (!nearbyTransferAvailable()) throw new Error("附近传文件仅支持手机 App。");
+  return NearbyTransfer.pickFile();
+}
+
+export async function nearbyStartServer(displayName: string, port?: number): Promise<NearbyServerInfo> {
+  if (!nearbyTransferAvailable()) throw new Error("附近传文件仅支持手机 App。");
+  return NearbyTransfer.startServer({ displayName, ...(port ? { port } : {}) });
+}
+
+export async function nearbyStopServer(): Promise<void> {
+  if (nearbyTransferAvailable()) await NearbyTransfer.stopServer();
+}
+
+export async function nearbyStartDiscovery(): Promise<void> {
+  if (!nearbyTransferAvailable()) throw new Error("附近传文件仅支持手机 App。");
+  await NearbyTransfer.startDiscovery();
+}
+
+export async function nearbyStopDiscovery(): Promise<void> {
+  if (nearbyTransferAvailable()) await NearbyTransfer.stopDiscovery();
+}
+
+export async function nearbyGetNetworkInfo(): Promise<NearbyNetworkInfo> {
+  if (!nearbyTransferAvailable()) throw new Error("附近传文件仅支持手机 App。");
+  return NearbyTransfer.getNetworkInfo();
+}
+
+export async function nearbyConnect(options: Parameters<BridgeNearbyTransferPlugin["connect"]>[0]): Promise<{ connectionId: string }> {
+  if (!nearbyTransferAvailable()) throw new Error("附近传文件仅支持手机 App。");
+  return NearbyTransfer.connect(options);
+}
+
+export async function nearbyAcceptConnection(connectionId: string): Promise<void> {
+  await NearbyTransfer.acceptConnection({ connectionId });
+}
+
+export async function nearbyRejectConnection(connectionId: string): Promise<void> {
+  await NearbyTransfer.rejectConnection({ connectionId });
+}
+
+export async function nearbyBeginFile(options: Parameters<BridgeNearbyTransferPlugin["beginFile"]>[0]): Promise<void> {
+  await NearbyTransfer.beginFile(options);
+}
+
+export async function nearbySendFile(options: Parameters<BridgeNearbyTransferPlugin["sendFile"]>[0]): Promise<void> {
+  await NearbyTransfer.sendFile(options);
+}
+
+export async function nearbySendChunk(options: Parameters<BridgeNearbyTransferPlugin["sendChunk"]>[0]): Promise<void> {
+  await NearbyTransfer.sendChunk(options);
+}
+
+export async function nearbyAcceptFile(connectionId: string, transferId: string): Promise<void> {
+  await NearbyTransfer.acceptFile({ connectionId, transferId });
+}
+
+export async function nearbyRejectFile(connectionId: string, transferId: string): Promise<void> {
+  await NearbyTransfer.rejectFile({ connectionId, transferId });
+}
+
+export async function nearbyListReceived(): Promise<NearbyReceivedFile[]> {
+  return (await NearbyTransfer.listReceived()).files;
+}
+
+export async function openNearbyReceived(file: import("./nearby-transfer-contract.js").NearbyReceivedFile): Promise<void> {
+  if (!nearbyTransferAvailable()) throw new Error("接收文件查看仅支持手机 App。");
+  await NearbyTransfer.openReceived({ id: file.id });
+}
+
+export async function nearbyDeleteReceived(id: string): Promise<void> {
+  await NearbyTransfer.deleteReceived({ id });
+}
+
+export function nearbyAddListener(event: "peerFound", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "peerLost", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "connectionState", handler: (event: { connection: NearbyConnection }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "fileOffer", handler: (event: { offer: NearbyFileOffer }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "fileAccepted", handler: (event: { connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "fileProgress", handler: (event: { progress: NearbyFileProgress }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "fileReceived", handler: (event: { file: NearbyReceivedFile; connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "diagnostic", handler: (event: NearbyDiagnostic) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "error", handler: (event: NearbyError) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: string, handler: (event: never) => void): Promise<NearbyListenerHandle> {
+  return NearbyTransfer.addListener(event as never, handler as never);
 }
 
 export function getMobileVpnCapability(): MobileVpnCapability {
@@ -310,6 +441,33 @@ export async function nativeAppVersion(): Promise<string> {
 }
 export async function nativeAppInfo(): Promise<{ id: string; build: string; version: string }> { return App.getInfo(); }
 
+export function nativeRemoteDesktopAvailable(): boolean {
+  return nativeRemoteDesktopPlatform() !== null;
+}
+
+export function nativeRemoteDesktopPlatform(): "ios" | "android" | null {
+  const platform = Capacitor.getPlatform();
+  return (platform === "ios" || platform === "android") && Capacitor.isPluginAvailable("BridgeRemoteDesktop")
+    ? platform : null;
+}
+
+export async function openNativeRemoteDesktop(url: string, title = "远程桌面"): Promise<void> {
+  if (!nativeRemoteDesktopAvailable()) throw new Error("当前 App 未启用原生远程桌面。");
+  await RemoteDesktop.open({ url, title });
+}
+
+export async function closeNativeRemoteDesktop(): Promise<void> {
+  if (nativeRemoteDesktopAvailable()) await RemoteDesktop.close();
+}
+
+export function onNativeRemoteDesktopClosed(listener: () => void): Promise<PluginListenerHandle> {
+  return RemoteDesktop.addListener("workspaceClosed", listener);
+}
+
+export function onNativeRemoteDesktopReconnect(listener: (event: { reason?: string }) => void): Promise<PluginListenerHandle> {
+  return RemoteDesktop.addListener("reconnectRequested", listener);
+}
+
 async function forwardPendingAppIntentRoute(): Promise<void> {
   if (!Capacitor.isPluginAvailable("BridgeAppIntent")) return;
   try {
@@ -423,7 +581,7 @@ async function installShakeDetector(): Promise<void> {
     if (shakeDetector.sample(acceleration, now)) window.dispatchEvent(new Event(MOBILE_SHAKE_EVENT));
   };
   let nativeHandle: PluginListenerHandle | null = null;
-  if (isAndroidPlatform() && Capacitor.isPluginAvailable("BridgeMotion")) {
+  if (Capacitor.isPluginAvailable("BridgeMotion")) {
     try {
       nativeHandle = await Motion.addListener("motion", (reading) => sample(reading, true, reading.timestampMs));
       nativeMotionAvailable = (await Motion.setEnabled({ enabled: motionEnabled })).available;
@@ -765,6 +923,12 @@ export async function shareBlob(blob: Blob, suppliedName: string): Promise<void>
   } finally {
     if (native && (android || !written)) await Filesystem.rmdir({ path: parent, directory: Directory.Cache, recursive: true }).catch(() => {});
   }
+}
+
+export async function shareNearbyReceived(file: import("./nearby-transfer-contract.js").NearbyReceivedFile): Promise<void> {
+  if (!Capacitor.isNativePlatform()) throw new Error("接收文件分享仅支持手机 App。");
+  const { uri } = await Filesystem.getUri({ path: file.path, directory: Directory.Cache });
+  await Share.share({ title: file.fileName, files: [uri], dialogTitle: "保存或分享接收文件" });
 }
 
 async function writeBlobToCache(blob: Blob, parent: string, name: string, progress?: (bytes: number) => void): Promise<string> {

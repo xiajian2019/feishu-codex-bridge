@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 
 import { DatabaseSync as DatabaseSyncConstructor, type SqliteDatabase } from "./sqlite.js";
@@ -44,6 +44,9 @@ import type {
   StoredBridgeTaskFollowup,
   StoredInboundEvent,
   StoredProject,
+  StoredIosTestflightApp,
+  StoredMobileApp,
+  StoredMobileAppInput,
   StoredWebTaskAttachment,
   ProjectStatus,
   TaskOrigin,
@@ -81,6 +84,53 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 
 CREATE INDEX IF NOT EXISTS idx_projects_status_name ON projects(status, name);
+
+CREATE TABLE IF NOT EXISTS ios_testflight_apps (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    app_store_name TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    project_path TEXT NOT NULL,
+    build_directory TEXT NOT NULL,
+    public_directory TEXT NOT NULL,
+    bundle_id TEXT NOT NULL UNIQUE,
+    team_id TEXT NOT NULL,
+    scheme TEXT NOT NULL,
+    configuration TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    info_plist_path TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    internal_only INTEGER NOT NULL DEFAULT 1 CHECK (internal_only IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ios_testflight_apps_enabled_name ON ios_testflight_apps(enabled, name);
+
+CREATE TABLE IF NOT EXISTS mobile_apps (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    ios_app_store_name TEXT,
+    ios_source_path TEXT,
+    ios_project_path TEXT,
+    ios_build_directory TEXT,
+    ios_public_directory TEXT,
+    ios_bundle_id TEXT,
+    ios_team_id TEXT,
+    ios_scheme TEXT,
+    ios_configuration TEXT,
+    ios_target_name TEXT,
+    ios_info_plist_path TEXT,
+    ios_internal_only INTEGER CHECK (ios_internal_only IN (0, 1)),
+    android_package_name TEXT,
+    android_apk_path TEXT,
+    android_snapshot_directory TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_mobile_apps_enabled_name ON mobile_apps(enabled, name);
 
 CREATE TABLE IF NOT EXISTS tasks (
     task_guid TEXT PRIMARY KEY,
@@ -795,6 +845,7 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec(SCHEMA);
     this.runMigrations();
+    this.migrateLegacyMobileApps();
     this.seedShortcutDefaults();
     this.workbench = new WorkbenchStore(this.db, () => this.now().getTime());
     this.usageSnapshotWriter = filePath === ":memory:" ? null
@@ -915,6 +966,264 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
       "INSERT OR IGNORE INTO projects (name, path, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
     ).run(name, resolve(path), input.status ?? "available", now, now);
     return this.getProject(name)!;
+  }
+
+  public listIosTestflightApps(): StoredIosTestflightApp[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM ios_testflight_apps ORDER BY enabled DESC, name COLLATE NOCASE ASC",
+    ).all() as Record<string, unknown>[];
+    return rows.map(mapIosTestflightApp);
+  }
+
+  public getIosTestflightApp(id: string): StoredIosTestflightApp | null {
+    const row = this.db.prepare("SELECT * FROM ios_testflight_apps WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? mapIosTestflightApp(row) : null;
+  }
+
+  public createIosTestflightApp(input: Omit<StoredIosTestflightApp, "id" | "created_at" | "updated_at">): StoredIosTestflightApp {
+    const id = randomUUID();
+    const now = this.timestamp();
+    this.validateIosTestflightApp(input);
+    this.db.prepare(`INSERT INTO ios_testflight_apps (
+      id, name, app_store_name, source_path, project_path, build_directory, public_directory,
+      bundle_id, team_id, scheme, configuration, target_name, info_plist_path, enabled, internal_only, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      id, input.name, input.app_store_name, resolve(input.source_path), resolve(input.project_path), resolve(input.build_directory),
+      resolve(input.public_directory), input.bundle_id, input.team_id, input.scheme, input.configuration, input.target_name,
+      input.info_plist_path, input.enabled ? 1 : 0, input.internal_only ? 1 : 0, now, now,
+    );
+    const app = this.getIosTestflightApp(id)!;
+    this.syncLegacyMobileApp(app);
+    return app;
+  }
+
+  public updateIosTestflightApp(
+    id: string,
+    input: Partial<Pick<StoredIosTestflightApp, "name" | "enabled" | "internal_only">>,
+  ): StoredIosTestflightApp | null {
+    const existing = this.getIosTestflightApp(id);
+    if (!existing) return null;
+    const next = {
+      name: input.name ?? existing.name,
+      app_store_name: existing.app_store_name,
+      source_path: existing.source_path,
+      project_path: existing.project_path,
+      build_directory: existing.build_directory,
+      public_directory: existing.public_directory,
+      bundle_id: existing.bundle_id,
+      team_id: existing.team_id,
+      scheme: existing.scheme,
+      configuration: existing.configuration,
+      target_name: existing.target_name,
+      info_plist_path: existing.info_plist_path,
+      enabled: input.enabled ?? existing.enabled,
+      internal_only: input.internal_only ?? existing.internal_only,
+    };
+    this.validateIosTestflightApp(next);
+    this.db.prepare(`UPDATE ios_testflight_apps SET
+      name = ?, enabled = ?, internal_only = ?, updated_at = ?
+      WHERE id = ?`).run(
+      next.name, next.enabled ? 1 : 0, next.internal_only ? 1 : 0, this.timestamp(), id,
+    );
+    const app = this.getIosTestflightApp(id);
+    if (app) this.syncLegacyMobileApp(app);
+    return app;
+  }
+
+  public listMobileApps(): StoredMobileApp[] {
+    const rows = this.db.prepare(
+      "SELECT * FROM mobile_apps ORDER BY enabled DESC, name COLLATE NOCASE ASC",
+    ).all() as Record<string, unknown>[];
+    return rows.map(mapMobileApp);
+  }
+
+  public getMobileApp(id: string): StoredMobileApp | null {
+    let row = this.db.prepare("SELECT * FROM mobile_apps WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    if (!row) {
+      const legacy = this.getIosTestflightApp(id);
+      if (legacy) {
+        this.syncLegacyMobileApp(legacy);
+        row = this.db.prepare("SELECT * FROM mobile_apps WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+      }
+    }
+    return row ? mapMobileApp(row) : null;
+  }
+
+  public createMobileApp(input: StoredMobileAppInput): StoredMobileApp {
+    const id = randomUUID();
+    const now = this.timestamp();
+    const normalized = this.normalizeMobileAppInput(input, id);
+    this.db.prepare(`INSERT INTO mobile_apps (
+      id, name, enabled,
+      ios_app_store_name, ios_source_path, ios_project_path, ios_build_directory, ios_public_directory,
+      ios_bundle_id, ios_team_id, ios_scheme, ios_configuration, ios_target_name, ios_info_plist_path, ios_internal_only,
+      android_package_name, android_apk_path, android_snapshot_directory, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      id, normalized.name, normalized.enabled ? 1 : 0,
+      normalized.ios?.app_store_name ?? null, normalized.ios?.source_path ?? null, normalized.ios?.project_path ?? null,
+      normalized.ios?.build_directory ?? null, normalized.ios?.public_directory ?? null, normalized.ios?.bundle_id ?? null,
+      normalized.ios?.team_id ?? null, normalized.ios?.scheme ?? null, normalized.ios?.configuration ?? null,
+      normalized.ios?.target_name ?? null, normalized.ios?.info_plist_path ?? null, normalized.ios ? (normalized.ios.internal_only ? 1 : 0) : null,
+      normalized.android?.package_name ?? null, normalized.android?.apk_path ?? null, normalized.android?.snapshot_directory ?? null,
+      now, now,
+    );
+    return this.getMobileApp(id)!;
+  }
+
+  public updateMobileApp(id: string, input: Partial<StoredMobileAppInput>): StoredMobileApp | null {
+    const existing = this.getMobileApp(id);
+    if (!existing) return null;
+    const normalized = this.normalizeMobileAppInput({
+      name: input.name ?? existing.name,
+      enabled: input.enabled ?? existing.enabled,
+      ios: input.ios === undefined ? existing.ios : input.ios,
+      android: input.android === undefined ? existing.android : input.android,
+    }, id);
+    this.db.prepare(`UPDATE mobile_apps SET
+      name = ?, enabled = ?,
+      ios_app_store_name = ?, ios_source_path = ?, ios_project_path = ?, ios_build_directory = ?, ios_public_directory = ?,
+      ios_bundle_id = ?, ios_team_id = ?, ios_scheme = ?, ios_configuration = ?, ios_target_name = ?, ios_info_plist_path = ?, ios_internal_only = ?,
+      android_package_name = ?, android_apk_path = ?, android_snapshot_directory = ?, updated_at = ?
+      WHERE id = ?`).run(
+      normalized.name, normalized.enabled ? 1 : 0,
+      normalized.ios?.app_store_name ?? null, normalized.ios?.source_path ?? null, normalized.ios?.project_path ?? null,
+      normalized.ios?.build_directory ?? null, normalized.ios?.public_directory ?? null, normalized.ios?.bundle_id ?? null,
+      normalized.ios?.team_id ?? null, normalized.ios?.scheme ?? null, normalized.ios?.configuration ?? null,
+      normalized.ios?.target_name ?? null, normalized.ios?.info_plist_path ?? null, normalized.ios ? (normalized.ios.internal_only ? 1 : 0) : null,
+      normalized.android?.package_name ?? null, normalized.android?.apk_path ?? null, normalized.android?.snapshot_directory ?? null,
+      this.timestamp(), id,
+    );
+    this.syncMobileAppToLegacy(id, normalized);
+    return this.getMobileApp(id);
+  }
+
+  private syncLegacyMobileApp(app: StoredIosTestflightApp): void {
+    const existing = this.db.prepare("SELECT id FROM mobile_apps WHERE id = ?").get(app.id) as { id?: string } | undefined;
+    const input: StoredMobileAppInput = {
+      name: app.name,
+      enabled: app.enabled,
+      ios: {
+        app_store_name: app.app_store_name,
+        source_path: app.source_path,
+        project_path: app.project_path,
+        build_directory: app.build_directory,
+        public_directory: app.public_directory,
+        bundle_id: app.bundle_id,
+        team_id: app.team_id,
+        scheme: app.scheme,
+        configuration: app.configuration,
+        target_name: app.target_name,
+        info_plist_path: app.info_plist_path,
+        internal_only: app.internal_only,
+      },
+      android: null,
+    };
+    const normalized = this.normalizeMobileAppInput(input, app.id);
+    const now = this.timestamp();
+    if (!existing) {
+      this.db.prepare(`INSERT OR IGNORE INTO mobile_apps (
+        id, name, enabled,
+        ios_app_store_name, ios_source_path, ios_project_path, ios_build_directory, ios_public_directory,
+        ios_bundle_id, ios_team_id, ios_scheme, ios_configuration, ios_target_name, ios_info_plist_path, ios_internal_only,
+        android_package_name, android_apk_path, android_snapshot_directory, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        app.id, normalized.name, normalized.enabled ? 1 : 0,
+        normalized.ios!.app_store_name, normalized.ios!.source_path, normalized.ios!.project_path, normalized.ios!.build_directory,
+        normalized.ios!.public_directory, normalized.ios!.bundle_id, normalized.ios!.team_id, normalized.ios!.scheme,
+        normalized.ios!.configuration, normalized.ios!.target_name, normalized.ios!.info_plist_path, normalized.ios!.internal_only ? 1 : 0,
+        null, null, null, app.created_at, now,
+      );
+      return;
+    }
+    this.db.prepare(`UPDATE mobile_apps SET
+      name = ?, enabled = ?, ios_app_store_name = ?, ios_source_path = ?, ios_project_path = ?, ios_build_directory = ?, ios_public_directory = ?,
+      ios_bundle_id = ?, ios_team_id = ?, ios_scheme = ?, ios_configuration = ?, ios_target_name = ?, ios_info_plist_path = ?, ios_internal_only = ?, updated_at = ?
+      WHERE id = ?`).run(
+      normalized.name, normalized.enabled ? 1 : 0, normalized.ios!.app_store_name, normalized.ios!.source_path, normalized.ios!.project_path,
+      normalized.ios!.build_directory, normalized.ios!.public_directory, normalized.ios!.bundle_id, normalized.ios!.team_id,
+      normalized.ios!.scheme, normalized.ios!.configuration, normalized.ios!.target_name, normalized.ios!.info_plist_path,
+      normalized.ios!.internal_only ? 1 : 0, now, app.id,
+    );
+  }
+
+  private syncMobileAppToLegacy(id: string, input: StoredMobileAppInput): void {
+    const ios = input.ios;
+    const legacy = this.getIosTestflightApp(id);
+    if (!ios || !legacy) return;
+    this.db.prepare(`UPDATE ios_testflight_apps SET
+      name = ?, app_store_name = ?, source_path = ?, project_path = ?, build_directory = ?, public_directory = ?,
+      bundle_id = ?, team_id = ?, scheme = ?, configuration = ?, target_name = ?, info_plist_path = ?, enabled = ?, internal_only = ?, updated_at = ?
+      WHERE id = ?`).run(
+      input.name, ios.app_store_name, ios.source_path, ios.project_path, ios.build_directory, ios.public_directory,
+      ios.bundle_id, ios.team_id, ios.scheme, ios.configuration, ios.target_name, ios.info_plist_path,
+      input.enabled ? 1 : 0, ios.internal_only ? 1 : 0, this.timestamp(), id,
+    );
+  }
+
+  private normalizeMobileAppInput(input: StoredMobileAppInput, id: string): StoredMobileAppInput {
+    const name = input.name.trim();
+    if (!name || name.length > 120) throw new Error("应用名称不能为空且不能超过 120 个字符。");
+    if (typeof input.enabled !== "boolean") throw new Error("enabled 必须是布尔值。");
+    if (!input.ios && !input.android) throw new Error("至少配置 iOS 或 Android 一个平台。");
+    const ios = input.ios ? {
+      app_store_name: input.ios.app_store_name.trim(), source_path: input.ios.source_path.trim(), project_path: input.ios.project_path.trim(),
+      build_directory: input.ios.build_directory.trim(), public_directory: input.ios.public_directory.trim(), bundle_id: input.ios.bundle_id.trim(),
+      team_id: input.ios.team_id.trim(), scheme: input.ios.scheme.trim(), configuration: input.ios.configuration.trim(), target_name: input.ios.target_name.trim(),
+      info_plist_path: input.ios.info_plist_path.trim(), internal_only: input.ios.internal_only,
+    } : null;
+    if (ios) {
+      this.validateMobileIosConfig(ios);
+      ios.source_path = resolve(ios.source_path); ios.project_path = resolve(ios.project_path);
+      ios.build_directory = resolve(ios.build_directory); ios.public_directory = resolve(ios.public_directory);
+    }
+    const android = input.android ? {
+      package_name: input.android.package_name.trim(), apk_path: input.android.apk_path.trim(),
+      snapshot_directory: (input.android.snapshot_directory || join(dirname(input.android.apk_path), ".bridge-mobile-apps", id)).trim(),
+    } : null;
+    if (android) {
+      this.validateMobileAndroidConfig(android);
+      android.apk_path = resolve(android.apk_path); android.snapshot_directory = resolve(android.snapshot_directory);
+    }
+    return { name, enabled: input.enabled, ios, android };
+  }
+
+  private validateMobileIosConfig(input: NonNullable<StoredMobileAppInput["ios"]>): void {
+    const textFields: Array<[string, string, number]> = [
+      ["app_store_name", input.app_store_name, 120], ["source_path", input.source_path, 1000], ["project_path", input.project_path, 1000],
+      ["build_directory", input.build_directory, 1000], ["public_directory", input.public_directory, 1000], ["scheme", input.scheme, 120],
+      ["configuration", input.configuration, 120], ["target_name", input.target_name, 120], ["info_plist_path", input.info_plist_path, 500],
+    ];
+    for (const [field, value, max] of textFields) if (!value.trim() || value.length > max) throw new Error(`${field} 无效。`);
+    for (const [field, value] of [["source_path", input.source_path], ["project_path", input.project_path], ["build_directory", input.build_directory], ["public_directory", input.public_directory]] as const) {
+      if (!isAbsolute(value)) throw new Error(`${field} 必须是绝对路径。`);
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,254}$/.test(input.bundle_id)) throw new Error("bundle_id 无效。");
+    if (!/^[A-Z0-9]{10}$/.test(input.team_id)) throw new Error("team_id 必须是 10 位 Apple Team ID。");
+    if (typeof input.internal_only !== "boolean") throw new Error("internal_only 必须是布尔值。");
+  }
+
+  private validateMobileAndroidConfig(input: NonNullable<StoredMobileAppInput["android"]>): void {
+    if (!/^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(input.package_name)) throw new Error("Android package name 无效。");
+    if (!isAbsolute(input.apk_path) || !input.apk_path.trim()) throw new Error("Android APK 路径必须是绝对路径。");
+    if (!isAbsolute(input.snapshot_directory) || !input.snapshot_directory.trim()) throw new Error("Android 快照目录必须是绝对路径。");
+  }
+
+  private validateIosTestflightApp(input: Omit<StoredIosTestflightApp, "id" | "created_at" | "updated_at">): void {
+    const textFields: Array<[string, string, number]> = [
+      ["name", input.name, 120], ["app_store_name", input.app_store_name, 120], ["source_path", input.source_path, 1000],
+      ["project_path", input.project_path, 1000], ["build_directory", input.build_directory, 1000], ["public_directory", input.public_directory, 1000],
+      ["scheme", input.scheme, 120], ["configuration", input.configuration, 120], ["target_name", input.target_name, 120],
+      ["info_plist_path", input.info_plist_path, 500],
+    ];
+    for (const [field, value, max] of textFields) {
+      if (typeof value !== "string" || !value.trim() || value.length > max) throw new Error(`${field} 无效。`);
+    }
+    for (const [field, value] of [["source_path", input.source_path], ["project_path", input.project_path], ["build_directory", input.build_directory], ["public_directory", input.public_directory]] as const) {
+      if (!isAbsolute(value)) throw new Error(`${field} 必须是绝对路径。`);
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,254}$/.test(input.bundle_id)) throw new Error("bundle_id 无效。");
+    if (!/^[A-Z0-9]{10}$/.test(input.team_id)) throw new Error("team_id 必须是 10 位 Apple Team ID。");
+    if (typeof input.enabled !== "boolean" || typeof input.internal_only !== "boolean") throw new Error("enabled 和 internal_only 必须是布尔值。");
   }
 
   public getShortcutConfig(): { groups: StoredShortcutGroup[]; shortcuts: StoredShortcut[] } {
@@ -4860,6 +5169,20 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
     addColumnIfMissing(this.db, "shortcuts", "display_mode", "TEXT NOT NULL DEFAULT 'closed'");
   }
 
+  private migrateLegacyMobileApps(): void {
+    this.db.exec(`INSERT OR IGNORE INTO mobile_apps (
+      id, name, enabled,
+      ios_app_store_name, ios_source_path, ios_project_path, ios_build_directory, ios_public_directory,
+      ios_bundle_id, ios_team_id, ios_scheme, ios_configuration, ios_target_name, ios_info_plist_path, ios_internal_only,
+      created_at, updated_at
+    ) SELECT
+      id, name, enabled,
+      app_store_name, source_path, project_path, build_directory, public_directory,
+      bundle_id, team_id, scheme, configuration, target_name, info_plist_path, internal_only,
+      created_at, updated_at
+    FROM ios_testflight_apps`);
+  }
+
   private seedShortcutDefaults(): void {
     this.transaction(() => {
       const now = this.timestamp();
@@ -5162,6 +5485,51 @@ function mapProject(row: Record<string, unknown>): StoredProject {
     status: String(row.status) as ProjectStatus,
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
+  };
+}
+
+function mapIosTestflightApp(row: Record<string, unknown>): StoredIosTestflightApp {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    app_store_name: String(row.app_store_name),
+    source_path: String(row.source_path),
+    project_path: String(row.project_path),
+    build_directory: String(row.build_directory),
+    public_directory: String(row.public_directory),
+    bundle_id: String(row.bundle_id),
+    team_id: String(row.team_id),
+    scheme: String(row.scheme),
+    configuration: String(row.configuration),
+    target_name: String(row.target_name),
+    info_plist_path: String(row.info_plist_path),
+    enabled: Number(row.enabled) === 1,
+    internal_only: Number(row.internal_only) === 1,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapMobileApp(row: Record<string, unknown>): StoredMobileApp {
+  const ios = row.ios_bundle_id === null || row.ios_bundle_id === undefined || String(row.ios_bundle_id).trim() === ""
+    ? null
+    : {
+      app_store_name: String(row.ios_app_store_name ?? ""), source_path: String(row.ios_source_path ?? ""),
+      project_path: String(row.ios_project_path ?? ""), build_directory: String(row.ios_build_directory ?? ""),
+      public_directory: String(row.ios_public_directory ?? ""), bundle_id: String(row.ios_bundle_id),
+      team_id: String(row.ios_team_id ?? ""), scheme: String(row.ios_scheme ?? ""), configuration: String(row.ios_configuration ?? ""),
+      target_name: String(row.ios_target_name ?? ""), info_plist_path: String(row.ios_info_plist_path ?? ""),
+      internal_only: Number(row.ios_internal_only) === 1,
+    };
+  const android = row.android_package_name === null || row.android_package_name === undefined || String(row.android_package_name).trim() === ""
+    ? null
+    : {
+      package_name: String(row.android_package_name), apk_path: String(row.android_apk_path ?? ""),
+      snapshot_directory: String(row.android_snapshot_directory ?? ""),
+    };
+  return {
+    id: String(row.id), name: String(row.name), enabled: Number(row.enabled) === 1, ios, android,
+    created_at: String(row.created_at), updated_at: String(row.updated_at),
   };
 }
 

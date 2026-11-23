@@ -1246,6 +1246,17 @@ pre {
     overflow: hidden;
     overflow-anchor: none;
   }
+  /* TmuxDashboardHost keeps the dashboard mounted across route changes. It is
+     an extra flex item between #root and .dashboard-page, so it must also
+     consume the mobile viewport or the page's own flex:1 has no bounded
+     height. Without this wrapper rule the terminal frame collapses to zero
+     and the composer follows the toolbar at the top of the screen. */
+  html.tmux-mobile-viewport #root > [data-route-cache="tmux-dashboard"] {
+    display: flex;
+    min-height: 0;
+    flex: 1 1 0;
+    flex-direction: column;
+  }
   html.tmux-mobile-viewport .system-navigation-shell { flex: 0 0 auto; }
   html.tmux-mobile-viewport .dashboard-page {
     flex: 1 1 0;

@@ -155,7 +155,7 @@ export function MobileNavigationBridge(): ReactElement | null {
     if (getMobileOpens().length) return;
     const route = safeMobileRoute(location.pathname + location.search);
     const key = scopedStorageKey("mobile-last-location");
-    if (!key || !route || ["/", "/mobile-shares", "/mobile-inbox"].includes(location.pathname)) return;
+    if (!key || !route || ["/", "/mobile-shares", "/mobile-inbox", "/nearby-transfer"].includes(location.pathname)) return;
     try { localStorage.setItem(key, route); } catch { /* Explicit navigation remains available. */ }
   }, [location.pathname, location.search, opens, scope]);
 
