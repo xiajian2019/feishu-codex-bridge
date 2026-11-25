@@ -51,10 +51,10 @@ JDK 不在默认路径时设置 `JAVA_HOME`；SDK 不在默认目录时设置 `A
 
 ### App 管理与分发
 
-Web 端新增“系统管理 → App 管理”（`/system-management/apps`），一个 App 记录可以只配置 iOS、只配置 Android，或同时配置两端。已有 `ios_testflight_apps` 记录会自动迁移为 iOS-only App；旧的 `/system-management/testflight` 页面和 `/api/mobile/testflight/*` 接口继续保留兼容。
+Web 端可从顶部导航的“App 管理”进入 `/system-management/apps`，一个 App 记录可以只配置 iOS、只配置 Android，或同时配置两端。已有 `ios_testflight_apps` 记录会自动迁移为 iOS-only App；旧的 `/system-management/testflight` 页面和 `/api/mobile/testflight/*` 接口继续保留兼容。
 
 - iOS 卡片保留 TestFlight 构建/上传和 Processing/内部群组状态；如果 Mac 发现已配对、解锁、开发者模式可用且 USB 直连的 iPhone/iPad，会额外提供“构建并 USB 安装”。该动作只构建并安装选定 App，不替换原 `mobile:ios:install` 的 Bridge 专用自动续签流程。
-- Android 卡片读取配置的 APK 与 `output-metadata.json`，沿用不可变快照、包名、版本、大小和 SHA-256 校验，提供会话保护的 APK 下载地址。它不替代 Bridge 自身的 Android 更新检查、缓存校验、系统安装器和手机环境窗口入口。
+- Android 卡片支持构建 APK 并查看状态和近期日志，也可读取配置的 APK 与 `output-metadata.json`，生成会话保护的不可变下载快照。标准 `android/app/build/outputs/apk/debug/app-debug.apk` 路径会自动推导 Android 源码目录；其他布局需在 Android 配置中单独填写源码目录，可选设置构建脚本的相对路径，默认为 `scripts/build-apk.mjs`。脚本由 Bun 在该目录运行，应负责构建和核验 APK；服务端在脚本成功后再校验 Gradle 元数据的包名和版本、复制快照并计算 SHA-256，不自行解析 APK 签名。Bridge 与 WQDrop 的现有脚本生成 debug APK，执行各自的单元测试及 APK 校验，不自动安装。Bridge 服务需要可用的 Bun、JDK 和 Android SDK。相同源码目录的管理构建串行执行；服务中断导致结果无法确认时显示失败并保留日志，不能据此认定构建成功。状态和近期日志位于系统临时目录，可能随系统清理而消失。此入口不替代 Bridge 自身的 Android 更新检查、缓存校验、系统安装器和手机环境窗口入口。
 - App 管理页面只负责按 App 聚合发布与下载动作；原有 iOS OTA 仍在系统设置/iPhone 页面，通用“上传下载”仍在原页面，避免把不同数据源的文件下载混成 App 发布包。
 
 ### iOS TestFlight 上传
@@ -98,7 +98,7 @@ bun run mobile:ios:testflight -- --build-number 4 --internal-only
 
 上传命令成功只表示 Apple 已接收交付，仍需在 App Store Connect → TestFlight 等待 Processing 完成，处理可能出现的 Export Compliance，然后把构建加入 Internal Testing 组。`--internal-only` 适合本人验证，安装仍需在 iPhone 上安装 TestFlight 并用有权访问该 App Store Connect App 的 Apple Account 接受邀请。每次重编译都要递增 `CFBundleVersion`；不能用相同构建号重复上传。
 
-TestFlight 的管理入口现在是“系统管理 → App 管理”。基础信息保存在 Bridge SQLite 的 `mobile_apps` 表中，iOS 配置仍包含源码目录、Xcode 工程、构建输出目录、Bundle ID、Team、Scheme、Configuration、Target、Info.plist 路径和内部测试开关；上传时浏览器只提交表记录的 `appId`，服务端按记录调用受控脚本，不接受浏览器传入任意命令。旧 TestFlight 页面仍可访问，App Store Connect API Key 仍从 Bridge 进程环境读取，不写入数据库。
+TestFlight 的管理入口是顶部导航的“App 管理”。基础信息保存在 Bridge SQLite 的 `mobile_apps` 表中，iOS 配置仍包含源码目录、Xcode 工程、构建输出目录、Bundle ID、Team、Scheme、Configuration、Target、Info.plist 路径和内部测试开关；上传时浏览器只提交表记录的 `appId`，服务端按记录调用受控脚本，不接受浏览器传入任意命令。旧 TestFlight 页面仍可访问，App Store Connect API Key 仍从 Bridge 进程环境读取，不写入数据库。
 
 ## 首次连接
 
@@ -260,7 +260,9 @@ App 内置页面，不使用 Capacitor `server.url` 加载远端网页，也不�
 第一批能力增强的入口、配置和验收边界见 [移动端第一批能力增强](mobile-phase-one-2026-10-29.md)：系统分享收件箱、本机原生通知/待处理、安全唤起与工作页恢复。后台即时推送已按用户选择明确为待配置，不能用本地通知插件宣称完成后台推送。
 
 - App 复用现有 React 页面，增加连接管理、系统返回与前后台恢复；断开浏览器连接或进入后台不会结束 Mac 上的 tmux session。Android 返回按顶层弹层、页面内详情、路由历史处理，根页由原生入口最小化；环境/预览/扫码/确认/编辑表单统一注册，忙碌确认不会穿透到底层页面。系统键盘优先行为仍需真机检查。
-- “附近传文件”位于 `/nearby-transfer`，是独立于 Bridge API 配对/请求链路的移动端功能模块。双方 App 前台打开页面后启动原生 `BridgeNearbyTransfer` 服务：普通局域网发布/浏览 `_bridge-nearby._tcp`，Android 连接 iPhone Personal Hotspot 时可使用当前 DHCP gateway 直连固定 TCP 端口 `43891`。服务、Bonjour/NSD、TCP 连接、文件 offer/接收和诊断监听由全局附近传输会话维持，离开页面或打开系统文件选择器不会因页面卸载主动断开；Android 与 iOS 都会在 hello 中交换设备 ID、设备名、平台和配对 token，并按设备 ID 合并双方同时发起造成的重复连接。列表显示原生设备名和平台，不再使用应用名作为设备名。移动端选择文件由原生文件选择器返回 `selectionId` 和元数据，控制帧仍使用少量 JSON，文件内容改为原生直接读取 URI 后通过 TCP 发送 `dataStart + binary bytes + dataEnd`，不再把文件内容切成 Base64 经过 Capacitor bridge；接收端原生直接写入 App 缓存，接收前需要用户确认，支持原生“打开查看”以及独立的“保存/分享”入口。页面保留最近 200 条原生启动、发现、连接和协议诊断日志，可复制；Android 也会写入 Logcat 的 `BridgeNearbyTransfer`，iOS 写入带 `[BridgeNearbyTransfer]` 前缀的控制台。当前版本不承诺进程被系统终止后的后台发现、后台接收或断点续传。
+- “附近传文件”位于 `/nearby-transfer`，独立于 Bridge API 配对/请求链路。双方 App 前台打开页面后启动原生 `BridgeNearbyTransfer` 服务：局域网发布/浏览 `_bridge-nearby._tcp`；发现失败时可显示本机二维码，由对方扫码或选择二维码图片连接，也可通过热点网关或设备地址直连固定 TCP 端口 `43891`。二维码包含可用地址、设备 ID 和服务 token；扫码端逐个尝试地址并校验设备 ID，接收方仍须确认连接。二维码不保证穿透 AP 客户端隔离或无路由网络。网络变化、返回前台和手动刷新会重新读取网络并刷新发现；Android 优先读取 Wi-Fi 的实时路由，热点网关不写死。
+- 服务、发现、TCP 连接、文件 offer/接收和诊断监听由全局附近传输会话维持，离开页面或打开系统文件选择器不会因页面卸载主动断开。Android 与 iOS 交换设备 ID、设备名、平台和服务 token，并按设备 ID 合并重复连接；连接确认仅接受有效方向和状态的消息。当前 TCP 和二维码连接尚未加密，公开的发现 token 不能作为可信身份认证，只适合可信网络。
+- 文件选择器返回 `selectionId` 和元数据，文件由原生侧直接读取并发送，不通过 Capacitor bridge 传递 Base64 文件内容。新版双端协商分块二进制协议，在每个分块之间允许控制消息，并在接收端校验 SHA-256、写入文件与元数据后回复完成确认；与旧版本连接时保留原二进制流，发送方提示无法确认对方接收结果。接收文件放在独立的 `content/` 子目录，避免覆盖 `meta.json`；旧接收文件仍可打开或分享。接收前需要用户确认；接收中取消会清理未完成文件并断开该连接。支持原生“打开查看”及独立的“保存/分享”。页面保留最近 200 条原生诊断日志；当前不承诺进程终止后的后台发现、后台接收或断点续传。
 - App WebView 会在系统原始 User-Agent 后追加 `BridgeApp/0.5.0 (Android)` 或 `BridgeApp/0.5.0 (iOS)`，服务端可据此区分原生 App 与普通浏览器；不包含配对 token。
 - 同一配对授权再次访问时会更新 UA（变化时立即更新），设备页显示 App 版本与系统摘要，原始 UA 收入折叠详情；保留用户设置的名称。原生下载沿用 WebView UA，避免系统下载器覆盖设备的 App 标识。设备列表前台每 30 秒及重新聚焦时刷新。
 - App 的文件、附件和导出共用顶部下载提示：显示文件名、实际字节进度、完成结果和失败原因，可收起提示并清除已结束记录。已收到入队回执的 Android 系统下载按服务器/设备作用域保存最小元数据（不保存 URL 或长期凭据），有效期 7 天，恢复最多 200 条；重启后重新查询系统结果。前台缓存下载/分享若被进程回收则标为中断，不能冒充已保存。没有总大小时显示不确定进度，不把任务入队或收到全部字节当作保存完成。

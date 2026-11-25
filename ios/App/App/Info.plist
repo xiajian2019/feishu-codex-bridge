@@ -42,7 +42,7 @@
 	<key>NSMotionUsageDescription</key>
 	<string>摇一摇切换 Bridge 环境需要使用设备运动传感器。</string>
 	<key>NSCameraUsageDescription</key>
-	<string>扫描 Mac 上的 Bridge 配对二维码，快速连接此设备。</string>
+	<string>扫描 Bridge 配对二维码或附近设备二维码，快速连接设备。</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

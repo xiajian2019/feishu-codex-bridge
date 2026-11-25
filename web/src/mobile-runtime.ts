@@ -54,9 +54,10 @@ export async function nearbyStopServer(): Promise<void> { await (await import(".
 export async function nearbyStartDiscovery(): Promise<void> { await (await import("./mobile-native.js")).nearbyStartDiscovery(); }
 export async function nearbyStopDiscovery(): Promise<void> { await (await import("./mobile-native.js")).nearbyStopDiscovery(); }
 export async function nearbyGetNetworkInfo(): Promise<NearbyNetworkInfo> { return (await import("./mobile-native.js")).nearbyGetNetworkInfo(); }
-export async function nearbyConnect(options: { peerId?: string; host?: string; port?: number; token?: string; name?: string; source?: "mdns" | "hotspot" }): Promise<{ connectionId: string }> {
+export async function nearbyConnect(options: { peerId?: string; host?: string; port?: number; token?: string; deviceId?: string; name?: string; source?: "mdns" | "hotspot" | "qr" }): Promise<{ connectionId: string }> {
   return (await import("./mobile-native.js")).nearbyConnect(options);
 }
+export async function nearbyDisconnect(connectionId: string): Promise<void> { await (await import("./mobile-native.js")).nearbyDisconnect(connectionId); }
 export async function nearbyPickFile(): Promise<NearbyFileSelection> { return (await import("./mobile-native.js")).nearbyPickFile(); }
 export async function nearbyAcceptConnection(connectionId: string): Promise<void> { await (await import("./mobile-native.js")).nearbyAcceptConnection(connectionId); }
 export async function nearbyRejectConnection(connectionId: string): Promise<void> { await (await import("./mobile-native.js")).nearbyRejectConnection(connectionId); }
@@ -72,8 +73,11 @@ export async function shareNearbyReceived(file: NearbyReceivedFile): Promise<voi
 export function nearbyAddListener(event: "peerFound", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "peerLost", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "connectionState", handler: (event: { connection: NearbyConnection }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "peerReady", handler: (event: { connectionId: string }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "networkChanged", handler: () => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "fileOffer", handler: (event: { offer: NearbyFileOffer }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "fileAccepted", handler: (event: { connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "fileCompleted", handler: (event: { connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "fileProgress", handler: (event: { progress: NearbyFileProgress }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "fileReceived", handler: (event: { file: NearbyReceivedFile; connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "diagnostic", handler: (event: NearbyDiagnostic) => void): Promise<NearbyListenerHandle>;
@@ -594,8 +598,8 @@ export async function sendMobileNotification(options: { id: number; title: strin
   return (await import("./mobile-native.js")).showNativeNotification(options);
 }
 
-export async function scanMobilePairingQr(): Promise<string | null> {
-  return (await import("./mobile-native.js")).scanPairingQr();
+export async function scanMobilePairingQr(instructions?: string): Promise<string | null> {
+  return (await import("./mobile-native.js")).scanPairingQr(instructions);
 }
 
 export async function setMobileShakeEnabled(enabled: boolean): Promise<void> {

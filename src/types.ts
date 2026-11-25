@@ -115,6 +115,8 @@ export interface StoredMobileAndroidConfig {
   package_name: string;
   apk_path: string;
   snapshot_directory: string;
+  source_path?: string;
+  build_script?: string;
 }
 
 /** One product can expose either native platform or both platform actions. */

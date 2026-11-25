@@ -59,7 +59,7 @@ export default defineConfig({
     cors: {
       origin: ["capacitor://localhost", "http://localhost", "https://localhost"],
       methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Accept", "Authorization", "Content-Type", "X-Bridge-Action-Token"],
+      allowedHeaders: ["Accept", "Authorization", "Content-Type", "X-Bridge-Action-Token", "X-Bridge-Transfer-Token", "X-Bridge-Transfer-Code", "X-Bridge-Session-Created-At"],
     },
     watch: {
       // Native projects and generated assets must not invalidate the Web dev server.

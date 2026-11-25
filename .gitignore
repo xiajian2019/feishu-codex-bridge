@@ -74,3 +74,4 @@ id_ed25519_sk
 *.ovpn
 *.mobileprovision
 ios/signing.xcconfig
+.env

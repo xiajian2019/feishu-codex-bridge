@@ -90,6 +90,9 @@
   background: var(--nearby-input-bg);
 }
 .nearby-transfer-hotspot { display: grid; gap: 8px; padding-top: 10px; border-top: 1px solid color-mix(in srgb, var(--nearby-card-border) 70%, transparent); }
+.nearby-transfer-qr { display: grid; justify-items: center; gap: 8px; text-align: center; }
+.nearby-transfer-qr img { display: block; width: min(280px, 100%); height: auto; border-radius: 8px; background: white; }
+.nearby-transfer-qr p { margin: 0; color: var(--nearby-muted); font-size: 13px; }
 .nearby-transfer-button { cursor: pointer; }
 .nearby-transfer-selected { margin: 0; color: var(--nearby-muted); font-size: 13px; }
 .nearby-transfer-error,

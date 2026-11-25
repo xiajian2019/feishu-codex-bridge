@@ -31,7 +31,8 @@ export async function nearbyStopServer(): Promise<void> {}
 export async function nearbyStartDiscovery(): Promise<void> { throw new Error("附近传文件仅支持手机 App。"); }
 export async function nearbyStopDiscovery(): Promise<void> {}
 export async function nearbyGetNetworkInfo(): Promise<NearbyNetworkInfo> { throw new Error("附近传文件仅支持手机 App。"); }
-export async function nearbyConnect(_options: { peerId?: string; host?: string; port?: number; token?: string; name?: string; source?: "mdns" | "hotspot" }): Promise<{ connectionId: string }> { throw new Error("附近传文件仅支持手机 App。"); }
+export async function nearbyConnect(_options: { peerId?: string; host?: string; port?: number; token?: string; deviceId?: string; name?: string; source?: "mdns" | "hotspot" | "qr" }): Promise<{ connectionId: string }> { throw new Error("附近传文件仅支持手机 App。"); }
+export async function nearbyDisconnect(_connectionId: string): Promise<void> { throw new Error("附近传文件仅支持手机 App。"); }
 export async function nearbyPickFile(): Promise<NearbyFileSelection> { throw new Error("附近传文件仅支持手机 App。"); }
 export async function nearbyAcceptConnection(_connectionId: string): Promise<void> { throw new Error("附近传文件仅支持手机 App。"); }
 export async function nearbyRejectConnection(_connectionId: string): Promise<void> { throw new Error("附近传文件仅支持手机 App。"); }
@@ -47,8 +48,11 @@ export async function shareNearbyReceived(_file: NearbyReceivedFile): Promise<vo
 export function nearbyAddListener(event: "peerFound", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "peerLost", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "connectionState", handler: (event: { connection: NearbyConnection }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "peerReady", handler: (event: { connectionId: string }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "networkChanged", handler: () => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "fileOffer", handler: (event: { offer: NearbyFileOffer }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "fileAccepted", handler: (event: { connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "fileCompleted", handler: (event: { connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "fileProgress", handler: (event: { progress: NearbyFileProgress }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "fileReceived", handler: (event: { file: NearbyReceivedFile; connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "diagnostic", handler: (event: NearbyDiagnostic) => void): Promise<NearbyListenerHandle>;
@@ -101,7 +105,7 @@ export const listMobileShares = appOnly;
 export const readMobileShareFiles = appOnly;
 export const getMobileNotificationPermission = appOnly;
 export const sendMobileNotification = appOnly;
-export const scanMobilePairingQr = appOnly;
+export async function scanMobilePairingQr(_instructions?: string): Promise<never> { return appOnly(); }
 export const setMobileShakeEnabled = appOnly;
 export const supportsMobileApkUpdates = async (): Promise<boolean> => false;
 export const checkMobileApkUpdate = async (): Promise<never> => appOnly();

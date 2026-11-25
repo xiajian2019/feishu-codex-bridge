@@ -101,6 +101,14 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
     private let frameQueue = DispatchQueue(label: "dev.feishu.codex.bridge.remote-desktop.frames", qos: .userInitiated)
     private var pendingFrame: BridgeRemoteDesktopFrame?
     private var renderingFrame = false
+    private var connected = false
+    private var controlsExpanded = false
+    private var clipboardOpen = false
+    private var panMode = false
+    private var immersiveMode = false
+    private var currentLayoutIsLandscape = false
+    private var currentLayoutReservesControls = false
+    private var hasAppliedLayout = false
 
     var onClosed: (() -> Void)?
     var onReconnectRequested: ((String) -> Void)?
@@ -115,14 +123,23 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
     private let controlsPanel = UIView()
     private let controlsScroll = UIScrollView()
     private let controlsStack = UIStackView()
+    private let collapsedControlsPanel = UIView()
+    private let collapsedControlsStack = UIStackView()
     private let keyboardPanel = UIView()
     private let keyboardInput = UITextView()
     private let keyboardSendButton = UIButton(type: .system)
+    private let clipboardPanel = UIView()
+    private let clipboardInput = UITextView()
+    private let clipboardSendButton = UIButton(type: .system)
+    private let clipboardCopyButton = UIButton(type: .system)
     private let keyboardButton = UIButton(type: .system)
     private let moreButton = UIButton(type: .system)
-    private var keyboardPanelHeightConstraint: NSLayoutConstraint!
-    private var keyboardContentConstraints: [NSLayoutConstraint] = []
     private var keyboardPanelVisible = false
+    private var topBarHeightConstraint: NSLayoutConstraint!
+    private var controlsPanelPortraitConstraints: [NSLayoutConstraint] = []
+    private var controlsPanelLandscapeConstraints: [NSLayoutConstraint] = []
+    private var canvasFullWidthConstraint: NSLayoutConstraint!
+    private var canvasLandscapeWidthConstraint: NSLayoutConstraint!
 
     init(url: URL, title: String) {
         initialURL = url
@@ -165,12 +182,13 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
         next.onConnected = { [weak self] name, width, height in
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.connected = true
                 self.statusLabel.text = "已连接"
                 self.statusLabel.textColor = UIColor(red: 0.35, green: 0.95, blue: 0.62, alpha: 1)
                 self.titleLabel.text = name.isEmpty ? self.desktopTitle : name
                 self.placeholderLabel.isHidden = true
                 self.retryButton.isHidden = true
-                self.controlsPanel.isHidden = false
+                self.setControlsExpanded(false)
                 self.canvas.setFramebufferSize(width: width, height: height)
                 self.startFPSCounter()
             }
@@ -181,6 +199,7 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
         next.onClipboard = { [weak self] text in
             DispatchQueue.main.async {
                 self?.remoteClipboard = text
+                self?.clipboardInput.text = text
                 self?.statusLabel.text = "收到远程剪贴板"
             }
         }
@@ -188,6 +207,22 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
             DispatchQueue.main.async { self?.setErrorState(message) }
         }
         next.start()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        updateLayoutForOrientation(isLandscape: view.bounds.width > view.bounds.height)
+    }
+
+    override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+        coordinator.animate(alongsideTransition: { [weak self] _ in
+            self?.updateLayoutForOrientation(isLandscape: size.width > size.height)
+        })
+    }
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
+        immersiveMode ? .landscape : .allButUpsideDown
     }
 
     func closeWorkspace() {
@@ -289,14 +324,12 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
         view.addSubview(retryButton)
 
         buildControls()
+        buildCollapsedControls()
 
         keyboardPanel.translatesAutoresizingMaskIntoConstraints = false
-        keyboardPanel.backgroundColor = UIColor(red: 0.07, green: 0.08, blue: 0.12, alpha: 0.98)
-        view.addSubview(keyboardPanel)
+        keyboardPanel.backgroundColor = .clear
 
         keyboardInput.delegate = self
-        keyboardInput.isHidden = false
-        keyboardInput.alpha = 1
         keyboardInput.backgroundColor = UIColor.white.withAlphaComponent(0.08)
         keyboardInput.layer.cornerRadius = 10
         keyboardInput.textColor = .white
@@ -320,19 +353,60 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
         keyboardSendButton.translatesAutoresizingMaskIntoConstraints = false
         keyboardPanel.addSubview(keyboardSendButton)
 
-        keyboardPanelHeightConstraint = keyboardPanel.heightAnchor.constraint(equalToConstant: 0)
-        keyboardContentConstraints = [
-            keyboardInput.topAnchor.constraint(equalTo: keyboardPanel.topAnchor, constant: 7),
-            keyboardInput.bottomAnchor.constraint(equalTo: keyboardPanel.bottomAnchor, constant: -7),
-            keyboardSendButton.centerYAnchor.constraint(equalTo: keyboardInput.centerYAnchor),
-            keyboardSendButton.heightAnchor.constraint(equalToConstant: 44),
+        controlsStack.addArrangedSubview(keyboardPanel)
+
+        clipboardPanel.translatesAutoresizingMaskIntoConstraints = false
+        clipboardPanel.backgroundColor = .clear
+        clipboardInput.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+        clipboardInput.layer.cornerRadius = 10
+        clipboardInput.textColor = .white
+        clipboardInput.tintColor = .white
+        clipboardInput.font = .systemFont(ofSize: 15)
+        clipboardInput.textContainerInset = UIEdgeInsets(top: 8, left: 9, bottom: 8, right: 9)
+        clipboardInput.autocorrectionType = .no
+        clipboardInput.translatesAutoresizingMaskIntoConstraints = false
+        clipboardPanel.addSubview(clipboardInput)
+
+        clipboardSendButton.setTitle("发送", for: .normal)
+        clipboardSendButton.setTitleColor(.white, for: .normal)
+        clipboardSendButton.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
+        clipboardSendButton.backgroundColor = UIColor.white.withAlphaComponent(0.10)
+        clipboardSendButton.layer.cornerRadius = 10
+        clipboardSendButton.addAction(UIAction { [weak self] _ in self?.sendClipboardInput() }, for: .touchUpInside)
+        clipboardSendButton.translatesAutoresizingMaskIntoConstraints = false
+        clipboardPanel.addSubview(clipboardSendButton)
+
+        clipboardCopyButton.setTitle("复制", for: .normal)
+        clipboardCopyButton.setTitleColor(.white, for: .normal)
+        clipboardCopyButton.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
+        clipboardCopyButton.backgroundColor = UIColor.white.withAlphaComponent(0.10)
+        clipboardCopyButton.layer.cornerRadius = 10
+        clipboardCopyButton.addAction(UIAction { [weak self] _ in self?.copyRemoteClipboard() }, for: .touchUpInside)
+        clipboardCopyButton.translatesAutoresizingMaskIntoConstraints = false
+        clipboardPanel.addSubview(clipboardCopyButton)
+        controlsStack.addArrangedSubview(clipboardPanel)
+
+        topBarHeightConstraint = topBar.heightAnchor.constraint(equalToConstant: 78)
+        canvasFullWidthConstraint = canvas.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+        canvasLandscapeWidthConstraint = canvas.trailingAnchor.constraint(equalTo: controlsPanel.leadingAnchor, constant: -8)
+        controlsPanelPortraitConstraints = [
+            controlsPanel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
+            controlsPanel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
+            controlsPanel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8),
+            controlsPanel.heightAnchor.constraint(equalToConstant: 300),
+        ]
+        controlsPanelLandscapeConstraints = [
+            controlsPanel.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 8),
+            controlsPanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8),
+            controlsPanel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8),
+            controlsPanel.widthAnchor.constraint(equalToConstant: 360),
         ]
 
         NSLayoutConstraint.activate([
             topBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             topBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             topBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            topBar.heightAnchor.constraint(equalToConstant: 78),
+            topBarHeightConstraint,
 
             closeButton.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 14),
             closeButton.bottomAnchor.constraint(equalTo: topBar.bottomAnchor, constant: -12),
@@ -357,10 +431,10 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
             keyboardButton.widthAnchor.constraint(equalToConstant: 48),
             keyboardButton.heightAnchor.constraint(equalToConstant: 44),
 
-            canvas.topAnchor.constraint(equalTo: topBar.bottomAnchor),
+            canvas.topAnchor.constraint(equalTo: view.topAnchor),
             canvas.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            canvas.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            canvas.bottomAnchor.constraint(equalTo: keyboardPanel.topAnchor),
+            canvasFullWidthConstraint,
+            canvas.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
             placeholderLabel.centerXAnchor.constraint(equalTo: canvas.centerXAnchor),
             placeholderLabel.centerYAnchor.constraint(equalTo: canvas.centerYAnchor),
@@ -370,91 +444,178 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
             retryButton.topAnchor.constraint(equalTo: placeholderLabel.bottomAnchor, constant: 18),
             retryButton.centerXAnchor.constraint(equalTo: canvas.centerXAnchor),
 
-            keyboardPanel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            keyboardPanel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            keyboardPanel.bottomAnchor.constraint(equalTo: controlsPanel.topAnchor),
-            keyboardPanelHeightConstraint,
-            keyboardInput.leadingAnchor.constraint(equalTo: keyboardPanel.leadingAnchor, constant: 12),
+            keyboardPanel.heightAnchor.constraint(equalToConstant: 58),
+            keyboardInput.topAnchor.constraint(equalTo: keyboardPanel.topAnchor, constant: 7),
+            keyboardInput.bottomAnchor.constraint(equalTo: keyboardPanel.bottomAnchor, constant: -7),
+            keyboardInput.leadingAnchor.constraint(equalTo: keyboardPanel.leadingAnchor),
+            keyboardSendButton.centerYAnchor.constraint(equalTo: keyboardInput.centerYAnchor),
+            keyboardSendButton.heightAnchor.constraint(equalToConstant: 44),
             keyboardSendButton.leadingAnchor.constraint(equalTo: keyboardInput.trailingAnchor, constant: 8),
-            keyboardSendButton.trailingAnchor.constraint(equalTo: keyboardPanel.trailingAnchor, constant: -12),
+            keyboardSendButton.trailingAnchor.constraint(equalTo: keyboardPanel.trailingAnchor),
             keyboardSendButton.widthAnchor.constraint(equalToConstant: 58),
+
+            clipboardPanel.heightAnchor.constraint(equalToConstant: 70),
+            clipboardInput.topAnchor.constraint(equalTo: clipboardPanel.topAnchor),
+            clipboardInput.bottomAnchor.constraint(equalTo: clipboardPanel.bottomAnchor),
+            clipboardInput.leadingAnchor.constraint(equalTo: clipboardPanel.leadingAnchor),
+            clipboardSendButton.centerYAnchor.constraint(equalTo: clipboardInput.centerYAnchor),
+            clipboardSendButton.heightAnchor.constraint(equalToConstant: 44),
+            clipboardSendButton.leadingAnchor.constraint(equalTo: clipboardInput.trailingAnchor, constant: 6),
+            clipboardSendButton.widthAnchor.constraint(equalToConstant: 58),
+            clipboardCopyButton.centerYAnchor.constraint(equalTo: clipboardSendButton.centerYAnchor),
+            clipboardCopyButton.heightAnchor.constraint(equalToConstant: 44),
+            clipboardCopyButton.leadingAnchor.constraint(equalTo: clipboardSendButton.trailingAnchor, constant: 6),
+            clipboardCopyButton.trailingAnchor.constraint(equalTo: clipboardPanel.trailingAnchor),
+            clipboardCopyButton.widthAnchor.constraint(equalToConstant: 58),
+
+            controlsScroll.leadingAnchor.constraint(equalTo: controlsPanel.leadingAnchor, constant: 7),
+            controlsScroll.trailingAnchor.constraint(equalTo: controlsPanel.trailingAnchor, constant: -7),
+            controlsScroll.topAnchor.constraint(equalTo: controlsPanel.topAnchor, constant: 7),
+            controlsScroll.bottomAnchor.constraint(equalTo: controlsPanel.bottomAnchor, constant: -7),
+            controlsStack.leadingAnchor.constraint(equalTo: controlsScroll.contentLayoutGuide.leadingAnchor),
+            controlsStack.trailingAnchor.constraint(equalTo: controlsScroll.contentLayoutGuide.trailingAnchor),
+            controlsStack.topAnchor.constraint(equalTo: controlsScroll.contentLayoutGuide.topAnchor),
+            controlsStack.bottomAnchor.constraint(equalTo: controlsScroll.contentLayoutGuide.bottomAnchor),
+            controlsStack.widthAnchor.constraint(equalTo: controlsScroll.frameLayoutGuide.widthAnchor),
+
+            collapsedControlsPanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            collapsedControlsPanel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
+            collapsedControlsStack.leadingAnchor.constraint(equalTo: collapsedControlsPanel.leadingAnchor, constant: 5),
+            collapsedControlsStack.trailingAnchor.constraint(equalTo: collapsedControlsPanel.trailingAnchor, constant: -5),
+            collapsedControlsStack.topAnchor.constraint(equalTo: collapsedControlsPanel.topAnchor, constant: 5),
+            collapsedControlsStack.bottomAnchor.constraint(equalTo: collapsedControlsPanel.bottomAnchor, constant: -5),
         ])
+
+        setKeyboardVisible(false)
+        setClipboardOpen(false)
+        setControlsExpanded(false)
+        updateLayoutForOrientation(isLandscape: view.bounds.width > view.bounds.height)
     }
 
     private func buildControls() {
         controlsPanel.translatesAutoresizingMaskIntoConstraints = false
         controlsPanel.backgroundColor = UIColor(red: 0.07, green: 0.08, blue: 0.12, alpha: 0.98)
+        controlsPanel.layer.cornerRadius = 16
+        controlsPanel.clipsToBounds = true
         controlsPanel.isHidden = true
         view.addSubview(controlsPanel)
 
         controlsScroll.translatesAutoresizingMaskIntoConstraints = false
-        controlsScroll.showsHorizontalScrollIndicator = false
+        controlsScroll.showsVerticalScrollIndicator = true
+        controlsScroll.alwaysBounceVertical = true
         controlsPanel.addSubview(controlsScroll)
-        controlsStack.axis = .horizontal
+        controlsStack.axis = .vertical
         controlsStack.spacing = 8
-        controlsStack.alignment = .center
+        controlsStack.alignment = .fill
         controlsStack.translatesAutoresizingMaskIntoConstraints = false
         controlsScroll.addSubview(controlsStack)
 
-        let actions: [(String, String, () -> Void)] = [
-            ("适应", "适应屏幕", { [weak self] in self?.canvas.fit() }),
+        controlsStack.addArrangedSubview(makeControlRow([
+            ("⛶", "全屏横屏", { [weak self] in self?.toggleImmersive() }),
+            ("⤢", "适应屏幕", { [weak self] in self?.canvas.fit() }),
             ("−", "缩小画面", { [weak self] in self?.canvas.adjustZoom(0.8) }),
             ("＋", "放大画面", { [weak self] in self?.canvas.adjustZoom(1.25) }),
-            ("重置", "重置画面", { [weak self] in self?.canvas.fit() }),
-            ("只读", "切换只读", { [weak self] in self?.toggleViewOnly() }),
-            ("剪贴板", "打开剪贴板", { [weak self] in self?.showClipboardActions() }),
-            ("⌘", "Command", { [weak self] in self?.sendKey(0xffeb) }),
-            ("⌃", "Control", { [weak self] in self?.sendKey(0xffe3) }),
-            ("⌥", "Option", { [weak self] in self?.sendKey(0xffe9) }),
-            ("⎋", "Escape", { [weak self] in self?.sendKey(0xff1b) }),
-            ("⇥", "Tab", { [weak self] in self?.sendKey(0xff09) }),
+            ("↺", "重置画面", { [weak self] in self?.canvas.fit() }),
+            ("✥", "移动画面", { [weak self] in self?.togglePanMode() }),
+            ("◉", "切换只读", { [weak self] in self?.toggleViewOnly() }),
+            ("⟳", "刷新屏幕", { [weak self] in self?.client?.refresh() }),
+            ("▣", "剪贴板", { [weak self] in self?.setClipboardOpen(!(self?.clipboardOpen ?? false)) }),
+        ]))
+        controlsStack.addArrangedSubview(makeControlRow([
+            ("↵", "回车", { [weak self] in self?.sendKey(0xff0d) }),
+            ("⌫", "删除", { [weak self] in self?.sendKey(0xff08) }),
             ("←", "向左", { [weak self] in self?.sendKey(0xff51) }),
             ("↑", "向上", { [weak self] in self?.sendKey(0xff52) }),
             ("↓", "向下", { [weak self] in self?.sendKey(0xff54) }),
             ("→", "向右", { [weak self] in self?.sendKey(0xff53) }),
-            ("⌫", "删除", { [weak self] in self?.sendKey(0xff08) }),
-            ("↵", "回车", { [weak self] in self?.sendKey(0xff0d) }),
-        ]
+            ("⇥", "Tab", { [weak self] in self?.sendKey(0xff09) }),
+            ("⎋", "Escape", { [weak self] in self?.sendKey(0xff1b) }),
+        ]))
+        controlsStack.addArrangedSubview(makeControlRow([
+            ("⌘Tab", "切换 App", { [weak self] in self?.sendShortcut(keysym: 0xff09, modifier: 0xffeb) }),
+            ("⌘Space", "打开 Spotlight", { [weak self] in self?.sendShortcut(keysym: 0x20, modifier: 0xffeb) }),
+            ("⌘`", "切换窗口", { [weak self] in self?.sendShortcut(keysym: 0x60, modifier: 0xffeb) }),
+            ("⌃↑", "调度中心", { [weak self] in self?.sendShortcut(keysym: 0xff52, modifier: 0xffe3) }),
+            ("⌘", "Command", { [weak self] in self?.sendKey(0xffeb) }),
+            ("⌃", "Control", { [weak self] in self?.sendKey(0xffe3) }),
+            ("⌥", "Option", { [weak self] in self?.sendKey(0xffe9) }),
+        ]))
+    }
+
+    private func buildCollapsedControls() {
+        collapsedControlsPanel.translatesAutoresizingMaskIntoConstraints = false
+        collapsedControlsPanel.backgroundColor = UIColor(red: 0.07, green: 0.08, blue: 0.12, alpha: 0.92)
+        collapsedControlsPanel.layer.cornerRadius = 16
+        collapsedControlsPanel.isHidden = true
+        view.addSubview(collapsedControlsPanel)
+
+        collapsedControlsStack.axis = .horizontal
+        collapsedControlsStack.spacing = 4
+        collapsedControlsStack.alignment = .center
+        collapsedControlsStack.translatesAutoresizingMaskIntoConstraints = false
+        collapsedControlsPanel.addSubview(collapsedControlsStack)
+
+        collapsedControlsStack.addArrangedSubview(makeControlButton(title: "⌨", accessibility: "打开键盘") { [weak self] in
+            self?.setControlsExpanded(true)
+            self?.setKeyboardVisible(true)
+        })
+        collapsedControlsStack.addArrangedSubview(makeControlButton(title: "⛶", accessibility: "全屏横屏") { [weak self] in
+            self?.toggleImmersive()
+        })
+        collapsedControlsStack.addArrangedSubview(makeControlButton(title: "•••", accessibility: "展开操作") { [weak self] in
+            self?.setControlsExpanded(true)
+        })
+    }
+
+    private func makeControlRow(_ actions: [(String, String, () -> Void)]) -> UIView {
+        let scroll = UIScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.showsHorizontalScrollIndicator = false
+        scroll.alwaysBounceHorizontal = true
+
+        let stack = UIStackView()
+        stack.axis = .horizontal
+        stack.spacing = 5
+        stack.alignment = .center
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        scroll.addSubview(stack)
         for (title, accessibility, action) in actions {
-            let button = makeControlButton(title: title, accessibility: accessibility, action: action)
-            controlsStack.addArrangedSubview(button)
+            stack.addArrangedSubview(makeControlButton(title: title, accessibility: accessibility, action: action))
         }
         NSLayoutConstraint.activate([
-            controlsPanel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            controlsPanel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            controlsPanel.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor),
-            controlsPanel.heightAnchor.constraint(equalToConstant: 76),
-            controlsScroll.leadingAnchor.constraint(equalTo: controlsPanel.leadingAnchor, constant: 12),
-            controlsScroll.trailingAnchor.constraint(equalTo: controlsPanel.trailingAnchor, constant: -12),
-            controlsScroll.topAnchor.constraint(equalTo: controlsPanel.topAnchor),
-            controlsScroll.bottomAnchor.constraint(equalTo: controlsPanel.bottomAnchor),
-            controlsStack.leadingAnchor.constraint(equalTo: controlsScroll.contentLayoutGuide.leadingAnchor),
-            controlsStack.trailingAnchor.constraint(equalTo: controlsScroll.contentLayoutGuide.trailingAnchor),
-            controlsStack.topAnchor.constraint(equalTo: controlsScroll.contentLayoutGuide.topAnchor),
-            controlsStack.bottomAnchor.constraint(equalTo: controlsScroll.contentLayoutGuide.bottomAnchor),
-            controlsStack.heightAnchor.constraint(equalTo: controlsScroll.frameLayoutGuide.heightAnchor),
+            scroll.heightAnchor.constraint(equalToConstant: 48),
+            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+            stack.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor),
         ])
+        return scroll
     }
 
     private func setConnectingState() {
+        connected = false
         statusLabel.text = "连接中"
         statusLabel.textColor = UIColor.white.withAlphaComponent(0.70)
         titleLabel.text = desktopTitle
         placeholderLabel.text = "正在连接 Mac 屏幕…"
         placeholderLabel.isHidden = false
         retryButton.isHidden = true
-        controlsPanel.isHidden = true
+        setControlsExpanded(false)
         setKeyboardVisible(false)
+        setClipboardOpen(false)
     }
 
     private func setErrorState(_ message: String) {
+        connected = false
         statusLabel.text = "连接失败"
         statusLabel.textColor = UIColor(red: 1, green: 0.38, blue: 0.38, alpha: 1)
         placeholderLabel.text = message
         placeholderLabel.isHidden = false
         retryButton.isHidden = false
-        controlsPanel.isHidden = true
+        setControlsExpanded(false)
         setKeyboardVisible(false)
+        setClipboardOpen(false)
         fpsTimer?.invalidate()
         fpsTimer = nil
     }
@@ -495,15 +656,13 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
     }
 
     private func toggleKeyboard() {
+        if !controlsExpanded { setControlsExpanded(true) }
         setKeyboardVisible(!keyboardPanelVisible)
     }
 
     private func setKeyboardVisible(_ visible: Bool) {
         keyboardPanelVisible = visible
-        keyboardPanelHeightConstraint?.constant = visible ? 58 : 0
-        keyboardPanel.alpha = visible ? 1 : 0
-        NSLayoutConstraint.deactivate(keyboardContentConstraints)
-        if visible { NSLayoutConstraint.activate(keyboardContentConstraints) }
+        keyboardPanel.isHidden = !visible
         keyboardSendButton.isEnabled = visible && !isViewOnly
         if visible {
             keyboardInput.becomeFirstResponder()
@@ -514,17 +673,32 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
     }
 
     private func toggleControls() {
-        controlsPanel.isHidden.toggle()
-        moreButton.setTitle(controlsPanel.isHidden ? "•••" : "⌄", for: .normal)
-        moreButton.accessibilityLabel = controlsPanel.isHidden ? "更多远程桌面操作" : "收起远程桌面操作"
+        setControlsExpanded(!controlsExpanded)
+    }
+
+    private func setControlsExpanded(_ expanded: Bool) {
+        controlsExpanded = connected && expanded
+        controlsPanel.isHidden = !(connected && controlsExpanded)
+        collapsedControlsPanel.isHidden = !(connected && !controlsExpanded)
+        moreButton.setTitle(controlsExpanded ? "⌄" : "•••", for: .normal)
+        moreButton.accessibilityLabel = controlsExpanded ? "收起远程桌面操作" : "更多远程桌面操作"
+        if !controlsExpanded { setKeyboardVisible(false) }
+        updateLayoutForOrientation(isLandscape: currentLayoutIsLandscape)
     }
 
     private func toggleViewOnly() {
         isViewOnly.toggle()
         client?.viewOnly = isViewOnly
+        canvas.viewOnly = isViewOnly
         keyboardInput.isEditable = !isViewOnly
         keyboardSendButton.isEnabled = keyboardPanelVisible && !isViewOnly
         statusLabel.text = isViewOnly ? "只读" : "已连接"
+    }
+
+    private func togglePanMode() {
+        panMode.toggle()
+        canvas.panMode = panMode
+        statusLabel.text = panMode ? "移动画面" : (isViewOnly ? "只读" : "已连接")
     }
 
     private func sendKey(_ keysym: UInt32) {
@@ -532,23 +706,69 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
         client?.sendKey(keysym: keysym)
     }
 
-    private func showClipboardActions() {
-        let alert = UIAlertController(title: "剪贴板", message: remoteClipboard.isEmpty ? "尚未收到远程剪贴板文字。" : remoteClipboard, preferredStyle: .actionSheet)
-        if !remoteClipboard.isEmpty {
-            alert.addAction(UIAlertAction(title: "复制远程文字", style: .default) { [weak self] _ in
-                UIPasteboard.general.string = self?.remoteClipboard
-            })
+    private func sendShortcut(keysym: UInt32, modifier: UInt32) {
+        guard !isViewOnly else { return }
+        client?.sendKey(keysym: modifier, down: true)
+        client?.sendKey(keysym: keysym, down: true)
+        client?.sendKey(keysym: keysym, down: false)
+        client?.sendKey(keysym: modifier, down: false)
+    }
+
+    private func setClipboardOpen(_ open: Bool) {
+        clipboardOpen = open
+        clipboardInput.text = open ? remoteClipboard : clipboardInput.text
+        clipboardPanel.isHidden = !open
+        UIView.performWithoutAnimation { self.view.layoutIfNeeded() }
+    }
+
+    private func sendClipboardInput() {
+        guard !isViewOnly else { return }
+        client?.sendClipboard(clipboardInput.text ?? "")
+        statusLabel.text = "已发送剪贴板"
+    }
+
+    private func copyRemoteClipboard() {
+        UIPasteboard.general.string = remoteClipboard
+        statusLabel.text = "已复制远程剪贴板"
+    }
+
+    private func toggleImmersive() {
+        immersiveMode.toggle()
+        if #available(iOS 16.0, *), let windowScene = view.window?.windowScene {
+            let orientations: UIInterfaceOrientationMask = immersiveMode ? .landscape : .allButUpsideDown
+            windowScene.requestGeometryUpdate(.iOS(interfaceOrientations: orientations)) { _ in }
+            setNeedsUpdateOfSupportedInterfaceOrientations()
+        } else {
+            let orientation = immersiveMode ? UIInterfaceOrientation.landscapeRight : .portrait
+            UIDevice.current.setValue(orientation.rawValue, forKey: "orientation")
+            UIViewController.attemptRotationToDeviceOrientation()
         }
-        alert.addAction(UIAlertAction(title: "发送本机剪贴板", style: .default) { [weak self] _ in
-            guard let self, !self.isViewOnly else { return }
-            self.client?.sendClipboard(UIPasteboard.general.string ?? "")
-        })
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
-        if let popover = alert.popoverPresentationController {
-            popover.sourceView = moreButton
-            popover.sourceRect = moreButton.bounds
+        updateLayoutForOrientation(isLandscape: view.bounds.width > view.bounds.height)
+    }
+
+    private func updateLayoutForOrientation(isLandscape: Bool) {
+        guard topBarHeightConstraint != nil else { return }
+        let reservesControls = isLandscape && connected && controlsExpanded
+        guard !hasAppliedLayout || currentLayoutIsLandscape != isLandscape || currentLayoutReservesControls != reservesControls else { return }
+        currentLayoutIsLandscape = isLandscape
+        currentLayoutReservesControls = reservesControls
+        hasAppliedLayout = true
+        topBarHeightConstraint.constant = isLandscape ? 52 : 78
+        topBar.backgroundColor = isLandscape ? .clear : UIColor(red: 0.07, green: 0.08, blue: 0.12, alpha: 0.96)
+        titleLabel.isHidden = isLandscape
+        statusLabel.isHidden = isLandscape
+        fpsLabel.isHidden = isLandscape
+        collapsedControlsStack.axis = isLandscape ? .vertical : .horizontal
+
+        NSLayoutConstraint.deactivate(controlsPanelPortraitConstraints + controlsPanelLandscapeConstraints)
+        NSLayoutConstraint.activate(isLandscape ? controlsPanelLandscapeConstraints : controlsPanelPortraitConstraints)
+        NSLayoutConstraint.deactivate([canvasFullWidthConstraint, canvasLandscapeWidthConstraint])
+        if reservesControls {
+            NSLayoutConstraint.activate([canvasLandscapeWidthConstraint])
+        } else {
+            NSLayoutConstraint.activate([canvasFullWidthConstraint])
         }
-        present(alert, animated: true)
+        UIView.performWithoutAnimation { self.view.layoutIfNeeded() }
     }
 
     private func sendKeyboardInput(includeEnter: Bool = false) {
@@ -621,8 +841,8 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
         button.accessibilityLabel = accessibility
         button.addAction(UIAction { _ in action() }, for: .touchUpInside)
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(greaterThanOrEqualToConstant: 48).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        button.widthAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 44).isActive = true
         return button
     }
 
@@ -657,6 +877,8 @@ private final class BridgeRemoteDesktopViewController: UIViewController, UITextV
 
 private final class BridgeRemoteDesktopCanvasView: UIView {
     var pointerHandler: ((UInt16, UInt16, UInt8) -> Void)?
+    var viewOnly = false
+    var panMode = false
 
     private var image: UIImage?
     private var framebufferWidth = 0
@@ -665,7 +887,12 @@ private final class BridgeRemoteDesktopCanvasView: UIView {
     private var pan = CGPoint.zero
     private var activeTouchIDs = Set<ObjectIdentifier>()
     private var pointerIsDown = false
+    private var singlePanActive = false
+    private var lastSinglePoint = CGPoint.zero
     private var previousTwoFingerCenter: CGPoint?
+    private var twoFingerTapCandidate = false
+    private var twoFingerMoved = false
+    private var twoFingerStartedAt: TimeInterval = 0
     private var pinchStartZoom: CGFloat = 1
     private var pinching = false
 
@@ -742,26 +969,50 @@ private final class BridgeRemoteDesktopCanvasView: UIView {
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         for touch in touches { activeTouchIDs.insert(ObjectIdentifier(touch)) }
         if activeTouchIDs.count == 1, let touch = touches.first, !pinching {
-            pointerIsDown = true
-            sendPointer(at: touch.location(in: self), mask: 1)
+            lastSinglePoint = touch.location(in: self)
+            pointerIsDown = !viewOnly && !panMode
+            singlePanActive = panMode || (viewOnly && zoom > 1)
+            if pointerIsDown { sendPointer(at: lastSinglePoint, mask: 1) }
         } else if activeTouchIDs.count >= 2 {
             if pointerIsDown {
                 pointerIsDown = false
                 sendPointer(at: touches.first?.location(in: self) ?? .zero, mask: 0)
             }
+            singlePanActive = false
+            twoFingerTapCandidate = true
+            twoFingerMoved = false
+            twoFingerStartedAt = touches.first?.timestamp ?? 0
             previousTwoFingerCenter = center(of: activeTouchIDs, in: event)
         }
         super.touchesBegan(touches, with: event)
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if activeTouchIDs.count == 1, pointerIsDown, !pinching, let touch = touches.first {
-            sendPointer(at: touch.location(in: self), mask: 1)
+        if activeTouchIDs.count == 1, !pinching, let touch = touches.first {
+            let point = touch.location(in: self)
+            let delta = CGPoint(x: point.x - lastSinglePoint.x, y: point.y - lastSinglePoint.y)
+            if pointerIsDown && zoom > 1 && hypot(delta.x, delta.y) > 8 {
+                pointerIsDown = false
+                singlePanActive = true
+                sendPointer(at: point, mask: 0)
+            }
+            if pointerIsDown {
+                sendPointer(at: point, mask: 1)
+            } else if singlePanActive || panMode || (viewOnly && zoom > 1) {
+                pan.x += delta.x
+                pan.y += delta.y
+                clampPan()
+                setNeedsDisplay()
+            }
+            lastSinglePoint = point
         } else if activeTouchIDs.count >= 2 {
             let current = center(of: activeTouchIDs, in: event)
             if let previous = previousTwoFingerCenter {
-                pan.x += current.x - previous.x
-                pan.y += current.y - previous.y
+                let deltaX = current.x - previous.x
+                let deltaY = current.y - previous.y
+                if hypot(deltaX, deltaY) > 8 { twoFingerMoved = true }
+                pan.x += deltaX
+                pan.y += deltaY
                 clampPan()
                 setNeedsDisplay()
             }
@@ -771,12 +1022,21 @@ private final class BridgeRemoteDesktopCanvasView: UIView {
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if activeTouchIDs.count >= 2, twoFingerTapCandidate, !twoFingerMoved,
+           let touch = touches.first, touch.timestamp - twoFingerStartedAt <= 0.35 {
+            let center = center(of: activeTouchIDs, in: event)
+            sendPointer(at: center, mask: 2)
+            sendPointer(at: center, mask: 0)
+        }
         for touch in touches { activeTouchIDs.remove(ObjectIdentifier(touch)) }
         if pointerIsDown && activeTouchIDs.isEmpty {
             pointerIsDown = false
             sendPointer(at: touches.first?.location(in: self) ?? .zero, mask: 0)
         }
-        if activeTouchIDs.count < 2 { previousTwoFingerCenter = nil }
+        if activeTouchIDs.count < 2 {
+            previousTwoFingerCenter = nil
+            twoFingerTapCandidate = false
+        }
         super.touchesEnded(touches, with: event)
     }
 
@@ -786,6 +1046,8 @@ private final class BridgeRemoteDesktopCanvasView: UIView {
             pointerIsDown = false
             sendPointer(at: touches.first?.location(in: self) ?? .zero, mask: 0)
         }
+        singlePanActive = false
+        twoFingerTapCandidate = false
         previousTwoFingerCenter = nil
         super.touchesCancelled(touches, with: event)
     }
@@ -938,12 +1200,16 @@ private final class BridgeRemoteDesktopClient {
 
     func sendKey(keysym: UInt32) {
         guard !viewOnly else { return }
+        sendKey(keysym: keysym, down: true)
+        sendKey(keysym: keysym, down: false)
+    }
+
+    func sendKey(keysym: UInt32, down: Bool) {
+        guard !viewOnly else { return }
         queue.async { [weak self] in
             guard let self, !self.closed else { return }
-            var data = Data([4, 1, 0, 0])
+            var data = Data([4, down ? 1 : 0, 0, 0])
             data.append(contentsOf: Self.u32(keysym))
-            self.send(data)
-            data[1] = 0
             self.send(data)
         }
     }
@@ -1113,7 +1379,11 @@ private final class BridgeRemoteDesktopClient {
                 switch type {
                 case 0:
                     var reader = RFBDataReader(data: buffer, offset: readOffset)
-                    guard reader.readUInt8() != nil, reader.skip(1), reader.skip(1), let count = reader.readUInt16() else { return }
+                    // FramebufferUpdate is: type (1), padding (1), count (2).
+                    // Skipping two bytes after the type shifts the rectangle
+                    // header by one byte and turns the real encoding into a
+                    // misleading value such as 214.
+                    guard reader.readUInt8() != nil, reader.skip(1), let count = reader.readUInt16() else { return }
                     readOffset = reader.offset
                     phase = .framebufferRects(Int(count))
                     frameDirty = false
@@ -1377,6 +1647,13 @@ private final class BridgeRemoteDesktopClient {
         data.append(contentsOf: Self.u16(0)); data.append(contentsOf: Self.u16(0))
         data.append(contentsOf: Self.u16(UInt16(framebufferWidth))); data.append(contentsOf: Self.u16(UInt16(framebufferHeight)))
         send(data)
+    }
+
+    func refresh() {
+        queue.async { [weak self] in
+            guard let self, !self.closed else { return }
+            self.sendFramebufferUpdateRequest(incremental: false)
+        }
     }
 
     private func send(_ data: Data) {

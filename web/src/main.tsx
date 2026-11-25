@@ -37,6 +37,8 @@ const TestFlight = lazy(() => import("./TestFlight.js").then((module) => ({ defa
 const AppManagement = lazy(() => import("./AppManagement.js").then((module) => ({ default: module.AppManagement })));
 const MobileInboxPage = lazy(() => import("./MobileInboxPage.js").then((module) => ({ default: module.MobileInboxPage })));
 const NearbyTransferPage = lazy(() => import("./NearbyTransferPage.js").then((module) => ({ default: module.NearbyTransferPage })));
+const ComposerTransferUpload = lazy(() => import("./ComposerTransferUpload.js").then((module) => ({ default: module.ComposerTransferUpload })));
+const MobileComposerTransferPage = lazy(() => import("./MobileComposerTransferPage.js").then((module) => ({ default: module.MobileComposerTransferPage })));
 const MobileAppOnlyVpnPocPage = lazy(() => import("./MobileAppOnlyVpnPocPage.js"));
 
 function LegacyDirectTasksRedirect() {
@@ -226,6 +228,8 @@ async function mountApp(): Promise<void> {
                   <Route path="/tasks" element={<App />} />
                   <Route path="/mobile-inbox" element={<MobileInboxPage />} />
                   <Route path="/nearby-transfer" element={<NearbyTransferPage />} />
+                  <Route path="/composer-transfer" element={<ComposerTransferUpload />} />
+                  <Route path="/system-management/app-tools" element={<MobileComposerTransferPage />} />
                   <Route path="/tasks/:source/:taskId" element={<TaskDetailPage />} />
                   <Route path="/direct-tasks" element={<LegacyDirectTasksRedirect />} />
                   <Route path="/codex-history" element={<BackendFeatureGate feature="codex-history"><CodexHistory /></BackendFeatureGate>} />

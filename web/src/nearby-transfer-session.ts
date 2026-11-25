@@ -1,8 +1,9 @@
 import {
-  isMobileApp, nearbyAddListener, nearbyConnect, nearbyGetNetworkInfo, nearbyListReceived,
-  nearbyStartDiscovery, nearbyStartServer, nearbyTransferAvailable,
+  MOBILE_RESUME_EVENT, isMobileApp, nearbyAddListener, nearbyConnect, nearbyDisconnect, nearbyGetNetworkInfo, nearbyListReceived,
+  nearbyStartDiscovery, nearbyStartServer, nearbyStopDiscovery, nearbyTransferAvailable,
 } from "./mobile-runtime.js";
 import { NEARBY_DEFAULT_PORT } from "./nearby-transfer-contract.js";
+import type { NearbyPairingInfo } from "./nearby-pairing.js";
 import type {
   NearbyConnection, NearbyDiagnostic, NearbyFileOffer, NearbyFileProgress, NearbyNetworkInfo, NearbyPeer,
   NearbyReceivedFile, NearbyServerInfo,
@@ -45,9 +46,26 @@ const subscribers = new Set<() => void>();
 const connectionPeerKeys = new Map<string, string>();
 const connectingPeerKeys = new Set<string>();
 const acceptedWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void; timer: number }>();
+const readyConnections = new Set<string>();
+const readyWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void; timer: number }>();
+const completedTransfers = new Set<string>();
+const completionWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void; timer: number }>();
 let initialization: Promise<void> | null = null;
 let listenersAttached = false;
 let localDeviceId = "";
+let lifecycleAttached = false;
+let refreshingDiscovery: Promise<void> | null = null;
+let discoveryRefreshPending = false;
+let networkRefreshTimer: number | null = null;
+
+function scheduleNetworkRefresh(): void {
+  if (snapshot.status === "starting" || snapshot.status === "idle" || snapshot.status === "unavailable") return;
+  if (networkRefreshTimer !== null) window.clearTimeout(networkRefreshTimer);
+  networkRefreshTimer = window.setTimeout(() => {
+    networkRefreshTimer = null;
+    void refreshNearbyDiscovery().catch((cause: unknown) => update({ error: errorMessage(cause, "刷新附近设备失败。") }));
+  }, 600);
+}
 
 export function getNearbyTransferSessionSnapshot(): NearbyTransferSessionSnapshot { return snapshot; }
 
@@ -100,16 +118,24 @@ export function isNearbyPeerBusy(peer: NearbyPeer): boolean {
 
 export async function ensureNearbyTransferSession(): Promise<void> {
   if (initialization) return initialization;
-  initialization = initializeSession();
+  initialization = initializeSession().then(() => {
+    if (snapshot.status === "failed") initialization = null;
+  }, (error: unknown) => {
+    initialization = null;
+    throw error;
+  });
   return initialization;
 }
 
 async function attachListeners(): Promise<void> {
   if (listenersAttached) return;
   await nearbyAddListener("diagnostic", (event) => appendDiagnostic(event));
-  await nearbyAddListener("error", ({ message, connectionId, transferId }) => {
+  await nearbyAddListener("error", ({ code, message, connectionId, transferId }) => {
     if (connectionId && transferId) rejectAcceptedWaiter(connectionId, transferId, new Error(message));
-    update({ error: message });
+    if (code === "NEARBY_SERVER_FAILED") {
+      initialization = null;
+      update({ error: message, status: "failed", server: null });
+    } else update({ error: message });
   });
   await nearbyAddListener("peerFound", ({ peer }) => {
     if (peer.id === localDeviceId) return;
@@ -130,23 +156,50 @@ async function attachListeners(): Promise<void> {
   await nearbyAddListener("connectionState", ({ connection }) => {
     const previousKey = connectionPeerKeys.get(connection.id);
     const key = connectionKey(connection);
+    let offers = snapshot.offers;
     if (connection.peer.deviceId) connectionPeerKeys.set(connection.id, key);
     if (connection.state === "connected") {
       connectingPeerKeys.delete(key);
       if (previousKey) connectingPeerKeys.delete(previousKey);
     }
     if (connection.state === "failed" || connection.state === "closed") {
+      offers = Object.fromEntries(Object.entries(offers).filter(([offerKey]) => !offerKey.startsWith(`${connection.id}:`)));
+      readyConnections.delete(connection.id);
+      finishReadyWaiter(connection.id, new Error(connection.error || "附近设备连接已断开。"));
+      for (const [key, waiter] of acceptedWaiters) {
+        if (key.startsWith(`${connection.id}:`)) { window.clearTimeout(waiter.timer); acceptedWaiters.delete(key); waiter.reject(new Error(connection.error || "附近设备连接已断开。")); }
+      }
+      for (const [key, waiter] of completionWaiters) {
+        if (key.startsWith(`${connection.id}:`)) { window.clearTimeout(waiter.timer); completionWaiters.delete(key); waiter.reject(new Error(connection.error || "附近设备连接已断开。")); }
+      }
       connectingPeerKeys.delete(key);
       if (previousKey) connectingPeerKeys.delete(previousKey);
       connectionPeerKeys.delete(connection.id);
     }
-    update({ connections: { ...snapshot.connections, [connection.id]: connection } });
+    update({ connections: { ...snapshot.connections, [connection.id]: connection }, offers });
   });
+  await nearbyAddListener("peerReady", ({ connectionId }) => {
+    readyConnections.add(connectionId);
+    finishReadyWaiter(connectionId);
+  });
+  await nearbyAddListener("networkChanged", scheduleNetworkRefresh);
   await nearbyAddListener("fileOffer", ({ offer }) => {
     update({ offers: { ...snapshot.offers, [`${offer.connectionId}:${offer.transferId}`]: offer } });
   });
   await nearbyAddListener("fileAccepted", ({ connectionId, transferId }) => {
     resolveAcceptedWaiter(connectionId, transferId);
+  });
+  await nearbyAddListener("fileCompleted", ({ connectionId, transferId }) => {
+    const key = `${connectionId}:${transferId}`;
+    const waiter = completionWaiters.get(key);
+    if (waiter) {
+      window.clearTimeout(waiter.timer);
+      completionWaiters.delete(key);
+      waiter.resolve();
+    } else {
+      completedTransfers.add(key);
+      if (completedTransfers.size > 200) completedTransfers.delete(completedTransfers.values().next().value!);
+    }
   });
   await nearbyAddListener("fileProgress", ({ progress }) => {
     const key = `${progress.connectionId}:${progress.transferId}`;
@@ -176,10 +229,18 @@ async function initializeSession(): Promise<void> {
   }
   update({ status: "starting", available: true, error: "" });
   await attachListeners();
+  if (!lifecycleAttached) {
+    lifecycleAttached = true;
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) scheduleNetworkRefresh();
+    });
+    window.addEventListener("online", scheduleNetworkRefresh);
+    window.addEventListener(MOBILE_RESUME_EVENT, scheduleNetworkRefresh);
+  }
   recordDiagnostic("info", "web.setup.start", "开始启动附近传文件本机服务");
 
   const [serverResult, networkResult] = await Promise.allSettled([
-    withTimeout(nearbyStartServer("", NEARBY_DEFAULT_PORT), 10_000, "启动本机服务超时（10 秒）。"),
+    withTimeout(nearbyStartServer("", NEARBY_DEFAULT_PORT), 25_000, "启动本机服务超时，请检查局域网权限后重试。"),
     nearbyGetNetworkInfo(),
   ]);
 
@@ -234,7 +295,7 @@ export async function connectNearbyPeer(peer: NearbyPeer): Promise<{ connectionI
 
 export async function connectNearbyHost(host: string, port: number): Promise<{ connectionId?: string; alreadyConnected: boolean }> {
   await ensureNearbyTransferSession();
-  const peer: NearbyPeer = { id: host, name: "iPhone 热点", host, port, source: "hotspot" };
+  const peer: NearbyPeer = { id: host, name: "热点设备", host, port, source: "hotspot" };
   if (isNearbyPeerBusy(peer)) return { alreadyConnected: true };
   connectingPeerKeys.add(peerKey(peer));
   try {
@@ -247,6 +308,70 @@ export async function connectNearbyHost(host: string, port: number): Promise<{ c
   }
 }
 
+export async function connectNearbyQr(info: NearbyPairingInfo): Promise<{ connectionId?: string; alreadyConnected: boolean }> {
+  await ensureNearbyTransferSession();
+  if (info.deviceId === localDeviceId.toLowerCase()) throw new Error("不能连接本机二维码。");
+  const peer: NearbyPeer = { id: info.deviceId, deviceId: info.deviceId, name: info.name, source: "qr" };
+  const key = peerKey(peer);
+  if (isNearbyPeerBusy(peer)) return { alreadyConnected: true };
+  connectingPeerKeys.add(key);
+  let lastError: unknown;
+  try {
+    for (const host of info.addresses) {
+      let connectionId = "";
+      try {
+        recordDiagnostic("info", "web.qr.connect", `尝试 ${host}:${info.port}`);
+        const result = await nearbyConnect({ host, port: info.port, token: info.token, deviceId: info.deviceId, name: info.name, source: "qr" });
+        connectionId = result.connectionId;
+        connectionPeerKeys.set(connectionId, key);
+        await waitForNearbyPeerReady(connectionId);
+        readyConnections.delete(connectionId);
+        return { connectionId, alreadyConnected: false };
+      } catch (cause) {
+        lastError = cause;
+        if (connectionId) {
+          await nearbyDisconnect(connectionId).catch(() => {});
+          connectionPeerKeys.delete(connectionId);
+          readyConnections.delete(connectionId);
+          const connections = { ...snapshot.connections };
+          delete connections[connectionId];
+          update({ connections });
+        }
+        connectingPeerKeys.add(key);
+      }
+    }
+    throw new Error(`无法连接 ${info.name}，请确认双方在同一可互通的网络并刷新二维码。${lastError instanceof Error ? `（${lastError.message}）` : ""}`);
+  } catch (cause) {
+    connectingPeerKeys.delete(key);
+    throw cause;
+  }
+}
+
+function waitForNearbyPeerReady(connectionId: string): Promise<void> {
+  if (readyConnections.has(connectionId)) return Promise.resolve();
+  const connection = snapshot.connections[connectionId];
+  if (connection?.state === "failed" || connection?.state === "closed") return Promise.reject(new Error(connection.error || "附近设备连接已断开。"));
+  return new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(() => finishReadyWaiter(connectionId, new Error("连接超时。")), 8_000);
+    readyWaiters.set(connectionId, { resolve, reject, timer });
+  });
+}
+
+function finishReadyWaiter(connectionId: string, error?: Error): void {
+  const waiter = readyWaiters.get(connectionId);
+  if (!waiter) return;
+  window.clearTimeout(waiter.timer);
+  readyWaiters.delete(connectionId);
+  if (error) waiter.reject(error);
+  else waiter.resolve();
+}
+
+export async function refreshNearbyNetwork(): Promise<NearbyNetworkInfo> {
+  const network = await nearbyGetNetworkInfo();
+  update({ network });
+  return network;
+}
+
 export async function waitForNearbyFileAccepted(connectionId: string, transferId: string, timeoutMs = 60_000): Promise<void> {
   const key = `${connectionId}:${transferId}`;
   return new Promise<void>((resolve, reject) => {
@@ -255,6 +380,26 @@ export async function waitForNearbyFileAccepted(connectionId: string, transferId
       reject(new Error("等待对方接受文件超时。"));
     }, timeoutMs);
     acceptedWaiters.set(key, { resolve, reject, timer });
+  });
+}
+
+export function cancelNearbyFileAccepted(connectionId: string, transferId: string): void {
+  const key = `${connectionId}:${transferId}`;
+  const waiter = acceptedWaiters.get(key);
+  if (!waiter) return;
+  window.clearTimeout(waiter.timer);
+  acceptedWaiters.delete(key);
+  waiter.resolve();
+}
+
+export function waitForNearbyFileCompleted(connectionId: string, transferId: string, timeoutMs = 60_000): Promise<void> {
+  const key = `${connectionId}:${transferId}`;
+  if (completedTransfers.delete(key)) return Promise.resolve();
+  const connection = snapshot.connections[connectionId];
+  if (connection?.state === "failed" || connection?.state === "closed") return Promise.reject(new Error(connection.error || "附近设备连接已断开。"));
+  return new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(() => { completionWaiters.delete(key); reject(new Error("未收到对方的文件接收确认。")); }, timeoutMs);
+    completionWaiters.set(key, { resolve, reject, timer });
   });
 }
 
@@ -290,9 +435,31 @@ export function removeNearbyOffer(connectionId: string, transferId: string): voi
   update({ offers });
 }
 
+export function markNearbyOfferAccepted(connectionId: string, transferId: string): void {
+  const key = `${connectionId}:${transferId}`;
+  const offer = snapshot.offers[key];
+  if (offer) update({ offers: { ...snapshot.offers, [key]: { ...offer, accepted: true } } });
+}
+
 export async function refreshNearbyDiscovery(): Promise<void> {
-  update({ peers: {} });
-  await nearbyStartDiscovery();
+  if (refreshingDiscovery) { discoveryRefreshPending = true; return refreshingDiscovery; }
+  refreshingDiscovery = (async () => {
+    do {
+      discoveryRefreshPending = false;
+      update({ error: "" });
+      if (!snapshot.server) {
+        await ensureNearbyTransferSession();
+        if (!snapshot.server) throw new Error(snapshot.error || "附近传文件服务未启动。请重试。");
+      }
+      const server = await withTimeout(nearbyStartServer("", NEARBY_DEFAULT_PORT), 25_000, "附近服务启动超时，请检查局域网权限后重试。");
+      localDeviceId = server.deviceId;
+      const network = await nearbyGetNetworkInfo();
+      await nearbyStopDiscovery();
+      update({ peers: {}, server, network });
+      await nearbyStartDiscovery();
+    } while (discoveryRefreshPending);
+  })().finally(() => { refreshingDiscovery = null; });
+  return refreshingDiscovery;
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {

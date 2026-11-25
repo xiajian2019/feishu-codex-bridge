@@ -1,4 +1,5 @@
 import { getLocalDraftScope, scopedStorageKey } from "./local-draft-scope.js";
+import { isComposerAssetReference, type ComposerAssetReference } from "./composer-asset-client.js";
 
 export type DraftAttachment = {
   id: string;
@@ -6,12 +7,14 @@ export type DraftAttachment = {
   contentType: string;
   size: number;
   lastModified: number;
+  remote?: ComposerAssetReference;
 };
 
 export type TmuxDraft = {
   version: 1;
   text: string;
   attachments: DraftAttachment[];
+  importedTransferIds?: string[];
   updatedAt: number;
 };
 
@@ -68,7 +71,11 @@ export function loadDraftMetadata(sessionId: string): TmuxDraft | null {
         && typeof attachment.contentType === "string"
         && Number.isFinite(attachment.size)
         && Number.isFinite(attachment.lastModified)
+        && (attachment.remote === undefined || isComposerAssetReference(attachment.remote))
       )),
+      importedTransferIds: Array.isArray(draft.importedTransferIds)
+        ? draft.importedTransferIds.filter((id): id is string => typeof id === "string" && /^composer_transfer_[a-f0-9-]{36}$/i.test(id)).slice(-1000)
+        : [],
       updatedAt: Number.isFinite(draft.updatedAt) ? Number(draft.updatedAt) : 0,
     };
   } catch {
@@ -76,19 +83,22 @@ export function loadDraftMetadata(sessionId: string): TmuxDraft | null {
   }
 }
 
-export function saveDraftMetadata(sessionId: string, draft: Omit<TmuxDraft, "version" | "updatedAt">, expectedScope = getLocalDraftScope()): void {
-  if (expectedScope !== getLocalDraftScope()) return;
+export function saveDraftMetadata(sessionId: string, draft: Omit<TmuxDraft, "version" | "updatedAt">, expectedScope = getLocalDraftScope()): boolean {
+  if (expectedScope !== getLocalDraftScope()) return false;
   const key = metadataKey(sessionId);
-  if (!key) return;
+  if (!key) return false;
   try {
     window.localStorage.setItem(key, JSON.stringify({
       version: 1,
       text: draft.text,
       attachments: draft.attachments,
+      importedTransferIds: draft.importedTransferIds,
       updatedAt: Date.now(),
     } satisfies TmuxDraft));
+    return true;
   } catch {
     // Private browsing or a full storage quota should not block message entry.
+    return false;
   }
 }
 

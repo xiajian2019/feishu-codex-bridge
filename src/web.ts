@@ -45,7 +45,8 @@ import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import { isNativeAppOrigin, MobileStreamTickets, type MobileStreamAuthorization } from "./mobile-auth.js";
 import { RemoteDesktopProxy, type RemoteDesktopConnector } from "./remote-desktop-proxy.js";
 import { listRemoteDesktopDisplays, type RemoteDesktopDisplay } from "./remote-desktop-displays.js";
-import { MobileApkStore } from "./mobile-apk.js";
+import { MobileApkStore, type MobileApkMetadata } from "./mobile-apk.js";
+import { MobileAndroidBuild } from "./mobile-android-build.js";
 import { MobileIosDeviceInstall } from "./mobile-ios-device-install.js";
 import { DemoBrowserAccess } from "./demo-browser-access.js";
 import {
@@ -197,6 +198,8 @@ export class DashboardServer {
   private readonly webRoot: string;
   private readonly taskAttachmentsDirectory: string;
   private readonly mobileApks: MobileApkStore;
+  private readonly managedMobileApkCache = new Map<string, { key: string; latest: MobileApkMetadata | null; error: string | null }>();
+  private readonly mobileAndroidBuild = new MobileAndroidBuild();
   private readonly mobileIosOta: MobileIosOta;
   private readonly mobileIosTestflight: MobileIosTestflight;
   private readonly mobileIosDeviceInstall: MobileIosDeviceInstall;
@@ -414,6 +417,10 @@ export class DashboardServer {
       }
       return;
     }
+    if (url.pathname.startsWith("/api/composer-transfers") && this.options.tmuxDashboard) {
+      await this.options.tmuxDashboard.handlePublicComposerTransferRequest(request, response);
+      return;
+    }
     if (request.method === "POST" && url.pathname === "/api/remote-desktop/ticket") {
       if (!this.requireAuthorization(request, response) || !this.requireActionAuthorization(request, response)) return;
       try {
@@ -438,7 +445,7 @@ export class DashboardServer {
           schemaVersion: 1, protocolVersion: 1, minimumClientProtocol: 1,
           version: await readBridgeVersion(),
           features: ["download-uploads", "mobile-apk-update", "mobile-ios-ota", "mobile-ios-testflight", "mobile-app-management", "backups", "remote-desktop",
-            ...(this.options.tmuxDashboard ? ["tmux"] : []),
+            ...(this.options.tmuxDashboard ? ["tmux", "composer-transfer-assets"] : []),
             ...(this.options.codexHistory ? ["codex-history"] : [])],
         } } : {}),
       });
@@ -559,6 +566,7 @@ export class DashboardServer {
         response,
         this.auth.currentDeviceId(request),
         () => this.auth.isAuthorized(request),
+        this.auth.connectionAuthorization(request),
       );
       return;
     }
@@ -572,6 +580,7 @@ export class DashboardServer {
         && url.pathname !== "/system-management/devices"
         && url.pathname !== "/system-management/shortcuts"
         && url.pathname !== "/system-management/backups"
+        && url.pathname !== "/composer-transfer"
       ) {
         sendJson(response, 401, { error: "pairing required" });
         return;
@@ -617,7 +626,7 @@ export class DashboardServer {
       response.setHeader("Referrer-Policy", "no-referrer");
       const appMatch = /^\/api\/mobile\/apps\/([^/]+)$/.exec(url.pathname);
       const androidDownloadMatch = /^\/api\/mobile\/apps\/([^/]+)\/android\/download$/.exec(url.pathname);
-      const appActionMatch = /^\/api\/mobile\/apps\/([^/]+)\/ios\/(testflight\/upload|install)$/.exec(url.pathname);
+      const appActionMatch = /^\/api\/mobile\/apps\/([^/]+)\/(?:ios\/(?:testflight\/upload|install)|android\/build)$/.exec(url.pathname);
       if (request.method === "GET" && androidDownloadMatch) {
         const app = this.options.db.getMobileApp(decodeURIComponent(androidDownloadMatch[1]!));
         if (!app?.android) { sendJson(response, 404, { error: "Android App 不存在或未配置 APK。" }); return; }
@@ -647,9 +656,15 @@ export class DashboardServer {
         if (request.method === "GET") {
           sendJson(response, 200, await this.mobileAppPayload(app));
         } else if (request.method === "PATCH" && appMatch) {
-          const updated = this.options.db.updateMobileApp(app.id, parseMobileAppPatch(await readJsonBody(request)));
+          if (app.android && this.mobileAndroidBuild.status(app).state === "running") {
+            sendJson(response, 409, { error: "Android 构建正在进行中，请完成后再编辑配置。" }); return;
+          }
+          const updated = this.options.db.updateMobileApp(app.id, parseMobileAppPatch(await readJsonBody(request), app));
           if (!updated) sendJson(response, 404, { error: "App 不存在。" });
           else sendJson(response, 200, await this.mobileAppPayload(updated));
+        } else if (request.method === "POST" && url.pathname.endsWith("/android/build")) {
+          this.mobileAndroidBuild.start(app);
+          sendJson(response, 202, await this.mobileAppPayload(this.options.db.getMobileApp(app.id)!));
         } else if (request.method === "POST" && url.pathname.endsWith("/ios/testflight/upload")) {
           if (!app.ios) { sendJson(response, 409, { error: "该 App 未配置 iOS。" }); return; }
           this.mobileIosTestflight.startUpload(toIosTestflightApp(app));
@@ -1523,12 +1538,24 @@ export class DashboardServer {
     } : null;
     let android: Record<string, unknown> | null = null;
     if (app.android) {
-      try {
-        android = { config: app.android, latest: await this.managedMobileApkStore(app).latest(), error: null };
-      } catch (error) {
-        this.options.logger?.warn("managed Android APK metadata is unavailable", { appId: app.id, error: error instanceof Error ? error.message : String(error) });
-        android = { config: app.android, latest: null, error: "APK 文件或 output-metadata.json 不可用，请检查 App 配置。" };
+      const build = this.mobileAndroidBuild.status(app);
+      const key = JSON.stringify([app.android.package_name, app.android.apk_path, app.android.snapshot_directory]);
+      const cached = this.managedMobileApkCache.get(app.id);
+      let artifact: { key: string; latest: MobileApkMetadata | null; error: string | null };
+      if (build.state === "running" && cached?.key === key) {
+        // Gradle may remove or replace the output while building. Keep the last
+        // immutable snapshot available and avoid copying the APK on every poll.
+        artifact = cached;
+      } else {
+        try {
+          artifact = { key, latest: await this.managedMobileApkStore(app).latest(), error: null };
+        } catch (error) {
+          this.options.logger?.warn("managed Android APK metadata is unavailable", { appId: app.id, error: error instanceof Error ? error.message : String(error) });
+          artifact = { key, latest: null, error: "APK 文件或 output-metadata.json 不可用，请检查 App 配置。" };
+        }
+        this.managedMobileApkCache.set(app.id, artifact);
       }
+      android = { config: app.android, build, latest: artifact.latest, error: artifact.error };
     }
     return { app, ios, android };
   }
@@ -3701,7 +3728,7 @@ export class DashboardServer {
     response.setHeader("Access-Control-Expose-Headers", "Content-Disposition, Retry-After");
     if (request.method === "OPTIONS") {
       const methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
-      const headers = ["authorization", "content-type", "x-bridge-action-token", "x-file-name", "x-bridge-client", "x-bridge-ssh-session-id", "x-bridge-session-created-at", "x-bridge-ssh-host", "x-bridge-ssh-port", "x-bridge-ssh-username"];
+      const headers = ["authorization", "content-type", "x-bridge-action-token", "x-bridge-transfer-token", "x-bridge-transfer-code", "x-file-name", "x-bridge-client", "x-bridge-ssh-session-id", "x-bridge-session-created-at", "x-bridge-ssh-host", "x-bridge-ssh-port", "x-bridge-ssh-username"];
       const requestedMethod = firstHeaderValue(request.headers["access-control-request-method"]);
       const requestedHeaders = firstHeaderValue(request.headers["access-control-request-headers"])
         ?.toLowerCase().split(",").map((value) => value.trim()).filter(Boolean) ?? [];
@@ -3716,7 +3743,15 @@ export class DashboardServer {
       response.end();
       return false;
     }
-    const publicRoute = url.pathname === "/api/auth/mobile/pair" || url.pathname === "/api/auth/status" || url.pathname === "/healthz";
+    // Composer transfer links are intentionally usable from a freshly opened
+    // native App. The QR code/one-time transfer token is the capability for
+    // this flow; requiring the App's normal Bearer token here turns a valid
+    // scan into a misleading network failure when the App is not paired to
+    // the same Bridge environment yet.
+    const composerTransferRoute = url.pathname === "/api/composer-transfers/claim"
+      || url.pathname.startsWith("/api/composer-transfers/");
+    const publicRoute = url.pathname === "/api/auth/mobile/pair" || url.pathname === "/api/auth/status"
+      || url.pathname === "/healthz" || composerTransferRoute;
     const streamTicket = request.method === "GET" && url.pathname === "/api/events" && url.searchParams.has("bridgeTicket");
     if (!publicRoute && !streamTicket && !this.auth.isBearerAuthorized(request)) {
       sendJson(response, 401, { error: "bearer token required" });
@@ -3788,14 +3823,23 @@ function parseMobileAppInput(body: Record<string, unknown>): StoredMobileAppInpu
     package_name: text(androidBody.packageName ?? androidBody.package_name),
     apk_path: text(androidBody.apkPath ?? androidBody.apk_path),
     snapshot_directory: text(androidBody.snapshotDirectory ?? androidBody.snapshot_directory),
+    source_path: text(androidBody.sourcePath ?? androidBody.source_path),
+    build_script: text(androidBody.buildScript ?? androidBody.build_script),
   } : null;
   return {
     name: text(body.name), enabled: body.enabled !== false, ios, android,
   };
 }
 
-function parseMobileAppPatch(body: Record<string, unknown>): Partial<StoredMobileAppInput> {
-  return parseMobileAppInput(body);
+function parseMobileAppPatch(body: Record<string, unknown>, existing: StoredMobileApp): Partial<StoredMobileAppInput> {
+  const input = parseMobileAppInput(body);
+  const android = body.android;
+  if (input.android && existing.android && android && typeof android === "object" && !Array.isArray(android)) {
+    const fields = android as Record<string, unknown>;
+    if (!("sourcePath" in fields) && !("source_path" in fields)) input.android.source_path = existing.android.source_path;
+    if (!("buildScript" in fields) && !("build_script" in fields)) input.android.build_script = existing.android.build_script;
+  }
+  return input;
 }
 
 function parseMobileIosConfig(body: Record<string, unknown>): StoredMobileIosConfig {
@@ -3854,12 +3898,14 @@ function isSpaRoute(pathname: string): boolean {
     || pathname === "/system-management/workspaces"
     || pathname === "/system-management/settings"
     || pathname === "/system-management/apps"
+    || pathname === "/system-management/app-tools"
     || pathname === "/system-management/testflight"
     || pathname === "/system-management/automations"
     || pathname === "/system-management/machines"
     || pathname === "/direct-tasks"
     || pathname === "/system-management/projects"
     || pathname === "/tasks"
+    || pathname === "/composer-transfer"
     || /^\/tasks\/(?:desk|direct|aamp)\/[^/]+$/.test(pathname)
     || pathname === "/codex-history"
     || /^\/codex-history\/[^/]+\/[^/]+$/.test(pathname)

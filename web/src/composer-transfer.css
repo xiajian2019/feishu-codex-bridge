@@ -1,0 +1,171 @@
+.composer-transfer-backdrop {
+  position: fixed;
+  z-index: 2600;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: #0008;
+}
+
+.composer-transfer-dialog {
+  width: min(100%, 460px);
+  max-height: min(760px, 90dvh);
+  overflow: auto;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: 0 18px 60px #0005;
+}
+
+.composer-transfer-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.composer-transfer-heading h2 { margin: 2px 0 0; }
+.composer-transfer-heading button { min-width: 32px; min-height: 32px; font-size: 20px; }
+.composer-transfer-qr { display: block; width: min(240px, 100%); height: auto; aspect-ratio: 1; margin: 12px auto; border-radius: 8px; background: #fff; }
+.composer-transfer-target { margin-top: 12px; text-align: center; }
+.composer-transfer-target p { margin: 8px 0; }
+.composer-transfer-hint { color: var(--muted); font-size: 13px; }
+.composer-transfer-context { display: flex; min-width: 0; align-items: baseline; gap: 6px; font-size: clamp(11px, 3.25vw, 13px); white-space: nowrap; }
+.composer-transfer-context-session, .composer-transfer-context-bridge { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.composer-transfer-context-session { flex: 0 0 auto; max-width: 40%; }
+.composer-transfer-context-bridge { flex: 1 1 auto; }
+.composer-transfer-card { margin-top: 14px; padding: 12px; border: 1px solid var(--accent); border-radius: 10px; background: var(--accent-soft); }
+.composer-transfer-card p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.composer-transfer-card ul { margin: 8px 0; padding: 0; list-style: none; }
+.composer-transfer-card li { overflow-wrap: anywhere; }
+.composer-transfer-card button { min-height: 36px; }
+.composer-transfer-error { color: var(--danger); }
+.composer-transfer-notice { color: var(--success, #16803c); }
+
+.composer-transfer-upload-page {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  place-items: start center;
+  padding: 20px 16px 28px;
+}
+
+.composer-transfer-upload-card {
+  width: min(100%, 620px);
+  box-sizing: border-box;
+  margin: 0;
+}
+
+/* This is a page, not the scrollable receiver dialog. */
+.composer-transfer-dialog.composer-transfer-upload-card { max-height: none; overflow: visible; }
+
+/* Keep content from showing through the App status-bar inset when scrolling. */
+html.bridge-mobile-app .system-navigation-shell.is-composer-transfer:not(.is-collapsed)::before {
+  position: absolute;
+  right: 0;
+  bottom: 100%;
+  left: 0;
+  height: var(--bridge-safe-top, 0px);
+  background: var(--card);
+  content: "";
+  pointer-events: none;
+}
+
+.composer-transfer-upload-card h1 {
+  margin: 4px 0 18px;
+  font-size: clamp(28px, 7vw, 42px);
+  line-height: 1.12;
+  letter-spacing: -0.03em;
+}
+
+.composer-transfer-upload-card form {
+  display: grid;
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.composer-transfer-field {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.composer-transfer-field textarea,
+.composer-transfer-field input[type="file"] {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg, var(--card));
+  color: var(--ink);
+  font: inherit;
+}
+
+.composer-transfer-field textarea {
+  min-height: 112px;
+  padding: 12px;
+  resize: vertical;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+.composer-transfer-field input[type="file"] {
+  padding: 10px;
+  font-size: 14px;
+}
+
+.composer-transfer-field small { color: var(--muted); font-size: 12px; font-weight: 400; }
+.composer-transfer-file-list { display: grid; gap: 6px; margin: -4px 0 0; padding: 0; list-style: none; }
+.composer-transfer-file-list li { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; padding: 7px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); }
+.composer-transfer-file-main { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.composer-transfer-file-thumbnail,
+.composer-transfer-file-type { display: grid; width: 44px; height: 44px; flex: 0 0 44px; place-items: center; overflow: hidden; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--paper); font-size: 9px; font-weight: 800; letter-spacing: .04em; }
+.composer-transfer-file-list li .composer-transfer-file-thumbnail { min-height: 44px; padding: 0; cursor: zoom-in; }
+.composer-transfer-file-thumbnail img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.composer-transfer-file-name { min-width: 0; overflow: hidden; padding: 3px 0; border: 0; color: var(--ink); background: transparent; font: inherit; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.composer-transfer-file-name:not(:disabled) { cursor: zoom-in; }
+.composer-transfer-file-name:not(:disabled):hover { color: var(--accent); }
+.composer-transfer-file-list li button { flex: 0 0 auto; min-height: 28px; padding: 3px 8px; }
+.composer-transfer-file-list li .composer-transfer-file-name { flex: 0 1 auto; }
+.composer-transfer-file-main { flex: 1 1 auto; }
+
+.composer-transfer-diagnostics { margin-top: 14px; color: var(--muted); font-size: 12px; }
+.composer-transfer-diagnostics summary { cursor: pointer; }
+.composer-transfer-diagnostics-body { margin-top: 8px; }
+.composer-transfer-diagnostics-body button { min-height: 32px; padding: 4px 9px; font-size: 12px; }
+.composer-transfer-diagnostics-body span { margin-left: 8px; }
+.composer-transfer-diagnostics-body pre { max-height: 220px; overflow: auto; padding: 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--paper); font-size: 11px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+
+.composer-transfer-preview-backdrop { position: fixed; z-index: 2800; inset: 0; display: grid; place-items: center; padding: 16px; background: #081018c7; backdrop-filter: blur(7px); }
+.composer-transfer-preview { display: grid; width: min(100%, 780px); max-height: min(90dvh, 860px); grid-template-rows: auto minmax(0, 1fr); overflow: hidden; border: 1px solid #ffffff2b; border-radius: 18px; color: #f8fafc; background: #111923; box-shadow: 0 24px 80px #0009; }
+.composer-transfer-preview header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 15px; border-bottom: 1px solid #ffffff1c; }
+.composer-transfer-preview header > div { display: grid; min-width: 0; gap: 3px; }
+.composer-transfer-preview header strong { font-size: 14px; }
+.composer-transfer-preview header small { overflow: hidden; color: #aab7c7; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.composer-transfer-preview header button { display: grid; width: 34px; height: 34px; min-height: 34px; place-items: center; padding: 0 0 3px; border: 1px solid #ffffff2b; border-radius: 9px; color: #f8fafc; background: #ffffff12; font-size: 25px; line-height: 1; }
+.composer-transfer-preview-canvas { display: grid; min-height: 180px; place-items: center; overflow: auto; padding: 18px; background: repeating-conic-gradient(#182331 0 25%, #111923 0 50%) 50% / 18px 18px; }
+.composer-transfer-preview-canvas img { display: block; max-width: 100%; max-height: calc(90dvh - 100px); object-fit: contain; }
+.composer-transfer-preview-canvas p { color: #aab7c7; }
+
+@media (max-width: 760px) {
+  .composer-transfer-preview-backdrop { align-items: end; padding: 0; }
+  .composer-transfer-preview { width: 100%; max-height: calc(100dvh - var(--bridge-safe-top, 0px)); border-radius: 18px 18px 0 0; padding-bottom: var(--bridge-safe-bottom, 0px); }
+  .composer-transfer-preview-canvas img { max-height: calc(100dvh - 130px); }
+}
+
+@media (max-width: 760px) {
+  .composer-transfer-backdrop {
+    --composer-transfer-safe-top: max(16px, var(--bridge-safe-top, env(safe-area-inset-top, 0px)));
+    --composer-transfer-safe-bottom: max(16px, var(--bridge-safe-bottom, env(safe-area-inset-bottom, 0px)));
+    padding: var(--composer-transfer-safe-top) max(16px, var(--bridge-safe-right, env(safe-area-inset-right, 0px))) var(--composer-transfer-safe-bottom) max(16px, var(--bridge-safe-left, env(safe-area-inset-left, 0px)));
+  }
+  .composer-transfer-backdrop .composer-transfer-dialog { max-height: min(760px, calc(100dvh - var(--composer-transfer-safe-top) - var(--composer-transfer-safe-bottom))); }
+  .composer-transfer-dialog.composer-transfer-upload-card { width: 100%; border-radius: 14px; padding: 16px; }
+}

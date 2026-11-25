@@ -500,6 +500,20 @@ export interface MobileAndroidConfig {
   package_name: string;
   apk_path: string;
   snapshot_directory: string;
+  source_path: string;
+  build_script: string;
+}
+
+export interface MobileAndroidBuildStatus {
+  available: boolean;
+  sourcePath: string | null;
+  scriptPath: string | null;
+  state: "idle" | "running" | "succeeded" | "failed";
+  message?: string;
+  unavailableReason?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  log?: string;
 }
 
 export interface MobileAppRecord {
@@ -550,7 +564,7 @@ export interface MobileApkArtifact {
 export interface MobileAppView {
   app: MobileAppRecord;
   ios: { config: MobileIosConfig; testflight: IosTestflightStatus; deviceInstall: MobileIosDeviceInstallStatus } | null;
-  android: { config: MobileAndroidConfig; latest: MobileApkArtifact | null; error: string | null } | null;
+  android: { config: MobileAndroidConfig; build: MobileAndroidBuildStatus; latest: MobileApkArtifact | null; error: string | null } | null;
 }
 
 export interface MobileAppInput {
@@ -570,7 +584,7 @@ export interface MobileAppInput {
     infoPlistPath: string;
     internalOnly: boolean;
   } | null;
-  android: { packageName: string; apkPath: string; snapshotDirectory: string } | null;
+  android: { packageName: string; apkPath: string; snapshotDirectory: string; sourcePath: string; buildScript: string } | null;
 }
 
 export async function fetchMobileApps(): Promise<MobileAppView[]> {
@@ -589,6 +603,13 @@ export async function updateMobileApp(id: string, input: MobileAppInput): Promis
   const token = await getActionToken();
   return getJson<MobileAppView>(`/api/mobile/apps/${encodeURIComponent(id)}`, {
     method: "PATCH", headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token }, body: JSON.stringify(input),
+  });
+}
+
+export async function buildMobileAppOnAndroid(id: string): Promise<MobileAppView> {
+  const token = await getActionToken();
+  return getJson<MobileAppView>(`/api/mobile/apps/${encodeURIComponent(id)}/android/build`, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token }, body: JSON.stringify({}),
   });
 }
 

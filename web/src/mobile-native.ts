@@ -124,7 +124,8 @@ interface BridgeNearbyTransferPlugin {
   startDiscovery(): Promise<void>;
   stopDiscovery(): Promise<void>;
   getNetworkInfo(): Promise<NearbyNetworkInfo>;
-  connect(options: { peerId?: string; host?: string; port?: number; token?: string; name?: string; source?: "mdns" | "hotspot" }): Promise<{ connectionId: string }>;
+  connect(options: { peerId?: string; host?: string; port?: number; token?: string; deviceId?: string; name?: string; source?: "mdns" | "hotspot" | "qr" }): Promise<{ connectionId: string }>;
+  disconnect(options: { connectionId: string }): Promise<void>;
   pickFile(): Promise<NearbyFileSelection>;
   acceptConnection(options: { connectionId: string }): Promise<void>;
   rejectConnection(options: { connectionId: string }): Promise<void>;
@@ -139,8 +140,11 @@ interface BridgeNearbyTransferPlugin {
   addListener(event: "peerFound", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
   addListener(event: "peerLost", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
   addListener(event: "connectionState", handler: (event: { connection: NearbyConnection }) => void): Promise<NearbyListenerHandle>;
+  addListener(event: "peerReady", handler: (event: { connectionId: string }) => void): Promise<NearbyListenerHandle>;
+  addListener(event: "networkChanged", handler: () => void): Promise<NearbyListenerHandle>;
   addListener(event: "fileOffer", handler: (event: { offer: NearbyFileOffer }) => void): Promise<NearbyListenerHandle>;
   addListener(event: "fileAccepted", handler: (event: { connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
+  addListener(event: "fileCompleted", handler: (event: { connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
   addListener(event: "fileProgress", handler: (event: { progress: NearbyFileProgress }) => void): Promise<NearbyListenerHandle>;
   addListener(event: "fileReceived", handler: (event: { file: NearbyReceivedFile; connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
   addListener(event: "diagnostic", handler: (event: NearbyDiagnostic) => void): Promise<NearbyListenerHandle>;
@@ -257,6 +261,10 @@ export async function nearbyConnect(options: Parameters<BridgeNearbyTransferPlug
   return NearbyTransfer.connect(options);
 }
 
+export async function nearbyDisconnect(connectionId: string): Promise<void> {
+  await NearbyTransfer.disconnect({ connectionId });
+}
+
 export async function nearbyAcceptConnection(connectionId: string): Promise<void> {
   await NearbyTransfer.acceptConnection({ connectionId });
 }
@@ -301,8 +309,11 @@ export async function nearbyDeleteReceived(id: string): Promise<void> {
 export function nearbyAddListener(event: "peerFound", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "peerLost", handler: (event: { peer: NearbyPeer }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "connectionState", handler: (event: { connection: NearbyConnection }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "peerReady", handler: (event: { connectionId: string }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "networkChanged", handler: () => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "fileOffer", handler: (event: { offer: NearbyFileOffer }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "fileAccepted", handler: (event: { connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
+export function nearbyAddListener(event: "fileCompleted", handler: (event: { connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "fileProgress", handler: (event: { progress: NearbyFileProgress }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "fileReceived", handler: (event: { file: NearbyReceivedFile; connectionId: string; transferId: string }) => void): Promise<NearbyListenerHandle>;
 export function nearbyAddListener(event: "diagnostic", handler: (event: NearbyDiagnostic) => void): Promise<NearbyListenerHandle>;
@@ -643,10 +654,10 @@ export async function copyImage(blob: Blob): Promise<void> {
   }
 }
 
-export async function scanPairingQr(): Promise<string | null> {
+export async function scanPairingQr(instructions = "扫描 Mac 上的 Bridge 配对二维码"): Promise<string | null> {
   if (!Capacitor.isNativePlatform()) throw new Error("原生扫码仅支持手机 App。");
   try {
-    const result = await CapacitorBarcodeScanner.scanBarcode({ hint: 0, scanInstructions: "扫描 Mac 上的 Bridge 配对二维码",
+    const result = await CapacitorBarcodeScanner.scanBarcode({ hint: 0, scanInstructions: instructions,
       scanButton: false, scanText: "扫码", cameraDirection: 1, scanOrientation: 3,
       cancelButtonAccessibilityLabel: "取消扫码", torchButtonOnAccessibilityLabel: "关闭闪光灯", torchButtonOffAccessibilityLabel: "打开闪光灯" });
     return result.ScanResult?.trim() || null;

@@ -126,6 +126,8 @@ CREATE TABLE IF NOT EXISTS mobile_apps (
     android_package_name TEXT,
     android_apk_path TEXT,
     android_snapshot_directory TEXT,
+    android_source_path TEXT,
+    android_build_script TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -650,6 +652,95 @@ CREATE INDEX IF NOT EXISTS idx_tmux_session_actions_session
   ON tmux_session_actions(session_record_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tmux_session_actions_created
   ON tmux_session_actions(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS composer_transfer_targets (
+    target_id TEXT PRIMARY KEY,
+    session_record_id TEXT NOT NULL,
+    tmux_session_id TEXT NOT NULL,
+    session_created_at INTEGER NOT NULL,
+    device_id TEXT,
+    code_hash TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN ('waiting', 'claimed', 'completed', 'expired', 'cancelled')),
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(session_record_id) REFERENCES tmux_sessions(record_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_composer_transfer_targets_session
+  ON composer_transfer_targets(session_record_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS composer_transfers (
+    transfer_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL,
+    transfer_token_hash TEXT NOT NULL UNIQUE,
+    source_device_id TEXT,
+    text TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK (status IN ('receiving', 'ready', 'imported', 'expired', 'failed')),
+    error TEXT,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(target_id) REFERENCES composer_transfer_targets(target_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_composer_transfers_target
+  ON composer_transfers(target_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS composer_transfer_items (
+    item_id TEXT PRIMARY KEY,
+    transfer_id TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+    received_bytes INTEGER NOT NULL DEFAULT 0 CHECK (received_bytes >= 0),
+    sha256 TEXT,
+    local_path TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'receiving', 'ready', 'failed')),
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(transfer_id) REFERENCES composer_transfers(transfer_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_composer_transfer_items_transfer
+  ON composer_transfer_items(transfer_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS composer_asset_adoptions (
+    transfer_id TEXT PRIMARY KEY,
+    target_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('preparing', 'ready')),
+    lease_id TEXT,
+    lease_until TEXT,
+    acknowledged INTEGER NOT NULL DEFAULT 0,
+    source_cleaned INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(transfer_id) REFERENCES composer_transfers(transfer_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS composer_draft_assets (
+    asset_id TEXT PRIMARY KEY,
+    transfer_id TEXT NOT NULL,
+    item_id TEXT NOT NULL UNIQUE,
+    storage_name TEXT NOT NULL UNIQUE,
+    copy_temp_owned INTEGER NOT NULL DEFAULT 0,
+    file_identity TEXT,
+    status TEXT NOT NULL CHECK (status IN ('preparing', 'ready', 'retained', 'released', 'cleaning', 'deleted')),
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(transfer_id) REFERENCES composer_asset_adoptions(transfer_id) ON DELETE CASCADE,
+    FOREIGN KEY(item_id) REFERENCES composer_transfer_items(item_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_composer_draft_assets_expiry
+  ON composer_draft_assets(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_composer_draft_assets_transfer
+  ON composer_draft_assets(transfer_id, status);
+CREATE INDEX IF NOT EXISTS idx_composer_asset_adoptions_target
+  ON composer_asset_adoptions(target_id, status);
+CREATE INDEX IF NOT EXISTS idx_composer_transfer_targets_device
+  ON composer_transfer_targets(device_id, status);
 `;
 
 export interface ClaimRunArgs {
@@ -766,6 +857,77 @@ export interface StoredRunWorkspaceSnapshot {
   run_id: string;
   stage: "before" | "after";
   snapshot: GitWorkspaceSnapshot;
+}
+
+export type ComposerTransferTargetStatus = "waiting" | "claimed" | "completed" | "expired" | "cancelled";
+export type ComposerTransferStatus = "receiving" | "ready" | "imported" | "expired" | "failed";
+export type ComposerTransferItemStatus = "pending" | "receiving" | "ready" | "failed";
+
+export interface StoredComposerTransferTarget {
+  target_id: string;
+  session_record_id: string;
+  tmux_session_id: string;
+  session_created_at: number;
+  device_id: string | null;
+  code_hash: string;
+  status: ComposerTransferTargetStatus;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoredComposerTransferItem {
+  item_id: string;
+  transfer_id: string;
+  file_name: string;
+  content_type: string;
+  size_bytes: number;
+  received_bytes: number;
+  sha256: string | null;
+  local_path: string;
+  status: ComposerTransferItemStatus;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoredComposerAssetAdoption {
+  transfer_id: string;
+  target_id: string;
+  status: "preparing" | "ready";
+  lease_id: string | null;
+  lease_until: string | null;
+  acknowledged: boolean;
+  source_cleaned: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoredComposerDraftAsset {
+  asset_id: string;
+  transfer_id: string;
+  item_id: string;
+  storage_name: string;
+  copy_temp_owned: boolean;
+  file_identity: string | null;
+  status: "preparing" | "ready" | "retained" | "released" | "cleaning" | "deleted";
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoredComposerTransfer {
+  transfer_id: string;
+  target_id: string;
+  transfer_token_hash: string;
+  source_device_id: string | null;
+  text: string;
+  status: ComposerTransferStatus;
+  error: string | null;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
+  items: StoredComposerTransferItem[];
 }
 
 export interface RunClaim {
@@ -1057,14 +1219,15 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
       id, name, enabled,
       ios_app_store_name, ios_source_path, ios_project_path, ios_build_directory, ios_public_directory,
       ios_bundle_id, ios_team_id, ios_scheme, ios_configuration, ios_target_name, ios_info_plist_path, ios_internal_only,
-      android_package_name, android_apk_path, android_snapshot_directory, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      android_package_name, android_apk_path, android_snapshot_directory, android_source_path, android_build_script, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       id, normalized.name, normalized.enabled ? 1 : 0,
       normalized.ios?.app_store_name ?? null, normalized.ios?.source_path ?? null, normalized.ios?.project_path ?? null,
       normalized.ios?.build_directory ?? null, normalized.ios?.public_directory ?? null, normalized.ios?.bundle_id ?? null,
       normalized.ios?.team_id ?? null, normalized.ios?.scheme ?? null, normalized.ios?.configuration ?? null,
       normalized.ios?.target_name ?? null, normalized.ios?.info_plist_path ?? null, normalized.ios ? (normalized.ios.internal_only ? 1 : 0) : null,
       normalized.android?.package_name ?? null, normalized.android?.apk_path ?? null, normalized.android?.snapshot_directory ?? null,
+      normalized.android?.source_path ?? null, normalized.android?.build_script ?? null,
       now, now,
     );
     return this.getMobileApp(id)!;
@@ -1083,7 +1246,7 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
       name = ?, enabled = ?,
       ios_app_store_name = ?, ios_source_path = ?, ios_project_path = ?, ios_build_directory = ?, ios_public_directory = ?,
       ios_bundle_id = ?, ios_team_id = ?, ios_scheme = ?, ios_configuration = ?, ios_target_name = ?, ios_info_plist_path = ?, ios_internal_only = ?,
-      android_package_name = ?, android_apk_path = ?, android_snapshot_directory = ?, updated_at = ?
+      android_package_name = ?, android_apk_path = ?, android_snapshot_directory = ?, android_source_path = ?, android_build_script = ?, updated_at = ?
       WHERE id = ?`).run(
       normalized.name, normalized.enabled ? 1 : 0,
       normalized.ios?.app_store_name ?? null, normalized.ios?.source_path ?? null, normalized.ios?.project_path ?? null,
@@ -1091,6 +1254,7 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
       normalized.ios?.team_id ?? null, normalized.ios?.scheme ?? null, normalized.ios?.configuration ?? null,
       normalized.ios?.target_name ?? null, normalized.ios?.info_plist_path ?? null, normalized.ios ? (normalized.ios.internal_only ? 1 : 0) : null,
       normalized.android?.package_name ?? null, normalized.android?.apk_path ?? null, normalized.android?.snapshot_directory ?? null,
+      normalized.android?.source_path ?? null, normalized.android?.build_script ?? null,
       this.timestamp(), id,
     );
     this.syncMobileAppToLegacy(id, normalized);
@@ -1179,10 +1343,12 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
     const android = input.android ? {
       package_name: input.android.package_name.trim(), apk_path: input.android.apk_path.trim(),
       snapshot_directory: (input.android.snapshot_directory || join(dirname(input.android.apk_path), ".bridge-mobile-apps", id)).trim(),
+      source_path: (input.android.source_path ?? "").trim(), build_script: (input.android.build_script ?? "").trim(),
     } : null;
     if (android) {
       this.validateMobileAndroidConfig(android);
       android.apk_path = resolve(android.apk_path); android.snapshot_directory = resolve(android.snapshot_directory);
+      if (android.source_path) android.source_path = resolve(android.source_path);
     }
     return { name, enabled: input.enabled, ios, android };
   }
@@ -1206,6 +1372,10 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
     if (!/^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(input.package_name)) throw new Error("Android package name 无效。");
     if (!isAbsolute(input.apk_path) || !input.apk_path.trim()) throw new Error("Android APK 路径必须是绝对路径。");
     if (!isAbsolute(input.snapshot_directory) || !input.snapshot_directory.trim()) throw new Error("Android 快照目录必须是绝对路径。");
+    if (input.source_path && (!isAbsolute(input.source_path) || input.source_path.length > 1000)) throw new Error("Android 源码目录必须是绝对路径。");
+    if (input.build_script && (input.build_script.length > 500 || isAbsolute(input.build_script) || input.build_script.split(/[\\/]/).includes("..") || !/\.(?:[cm]?js|ts)$/.test(input.build_script))) {
+      throw new Error("Android 构建脚本必须是源码目录内的 JavaScript 或 TypeScript 相对路径。");
+    }
   }
 
   private validateIosTestflightApp(input: Omit<StoredIosTestflightApp, "id" | "created_at" | "updated_at">): void {
@@ -4387,17 +4557,23 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
   }
 
   public revokeWebAuthSession(sessionId: string, revokedAt: string): void {
-    this.db
-      .prepare(
-        "UPDATE web_auth_sessions SET revoked_at = ? WHERE session_id = ? AND revoked_at IS NULL",
-      )
-      .run(revokedAt, sessionId);
+    this.transaction(() => {
+      this.db.prepare("UPDATE web_auth_sessions SET revoked_at = ? WHERE session_id = ? AND revoked_at IS NULL").run(revokedAt, sessionId);
+      this.db.prepare(`UPDATE composer_draft_assets SET status = 'released', expires_at = ?, updated_at = ?
+        WHERE status = 'ready' AND transfer_id IN (
+          SELECT x.transfer_id FROM composer_transfers x JOIN composer_transfer_targets t ON t.target_id = x.target_id WHERE t.device_id = ?
+        )`).run(revokedAt, revokedAt, sessionId);
+    });
   }
 
   public revokeAllWebAuthSessions(revokedAt: string): void {
-    this.db
-      .prepare("UPDATE web_auth_sessions SET revoked_at = ? WHERE revoked_at IS NULL")
-      .run(revokedAt);
+    this.transaction(() => {
+      this.db.prepare("UPDATE web_auth_sessions SET revoked_at = ? WHERE revoked_at IS NULL").run(revokedAt);
+      this.db.prepare(`UPDATE composer_draft_assets SET status = 'released', expires_at = ?, updated_at = ?
+        WHERE status = 'ready' AND transfer_id IN (
+          SELECT x.transfer_id FROM composer_transfers x JOIN composer_transfer_targets t ON t.target_id = x.target_id WHERE t.device_id IS NOT NULL AND t.device_id != 'local'
+        )`).run(revokedAt, revokedAt);
+    });
   }
 
   public recordTmuxSession(
@@ -4888,6 +5064,391 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
     return { items: rows.map(mapTmuxSessionAction), total: count.total };
   }
 
+  public createComposerTransferTarget(input: {
+    targetId: string;
+    sessionRecordId: string;
+    tmuxSessionId: string;
+    sessionCreatedAt: number;
+    deviceId: string | null;
+    codeHash: string;
+    expiresAt: string;
+  }): StoredComposerTransferTarget {
+    const now = this.timestamp();
+    this.db.prepare(`INSERT INTO composer_transfer_targets
+      (target_id, session_record_id, tmux_session_id, session_created_at, device_id,
+       code_hash, status, expires_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'waiting', ?, ?, ?)`).run(
+      input.targetId,
+      input.sessionRecordId,
+      input.tmuxSessionId,
+      input.sessionCreatedAt,
+      input.deviceId,
+      input.codeHash,
+      input.expiresAt,
+      now,
+      now,
+    );
+    return this.getComposerTransferTarget(input.targetId)!;
+  }
+
+  public getComposerTransferTarget(targetId: string): StoredComposerTransferTarget | null {
+    const row = this.db.prepare("SELECT * FROM composer_transfer_targets WHERE target_id = ?").get(targetId) as Record<string, unknown> | undefined;
+    return row ? mapComposerTransferTarget(row) : null;
+  }
+
+  public getComposerTransferTargetByCodeHash(codeHash: string): StoredComposerTransferTarget | null {
+    const row = this.db.prepare("SELECT * FROM composer_transfer_targets WHERE code_hash = ?").get(codeHash) as Record<string, unknown> | undefined;
+    return row ? mapComposerTransferTarget(row) : null;
+  }
+
+  public claimComposerTransferTarget(input: {
+    targetId: string;
+    transferId: string;
+    transferTokenHash: string;
+    sourceDeviceId: string | null;
+    expiresAt: string;
+  }): StoredComposerTransfer | null {
+    return this.transaction(() => {
+      const target = this.getComposerTransferTarget(input.targetId);
+      if (!target || target.status !== "waiting" || Date.parse(target.expires_at) <= this.now().getTime()) return null;
+      const now = this.timestamp();
+      const updated = this.db.prepare(`UPDATE composer_transfer_targets
+        SET status = 'claimed', updated_at = ?
+        WHERE target_id = ? AND status = 'waiting' AND expires_at > ?`).run(now, input.targetId, now);
+      if (updated.changes !== 1) return null;
+      this.db.prepare(`INSERT INTO composer_transfers
+        (transfer_id, target_id, transfer_token_hash, source_device_id, text, status, error,
+         expires_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, '', 'receiving', NULL, ?, ?, ?)`).run(
+        input.transferId,
+        input.targetId,
+        input.transferTokenHash,
+        input.sourceDeviceId,
+        input.expiresAt,
+        now,
+        now,
+      );
+      return this.getComposerTransfer(input.transferId);
+    });
+  }
+
+  public getComposerTransfer(transferId: string): StoredComposerTransfer | null {
+    const row = this.db.prepare("SELECT * FROM composer_transfers WHERE transfer_id = ?").get(transferId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    const items = this.db.prepare(
+      "SELECT * FROM composer_transfer_items WHERE transfer_id = ? ORDER BY created_at ASC, item_id ASC",
+    ).all(transferId) as Record<string, unknown>[];
+    return { ...mapComposerTransfer(row), items: items.map(mapComposerTransferItem) };
+  }
+
+  public listComposerTransfersForTarget(targetId: string): StoredComposerTransfer[] {
+    const rows = this.db.prepare(
+      "SELECT transfer_id FROM composer_transfers WHERE target_id = ? ORDER BY created_at ASC, transfer_id ASC",
+    ).all(targetId) as Array<{ transfer_id?: string }>;
+    return rows.flatMap((row) => row.transfer_id ? [this.getComposerTransfer(row.transfer_id)!] : []);
+  }
+
+  public getComposerTransferByTokenHash(tokenHash: string): StoredComposerTransfer | null {
+    const row = this.db.prepare("SELECT transfer_id FROM composer_transfers WHERE transfer_token_hash = ?").get(tokenHash) as { transfer_id?: string } | undefined;
+    return row?.transfer_id ? this.getComposerTransfer(row.transfer_id) : null;
+  }
+
+  public updateComposerTransferText(transferId: string, text: string): StoredComposerTransfer | null {
+    const now = this.timestamp();
+    this.db.prepare("UPDATE composer_transfers SET text = ?, updated_at = ? WHERE transfer_id = ? AND status = 'receiving'")
+      .run(text, now, transferId);
+    return this.getComposerTransfer(transferId);
+  }
+
+  public createComposerTransferItem(input: {
+    itemId: string;
+    transferId: string;
+    fileName: string;
+    contentType: string;
+    sizeBytes: number;
+    localPath: string;
+    sha256: string | null;
+  }): StoredComposerTransferItem {
+    const now = this.timestamp();
+    this.db.prepare(`INSERT INTO composer_transfer_items
+      (item_id, transfer_id, file_name, content_type, size_bytes, received_bytes,
+       sha256, local_path, status, error, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'pending', NULL, ?, ?)`).run(
+      input.itemId,
+      input.transferId,
+      input.fileName,
+      input.contentType,
+      input.sizeBytes,
+      input.sha256,
+      input.localPath,
+      now,
+      now,
+    );
+    return this.getComposerTransferItem(input.itemId)!;
+  }
+
+  public getComposerTransferItem(itemId: string): StoredComposerTransferItem | null {
+    const row = this.db.prepare("SELECT * FROM composer_transfer_items WHERE item_id = ?").get(itemId) as Record<string, unknown> | undefined;
+    return row ? mapComposerTransferItem(row) : null;
+  }
+
+  public updateComposerTransferItemProgress(itemId: string, receivedBytes: number): StoredComposerTransferItem | null {
+    const now = this.timestamp();
+    this.db.prepare(`UPDATE composer_transfer_items
+      SET received_bytes = ?, status = 'receiving', updated_at = ?
+      WHERE item_id = ? AND status IN ('pending', 'receiving')`).run(receivedBytes, now, itemId);
+    return this.getComposerTransferItem(itemId);
+  }
+
+  public finishComposerTransferItem(input: {
+    itemId: string;
+    status: "ready" | "failed";
+    sha256?: string | null;
+    error?: string | null;
+  }): StoredComposerTransferItem | null {
+    const now = this.timestamp();
+    this.db.prepare(`UPDATE composer_transfer_items
+      SET status = ?, sha256 = COALESCE(?, sha256), error = ?, updated_at = ?
+      WHERE item_id = ?`).run(input.status, input.sha256 ?? null, input.error ?? null, now, input.itemId);
+    return this.getComposerTransferItem(input.itemId);
+  }
+
+  public markComposerTransferReady(transferId: string): StoredComposerTransfer | null {
+    const now = this.timestamp();
+    this.db.prepare(`UPDATE composer_transfers SET status = 'ready', error = NULL, updated_at = ?
+      WHERE transfer_id = ? AND status = 'receiving'`).run(now, transferId);
+    return this.getComposerTransfer(transferId);
+  }
+
+  public consumeComposerTransfer(transferId: string): StoredComposerTransfer | null {
+    return this.transaction(() => {
+      const now = this.timestamp();
+      const transfer = this.getComposerTransfer(transferId);
+      if (!transfer || transfer.status === "imported") return transfer;
+      this.db.prepare("UPDATE composer_transfers SET status = 'imported', updated_at = ? WHERE transfer_id = ? AND status = 'ready'")
+        .run(now, transferId);
+      this.db.prepare("UPDATE composer_transfer_targets SET status = 'completed', updated_at = ? WHERE target_id = ? AND status = 'claimed'")
+        .run(now, transfer.target_id);
+      return this.getComposerTransfer(transferId);
+    });
+  }
+
+  public getComposerAssetAdoption(transferId: string): StoredComposerAssetAdoption | null {
+    const row = this.db.prepare("SELECT * FROM composer_asset_adoptions WHERE transfer_id = ?").get(transferId) as Record<string, unknown> | undefined;
+    return row ? mapComposerAssetAdoption(row) : null;
+  }
+
+  public listComposerAssetAdoptionsForTarget(targetId: string): StoredComposerAssetAdoption[] {
+    return (this.db.prepare("SELECT * FROM composer_asset_adoptions WHERE target_id = ?").all(targetId) as Record<string, unknown>[]).map(mapComposerAssetAdoption);
+  }
+
+  public listComposerDraftAssets(transferId: string): StoredComposerDraftAsset[] {
+    return (this.db.prepare("SELECT * FROM composer_draft_assets WHERE transfer_id = ? ORDER BY created_at, asset_id").all(transferId) as Record<string, unknown>[]).map(mapComposerDraftAsset);
+  }
+
+  public getComposerDraftAsset(assetId: string): StoredComposerDraftAsset | null {
+    const row = this.db.prepare("SELECT * FROM composer_draft_assets WHERE asset_id = ?").get(assetId) as Record<string, unknown> | undefined;
+    return row ? mapComposerDraftAsset(row) : null;
+  }
+
+  public beginComposerAssetAdoption(input: {
+    targetId: string; transferId: string; leaseId: string; leaseUntil: string; expiresAt: string;
+    assets: Array<{ assetId: string; itemId: string; storageName: string }>;
+  }): "acquired" | "ready" | "busy" | "invalid" {
+    return this.transaction(() => {
+      const target = this.getComposerTransferTarget(input.targetId);
+      const transfer = this.getComposerTransfer(input.transferId);
+      const existing = this.getComposerAssetAdoption(input.transferId);
+      if (!target || !transfer || transfer.target_id !== input.targetId || (existing && existing.target_id !== input.targetId)) return "invalid";
+      if (existing?.status === "ready") return "ready";
+      const now = this.timestamp();
+      if (target.status !== "claimed" || transfer.status !== "ready" || (!existing && target.expires_at <= now)) return "invalid";
+      if (existing?.lease_id && existing.lease_until && existing.lease_until > now) return "busy";
+      if (!existing) {
+        if (!input.assets.length || transfer.items.length !== input.assets.length || transfer.items.some((item) => item.status !== "ready" || !item.sha256 || !input.assets.some((asset) => asset.itemId === item.item_id))) return "invalid";
+        this.db.prepare(`INSERT INTO composer_asset_adoptions
+          (transfer_id, target_id, status, lease_id, lease_until, acknowledged, created_at, updated_at)
+          VALUES (?, ?, 'preparing', ?, ?, 0, ?, ?)`).run(input.transferId, input.targetId, input.leaseId, input.leaseUntil, now, now);
+        const insert = this.db.prepare(`INSERT INTO composer_draft_assets
+          (asset_id, transfer_id, item_id, storage_name, status, expires_at, created_at, updated_at)
+          VALUES (?, ?, ?, ?, 'preparing', ?, ?, ?)`);
+        for (const asset of input.assets) insert.run(asset.assetId, input.transferId, asset.itemId, asset.storageName, input.expiresAt, now, now);
+      } else {
+        this.db.prepare("UPDATE composer_asset_adoptions SET lease_id = ?, lease_until = ?, updated_at = ? WHERE transfer_id = ? AND status = 'preparing'")
+          .run(input.leaseId, input.leaseUntil, now, input.transferId);
+      }
+      return "acquired";
+    });
+  }
+
+  public renewComposerAssetAdoptionLease(transferId: string, leaseId: string, leaseUntil: string): boolean {
+    return this.db.prepare("UPDATE composer_asset_adoptions SET lease_until = ?, updated_at = ? WHERE transfer_id = ? AND status = 'preparing' AND lease_id = ?")
+      .run(leaseUntil, this.timestamp(), transferId, leaseId).changes === 1;
+  }
+
+  public releaseComposerAssetAdoptionLease(transferId: string, leaseId: string): void {
+    this.db.prepare("UPDATE composer_asset_adoptions SET lease_id = NULL, lease_until = NULL, updated_at = ? WHERE transfer_id = ? AND status = 'preparing' AND lease_id = ?")
+      .run(this.timestamp(), transferId, leaseId);
+  }
+
+  public finishComposerAssetAdoption(transferId: string, leaseId: string, expiresAt: string): boolean {
+    return this.transaction(() => {
+      const adoption = this.getComposerAssetAdoption(transferId);
+      if (adoption?.status === "ready") return true;
+      if (!adoption || adoption.lease_id !== leaseId || adoption.status !== "preparing") return false;
+      const target = this.getComposerTransferTarget(adoption.target_id);
+      const transfer = this.getComposerTransfer(transferId);
+      if (!target || target.status !== "claimed" || !transfer || transfer.status !== "ready"
+        || this.listComposerDraftAssets(transferId).some((asset) => !asset.file_identity)) return false;
+      const now = this.timestamp();
+      if (target.device_id && target.device_id !== "local") {
+        const device = this.db.prepare("SELECT revoked_at, expires_at FROM web_auth_sessions WHERE session_id = ?")
+          .get(target.device_id) as { revoked_at: string | null; expires_at: string } | undefined;
+        if (!device || device.revoked_at !== null || device.expires_at <= now) return false;
+      }
+      this.db.prepare("UPDATE composer_draft_assets SET status = 'ready', expires_at = ?, updated_at = ? WHERE transfer_id = ? AND status = 'preparing'").run(expiresAt, now, transferId);
+      this.db.prepare("UPDATE composer_transfers SET status = 'imported', updated_at = ? WHERE transfer_id = ? AND status = 'ready'").run(now, transferId);
+      this.db.prepare("UPDATE composer_transfer_targets SET status = 'completed', updated_at = ? WHERE target_id = ? AND status = 'claimed'").run(now, adoption.target_id);
+      this.db.prepare("UPDATE composer_asset_adoptions SET status = 'ready', lease_id = NULL, lease_until = NULL, updated_at = ? WHERE transfer_id = ? AND lease_id = ?").run(now, transferId, leaseId);
+      return true;
+    });
+  }
+
+  public listComposerAssetAdoptionsForRecovery(now: string): StoredComposerAssetAdoption[] {
+    const rows = this.db.prepare(`SELECT * FROM composer_asset_adoptions
+      WHERE (status = 'preparing' AND (lease_until IS NULL OR lease_until <= ?)) OR (status = 'ready' AND source_cleaned = 0)
+      ORDER BY updated_at LIMIT 20`).all(now) as Record<string, unknown>[];
+    return rows.map(mapComposerAssetAdoption);
+  }
+
+  public markComposerAssetSourcesCleaned(transferId: string): void {
+    this.db.prepare("UPDATE composer_asset_adoptions SET source_cleaned = 1, updated_at = ? WHERE transfer_id = ? AND status = 'ready'")
+      .run(this.timestamp(), transferId);
+  }
+
+  public discardComposerAssetAdoption(transferId: string): boolean {
+    return this.db.prepare("DELETE FROM composer_asset_adoptions WHERE transfer_id = ? AND status = 'preparing' AND (lease_until IS NULL OR lease_until <= ?)")
+      .run(transferId, this.timestamp()).changes === 1;
+  }
+
+  public acknowledgeComposerAssetAdoption(transferId: string): void {
+    this.db.prepare("UPDATE composer_asset_adoptions SET acknowledged = 1, updated_at = ? WHERE transfer_id = ? AND status = 'ready'").run(this.timestamp(), transferId);
+  }
+
+  public listPendingComposerAssetAdoptions(sessionRecordId: string, deviceId: string): StoredComposerAssetAdoption[] {
+    const rows = this.db.prepare(`SELECT a.* FROM composer_asset_adoptions a
+      JOIN composer_transfer_targets t ON t.target_id = a.target_id
+      WHERE t.session_record_id = ? AND COALESCE(t.device_id, 'local') = ? AND a.status IN ('preparing', 'ready') AND a.acknowledged = 0 AND t.status IN ('claimed', 'completed')
+      ORDER BY a.created_at, a.transfer_id`).all(sessionRecordId, deviceId) as Record<string, unknown>[];
+    return rows.map(mapComposerAssetAdoption);
+  }
+
+  public markComposerAssetFileIdentity(assetId: string, transferId: string, leaseId: string, identity: string): boolean {
+    return this.db.prepare(`UPDATE composer_draft_assets SET file_identity = ?, updated_at = ?
+      WHERE asset_id = ? AND transfer_id = ? AND status = 'preparing' AND EXISTS (
+        SELECT 1 FROM composer_asset_adoptions a WHERE a.transfer_id = ? AND a.status = 'preparing' AND a.lease_id = ?
+      ) AND (file_identity IS NULL OR file_identity = ?)`)
+      .run(identity, this.timestamp(), assetId, transferId, transferId, leaseId, identity).changes === 1;
+  }
+
+  public clearComposerAssetFileIdentity(assetId: string, transferId: string, leaseId: string, identity: string): boolean {
+    return this.db.prepare(`UPDATE composer_draft_assets SET file_identity = NULL, updated_at = ?
+      WHERE asset_id = ? AND transfer_id = ? AND status = 'preparing' AND file_identity = ? AND EXISTS (
+        SELECT 1 FROM composer_asset_adoptions a WHERE a.transfer_id = ? AND a.status = 'preparing' AND a.lease_id = ?
+      )`).run(this.timestamp(), assetId, transferId, identity, transferId, leaseId).changes === 1;
+  }
+
+  public markComposerAssetCopyTempOwned(assetId: string, transferId: string, leaseId: string): boolean {
+    return this.db.prepare(`UPDATE composer_draft_assets SET copy_temp_owned = 1, updated_at = ?
+      WHERE asset_id = ? AND transfer_id = ? AND status = 'preparing' AND EXISTS (
+        SELECT 1 FROM composer_asset_adoptions a WHERE a.transfer_id = ? AND a.status = 'preparing' AND a.lease_id = ?
+      )`).run(this.timestamp(), assetId, transferId, transferId, leaseId).changes === 1;
+  }
+
+  public touchComposerDraftAsset(assetId: string, expiresAt: string): boolean {
+    return this.db.prepare("UPDATE composer_draft_assets SET expires_at = ?, updated_at = ? WHERE asset_id = ? AND status = 'ready'")
+      .run(expiresAt, this.timestamp(), assetId).changes === 1;
+  }
+
+  public retainComposerDraftAsset(assetId: string): boolean {
+    return this.db.prepare("UPDATE composer_draft_assets SET status = 'retained', updated_at = ? WHERE asset_id = ? AND status IN ('ready', 'retained')")
+      .run(this.timestamp(), assetId).changes === 1;
+  }
+
+  public retainComposerDraftAssets(assetIds: string[]): boolean {
+    return this.transaction(() => {
+      const rows = assetIds.map((id) => this.getComposerDraftAsset(id));
+      if (rows.some((row) => !row || !["ready", "retained"].includes(row.status))) return false;
+      for (const id of assetIds) this.retainComposerDraftAsset(id);
+      return true;
+    });
+  }
+
+  public releaseComposerDraftAsset(assetId: string, expiresAt: string): boolean {
+    return this.db.prepare("UPDATE composer_draft_assets SET status = 'released', expires_at = ?, updated_at = ? WHERE asset_id = ? AND status = 'ready'")
+      .run(expiresAt, this.timestamp(), assetId).changes === 1;
+  }
+
+  public claimExpiredComposerDraftAssets(now: string): StoredComposerDraftAsset[] {
+    return this.transaction(() => {
+      this.db.prepare("UPDATE composer_draft_assets SET status = 'cleaning', updated_at = ? WHERE status IN ('ready', 'released') AND expires_at <= ?")
+        .run(now, now);
+      return (this.db.prepare("SELECT * FROM composer_draft_assets WHERE status = 'cleaning'").all() as Record<string, unknown>[]).map(mapComposerDraftAsset);
+    });
+  }
+
+  public finishComposerDraftAssetCleanup(assetId: string): void {
+    this.db.prepare("UPDATE composer_draft_assets SET status = 'deleted', updated_at = ? WHERE asset_id = ? AND status = 'cleaning'")
+      .run(this.timestamp(), assetId);
+  }
+
+  public cancelComposerTransferTarget(targetId: string): boolean {
+    return this.transaction(() => {
+      const now = this.timestamp();
+      const result = this.db.prepare(`UPDATE composer_transfer_targets
+        SET status = 'cancelled', updated_at = ? WHERE target_id = ? AND status IN ('waiting', 'claimed')
+        AND NOT EXISTS (SELECT 1 FROM composer_asset_adoptions a WHERE a.target_id = ? AND a.status = 'preparing' AND a.lease_until > ?)`)
+        .run(now, targetId, targetId, now);
+      if (result.changes > 0) {
+        this.db.prepare("UPDATE composer_transfers SET status = 'expired', updated_at = ? WHERE target_id = ? AND status IN ('receiving', 'ready')")
+          .run(now, targetId);
+      }
+      return result.changes > 0;
+    });
+  }
+
+  public listExpiredComposerTransfers(now: string): Array<{ transferId: string; targetId: string; paths: string[] }> {
+    const rows = this.db.prepare(`SELECT t.transfer_id, t.target_id, i.local_path
+      FROM composer_transfers t LEFT JOIN composer_transfer_items i ON i.transfer_id = t.transfer_id
+      WHERE t.status IN ('receiving', 'ready') AND t.expires_at <= ?
+        AND NOT EXISTS (SELECT 1 FROM composer_asset_adoptions a WHERE a.transfer_id = t.transfer_id AND a.status = 'preparing')`)
+      .all(now) as Array<Record<string, unknown>>;
+    const byTransfer = new Map<string, { transferId: string; targetId: string; paths: string[] }>();
+    for (const row of rows) {
+      const transferId = String(row.transfer_id);
+      const entry = byTransfer.get(transferId) ?? { transferId, targetId: String(row.target_id), paths: [] };
+      if (typeof row.local_path === "string") entry.paths.push(row.local_path);
+      byTransfer.set(transferId, entry);
+    }
+    return [...byTransfer.values()];
+  }
+
+  public expireComposerTransfer(transferId: string): boolean {
+    return this.transaction(() => {
+      const now = this.timestamp();
+      const expired = this.db.prepare(`UPDATE composer_transfers SET status = 'expired', updated_at = ?
+        WHERE transfer_id = ? AND status IN ('receiving', 'ready')
+        AND NOT EXISTS (SELECT 1 FROM composer_asset_adoptions a
+          WHERE a.transfer_id = composer_transfers.transfer_id AND a.status = 'preparing')`)
+        .run(now, transferId);
+      if (!expired.changes) return false;
+      this.db.prepare(`UPDATE composer_transfer_targets SET status = 'expired', updated_at = ?
+        WHERE target_id = (SELECT target_id FROM composer_transfers WHERE transfer_id = ?)
+        AND status IN ('waiting', 'claimed')`).run(now, transferId);
+      return true;
+    });
+  }
+
   public close(): void {
     this.usageSnapshotWriter?.stop();
     try {
@@ -5061,6 +5622,9 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
         ALTER TABLE codex_account_usage_snapshots_by_date RENAME TO codex_account_usage_snapshots;
       `);
     });
+    addColumnIfMissing(this.db, "composer_asset_adoptions", "source_cleaned", "INTEGER NOT NULL DEFAULT 0");
+    addColumnIfMissing(this.db, "composer_draft_assets", "copy_temp_owned", "INTEGER NOT NULL DEFAULT 0");
+    addColumnIfMissing(this.db, "composer_draft_assets", "file_identity", "TEXT");
     addColumnIfMissing(this.db, "web_auth_pairings", "target_session_id", "TEXT");
     addColumnIfMissing(this.db, "web_auth_pairings", "target_code_hash", "TEXT");
     addColumnIfMissing(this.db, "web_auth_pairings", "target_token_hash", "TEXT");
@@ -5068,6 +5632,8 @@ export class StateDatabase implements CodexHistoryDetailCacheStore {
     addColumnIfMissing(this.db, "web_auth_sessions", "client_type", "TEXT NOT NULL DEFAULT 'unknown'");
     addColumnIfMissing(this.db, "web_auth_sessions", "last_access_origin", "TEXT");
     addColumnIfMissing(this.db, "web_auth_sessions", "last_access_origin_at", "TEXT");
+    addColumnIfMissing(this.db, "mobile_apps", "android_source_path", "TEXT");
+    addColumnIfMissing(this.db, "mobile_apps", "android_build_script", "TEXT");
     // These columns were added after the minimal schema in the design document.
     // Keeping the migration additive lets an operator upgrade an existing database.
     // Remove the abandoned model-usage cache from existing Bridge databases.
@@ -5377,7 +5943,7 @@ function isSqliteBusyError(error: unknown): boolean {
 
 function addColumnIfMissing(
   db: SqliteDatabase,
-  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts" | "shortcut_groups" | "tmux_sessions" | "tmux_session_actions" | "web_auth_pairings" | "web_auth_sessions",
+  table: "tasks" | "runs" | "bridge_tasks" | "bridge_task_attachments" | "shortcuts" | "shortcut_groups" | "tmux_sessions" | "tmux_session_actions" | "web_auth_pairings" | "web_auth_sessions" | "mobile_apps" | "composer_asset_adoptions" | "composer_draft_assets",
   column: string,
   definition: string,
 ): void {
@@ -5526,6 +6092,7 @@ function mapMobileApp(row: Record<string, unknown>): StoredMobileApp {
     : {
       package_name: String(row.android_package_name), apk_path: String(row.android_apk_path ?? ""),
       snapshot_directory: String(row.android_snapshot_directory ?? ""),
+      source_path: String(row.android_source_path ?? ""), build_script: String(row.android_build_script ?? ""),
     };
   return {
     id: String(row.id), name: String(row.name), enabled: Number(row.enabled) === 1, ios, android,
@@ -5801,6 +6368,73 @@ function mapTmuxSessionAction(row: Record<string, unknown>): StoredTmuxSessionAc
     error: nullableString(row.error),
     created_at: String(row.created_at),
     completed_at: nullableString(row.completed_at),
+  };
+}
+
+function mapComposerAssetAdoption(row: Record<string, unknown>): StoredComposerAssetAdoption {
+  return {
+    transfer_id: String(row.transfer_id), target_id: String(row.target_id), status: row.status as StoredComposerAssetAdoption["status"],
+    lease_id: typeof row.lease_id === "string" ? row.lease_id : null,
+    lease_until: typeof row.lease_until === "string" ? row.lease_until : null,
+    acknowledged: Number(row.acknowledged) === 1, source_cleaned: Number(row.source_cleaned) === 1,
+    created_at: String(row.created_at), updated_at: String(row.updated_at),
+  };
+}
+
+function mapComposerDraftAsset(row: Record<string, unknown>): StoredComposerDraftAsset {
+  return {
+    asset_id: String(row.asset_id), transfer_id: String(row.transfer_id), item_id: String(row.item_id),
+    storage_name: String(row.storage_name), copy_temp_owned: Number(row.copy_temp_owned) === 1,
+    file_identity: typeof row.file_identity === "string" ? row.file_identity : null,
+    status: row.status as StoredComposerDraftAsset["status"],
+    expires_at: String(row.expires_at), created_at: String(row.created_at), updated_at: String(row.updated_at),
+  };
+}
+
+function mapComposerTransferTarget(row: Record<string, unknown>): StoredComposerTransferTarget {
+  return {
+    target_id: String(row.target_id),
+    session_record_id: String(row.session_record_id),
+    tmux_session_id: String(row.tmux_session_id),
+    session_created_at: Number(row.session_created_at),
+    device_id: nullableString(row.device_id),
+    code_hash: String(row.code_hash),
+    status: String(row.status) as ComposerTransferTargetStatus,
+    expires_at: String(row.expires_at),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapComposerTransfer(row: Record<string, unknown>): Omit<StoredComposerTransfer, "items"> {
+  return {
+    transfer_id: String(row.transfer_id),
+    target_id: String(row.target_id),
+    transfer_token_hash: String(row.transfer_token_hash),
+    source_device_id: nullableString(row.source_device_id),
+    text: String(row.text ?? ""),
+    status: String(row.status) as ComposerTransferStatus,
+    error: nullableString(row.error),
+    expires_at: String(row.expires_at),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapComposerTransferItem(row: Record<string, unknown>): StoredComposerTransferItem {
+  return {
+    item_id: String(row.item_id),
+    transfer_id: String(row.transfer_id),
+    file_name: String(row.file_name),
+    content_type: String(row.content_type),
+    size_bytes: Number(row.size_bytes),
+    received_bytes: Number(row.received_bytes),
+    sha256: nullableString(row.sha256),
+    local_path: String(row.local_path),
+    status: String(row.status) as ComposerTransferItemStatus,
+    error: nullableString(row.error),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
   };
 }
 

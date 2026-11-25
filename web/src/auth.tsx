@@ -37,7 +37,7 @@ interface PairingInfo {
 
 export function AuthGate({ children }: { children: ReactNode }): ReactElement {
   const location = useLocation();
-  if (isMobileApp() && location.pathname === "/nearby-transfer") return <>{children}</>;
+  if (location.pathname === "/composer-transfer" || (isMobileApp() && location.pathname === "/nearby-transfer")) return <>{children}</>;
   return <AuthenticatedAuthGate>{children}</AuthenticatedAuthGate>;
 }
 

@@ -108,7 +108,7 @@ export function MobileShareInbox(): ReactElement {
         const current = previous?.text ?? "";
         const next = text.trim() && current.includes(text.trim()) ? current : appendMobileShareText(current, text);
         await assertSession();
-        saveDraftMetadata(target.sessionId, { text: next, attachments }, scope);
+        saveDraftMetadata(target.sessionId, { text: next, attachments, importedTransferIds: previous?.importedTransferIds }, scope);
         if (loadDraftMetadata(target.sessionId)?.text !== next) throw new Error("文本草稿未能保存，原分享仍保留。");
         navigate("/tmux-dashboard?session=" + encodeURIComponent(target.sessionId));
       } else {

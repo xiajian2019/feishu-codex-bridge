@@ -1,4 +1,4 @@
-import type { ShortcutStore } from "./tmux-shortcuts.js";
+import { normalizeShortcutStore, type ShortcutStore } from "./tmux-shortcuts.js";
 import { getBridgeOrigin } from "./mobile-runtime.js";
 
 const CACHE_KEY = "feishu-codex-bridge.shortcut-config.v1";
@@ -57,18 +57,20 @@ export function readShortcutConfigCache(): ShortcutStore | null {
       window.localStorage.removeItem(storageKey(CACHE_KEY));
       return null;
     }
-    memory = { revision, store: entry.store };
-    return entry.store;
+    const normalized = normalizeShortcutStore(entry.store);
+    memory = { revision, store: normalized };
+    return normalized;
   } catch {
     return null;
   }
 }
 
 export function writeShortcutConfigCache(store: ShortcutStore): void {
-  memory = { revision: readShortcutConfigRevision(), store };
+  const normalized = normalizeShortcutStore(store);
+  memory = { revision: readShortcutConfigRevision(), store: normalized };
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(storageKey(CACHE_KEY), JSON.stringify({ version: 1, cachedAt: Date.now(), store } satisfies CacheEntry));
+    window.localStorage.setItem(storageKey(CACHE_KEY), JSON.stringify({ version: 1, cachedAt: Date.now(), store: normalized } satisfies CacheEntry));
   } catch {
     // Keep the shared memory cache when storage is unavailable or full.
   }

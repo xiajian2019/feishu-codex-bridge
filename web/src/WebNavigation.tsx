@@ -6,26 +6,68 @@ import { isMobileApp, openMobileConnectionSettings } from "./mobile-runtime.js";
 
 const PAGES = [
   { to: "/tmux-dashboard", label: "Tmux", end: false },
-  { to: "/remote-desktop", label: "远程桌面", end: true },
+  { to: "/system-management/apps", label: "App 管理", end: true },
   { to: "/demos", label: "Demo", end: true },
-  { to: "/tasks", label: "任务面板", end: true },
   { to: "/codex-history", label: "Codex 历史", end: true },
 ] as const;
 
-const SYSTEM_PAGES = [
-  { to: "/system-management/health", label: "运行状态" },
-  { to: "/system-management/backups", label: "数据备份" },
-  { to: "/system-management/devices", label: "设备管理" },
-  { to: "/system-management/projects", label: "项目管理" },
-  { to: "/system-management/shortcuts", label: "快捷键与技能管理" },
-  { to: "/system-management/usage", label: "Codex 用量" },
-  { to: "/system-management/workspaces", label: "Git 工作区" },
-  { to: "/system-management/automations", label: "自动化" },
-  { to: "/system-management/machines", label: "执行机器" },
-  { to: "/system-management/uploads", label: "上传下载" },
-  { to: "/system-management/apps", label: "App管理" },
-  { to: "/system-management/jj", label: "JJ 工具" },
-  { to: "/system-management/settings", label: "系统设置" },
+const SYSTEM_NAVIGATION_GROUPS = [
+  {
+    id: "operations",
+    label: "运行与数据",
+    column: "left",
+    pages: [
+      { to: "/system-management/health", label: "运行状态" },
+      { to: "/system-management/backups", label: "数据备份" },
+      { to: "/system-management/uploads", label: "上传下载" },
+    ],
+  },
+  {
+    id: "workspace",
+    label: "项目与执行",
+    column: "right",
+    pages: [
+      { to: "/tasks", label: "任务面板" },
+      { to: "/system-management/projects", label: "项目管理" },
+      { to: "/system-management/workspaces", label: "Git 工作区" },
+      { to: "/system-management/automations", label: "自动化" },
+      { to: "/system-management/machines", label: "执行机器" },
+    ],
+  },
+  {
+    id: "codex",
+    label: "Codex 工具",
+    column: "left",
+    pages: [
+      { to: "/system-management/shortcuts", label: "快捷键与技能" },
+      { to: "/system-management/usage", label: "Codex 用量" },
+      { to: "/system-management/jj", label: "JJ 工具" },
+    ],
+  },
+  {
+    id: "devices",
+    label: "设备与连接",
+    column: "right",
+    pages: [
+      { to: "/remote-desktop", label: "远程桌面" },
+      { to: "/system-management/devices", label: "设备管理" },
+    ],
+  },
+  {
+    id: "preferences",
+    label: "偏好设置",
+    column: "left",
+    pages: [
+      { to: "/system-management/settings", label: "系统设置" },
+    ],
+  },
+] as const;
+
+const MOBILE_SYSTEM_PAGES = [
+  { to: "/system-management/app-tools", label: "扫一扫" },
+  { to: "/mobile-inbox", label: "待处理" },
+  { to: "/mobile-shares", label: "分享收件箱" },
+  { to: "/nearby-transfer", label: "附近传文件" },
 ] as const;
 
 type SystemNavigationState = {
@@ -54,9 +96,12 @@ export function WebNavigation(): ReactElement {
   const { collapsed, toggle } = useSystemNavigation();
   const location = useLocation();
   const pages = PAGES;
-  const systemActive = location.pathname.startsWith("/system-management") || location.pathname === "/pair-admin"
-    || (isMobileApp() && ["/mobile-inbox", "/mobile-shares", "/nearby-transfer"].includes(location.pathname));
-  const [systemOpen, setSystemOpen] = useState(systemActive);
+  const standaloneToolRoute = location.pathname === "/system-management/app-tools" || location.pathname === "/composer-transfer";
+  const appManagementRoute = location.pathname === "/system-management/apps" || location.pathname.startsWith("/system-management/apps/");
+  const systemActive = !standaloneToolRoute && !appManagementRoute && (location.pathname.startsWith("/system-management") || location.pathname === "/pair-admin"
+    || location.pathname === "/remote-desktop" || location.pathname === "/tasks" || location.pathname.startsWith("/tasks/")
+    || (isMobileApp() && ["/mobile-inbox", "/mobile-shares", "/nearby-transfer"].includes(location.pathname)));
+  const [systemOpen, setSystemOpen] = useState(false);
   useMobileBack(systemOpen, () => setSystemOpen(false), 1000);
   const [popoverPosition, setPopoverPosition] = useState<{ top: number; left: number } | null>(null);
   const systemTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -70,11 +115,8 @@ export function WebNavigation(): ReactElement {
   }, []);
 
   useEffect(() => {
-    if (systemActive) setSystemOpen(true);
-  }, [systemActive]);
-  useEffect(() => {
-    if (!systemActive) setSystemOpen(false);
-  }, [location.pathname, systemActive]);
+    setSystemOpen(false);
+  }, [location.pathname]);
 
   useEffect(() => {
     if (collapsed) setSystemOpen(false);
@@ -87,8 +129,8 @@ export function WebNavigation(): ReactElement {
     }
     const trigger = systemTriggerRef.current;
     if (!trigger) return;
-    const popoverWidth = 190;
-    const estimatedPopoverHeight = 360;
+    const popoverWidth = Math.min(440, window.innerWidth - 24);
+    const estimatedPopoverHeight = window.innerWidth <= 480 ? 420 : 360;
     const updatePosition = (): void => {
       const rect = trigger.getBoundingClientRect();
       const maxLeft = Math.max(12, window.innerWidth - popoverWidth - 12);
@@ -143,30 +185,52 @@ export function WebNavigation(): ReactElement {
         className="web-navigation-submenu-popover"
         role="menu"
         aria-label="系统管理"
-        style={{ top: popoverPosition.top, left: popoverPosition.left }}
+        style={{ top: popoverPosition.top, left: popoverPosition.left, maxHeight: `calc(100dvh - ${popoverPosition.top + 12}px)` }}
       >
-        {SYSTEM_PAGES.map((page) => (
-          <NavLink
-            key={page.to}
-            to={page.to}
-            role="menuitem"
-            className={({ isActive }) => isActive ? "is-active" : undefined}
-            onClick={closePopovers}
-          >{page.label}</NavLink>
-        ))}
+        <div className="web-navigation-submenu-heading" role="presentation">
+          <strong>系统管理</strong>
+          <span>按使用场景整理</span>
+        </div>
+        <div className="web-navigation-submenu-columns" role="presentation">
+          {(["left", "right"] as const).map((column) => (
+            <div key={column} className="web-navigation-submenu-column" role="presentation">
+              {SYSTEM_NAVIGATION_GROUPS.filter((group) => group.column === column).map((group) => (
+                <section key={group.id} className="web-navigation-submenu-group" role="group" aria-labelledby={`system-navigation-group-${group.id}`}>
+                  <h2 id={`system-navigation-group-${group.id}`}>{group.label}</h2>
+                  <div className="web-navigation-submenu-group-items">
+                    {group.pages.map((page) => (
+                      <NavLink
+                        key={page.to}
+                        to={page.to}
+                        role="menuitem"
+                        className={({ isActive }) => isActive ? "is-active" : undefined}
+                        onClick={closePopovers}
+                      >{page.label}</NavLink>
+                    ))}
+                  </div>
+                </section>
+              ))}
+            </div>
+          ))}
+        </div>
         {isMobileApp() ? <>
-          <button
-            className="web-navigation-submenu-action"
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              closePopovers();
-              openMobileConnectionSettings();
-            }}
-          >App 连接</button>
-          <NavLink to="/mobile-inbox" role="menuitem" className={({ isActive }) => isActive ? "is-active" : undefined} onClick={closePopovers}>待处理</NavLink>
-          <NavLink to="/mobile-shares" role="menuitem" className={({ isActive }) => isActive ? "is-active" : undefined} onClick={closePopovers}>分享收件箱</NavLink>
-          <NavLink to="/nearby-transfer" role="menuitem" className={({ isActive }) => isActive ? "is-active" : undefined} onClick={closePopovers}>附近传文件</NavLink>
+          <section className="web-navigation-submenu-group is-mobile" role="group" aria-labelledby="system-navigation-group-mobile">
+            <h2 id="system-navigation-group-mobile">App 与连接</h2>
+            <div className="web-navigation-submenu-group-items">
+              <button
+                className="web-navigation-submenu-action"
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  closePopovers();
+                  openMobileConnectionSettings();
+                }}
+              >App 连接</button>
+              {MOBILE_SYSTEM_PAGES.map((page) => (
+                <NavLink key={page.to} to={page.to} role="menuitem" className={({ isActive }) => isActive ? "is-active" : undefined} onClick={closePopovers}>{page.label}</NavLink>
+              ))}
+            </div>
+          </section>
         </> : null}
       </div>,
       document.body,
@@ -174,7 +238,7 @@ export function WebNavigation(): ReactElement {
     : null;
 
   return (
-    <div className={`system-navigation-shell${collapsed ? " is-collapsed" : ""}`}>
+    <div className={`system-navigation-shell${collapsed ? " is-collapsed" : ""}${location.pathname === "/composer-transfer" ? " is-composer-transfer" : ""}`}>
       <nav className="web-navigation" aria-label="系统页面">
         <button
           className="web-navigation-toggle"
@@ -194,7 +258,7 @@ export function WebNavigation(): ReactElement {
               {page.label}
             </NavLink>
           ))}
-          <div className={`web-navigation-group${systemOpen ? " is-open" : ""}`}>
+          <div className={`web-navigation-group${systemOpen ? " is-open" : ""}${systemActive ? " is-current" : ""}`}>
             <button
               ref={systemTriggerRef}
               className="web-navigation-group-trigger"

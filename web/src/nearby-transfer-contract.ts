@@ -12,7 +12,7 @@ export interface NearbyPeer {
   host?: string;
   port?: number;
   token?: string;
-  source: "mdns" | "hotspot";
+  source: "mdns" | "hotspot" | "qr";
 }
 
 export interface NearbyConnection {
@@ -20,6 +20,7 @@ export interface NearbyConnection {
   peer: NearbyPeer;
   state: NearbyConnectionState;
   incoming?: boolean;
+  verifiedTransfer?: boolean;
   error?: string;
 }
 
@@ -29,6 +30,7 @@ export interface NearbyFileOffer {
   fileName: string;
   mimeType: string;
   size: number;
+  accepted?: boolean;
 }
 
 export interface NearbyReceivedFile {
