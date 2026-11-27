@@ -136,7 +136,9 @@ mock.module("@capacitor/clipboard", () => ({ Clipboard: { write: async (options:
 mock.module("@capacitor/barcode-scanner", () => ({ CapacitorBarcodeScanner: { scanBarcode: async (options: Record<string, unknown>) => {
   nativeScans.push(options);
   if (scenario === "android-scan-cancel") throw new Error("scan cancelled");
+  if (scenario === "ios-scan-cancel") throw Object.assign(new Error("Couldn’t scan because the process was cancelled."), { code: "OS-PLUG-BARC-0006" });
   if (scenario === "android-scan-failure") throw new Error("camera permission denied");
+  if (scenario === "ios-scan-failure") throw Object.assign(new Error("Couldn’t scan because camera access wasn’t provided."), { code: "OS-PLUG-BARC-0007" });
   return { ScanResult: " bridgecodex://connect?fixture=pairing " };
 } } }));
 mock.module("@capacitor/filesystem", () => ({
@@ -291,9 +293,9 @@ if (scenario === "android-image-copy" || scenario === "ios-image-copy") {
   } else assert.equal(clipboardWrites[0]?.image, "data:image/png;base64," + Buffer.from(bytes).toString("base64"));
   process.exit(0);
 }
-if (scenario?.startsWith("android-scan-")) {
-  if (scenario === "android-scan-failure") await assert.rejects(native.scanPairingQr(), /permission denied/);
-  else assert.equal(await native.scanPairingQr(), scenario === "android-scan-cancel" ? null : "bridgecodex://connect?fixture=pairing");
+if (scenario?.includes("-scan-")) {
+  if (scenario.endsWith("-scan-failure")) await assert.rejects(native.scanPairingQr(), /camera/i);
+  else assert.equal(await native.scanPairingQr(), scenario.endsWith("-scan-cancel") ? null : "bridgecodex://connect?fixture=pairing");
   assert.equal(nativeScans.length, 1);
   assert.equal(nativeScans[0]?.cameraDirection, 1);
   process.exit(0);

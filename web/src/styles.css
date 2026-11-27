@@ -856,19 +856,19 @@ pre {
 .dashboard-session-path { color: #8290a0; font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .dashboard-session-meta { color: #9aa6b5; font-size: 11px; line-height: 1.3; }
 .dashboard-codex-home-select { min-width: 0; min-height: 32px; padding: 4px 7px; border: 1px solid #354252; border-radius: 7px; color: #d8dee9; background: #202832; font-size: 12px; }
-.dashboard-codex-inline { position: relative; z-index: 20; display: flex; flex: 0 0 auto; align-items: center; gap: 9px; min-width: 0; touch-action: auto; }
+.dashboard-codex-inline { --dashboard-toolbar-control-size: 36px; position: relative; z-index: 20; display: flex; flex: 0 0 auto; align-items: center; gap: 9px; min-width: 0; touch-action: auto; }
 .dashboard-codex-home-label { overflow: hidden; max-width: min(45vw, 240px); color: #d8dee9; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
-.dashboard-codex-usage-trigger { display: grid; min-width: 0; max-width: min(45vw, 240px); justify-items: center; gap: 2px; padding: 2px 5px; border: 1px solid transparent; border-radius: 7px; color: #d8dee9; background: transparent; font: inherit; text-align: center; cursor: pointer; }
+.dashboard-codex-usage-trigger { display: grid; min-width: 0; max-width: min(45vw, 240px); height: var(--dashboard-toolbar-control-size); min-height: var(--dashboard-toolbar-control-size); align-content: center; justify-items: center; gap: 2px; padding: 2px 5px; border: 1px solid transparent; border-radius: 7px; color: #d8dee9; background: transparent; font: inherit; text-align: center; cursor: pointer; }
 .dashboard-codex-usage-trigger:hover:not(:disabled) { background: #202832; }
 .dashboard-codex-usage-trigger:focus-visible { outline: 2px solid #78b791; outline-offset: 1px; }
 .dashboard-codex-usage-trigger:disabled { cursor: not-allowed; opacity: .72; }
 .dashboard-codex-usage-trigger .dashboard-codex-home-label { display: block; max-width: 100%; text-align: center; }
 .dashboard-codex-usage-summary { display: block; margin: 0; padding: 0; color: #8995a3; font-size: 9px; font-weight: 700; line-height: 1; text-align: center; white-space: nowrap; }
 .dashboard-codex-actions { position: relative; margin-left: auto; }
-.dashboard-terminal-mode-options { margin-left: 0; }
+.dashboard-terminal-mode-options { position: static; margin-left: 0; }
 .dashboard-terminal-mode-options > summary { touch-action: manipulation; }
-.dashboard-terminal-mode-options .dashboard-codex-actions-panel { right: auto; left: 0; width: min(190px, calc(100vw - 24px)); }
-.dashboard-codex-actions > summary { display: grid; width: 34px; height: 34px; min-height: 34px; place-items: center; list-style: none; border: 1px solid #35404d; border-radius: 7px; color: #c8d4e2; background: #202832; font-size: 18px; line-height: 1; cursor: pointer; touch-action: manipulation; }
+.dashboard-terminal-mode-options .dashboard-codex-actions-panel { right: 0; left: auto; width: min(190px, calc(100vw - 24px)); }
+.dashboard-codex-actions > summary { display: grid; width: var(--dashboard-toolbar-control-size); height: var(--dashboard-toolbar-control-size); min-height: var(--dashboard-toolbar-control-size); place-items: center; list-style: none; border: 1px solid #35404d; border-radius: 7px; color: #c8d4e2; background: #202832; font-size: 18px; line-height: 1; cursor: pointer; touch-action: manipulation; }
 .dashboard-codex-actions > summary::-webkit-details-marker { display: none; }
 .dashboard-codex-actions > summary:hover { background: #293542; }
 .dashboard-codex-actions-panel { position: absolute; z-index: 200; top: calc(100% + 6px); right: 0; display: grid; gap: 2px; width: min(240px, calc(100vw - 24px)); padding: 6px; border: 1px solid #3b4655; border-radius: 9px; background: #1a222c; box-shadow: 0 10px 28px #0008; pointer-events: auto; touch-action: auto; }
@@ -896,7 +896,7 @@ pre {
 .dashboard-active-session-edit:disabled { cursor: not-allowed; opacity: .5; }
 .dashboard-active-session-edit svg { width: 1em; height: 1em; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 2; }
 .dashboard-terminal-actions { flex: 0 0 auto; }
-.dashboard-terminal-mode-toggle { display: grid; width: 34px; min-width: 34px; height: 34px; min-height: 34px; place-items: center; padding: 0; border: 1px solid #35404d; border-radius: 7px; color: #aebdce; background: #202832; cursor: pointer; touch-action: manipulation; }
+.dashboard-terminal-mode-toggle { display: grid; width: var(--dashboard-toolbar-control-size); min-width: var(--dashboard-toolbar-control-size); height: var(--dashboard-toolbar-control-size); min-height: var(--dashboard-toolbar-control-size); place-items: center; padding: 0; border: 1px solid #35404d; border-radius: 7px; color: #aebdce; background: #202832; cursor: pointer; touch-action: manipulation; }
 .dashboard-terminal-mode-toggle:hover:not(:disabled) { color: #eef6ff; background: #293542; }
 .dashboard-terminal-mode-toggle.is-active { border-color: #d49a5c; color: #ffe0ae; background: #4a3322; box-shadow: 0 0 0 1px #d49a5c33; }
 .dashboard-terminal-mode-toggle:disabled { cursor: not-allowed; opacity: .5; }
@@ -1307,11 +1307,10 @@ pre {
   .dashboard-active-session-title { font-size: 10px; }
   .dashboard-active-session div span { max-width: 42vw; margin-top: 0; font-size: 8px; }
   .dashboard-codex-inline { grid-column: 3; grid-row: 1; gap: 8px; }
-  .dashboard-terminal-mode-toggle { width: 32px; min-width: 32px; height: 32px; min-height: 32px; padding: 0; font-size: 15px; }
-  .dashboard-codex-usage-trigger { max-width: min(22vw, 88px); min-height: 32px; gap: 1px; padding: 2px 4px; }
+  .dashboard-terminal-mode-toggle { padding: 0; font-size: 15px; }
+  .dashboard-codex-usage-trigger { max-width: min(22vw, 88px); gap: 1px; padding: 2px 4px; }
   .dashboard-codex-home-label { max-width: min(22vw, 88px); font-size: 11px; }
   .dashboard-codex-usage-summary { max-width: min(22vw, 88px); font-size: 8px; }
-  .dashboard-codex-actions > summary { width: 32px; height: 32px; min-height: 32px; }
   .dashboard-codex-actions-panel { width: min(230px, calc(100vw - 24px)); }
   .dashboard-session-actions { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; padding: 2px 6px 5px; }
   .dashboard-session-entry.is-archived .dashboard-session-actions { grid-template-columns: repeat(3, minmax(0, 1fr)); }

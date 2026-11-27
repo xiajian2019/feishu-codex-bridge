@@ -4,6 +4,7 @@ import { getActionToken } from "./api.js";
 import { readBridgeJson } from "./bridge-json.js";
 import { getBridgeOrigin } from "./mobile-runtime.js";
 import { acknowledgeComposerAdoption, adoptComposerTransfer, supportsComposerAssets, type ComposerAssetAdoption } from "./composer-asset-client.js";
+import { ComposerPeerTransferPanel } from "./ComposerPeerTransferPanel.js";
 import { useMobileBack } from "./use-mobile-back.js";
 import "./composer-transfer.css";
 
@@ -37,6 +38,7 @@ type ComposerTransferReceiverProps = {
 };
 
 export function ComposerTransferReceiver({ sessionId, sessionCreatedAt, onImportText, onImportFile, onImportAssets, onClose }: ComposerTransferReceiverProps): ReactElement {
+  const [transferMode, setTransferMode] = useState<"server" | "peerjs">("server");
   const [target, setTarget] = useState<Target | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [transfers, setTransfers] = useState<Transfer[]>([]);
@@ -237,20 +239,34 @@ export function ComposerTransferReceiver({ sessionId, sessionCreatedAt, onImport
   return <div className="composer-transfer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) void stopReceiving(); }}>
     <section className="composer-transfer-dialog" role="dialog" aria-modal="true" aria-label="手机导入 Composer">
       <header className="composer-transfer-heading"><h2>从手机导入</h2><button type="button" onClick={() => void stopReceiving()} disabled={importing || closing} aria-label="关闭">×</button></header>
-      {busy ? <p role="status">正在生成接收二维码…</p> : null}
-      {closing ? <p role="status">正在停止接收…</p> : null}
-      {error ? <p className="composer-transfer-error" role="alert">{error}</p> : null}
-      {target && !busy ? <div className="composer-transfer-target">
-        {qrDataUrl ? <img className="composer-transfer-qr" src={qrDataUrl} alt="手机导入二维码" /> : null}
-        <p>用手机扫描二维码，打开上传页面。接收码 <code>{target.code}</code>，10 分钟内有效。</p>
-        <p className="composer-transfer-hint">手机提交后会出现在这里；点击“加入 Composer”才会写入当前草稿，不会自动发送。</p>
-      </div> : null}
-      {transfers.map((transfer) => <article className="composer-transfer-card" key={transfer.transferId}>
-        <strong>手机内容已准备好</strong>
-        {transfer.text ? <p>{transfer.text.slice(0, 240)}{transfer.text.length > 240 ? "…" : ""}</p> : null}
-        {transfer.items.length ? <ul>{transfer.items.map((item) => <li key={item.itemId}>{item.fileName} · {formatBytes(item.sizeBytes)}</li>)}</ul> : null}
-        <button type="button" className="primary" disabled={importing || closing} onClick={() => void importTransfer(transfer)}>{importing ? "正在加入…" : importedTransferId.current === transfer.transferId ? "重试确认" : "加入 Composer"}</button>
-      </article>)}
+      <div className="composer-transfer-tabs" role="tablist" aria-label="手机导入方式">
+        <button type="button" role="tab" aria-selected={transferMode === "server"} className={transferMode === "server" ? "is-active" : ""} onClick={() => setTransferMode("server")}>
+          Bridge 中转
+        </button>
+        <button type="button" role="tab" aria-selected={transferMode === "peerjs"} className={transferMode === "peerjs" ? "is-active" : ""} onClick={() => setTransferMode("peerjs")}>
+          WebRTC 直传
+        </button>
+      </div>
+      {transferMode === "server" ? <>
+        {busy ? <p role="status">正在生成接收二维码…</p> : null}
+        {closing ? <p role="status">正在停止接收…</p> : null}
+        {error ? <p className="composer-transfer-error" role="alert">{error}</p> : null}
+        {target && !busy ? <div className="composer-transfer-target">
+          {qrDataUrl ? <img className="composer-transfer-qr" src={qrDataUrl} alt="手机导入二维码" /> : null}
+          <p>用手机扫描二维码，打开上传页面。接收码 <code>{target.code}</code>，10 分钟内有效。</p>
+          <p className="composer-transfer-hint">手机提交后会出现在这里；点击“加入 Composer”才会写入当前草稿，不会自动发送。</p>
+        </div> : null}
+        {transfers.map((transfer) => <article className="composer-transfer-card" key={transfer.transferId}>
+          <strong>手机内容已准备好</strong>
+          {transfer.text ? <p>{transfer.text.slice(0, 240)}{transfer.text.length > 240 ? "…" : ""}</p> : null}
+          {transfer.items.length ? <ul>{transfer.items.map((item) => <li key={item.itemId}>{item.fileName} · {formatBytes(item.sizeBytes)}</li>)}</ul> : null}
+          <button type="button" className="primary" disabled={importing || closing} onClick={() => void importTransfer(transfer)}>{importing ? "正在加入…" : importedTransferId.current === transfer.transferId ? "重试确认" : "加入 Composer"}</button>
+        </article>)}
+      </> : <ComposerPeerTransferPanel
+        onImportText={onImportText}
+        onImportFile={onImportFile}
+        onClose={() => void stopReceiving()}
+      />}
     </section>
   </div>;
 }

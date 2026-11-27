@@ -35,6 +35,7 @@ describe("MobileIosTestflight", () => {
     mkdirSync(buildDirectory, { recursive: true });
     writeFileSync(join(project, "project.pbxproj"), `/* Release */ = {
       isa = XCBuildConfiguration;
+      baseConfigurationReference = Signing.xcconfig;
       buildSettings = {
         CURRENT_PROJECT_VERSION = 1;
         INFOPLIST_FILE = OneHandKit/Info.plist;

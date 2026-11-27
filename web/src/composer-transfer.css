@@ -29,21 +29,33 @@
 
 .composer-transfer-heading h2 { margin: 2px 0 0; }
 .composer-transfer-heading button { min-width: 32px; min-height: 32px; font-size: 20px; }
+.composer-transfer-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; margin: 16px 0 12px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
+.composer-transfer-tabs button { min-height: 36px; padding: 7px 10px; border: 1px solid transparent; border-radius: 7px; color: var(--muted); background: transparent; font: inherit; font-size: 13px; font-weight: 700; transition: border-color .15s ease, color .15s ease, background .15s ease, box-shadow .15s ease; }
+.composer-transfer-tabs button:not(.is-active) { opacity: .72; }
+.composer-transfer-tabs button:not(.is-active):hover, .composer-transfer-tabs button:not(.is-active):focus-visible { opacity: 1; color: var(--ink); background: color-mix(in srgb, var(--card) 72%, transparent); }
+.composer-transfer-tabs button.is-active { border-color: var(--accent); color: #fff; background: var(--accent); box-shadow: 0 2px 6px #00000024; opacity: 1; }
+:root[data-theme="dark"] .composer-transfer-tabs { border-color: #3c4b5c; background: #10151b; }
+:root[data-theme="dark"] .composer-transfer-tabs button { color: #8794a5; }
+:root[data-theme="dark"] .composer-transfer-tabs button:not(.is-active):hover, :root[data-theme="dark"] .composer-transfer-tabs button:not(.is-active):focus-visible { color: #d8dee9; background: #202832; }
+:root[data-theme="dark"] .composer-transfer-tabs button.is-active { border-color: #4e806b; color: #10141a; background: #89d2a8; box-shadow: 0 2px 8px #0008; }
 .composer-transfer-qr { display: block; width: min(240px, 100%); height: auto; aspect-ratio: 1; margin: 12px auto; border-radius: 8px; background: #fff; }
 .composer-transfer-target { margin-top: 12px; text-align: center; }
 .composer-transfer-target p { margin: 8px 0; }
 .composer-transfer-hint { color: var(--muted); font-size: 13px; }
 .composer-transfer-context { display: flex; min-width: 0; align-items: baseline; gap: 6px; font-size: clamp(11px, 3.25vw, 13px); white-space: nowrap; }
-.composer-transfer-context-session, .composer-transfer-context-bridge { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.composer-transfer-context-session { flex: 0 0 auto; max-width: 40%; }
-.composer-transfer-context-bridge { flex: 1 1 auto; }
+.composer-transfer-context-bridge { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .composer-transfer-card { margin-top: 14px; padding: 12px; border: 1px solid var(--accent); border-radius: 10px; background: var(--accent-soft); }
 .composer-transfer-card p { white-space: pre-wrap; overflow-wrap: anywhere; }
 .composer-transfer-card ul { margin: 8px 0; padding: 0; list-style: none; }
 .composer-transfer-card li { overflow-wrap: anywhere; }
 .composer-transfer-card button { min-height: 36px; }
+.composer-transfer-progress, .composer-transfer-error { min-width: 0; overflow-wrap: anywhere; }
 .composer-transfer-error { color: var(--danger); }
 .composer-transfer-notice { color: var(--success, #16803c); }
+.composer-peer-transfer-panel { min-width: 0; }
+.composer-peer-transfer-status { margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.composer-peer-transfer-footnote { margin: 14px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.composer-peer-transfer-upload-card .composer-peer-transfer-status { padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--paper); }
 
 .composer-transfer-upload-page {
   min-height: 0;
@@ -55,6 +67,7 @@
 
 .composer-transfer-upload-card {
   width: min(100%, 620px);
+  min-width: 0;
   box-sizing: border-box;
   margin: 0;
 }
@@ -76,6 +89,7 @@ html.bridge-mobile-app .system-navigation-shell.is-composer-transfer:not(.is-col
 
 .composer-transfer-upload-card h1 {
   margin: 4px 0 18px;
+  overflow-wrap: anywhere;
   font-size: clamp(28px, 7vw, 42px);
   line-height: 1.12;
   letter-spacing: -0.03em;
@@ -83,6 +97,8 @@ html.bridge-mobile-app .system-navigation-shell.is-composer-transfer:not(.is-col
 
 .composer-transfer-upload-card form {
   display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
   margin-top: 18px;
 }
@@ -122,7 +138,7 @@ html.bridge-mobile-app .system-navigation-shell.is-composer-transfer:not(.is-col
 }
 
 .composer-transfer-field small { color: var(--muted); font-size: 12px; font-weight: 400; }
-.composer-transfer-file-list { display: grid; gap: 6px; margin: -4px 0 0; padding: 0; list-style: none; }
+.composer-transfer-file-list { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr); gap: 6px; margin: -4px 0 0; padding: 0; list-style: none; }
 .composer-transfer-file-list li { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; padding: 7px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); }
 .composer-transfer-file-main { display: flex; min-width: 0; align-items: center; gap: 9px; }
 .composer-transfer-file-thumbnail,

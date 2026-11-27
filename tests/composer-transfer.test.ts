@@ -62,11 +62,14 @@ it("relays a phone Composer transfer through a one-time target and imports it in
     });
     expect(invalidClaimResponse.status).toBe(404);
 
+    session.name = "renamed-transfer";
+    db.recordTmuxSession(session);
     const claimResponse = await fetch(base + "/api/composer-transfers/claim", {
-      method: "POST", headers: { Origin: "capacitor://localhost", "Content-Type": "application/json" }, body: JSON.stringify({ code: target.code }),
+      method: "POST", headers: { Origin: "capacitor://localhost", "Content-Type": "application/json" }, body: JSON.stringify({ code: target.code, sessionName: "spoofed" }),
     });
     expect(claimResponse.status).toBe(200);
-    const claim = await claimResponse.json() as { transferId: string; transferToken: string };
+    const claim = await claimResponse.json() as { transferId: string; transferToken: string; target: { sessionId: string; sessionCreatedAt: number; sessionName: string | null } };
+    expect(claim.target).toEqual({ sessionId: "$41", sessionCreatedAt: 41, sessionName: "renamed-transfer" });
 
     const transferHeaders = { Origin: "capacitor://localhost", "Content-Type": "application/json", "X-Bridge-Transfer-Token": claim.transferToken };
     const textResponse = await fetch(`${base}/api/composer-transfers/${claim.transferId}/text`, {

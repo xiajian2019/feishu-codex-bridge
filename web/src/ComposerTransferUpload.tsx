@@ -5,12 +5,13 @@ import { bridgeUrl, copyMobileText, getBridgeOrigin, isMobileApp } from "./mobil
 import { formatTransferDiagnosticError } from "./composer-transfer-diagnostics.js";
 import { useMobileBack } from "./use-mobile-back.js";
 import "./composer-transfer.css";
+import { ComposerPeerTransferUpload } from "./ComposerPeerTransferUpload.js";
 
 type Claim = {
   transferId: string;
   transferToken: string;
   expiresAt: string;
-  target: { sessionId: string; sessionCreatedAt: number };
+  target: { sessionId: string; sessionCreatedAt: number; sessionName?: string | null };
 };
 
 type UploadItem = { itemId: string; offset: number; sizeBytes: number; fileName: string };
@@ -20,6 +21,15 @@ const CHUNK_BYTES = 8 * 1024 * 1024;
 
 export function ComposerTransferUpload(): ReactElement {
   const location = useLocation();
+  const search = new URLSearchParams(location.search);
+  if (search.get("mode") === "peerjs") return <ComposerPeerTransferUpload key={location.key} />;
+  const code = search.get("code")?.trim() ?? "";
+  // A scan creates a new navigation entry, even when it returns to this route.
+  // Keep each one-time claim and its form state within that entry.
+  return <ComposerTransferUploadAttempt key={location.key} code={code} />;
+}
+
+function ComposerTransferUploadAttempt({ code }: { code: string }): ReactElement {
   const [claim, setClaim] = useState<Claim | null>(null);
   const [text, setText] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -33,7 +43,6 @@ export function ComposerTransferUpload(): ReactElement {
   const [copyStatus, setCopyStatus] = useState("");
   const claimPromise = useRef<Promise<Claim> | null>(null);
   const diagnosticSecrets = useRef<string[]>([]);
-  const code = new URLSearchParams(location.search).get("code")?.trim() ?? "";
   diagnosticSecrets.current = [code, claim?.transferId ?? "", claim?.transferToken ?? "", text, ...files.map((file) => file.name)];
   const record = useCallback((message: string): void => {
     setDiagnosticLines((lines) => [...lines, `[${new Date().toISOString()}] ${message}`].slice(-100));
@@ -42,6 +51,7 @@ export function ComposerTransferUpload(): ReactElement {
     record(`${phase}：${formatTransferDiagnosticError(cause, diagnosticSecrets.current)}`);
   }, [record]);
   const diagnostics = { record, failure };
+  const sessionName = typeof claim?.target?.sessionName === "string" ? claim.target.sessionName.trim() : "";
   const diagnosticReport = [
     "Composer 传输诊断（不含接收码、令牌、正文和文件名）",
     `环境：${isMobileApp() ? "手机 App" : "浏览器"}；Bridge：${getBridgeOrigin()}；设备在线状态：${navigator.onLine ? "在线" : "离线"}`,
@@ -163,12 +173,9 @@ export function ComposerTransferUpload(): ReactElement {
 
   return <main className="page-main composer-transfer-upload-page">
     <section className="composer-transfer-dialog composer-transfer-upload-card">
-      <p className="dashboard-eyebrow">BRIDGE COMPOSER</p>
-      <h1>发送到 Composer</h1>
+      <h1>发送到 {sessionName || "目标 Session"}</h1>
       {!claim && !error ? <p role="status">正在验证接收码…</p> : null}
       {claim ? <p className="composer-transfer-hint composer-transfer-context">
-        <span className="composer-transfer-context-session" title={claim.target.sessionId}>Session：<code>{claim.target.sessionId}</code></span>
-        <span aria-hidden="true">·</span>
         <span className="composer-transfer-context-bridge" title={getBridgeOrigin()}>Bridge：<code>{getBridgeOrigin()}</code></span>
       </p> : null}
       {error ? <p className="composer-transfer-error" role="alert">{error}</p> : null}
@@ -182,7 +189,7 @@ export function ComposerTransferUpload(): ReactElement {
           </div>
           <button type="button" aria-label={`移除 ${file.name}`} disabled={busy} onClick={() => removeFile(index)}>移除</button>
         </li>)}</ul> : null}
-        {progress ? <p role="status">{progress}</p> : null}
+        {progress ? <p className="composer-transfer-progress" role="status">{progress}</p> : null}
         <button className="primary" type="submit" disabled={busy}>{busy ? "发送中…" : "发送到 Composer"}</button>
       </form> : null}
       {done ? <p className="composer-transfer-notice" role="status">发送完成。现在可以返回目标设备，点击“加入 Composer”。</p> : null}

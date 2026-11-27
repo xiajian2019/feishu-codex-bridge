@@ -56,7 +56,7 @@ function projectBuildNumber(app: StoredIosTestflightApp): number {
   try {
     const project = readFileSync(join(app.project_path, "project.pbxproj"), "utf8");
     const configuration = escapeRegExp(app.configuration);
-    const blocks = [...project.matchAll(new RegExp(`\\/\\*\\s*${configuration}\\s*\\*\\/\\s*=\\s*\\{\\s*isa = XCBuildConfiguration;\\s*buildSettings = \\{([\\s\\S]*?)\\n\\s*\\};\\s*name = ${configuration};\\s*\\};`, "g"))];
+    const blocks = [...project.matchAll(new RegExp(`\\/\\*\\s*${configuration}\\s*\\*\\/\\s*=\\s*\\{\\s*isa = XCBuildConfiguration;[\\s\\S]*?buildSettings = \\{([\\s\\S]*?)\\n\\s*\\};\\s*name = ${configuration};\\s*\\};`, "g"))];
     const block = blocks.map((match) => match[1]).find((value) => {
       const productName = value.match(/^\s*PRODUCT_NAME\s*=\s*"?([^";\n]+)"?;/m)?.[1]?.trim();
       return value.includes(`INFOPLIST_FILE = ${app.info_plist_path};`)

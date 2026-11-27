@@ -3871,7 +3871,7 @@ function deriveIosTestflightInfoPlist(projectPath: string, targetName: string, c
   try {
     const project = readFileSync(join(projectPath, "project.pbxproj"), "utf8");
     const escaped = configuration.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const blocks = [...project.matchAll(new RegExp(`\\/\\*\\s*${escaped}\\s*\\*\\/\\s*=\\s*\\{\\s*isa = XCBuildConfiguration;\\s*buildSettings = \\{([\\s\\S]*?)\\n\\s*\\};\\s*name = ${escaped};\\s*\\};`, "g"))];
+    const blocks = [...project.matchAll(new RegExp(`\\/\\*\\s*${escaped}\\s*\\*\\/\\s*=\\s*\\{\\s*isa = XCBuildConfiguration;[\\s\\S]*?buildSettings = \\{([\\s\\S]*?)\\n\\s*\\};\\s*name = ${escaped};\\s*\\};`, "g"))];
     const block = blocks.map((match) => match[1]).find((value) => value.includes(`PRODUCT_NAME = ${targetName};`));
     const info = block?.match(/^\s*INFOPLIST_FILE\s*=\s*"?([^";\n]+)"?;/m)?.[1]?.trim();
     return info || null;

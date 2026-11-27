@@ -1,7 +1,8 @@
 import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type Dispatch, type ReactElement, type ReactNode, type SetStateAction } from "react";
-import { createPortal } from "react-dom";
-import { NavLink, useLocation } from "react-router";
-import { isMobileApp, openMobileConnectionSettings } from "./mobile-runtime.js";
+import { createPortal, flushSync } from "react-dom";
+import { NavLink, useLocation, useNavigate } from "react-router";
+import { getBridgeOrigin, isMobileApp, openMobileConnectionSettings, scanMobilePairingQr } from "./mobile-runtime.js";
+import { parseComposerTransferQrPayload } from "./composer-transfer-link.js";
 
 
 const PAGES = [
@@ -64,7 +65,7 @@ const SYSTEM_NAVIGATION_GROUPS = [
 ] as const;
 
 const MOBILE_SYSTEM_PAGES = [
-  { to: "/system-management/app-tools", label: "扫一扫" },
+  { to: "/system-management/app-tools", label: "扫码备用方式" },
   { to: "/mobile-inbox", label: "待处理" },
   { to: "/mobile-shares", label: "分享收件箱" },
   { to: "/nearby-transfer", label: "附近传文件" },
@@ -95,6 +96,11 @@ import { useMobileBack } from "./use-mobile-back.js";
 export function WebNavigation(): ReactElement {
   const { collapsed, toggle } = useSystemNavigation();
   const location = useLocation();
+  const navigate = useNavigate();
+  const scanPending = useRef(false);
+  const mounted = useRef(false);
+  const locationKey = useRef(location.key);
+  locationKey.current = location.key;
   const pages = PAGES;
   const standaloneToolRoute = location.pathname === "/system-management/app-tools" || location.pathname === "/composer-transfer";
   const appManagementRoute = location.pathname === "/system-management/apps" || location.pathname.startsWith("/system-management/apps/");
@@ -107,6 +113,11 @@ export function WebNavigation(): ReactElement {
   const systemTriggerRef = useRef<HTMLButtonElement | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
   const activePopover = systemOpen ? "system" : null;
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
   useEffect(() => {
     const closeForMobileEnvironment = (): void => setSystemOpen(false);
@@ -177,6 +188,33 @@ export function WebNavigation(): ReactElement {
     setSystemOpen(false);
   };
 
+  const scanComposerQr = async (): Promise<void> => {
+    if (scanPending.current) return;
+    scanPending.current = true;
+    const scanLocation = locationKey.current;
+    const bridgeOrigin = getBridgeOrigin();
+    closePopovers();
+    try {
+      // If the optional Web camera is open, release it before starting native capture.
+      flushSync(() => window.dispatchEvent(new Event("bridge:prepare-native-composer-scan")));
+      const value = await scanMobilePairingQr("扫描 Composer 手机同步二维码");
+      if (!mounted.current || locationKey.current !== scanLocation || getBridgeOrigin() !== bridgeOrigin || !value) return;
+      const payload = parseComposerTransferQrPayload(value, bridgeOrigin);
+      if (payload.mode === "peerjs") {
+        navigate(`/composer-transfer?mode=peerjs&peer=${encodeURIComponent(payload.peerId)}&token=${encodeURIComponent(payload.token)}`);
+      } else {
+        navigate(`/composer-transfer?code=${encodeURIComponent(payload.code)}`);
+      }
+    } catch (cause) {
+      if (!mounted.current || locationKey.current !== scanLocation || getBridgeOrigin() !== bridgeOrigin) return;
+      navigate("/system-management/app-tools", { state: {
+        composerScanError: cause instanceof Error ? cause.message : "原生扫码失败，请重试或使用其他方式。",
+      } });
+    } finally {
+      scanPending.current = false;
+    }
+  };
+
   const systemPopover = activePopover === "system" && popoverPosition
     ? createPortal(
       <div
@@ -225,7 +263,8 @@ export function WebNavigation(): ReactElement {
                   closePopovers();
                   openMobileConnectionSettings();
                 }}
-              >App 连接</button>
+              >连接管理</button>
+              <button className="web-navigation-submenu-action" type="button" role="menuitem" onClick={() => void scanComposerQr()}>扫一扫</button>
               {MOBILE_SYSTEM_PAGES.map((page) => (
                 <NavLink key={page.to} to={page.to} role="menuitem" className={({ isActive }) => isActive ? "is-active" : undefined} onClick={closePopovers}>{page.label}</NavLink>
               ))}

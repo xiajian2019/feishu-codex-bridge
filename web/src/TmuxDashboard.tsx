@@ -394,6 +394,7 @@ export function TmuxDashboard({ active = true }: { active?: boolean }): ReactEle
   const [codexUsageLoading, setCodexUsageLoading] = useState(false);
   const [codexUsageError, setCodexUsageError] = useState<string | null>(null);
   const [codexUsageDialogOpen, setCodexUsageDialogOpen] = useState(false);
+  const [openToolbarMenu, setOpenToolbarMenu] = useState<"terminal" | "session" | null>(null);
   const [mobileView, setMobileView] = useState<"sessions" | "terminal">("sessions");
   const [selectedId, setSelectedId] = useState<string | null>(() => initialSelectedId);
   const [sessionsRefreshing, setSessionsRefreshing] = useState(false);
@@ -446,6 +447,7 @@ export function TmuxDashboard({ active = true }: { active?: boolean }): ReactEle
   const terminalHostRef = useRef<HTMLDivElement | null>(null);
   const terminalHistoryHostRef = useRef<HTMLDivElement | null>(null);
   const projectPickerRef = useRef<HTMLDivElement | null>(null);
+  const toolbarMenuContainerRef = useRef<HTMLDivElement | null>(null);
   const terminalInstanceRef = useRef<Terminal | null>(null);
   const terminalHistoryInstanceRef = useRef<Terminal | null>(null);
   const activeTerminalInstanceRef = useRef<Terminal | null>(null);
@@ -483,6 +485,24 @@ export function TmuxDashboard({ active = true }: { active?: boolean }): ReactEle
   }, [sessionInspector]);
 
   useEffect(() => {
+    if (!openToolbarMenu) return;
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      if (event.target instanceof Node && !toolbarMenuContainerRef.current?.contains(event.target)) setOpenToolbarMenu(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setOpenToolbarMenu(null);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [openToolbarMenu]);
+
+  useEffect(() => { setOpenToolbarMenu(null); }, [selectedId]);
+
+  useEffect(() => {
     if (!active) return;
     const params = new URLSearchParams(location.search);
     if (selectedId) {
@@ -509,8 +529,9 @@ export function TmuxDashboard({ active = true }: { active?: boolean }): ReactEle
   }, [location.hash, location.pathname, location.search, location.state, navigate]);
 
   useLayoutEffect(() => {
-    if (mobileView === "terminal") return bindMobileTerminalViewport(window);
-  }, [mobileView]);
+    if (!active || mobileView !== "terminal") return;
+    return bindMobileTerminalViewport(window);
+  }, [active, mobileView]);
 
   useLayoutEffect(() => {
     const detailClass = "tmux-terminal-detail";
@@ -2303,8 +2324,10 @@ export function TmuxDashboard({ active = true }: { active?: boolean }): ReactEle
             <button className="dashboard-mobile-back" type="button" onClick={showSessionsOnMobile} aria-label="Back to sessions">‹</button>
             <div className="dashboard-active-session"><div><div className="dashboard-active-session-title"><strong>{selectedSession?.name ?? "No session selected"}</strong>{selectedSession ? <button className="dashboard-active-session-edit" type="button" onClick={openSessionEditDialog} disabled={Boolean(selectedSession.endedAt || selectedSession.suspendedAt)} aria-label="编辑 Session 名称和工作目录" title="编辑 Session 名称和工作目录"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m4 16.5-.8 4.3 4.3-.8L19 8.5 15.5 5z" /><path d="m13.8 6.7 3.5 3.5" /></svg></button> : null}</div><span title={selectedSession?.cwd}>{selectedSession?.workspaceBranch ? `任务分支 ${selectedSession.workspaceBranch} · ${selectedSession.workspaceStatus ?? "工作区"} · ` : ""}{selectedSession?.cwd ?? "Choose a session to open its terminal"}</span></div></div>
             {selectedSession ? (
-              <div className="dashboard-codex-inline" aria-label="Session 账号与操作">
+              <div ref={toolbarMenuContainerRef} className="dashboard-codex-inline" aria-label="Session 账号与操作">
                 <TmuxMobileTerminalMode
+                  menuOpen={openToolbarMenu === "terminal"}
+                  onMenuOpenChange={(open) => setOpenToolbarMenu((current) => open ? "terminal" : current === "terminal" ? null : current)}
                   terminalInputEnabled={terminalInputEnabled}
                   terminalAttached={terminalStatus === "ATTACHED"}
                   onToggleTerminalInput={() => setTerminalInputEnabled((current) => !current)}
@@ -2326,7 +2349,7 @@ export function TmuxDashboard({ active = true }: { active?: boolean }): ReactEle
                   className="dashboard-codex-usage-trigger"
                   type="button"
                   disabled={!selectedSession.codexHomeId || terminalStatus !== "ATTACHED"}
-                  onClick={() => setCodexUsageDialogOpen(true)}
+                  onClick={() => { setOpenToolbarMenu(null); setCodexUsageDialogOpen(true); }}
                   title={!selectedSession.codexHomeId
                     ? "当前 Session 未关联 Codex 账号"
                     : terminalStatus !== "ATTACHED" ? "终端连接完成后查看 Codex 用量" : "查看当前 Codex 用量"}
@@ -2341,8 +2364,8 @@ export function TmuxDashboard({ active = true }: { active?: boolean }): ReactEle
                     {currentCodexRemainingPercentages[0]}·{currentCodexRemainingPercentages[1]}
                   </span>
                 </button>
-                <details className="dashboard-codex-actions">
-                  <summary aria-label="Session 操作" title="Session 操作"><span className="menu-chevron" aria-hidden="true" /></summary>
+                <details className="dashboard-codex-actions" open={openToolbarMenu === "session"}>
+                  <summary aria-label="Session 操作" title="Session 操作" onClick={(event) => { event.preventDefault(); setOpenToolbarMenu((current) => current === "session" ? null : "session"); }}><span className="menu-chevron" aria-hidden="true" /></summary>
                   <div className="dashboard-codex-actions-panel">
                     <button type="button" onClick={() => openSessionInspector("history", selectedSession.id)}>
                       查看历史（当前 Session）

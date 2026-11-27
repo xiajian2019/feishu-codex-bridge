@@ -3,11 +3,12 @@ import { loadPairingScanner, pairingCameraFailure, type PairingScannerInstance }
 import { recordPairingScan } from "./pairing-diagnostics.js";
 import { isMobileApp } from "./mobile-runtime.js";
 
-export function PairingScanner({ onDecode, onClose, onPhoto, onImage }: {
+export function PairingScanner({ onDecode, onClose, onPhoto, onImage, readyMessage = "将完整二维码放入扫描框，识别后自动登录，无需拍照确认。" }: {
   onDecode: (value: string) => void;
   onClose: () => void;
   onPhoto: () => void;
   onImage?: () => void;
+  readyMessage?: string;
 }): ReactElement {
   const stopRef = useRef<(() => void) | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -49,7 +50,7 @@ export function PairingScanner({ onDecode, onClose, onPhoto, onImage }: {
         scanner.setInversionMode("both");
         await scanner.start();
         if (cancelled) { scanner.destroy(); return; }
-        setMessage("将完整二维码放入扫描框，识别后自动登录，无需拍照确认。");
+        setMessage(readyMessage);
       } catch (error) {
         if (cancelled) return;
         scanner?.destroy();
@@ -61,7 +62,7 @@ export function PairingScanner({ onDecode, onClose, onPhoto, onImage }: {
       }
     })();
     return () => { stop(); stopRef.current = null; document.removeEventListener("visibilitychange", hide); window.removeEventListener("pagehide", stop); };
-  }, []);
+  }, [readyMessage]);
 
   return <div className="pairing-camera" role="region" aria-label="实时扫码">
     <div className="pairing-camera-video"><video ref={videoRef} autoPlay muted playsInline aria-label="配对二维码扫描画面" /></div>

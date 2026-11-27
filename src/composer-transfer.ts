@@ -38,6 +38,7 @@ export interface ComposerTransferClaimResult {
   target: {
     sessionId: string;
     sessionCreatedAt: number;
+    sessionName: string | null;
   };
 }
 
@@ -95,6 +96,9 @@ export class ComposerTransferStore {
       this.db.cancelComposerTransferTarget(target.target_id);
       throw new ComposerTransferError(410, "接收凭证已过期，请在 Composer 中重新生成。");
     }
+    const session = this.db.getTmuxSession(target.session_record_id);
+    const sessionName = session?.tmux_session_id === target.tmux_session_id && session.tmux_created_at === target.session_created_at
+      ? session.session_name : null;
     const transferToken = randomBytes(32).toString("base64url");
     const transferId = `composer_transfer_${randomUUID()}`;
     const transfer = this.db.claimComposerTransferTarget({
@@ -109,7 +113,7 @@ export class ComposerTransferStore {
       transferId,
       transferToken,
       expiresAt: transfer.expires_at,
-      target: { sessionId: target.tmux_session_id, sessionCreatedAt: target.session_created_at },
+      target: { sessionId: target.tmux_session_id, sessionCreatedAt: target.session_created_at, sessionName },
     };
   }
 

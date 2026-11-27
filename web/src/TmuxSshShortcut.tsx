@@ -57,6 +57,8 @@ export function TmuxSshShortcut({ onError, sessionSelection }: { onError: (messa
 }
 
 export function TmuxMobileTerminalMode({
+  menuOpen,
+  onMenuOpenChange,
   terminalInputEnabled,
   terminalAttached,
   onToggleTerminalInput,
@@ -66,6 +68,8 @@ export function TmuxMobileTerminalMode({
   webShellOpen = false,
   webShellRetained = false,
 }: {
+  menuOpen: boolean;
+  onMenuOpenChange: (open: boolean) => void;
   terminalInputEnabled: boolean;
   terminalAttached: boolean;
   onToggleTerminalInput: () => void;
@@ -75,13 +79,10 @@ export function TmuxMobileTerminalMode({
   webShellOpen?: boolean;
   webShellRetained?: boolean;
 }): ReactElement {
-  const menuRef = useRef<HTMLDetailsElement | null>(null);
   const [opening, setOpening] = useState(false);
   const nativePlatform: NativeSshPlatform | null = isNativeSshWorkspaceAvailable() ? getNativeSshPlatform() : null;
   const nativeAvailable = nativePlatform !== null;
-  const closeMenu = (): void => {
-    if (menuRef.current) menuRef.current.open = false;
-  };
+  const closeMenu = (): void => onMenuOpenChange(false);
   const openNativeSheet = async (): Promise<void> => {
     if (opening || !nativeAvailable) return;
     setOpening(true);
@@ -96,8 +97,8 @@ export function TmuxMobileTerminalMode({
   };
 
   const active = terminalInputEnabled || webShellOpen;
-  return <details ref={menuRef} className="dashboard-codex-actions dashboard-terminal-mode-options">
-    <summary className={`dashboard-terminal-mode-toggle${active ? " is-active" : ""}`} aria-label="选择终端操作方式" title="选择终端操作方式">
+  return <details open={menuOpen} className="dashboard-codex-actions dashboard-terminal-mode-options">
+    <summary className={`dashboard-terminal-mode-toggle${active ? " is-active" : ""}`} aria-label="选择终端操作方式" title="选择终端操作方式" onClick={(event) => { event.preventDefault(); onMenuOpenChange(!menuOpen); }}>
       {active ? (
         <svg className="dashboard-terminal-mode-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
           <rect x="3" y="4" width="18" height="15" rx="2" />

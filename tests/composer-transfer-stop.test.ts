@@ -15,6 +15,21 @@ async function fixture() {
   return { root, db, store, target };
 }
 
+for (const rebound of [{ id: "$99", createdAt: 41 }, { id: "$41", createdAt: 99 }]) {
+  it(`does not return the name of a rebound session ${rebound.id}/${rebound.createdAt} for an older target`, async () => {
+    const f = await fixture();
+    try {
+      const target = f.db.getComposerTransferTarget(f.target.targetId)!;
+      expect(f.db.markTmuxSessionRecordSuspended(target.session_record_id)).not.toBeNull();
+      expect(f.db.resumeTmuxSession(target.session_record_id, { ...rebound, name: "other-session", cwd: f.root })).not.toBeNull();
+      const claim = f.store.claim(f.target.code, null);
+      expect(claim.target).toEqual({ sessionId: "$41", sessionCreatedAt: 41, sessionName: null });
+    } finally {
+      await f.store.dispose(); f.db.close(); await rm(f.root, { recursive: true, force: true });
+    }
+  });
+}
+
 it("revokes a ready transfer and removes its received file when stopped", async () => {
   const f = await fixture();
   try {
