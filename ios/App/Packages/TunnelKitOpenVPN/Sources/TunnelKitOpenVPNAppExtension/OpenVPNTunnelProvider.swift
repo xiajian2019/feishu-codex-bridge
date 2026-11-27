@@ -140,6 +140,15 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    /// Allows a host app to resolve sensitive configuration from its shared
+    /// Keychain while preserving the standard dictionary-based configuration.
+    open func loadProviderConfiguration(from tunnelProtocol: NETunnelProviderProtocol) throws -> OpenVPN.ProviderConfiguration {
+        guard let providerConfiguration = tunnelProtocol.providerConfiguration else {
+            throw ConfigurationError.parameter(name: "protocolConfiguration.providerConfiguration")
+        }
+        return try fromDictionary(OpenVPN.ProviderConfiguration.self, providerConfiguration)
+    }
+
     open override func startTunnel(options: [String: NSObject]? = nil, completionHandler: @escaping (Error?) -> Void) {
 
         // required configuration
@@ -150,10 +159,7 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
             guard let _ = tunnelProtocol.serverAddress else {
                 throw ConfigurationError.parameter(name: "protocolConfiguration.serverAddress")
             }
-            guard let providerConfiguration = tunnelProtocol.providerConfiguration else {
-                throw ConfigurationError.parameter(name: "protocolConfiguration.providerConfiguration")
-            }
-            cfg = try fromDictionary(OpenVPN.ProviderConfiguration.self, providerConfiguration)
+            cfg = try loadProviderConfiguration(from: tunnelProtocol)
         } catch let cfgError as ConfigurationError {
             switch cfgError {
             case .parameter(let name):

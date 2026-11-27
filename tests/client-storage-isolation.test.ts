@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it } from "bun:test";
-import { getLocalDraftScope, scopedStorageKey, setLocalDraftScope } from "../web/src/local-draft-scope.js";
+import { getLocalDraftScope, LOCAL_DRAFT_SCOPE_EVENT, LOCAL_DRAFT_SCOPE_WILL_CHANGE_EVENT, scopedStorageKey, setLocalDraftScope } from "../web/src/local-draft-scope.js";
 import { clearLocalDraftsAfterDeviceRevocation } from "../web/src/local-draft-cleanup.js";
 import { loadDraftAttachment, loadDraftMetadata, saveDraftAttachment, saveDraftMetadata, clearDraftAttachments } from "../web/src/tmux-draft-store.js";
 import { cacheBridgeJson, readCachedBridgeJson } from "../web/src/connection-state.js";
@@ -81,6 +81,17 @@ it("isolates the same resource IDs across ports, instances and devices without s
   expect(scopedStorageKey("history-detail", JSON.stringify(["home", "thread"]))).not.toBe(keyA);
   setLocalDraftScope(null);
   expect(scopedStorageKey("task-followup", "same-id")).toBeNull();
+});
+
+it("announces a scope change while the old scope is still writable", () => {
+  const oldScope = getLocalDraftScope();
+  const events: Array<{ type: string; scope: string | null }> = [];
+  (window as unknown as { dispatchEvent: (event: Event) => boolean }).dispatchEvent = (event) => { events.push({ type: event.type, scope: getLocalDraftScope() }); return true; };
+  setLocalDraftScope("b".repeat(43), serverA);
+  expect(events.map((event) => event.type)).toEqual([LOCAL_DRAFT_SCOPE_WILL_CHANGE_EVENT, LOCAL_DRAFT_SCOPE_EVENT]);
+  expect(events[0]?.scope).toBe(oldScope);
+  expect(events[1]?.scope).toBe(getLocalDraftScope());
+  expect(events[1]?.scope).not.toBe(oldScope);
 });
 
 it("keeps tmux text and attachment bytes isolated, including clear-by-session", async () => {

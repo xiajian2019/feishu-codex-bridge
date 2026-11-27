@@ -1734,6 +1734,7 @@ open class BridgeConnectBotSshActivity : BridgeActivity() {
         val action = shortcut.actionKey
         when (action) {
             "attachment" -> pickComposerAttachments()
+            "phone-transfer" -> { composerNotice = "请连接 Bridge，在 Web tmux 页面使用手机导入。"; return }
             "skill-picker" -> { state.setSkillTrigger(null); openSkillPicker() }
             "scroll-top" -> terminalScrollController?.scrollToTop() ?: run { composerNotice = "终端滚动控件暂不可用。" }
             "scroll-bottom" -> terminalScrollController?.scrollToBottom() ?: run { composerNotice = "终端滚动控件暂不可用。" }

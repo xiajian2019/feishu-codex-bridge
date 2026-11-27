@@ -1,0 +1,3 @@
+// Local settings are optional and are not tracked by Git.
+#include? ".xcconfig"
+DEVELOPMENT_TEAM = $(BRIDGE_IOS_DEVELOPMENT_TEAM)

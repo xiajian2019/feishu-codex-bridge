@@ -16,7 +16,7 @@ MacBook 上有一个正在工作的 Codex 会话。人暂时离开电脑后，�
 
 ## 两条入口，分开理解
 
-- **手机接续 tmux 会话：** Safari → Bridge → Mac 上已有的 tmux session → 其中运行的 Codex。Composer 把消息交给所选 Codex session；它不是可输入任意 shell 命令的远程终端。
+- **手机接续 tmux 会话：** Safari → Bridge → Mac 上已有的 tmux session → 其中运行的 Codex。默认 Composer 把消息交给所选 Codex session；显式开启“终端输入”后，按键会直接进入 tmux，并具有当前终端进程的权限。
 - **飞书提交任务：** 飞书消息进入已配置的 Direct 运行时，由 Codex SDK 执行并更新飞书任务卡片。这是另一条任务流程，可在同事对飞书入口感兴趣时单独演示。
 
 第一场建议只讲手机接续会话这一个场景。项目还支持 Codex History、Web Task Desk，以及可选的 AAMP + Relay；先不把这些入口都塞进同一段介绍。

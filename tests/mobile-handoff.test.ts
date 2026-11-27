@@ -1,10 +1,10 @@
 import { afterEach, expect, it } from "bun:test";
-import { appendMobileShareText, assertMobileShareContext, clearMobileOpenError, consumeMobileOpen, getMobileOpenError, getMobileOpens, parseMobileNotificationTarget, parseMobileOpenUrl, queueMobileOpen, readMobileNotificationLedger, restoreMobileOpens, safeMobileRoute } from "../web/src/mobile-handoff.js";
+import { appendMobileShareText, assertMobileShareContext, clearMobileOpenError, consumeMobileAppIntentRoute, consumeMobileOpen, getMobileOpenError, getMobileOpens, getPendingMobileAppIntentRoute, parseMobileNotificationTarget, parseMobileOpenUrl, queueMobileAppIntentRoute, queueMobileOpen, readMobileNotificationLedger, restoreMobileOpens, safeMobileRoute } from "../web/src/mobile-handoff.js";
 
-afterEach(() => { for (const item of getMobileOpens()) consumeMobileOpen(item.id); clearMobileOpenError(); });
+afterEach(() => { for (const item of getMobileOpens()) consumeMobileOpen(item.id); consumeMobileAppIntentRoute(); clearMobileOpenError(); });
 
 it("accepts only read/navigation routes and known parameters", () => {
-  for (const route of ["/", "/mobile-inbox", "/tasks/desk/task-1", "/codex-history/home/thread", "/tmux-dashboard?session=%241", "/tmux-dashboard/files/session-1"]) expect(safeMobileRoute(route)).toBe(route);
+  for (const route of ["/", "/tasks", "/mobile-inbox", "/nearby-transfer", "/tasks/desk/task-1", "/codex-history/home/thread", "/tmux-dashboard?session=%241", "/tmux-dashboard/files/session-1"]) expect(safeMobileRoute(route)).toBe(route);
   for (const route of ["https://evil.fixture/", "//evil.fixture/", "/api/auth/logout", "/system-management/backups?restore=1", "/tasks/desk/a/../b", "/tasks/desk/%2e%2e", "/tasks/desk/a%2fb", "/tmux-dashboard?bridgeTicket=secret", "/codex-history/home/thread#token=secret", "/tmux-dashboard?session=x\n"]) expect(safeMobileRoute(route)).toBeNull();
 });
 
@@ -32,6 +32,31 @@ it("coalesces cold/warm duplicate opens and retains later distinct requests unti
   expect(getMobileOpens()).toHaveLength(2);
   consumeMobileOpen(getMobileOpens()[0]!.id); expect(getMobileOpens()[0]?.server).toBe("https://other.fixture");
   queueMobileOpen("javascript:alert(1)"); expect(getMobileOpenError()).toBeTruthy(); expect(getMobileOpens()).toHaveLength(1);
+});
+
+it("keeps App Intent navigation local to the current authenticated environment", () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const rows = new Map<string, string>();
+  Object.defineProperty(globalThis, "window", { configurable: true, value: {
+    sessionStorage: {
+      getItem: (key: string) => rows.get(key) ?? null,
+      setItem: (key: string, value: string) => { rows.set(key, value); },
+      removeItem: (key: string) => { rows.delete(key); },
+    },
+    dispatchEvent: () => true,
+  } });
+  try {
+    queueMobileAppIntentRoute("/tmux-dashboard");
+    expect(getPendingMobileAppIntentRoute()).toBe("/tmux-dashboard");
+    expect(rows.get("bridge.mobile.pending-app-intent-route.v1")).toBe("/tmux-dashboard");
+    expect(consumeMobileAppIntentRoute()).toBe("/tmux-dashboard");
+    expect(getPendingMobileAppIntentRoute()).toBeNull();
+    queueMobileAppIntentRoute("/api/auth/logout");
+    expect(getPendingMobileAppIntentRoute()).toBeNull();
+  } finally {
+    consumeMobileAppIntentRoute();
+    if (original) Object.defineProperty(globalThis, "window", original); else Reflect.deleteProperty(globalThis, "window");
+  }
 });
 
 it("appends shared text without replacing the user's existing draft", () => {

@@ -76,6 +76,67 @@ export interface StoredProject {
   updated_at: string;
 }
 
+export interface StoredIosTestflightApp {
+  id: string;
+  name: string;
+  app_store_name: string;
+  source_path: string;
+  project_path: string;
+  build_directory: string;
+  public_directory: string;
+  bundle_id: string;
+  team_id: string;
+  scheme: string;
+  configuration: string;
+  target_name: string;
+  info_plist_path: string;
+  enabled: boolean;
+  internal_only: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoredMobileIosConfig {
+  app_store_name: string;
+  source_path: string;
+  project_path: string;
+  build_directory: string;
+  public_directory: string;
+  bundle_id: string;
+  team_id: string;
+  scheme: string;
+  configuration: string;
+  target_name: string;
+  info_plist_path: string;
+  internal_only: boolean;
+}
+
+export interface StoredMobileAndroidConfig {
+  package_name: string;
+  apk_path: string;
+  snapshot_directory: string;
+  source_path?: string;
+  build_script?: string;
+}
+
+/** One product can expose either native platform or both platform actions. */
+export interface StoredMobileApp {
+  id: string;
+  name: string;
+  enabled: boolean;
+  ios: StoredMobileIosConfig | null;
+  android: StoredMobileAndroidConfig | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoredMobileAppInput {
+  name: string;
+  enabled: boolean;
+  ios: StoredMobileIosConfig | null;
+  android: StoredMobileAndroidConfig | null;
+}
+
 export const SHORTCUT_KINDS = ["terminal", "insert", "send", "sequence"] as const;
 export type ShortcutKind = (typeof SHORTCUT_KINDS)[number];
 export const SHORTCUT_SURFACES = ["palette", "composer"] as const;

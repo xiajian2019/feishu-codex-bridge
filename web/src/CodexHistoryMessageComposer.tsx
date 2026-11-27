@@ -6,6 +6,7 @@ import type {
   CodexHistoryReasoningEffort,
 } from "./types.js";
 import { deleteCodexHistoryAttachment, uploadCodexHistoryAttachment } from "./api.js";
+import { createComposerImeGuard } from "./composer-ime.js";
 import {
   clearCodexHistoryDraft,
   loadCodexHistoryDraft,
@@ -149,6 +150,7 @@ export function CodexHistoryMessageComposer({
   const [interactiveApproval, setInteractiveApproval] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
+  const imeGuard = useRef(createComposerImeGuard()).current;
   const currentScopeRef = useRef(settingsScopeKey);
   const consumedInsertionIdRef = useRef("");
   currentScopeRef.current = settingsScopeKey;
@@ -465,6 +467,12 @@ export function CodexHistoryMessageComposer({
           event.currentTarget.style.height = "auto";
           event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 160)}px`;
         }}
+        onCompositionStart={() => imeGuard.start()}
+        onCompositionEnd={(event) => imeGuard.end(event.timeStamp)}
+        onKeyDownCapture={(event) => {
+          if (imeGuard.isImeEnter(event.nativeEvent)) event.stopPropagation();
+        }}
+        onBlur={() => imeGuard.reset()}
         onKeyDown={handleKeyDown}
       />
       <div className="dashboard-composer-actions">

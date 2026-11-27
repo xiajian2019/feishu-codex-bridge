@@ -10,13 +10,18 @@ export const BRIDGE_NETWORK_SETTINGS_EVENT = "bridge:network-settings-changed";
 
 const BRIDGE_NETWORK_SETTINGS_KEY = "bridge.mobile.network-settings";
 
+export type IosVpnProvider = "external" | "tunnelkit";
+
 export interface BridgeNetworkSettings {
   globalMacHost: string;
+  useHttps: boolean;
   vpnBypassWifiSsids: string[];
+  iosVpnProvider?: IosVpnProvider;
 }
 
 const DEFAULT_NETWORK_SETTINGS: BridgeNetworkSettings = {
   globalMacHost: BRIDGE_GLOBAL_MAC_HOST,
+  useHttps: false,
   vpnBypassWifiSsids: [],
 };
 
@@ -71,11 +76,16 @@ export function readBridgeNetworkSettings(storage: Storage | null = browserStora
   try {
     const raw = storage.getItem(BRIDGE_NETWORK_SETTINGS_KEY);
     if (!raw) return { ...DEFAULT_NETWORK_SETTINGS, vpnBypassWifiSsids: [] };
-    const parsed = JSON.parse(raw) as { globalMacHost?: unknown; vpnBypassWifiSsids?: unknown };
+    const parsed = JSON.parse(raw) as { globalMacHost?: unknown; useHttps?: unknown; vpnBypassWifiSsids?: unknown; iosVpnProvider?: unknown };
     const globalMacHost = typeof parsed.globalMacHost === "string"
       ? (() => { try { return normalizeGlobalMacHost(parsed.globalMacHost!); } catch { return DEFAULT_NETWORK_SETTINGS.globalMacHost; } })()
       : DEFAULT_NETWORK_SETTINGS.globalMacHost;
-    return { globalMacHost, vpnBypassWifiSsids: normalizeWifiSsids(parsed.vpnBypassWifiSsids) };
+    // Missing settings are from older installs. Keep an explicitly selected
+    // HTTPS value, but let new Android installs use the LAN HTTP default.
+    const useHttps = parsed.useHttps === true;
+    const iosVpnProvider = parsed.iosVpnProvider === "external" || parsed.iosVpnProvider === "tunnelkit"
+      ? parsed.iosVpnProvider : undefined;
+    return { globalMacHost, useHttps, vpnBypassWifiSsids: normalizeWifiSsids(parsed.vpnBypassWifiSsids), ...(iosVpnProvider ? { iosVpnProvider } : {}) };
   } catch {
     return { ...DEFAULT_NETWORK_SETTINGS, vpnBypassWifiSsids: [] };
   }
@@ -86,12 +96,16 @@ export function getConfiguredGlobalMacHost(): string {
 }
 
 export function saveBridgeNetworkSettings(
-  input: { globalMacHost: string; vpnBypassWifiSsids: readonly string[] },
+  input: { globalMacHost: string; useHttps?: boolean; vpnBypassWifiSsids: readonly string[]; iosVpnProvider?: IosVpnProvider },
   storage: Storage | null = browserStorage(),
 ): BridgeNetworkSettings {
+  const current = readBridgeNetworkSettings(storage);
+  const iosVpnProvider = input.iosVpnProvider ?? current.iosVpnProvider;
   const settings: BridgeNetworkSettings = {
     globalMacHost: normalizeGlobalMacHost(input.globalMacHost),
+    useHttps: input.useHttps ?? current.useHttps,
     vpnBypassWifiSsids: normalizeWifiSsids(input.vpnBypassWifiSsids),
+    ...(iosVpnProvider ? { iosVpnProvider } : {}),
   };
   if (!storage) throw new Error("当前环境无法保存网络配置。");
   storage.setItem(BRIDGE_NETWORK_SETTINGS_KEY, JSON.stringify(settings));
@@ -99,11 +113,15 @@ export function saveBridgeNetworkSettings(
   return settings;
 }
 
-export function bridgeOriginForPort(port: number, protocol = "http:"): string {
+export function bridgeOriginForPort(port: number, protocol: "http:" | "https:" = getConfiguredBridgeProtocol()): string {
   if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new RangeError("Bridge port must be between 1 and 65535.");
   const url = new URL(`${protocol}//${urlHost(getConfiguredGlobalMacHost())}`);
   url.port = String(port);
   return url.origin;
+}
+
+export function getConfiguredBridgeProtocol(): "http:" | "https:" {
+  return readBridgeNetworkSettings().useHttps ? "https:" : "http:";
 }
 
 /** Replace a private Bridge endpoint's host while retaining its protocol/port. */

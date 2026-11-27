@@ -24,6 +24,8 @@ public class MainActivity extends BridgeConnectBotSshActivity {
         registerPlugin(BridgeUpdaterPlugin.class);
         registerPlugin(BridgeShareInboxPlugin.class);
         registerPlugin(BridgeNativeThemePlugin.class);
+        registerPlugin(BridgeRemoteDesktopPlugin.class);
+        registerPlugin(BridgeNearbyTransferPlugin.class);
         registerPlugin(BridgeComposerDataPlugin.class);
         registerPlugin(BridgeConnectBotSSHPlugin.class);
         registerPlugin(BridgeMotionPlugin.class);

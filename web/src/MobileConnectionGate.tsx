@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type Fo
 import { normalizeConfiguredBridgeServer, parseMobilePairingInput } from "./mobile-connection.js";
 import {
   BRIDGE_NETWORK_SETTINGS_EVENT, bridgeOriginForPort, getConfiguredGlobalMacHost,
-  readBridgeNetworkSettings, saveBridgeNetworkSettings,
+  readBridgeNetworkSettings, saveBridgeNetworkSettings, type IosVpnProvider,
 } from "./bridge-global-config.js";
 import { createMobileVpnRetry } from "./mobile-vpn-retry.js";
 import {
@@ -10,8 +10,8 @@ import {
   initializeMobileRuntime, installMobileApkUpdate, MOBILE_CONNECTION_EVENT, MOBILE_RESUME_EVENT, MOBILE_SETTINGS_EVENT,
   MOBILE_OPENVPN_CONNECT_EVENT, MOBILE_SHAKE_EVENT, openExternalOpenVPNConnect, openMobileConnectionSettings, pairMobileConnection,
   stopMobileVpnRecoveryMonitor, switchMobileConnection,
-  applyConfiguredBridgeNetworkSettings, checkAndConnectMobileVpn, getMobileAppVersion, getMobileAppBuild, readCurrentWifiSsid, supportsMobileApkUpdates,
-  getMobileVpnCapability, importMobileVpnProfile, isMobileApp, type MobileApkUpdate,
+  applyConfiguredBridgeNetworkSettings, applyConfiguredBridgeOrigin, checkAndConnectMobileVpn, getMobileAppVersion, getMobileAppBuild, readCurrentWifiSsid, supportsMobileApkUpdates,
+  getMobileVpnCapability, getNativeRemoteDesktopPlatform, importMobileVpnProfile, isMobileApp, openNativeRemoteDesktop, type MobileApkUpdate,
 } from "./mobile-runtime.js";
 import type { MobileVpnCapability } from "./mobile-vpn-contract.js";
 import MobileDownloadStatus from "./MobileDownloadStatus.js";
@@ -32,8 +32,32 @@ import {
 import { isAppActive } from "./foreground-polling.js";
 import { createMobileWorkspaceOverlay } from "./mobile-workspace-overlay.js";
 import { MobileHandoffShell, MobileNavigationBridge } from "./MobileHandoff.js";
+import { createRemoteDesktopStreamUrl } from "./remote-desktop-api.js";
 
 type ConnectionState = "loading" | "setup" | "ready" | "unavailable";
+type BridgeProtocol = "http:" | "https:";
+
+function protocolFromAddress(value: string): BridgeProtocol | null {
+  try {
+    const protocol = new URL(value.trim()).protocol;
+    return protocol === "http:" || protocol === "https:" ? protocol : null;
+  } catch {
+    return null;
+  }
+}
+
+function addressWithProtocol(value: string, protocol: BridgeProtocol): string {
+  const text = value.trim();
+  if (!text) return text;
+  try {
+    const url = new URL(/^[a-z][a-z\d+.-]*:\/\//i.test(text) ? text : `${protocol}//${text}`);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return text;
+    url.protocol = protocol;
+    return url.origin;
+  } catch {
+    return text;
+  }
+}
 
 export default function MobileConnectionGate({ children }: { children: ReactNode }): ReactElement {
   return <MobileHandoffShell><MobileConnectionContent>{children}</MobileConnectionContent><MobileDownloadStatus /></MobileHandoffShell>;
@@ -41,18 +65,24 @@ export default function MobileConnectionGate({ children }: { children: ReactNode
 export function MobileConnectionContent({ children }: { children: ReactNode }): ReactElement {
   const location = useLocation();
   const navigate = useNavigate();
-  const isStandaloneMobileRoute = location.pathname === "/system-management/app-only-vpn-poc";
+  const isStandaloneMobileRoute = location.pathname === "/system-management/app-only-vpn-poc" || location.pathname === "/nearby-transfer";
   const [state, setState] = useState<ConnectionState>("loading");
-  const [mode, setMode] = useState<"bridge" | "ssh">(() => {
-    try { return window.localStorage.getItem("bridge.connection.mode") === "ssh" ? "ssh" : "bridge"; }
+  const [mode, setMode] = useState<"bridge" | "ssh" | "vnc">(() => {
+    try {
+      const saved = window.localStorage.getItem("bridge.connection.mode");
+      return saved === "ssh" ? "ssh" : saved === "vnc" ? "vnc" : "bridge";
+    }
     catch { return "bridge"; }
   });
-  const selectMode = (next: "bridge" | "ssh"): void => {
+  const [remoteDesktopPlatform, setRemoteDesktopPlatform] = useState<"ios" | "android" | null>(null);
+  const [remoteDesktopCapabilityChecked, setRemoteDesktopCapabilityChecked] = useState(false);
+  const selectMode = (next: "bridge" | "ssh" | "vnc"): void => {
     setMode(next);
     try { window.localStorage.setItem("bridge.connection.mode", next); } catch { /* preference only */ }
     setEditing(true);
   };
   const [address, setAddress] = useState("");
+  const [useHttps, setUseHttps] = useState(() => readBridgeNetworkSettings().useHttps);
   const [pairingInput, setPairingInput] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -115,7 +145,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
     if (vpnMessageTimerRef.current !== null) window.clearTimeout(vpnMessageTimerRef.current);
   }, []);
   useMobileBack(environmentDialogOpen, () => { if (!environmentBusy) closeEnvironmentDialog(); }, 220);
-  useMobileBack(editing || mode === "ssh", () => {
+  useMobileBack(editing || mode === "ssh" || mode === "vnc", () => {
     if (!busy) returnToWorkbench();
   }, 50);
 
@@ -128,6 +158,22 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
   useEffect(() => { void getMobileAppVersion().then(setAppVersion).catch(() => setAppVersion("暂不可读")); }, []);
   useEffect(() => {
     let active = true;
+    void getNativeRemoteDesktopPlatform().then((platform) => {
+      if (!active) return;
+      setRemoteDesktopPlatform(platform);
+      setRemoteDesktopCapabilityChecked(true);
+    }).catch(() => {
+      if (active) setRemoteDesktopCapabilityChecked(true);
+    });
+    return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    const refresh = (): void => setUseHttps(readBridgeNetworkSettings().useHttps);
+    window.addEventListener(BRIDGE_NETWORK_SETTINGS_EVENT, refresh);
+    return () => window.removeEventListener(BRIDGE_NETWORK_SETTINGS_EVENT, refresh);
+  }, []);
+  useEffect(() => {
+    let active = true;
     void getMobileVpnCapability().then((capability) => { if (active) setVpnCapability(capability); }).catch(() => {});
     return () => { active = false; };
   }, []);
@@ -135,7 +181,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
     if ((location.state as { mobileOpenConnectionSettings?: boolean } | null)?.mobileOpenConnectionSettings !== true) return;
     setAddress(getMobileConnection()?.server ?? ""); setMode("bridge"); setEditing(true); setError(null);
     try { window.localStorage.setItem("bridge.connection.mode", "bridge"); } catch { /* preference only */ }
-    navigate("/", { replace: true, state: null });
+    navigate("/tasks", { replace: true, state: null });
   }, [location.state, navigate]);
 
   useEffect(() => {
@@ -295,10 +341,31 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
     };
   }, [state]);
 
+  const updateBridgeProtocol = async (protocol: BridgeProtocol, applyCurrentConnection = true): Promise<void> => {
+    if (busy) return;
+    const nextUseHttps = protocol === "https:";
+    setBusy(true); setError(null);
+    try {
+      const current = readBridgeNetworkSettings();
+      saveBridgeNetworkSettings({ ...current, useHttps: nextUseHttps });
+      setUseHttps(nextUseHttps);
+      if (applyCurrentConnection) await applyConfiguredBridgeOrigin();
+      setAddress(applyCurrentConnection
+        ? getMobileConnection()?.server ?? addressWithProtocol(address, protocol)
+        : addressWithProtocol(address, protocol));
+    } catch (cause) {
+      setError(cause instanceof Error ? `协议已保存，但当前连接尚未切换：${cause.message}` : "协议已保存，但当前连接尚未切换，请重试。");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const pairingAddress = (): string => addressWithProtocol(address, protocolFromAddress(address) ?? (useHttps ? "https:" : "http:"));
+
   const submit = async (event: FormEvent): Promise<void> => {
     event.preventDefault(); setBusy(true); setError(null);
     try {
-      const parsed = parseMobilePairingInput(pairingInput, "", address);
+      const parsed = parseMobilePairingInput(pairingInput, "", pairingAddress());
       await pairMobileConnection(parsed.server, parsed.code);
       window.location.replace("/");
     } catch (cause) { setError(connectionError(cause)); }
@@ -308,7 +375,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
   const scanAndPair = async (value: string): Promise<void> => {
     setBusy(true); setError(null);
     try {
-      const parsed = parseMobilePairingInput(value, "", address);
+      const parsed = parseMobilePairingInput(value, "", pairingAddress());
       setPairingInput(value);
       await pairMobileConnection(parsed.server, parsed.code);
       window.location.replace("/");
@@ -532,12 +599,12 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
           <div className="mobile-connect-mark" aria-hidden="true">B</div>
           <div className="mobile-connect-brand-copy">
             <h1 id="mobile-connect-title">连接你的 Mac</h1>
-            <span className={`mobile-connect-status is-${mode === "ssh" ? "ssh" : state}`}>
+            <span className={`mobile-connect-status is-${mode === "ssh" ? "ssh" : mode === "vnc" ? "vnc" : state}`}>
               <i aria-hidden="true" />
-              Bridge App · {mode === "ssh" ? "SSH 直接连接" : state === "loading" ? "检查连接" : state === "unavailable" ? "连接不可用" : getMobileConnection()?.token ? "已配对" : "未配对"}
+              Bridge App · {mode === "ssh" ? "SSH 直接连接" : mode === "vnc" ? "原生远程桌面" : state === "loading" ? "检查连接" : state === "unavailable" ? "连接不可用" : getMobileConnection()?.token ? "已配对" : "未配对"}
             </span>
           </div>
-          {(editing || mode === "ssh") && getMobileConnection()?.token && <button type="button" className="mobile-connect-return" disabled={busy}
+          {(editing || mode === "ssh" || mode === "vnc") && getMobileConnection()?.token && <button type="button" className="mobile-connect-return" disabled={busy}
             onClick={returnToWorkbench}>返回工作台</button>}
         </div>
       </header>
@@ -550,14 +617,29 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
           aria-pressed={mode === "ssh"} onClick={() => selectMode("ssh")}>
           SSH / Mac
         </button>
+        <button type="button" className={`mobile-workspace-switcher-item${mode === "vnc" ? " is-active" : ""}`}
+          aria-pressed={mode === "vnc"} onClick={() => selectMode("vnc")}>
+          VNC
+        </button>
       </nav>
-      {mode === "ssh" ? <MobileSshLogin /> : <>
+      {mode === "ssh" ? <MobileSshLogin /> : mode === "vnc" ? <MobileRemoteDesktopPanel
+        platform={remoteDesktopPlatform}
+        capabilityChecked={remoteDesktopCapabilityChecked}
+      /> : <>
       {getMobileConnection()?.token ? <CompatibilityNotice /> : null}
       {state === "loading" && !editing ? <p role="status">正在恢复连接…</p> : <>
         {state === "unavailable" && !editing ? <>
           <div className="mobile-connect-unavailable">
             <span className="mobile-connect-unavailable-label">当前地址</span>
-            <p className="mobile-connect-server">{address || "尚未设置服务地址"}</p>
+            <div className="mobile-connect-server-row">
+              <p className="mobile-connect-server">{address || "尚未设置服务地址"}</p>
+              <select aria-label="当前地址协议" value={protocolFromAddress(address) ?? (useHttps ? "https:" : "http:")}
+                disabled={busy} onChange={(event) => { void updateBridgeProtocol(event.currentTarget.value as BridgeProtocol); }}>
+                <option value="http:">HTTP</option>
+                <option value="https:">HTTPS</option>
+              </select>
+            </div>
+            <small className="mobile-connect-protocol-help">Android 默认使用 HTTP；已在手机上安装并信任证书后可切换 HTTPS。</small>
           </div>
           {error && <p className="mobile-connect-error" role="alert">{error}</p>}
           <div className="mobile-connect-actions">
@@ -588,9 +670,16 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
             <details className="mobile-connect-code-only">
               <summary>仅有配对码</summary>
               <label htmlFor="mobile-server">Bridge 地址</label>
-              <input id="mobile-server" value={address} onChange={(event) => setAddress(event.target.value)}
-                placeholder="http://192.168.1.10:17310" autoCapitalize="none" autoCorrect="off" spellCheck={false}
-                inputMode="url" autoComplete="url" disabled={busy} />
+              <div className="mobile-connect-address-input">
+                <input id="mobile-server" value={address} onChange={(event) => setAddress(event.target.value)}
+                  placeholder="192.168.1.10:17310" autoCapitalize="none" autoCorrect="off" spellCheck={false}
+                  inputMode="url" autoComplete="url" disabled={busy} />
+                <select aria-label="Bridge 协议" value={protocolFromAddress(address) ?? (useHttps ? "https:" : "http:")}
+                  disabled={busy} onChange={(event) => { void updateBridgeProtocol(event.currentTarget.value as BridgeProtocol, false); }}>
+                  <option value="http:">HTTP</option>
+                  <option value="https:">HTTPS</option>
+                </select>
+              </div>
               <p className="mobile-connect-help">单独输入配对码时，使用此地址连接。</p>
             </details>
           </section>
@@ -629,7 +718,7 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
         </details> : null}
       </>}
       </>}
-      {(mode === "ssh" || !getMobileConnection()?.token) && <details className="mobile-connect-maintenance">
+      {(mode === "ssh" || mode === "vnc" || !getMobileConnection()?.token) && <details className="mobile-connect-maintenance">
         <summary>网络设置</summary>
         <MobileAutoVpnSettings disabled={busy} onApplied={() => setAddress(getMobileConnection()?.server ?? "")} />
       </details>}
@@ -638,10 +727,65 @@ export function MobileConnectionContent({ children }: { children: ReactNode }): 
   </main>;
 }
 
+function MobileRemoteDesktopPanel({
+  platform,
+  capabilityChecked,
+}: {
+  platform: "ios" | "android" | null;
+  capabilityChecked: boolean;
+}): ReactElement {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const openRemoteDesktop = async (): Promise<void> => {
+    if (busy) return;
+    if (!platform) {
+      setError("当前 App 未启用原生远程桌面，请重新安装包含原生 VNC 的版本。");
+      return;
+    }
+    if (!getMobileConnection()?.token) {
+      setError("请先在 Bridge 标签完成配对，再打开远程桌面。");
+      return;
+    }
+    setBusy(true); setError(null); setMessage(null);
+    try {
+      // Android derives vnc://<Bridge host>:5900 inside the native plugin;
+      // the Android path therefore never creates a WebSocket ticket.
+      const target = platform === "android" ? "" : await createRemoteDesktopStreamUrl();
+      await openNativeRemoteDesktop(target, "远程桌面");
+      setMessage(platform === "android"
+        ? "已打开 Android 原生 VNC，使用 TCP 直连 Mac 的 5900 端口。"
+        : "已打开 iOS 原生远程桌面。");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "无法打开原生远程桌面。");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <section className="mobile-remote-desktop-panel" aria-label="原生远程桌面">
+    <div>
+      <h2>原生远程桌面</h2>
+      <p>Android 使用原生 VNC 直连 TCP，不经过 WebSocket；iOS 使用原生远程桌面页面。</p>
+    </div>
+    {!capabilityChecked ? <p role="status">正在检查原生远程桌面…</p> : platform ? <>
+      <p className="mobile-connect-help">当前平台：{platform === "android" ? "Android 原生 VNC" : "iOS 原生远程桌面"}</p>
+      <button type="button" className="mobile-connect-primary" disabled={busy} onClick={() => { void openRemoteDesktop(); }}>
+        {busy ? "正在打开…" : "打开远程桌面"}<span aria-hidden="true">→</span>
+      </button>
+    </> : <p className="mobile-connect-help">当前 App 没有注册原生远程桌面插件。</p>}
+    {message ? <p className="mobile-connect-network-message" role="status">{message}</p> : null}
+    {error ? <p className="mobile-connect-error" role="alert">{error}</p> : null}
+  </section>;
+}
+
 export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }: { disabled?: boolean; onApplied?: () => void }): ReactElement {
   const navigate = useNavigate();
   const [globalHost, setGlobalHost] = useState(getConfiguredGlobalMacHost);
+  const [useHttps, setUseHttps] = useState(() => readBridgeNetworkSettings().useHttps);
   const [wifiSsids, setWifiSsids] = useState(() => readBridgeNetworkSettings().vpnBypassWifiSsids);
+  const [iosVpnProvider, setIosVpnProvider] = useState<IosVpnProvider>(() => readBridgeNetworkSettings().iosVpnProvider ?? "external");
   const [wifiInput, setWifiInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [wifiReadBusy, setWifiReadBusy] = useState(false);
@@ -663,7 +807,9 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
     const refresh = (): void => {
       const settings = readBridgeNetworkSettings();
       setGlobalHost(settings.globalMacHost);
+      setUseHttps(settings.useHttps);
       setWifiSsids(settings.vpnBypassWifiSsids);
+      setIosVpnProvider(settings.iosVpnProvider ?? "external");
       setWifiInput("");
     };
     window.addEventListener(BRIDGE_NETWORK_SETTINGS_EVENT, refresh);
@@ -680,7 +826,9 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
         ? [...wifiSsids, manualWifi] : wifiSsids;
       const settings = saveBridgeNetworkSettings({
         globalMacHost: globalHost,
+        useHttps,
         vpnBypassWifiSsids: nextWifiSsids,
+        ...(vpnCapability?.platform === "ios" ? { iosVpnProvider } : {}),
       });
       try {
         await applyConfiguredBridgeNetworkSettings();
@@ -692,7 +840,9 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
         setError(cause instanceof Error ? cause.message : "当前连接暂未切换，请稍后重试。");
       }
       setGlobalHost(settings.globalMacHost);
+      setUseHttps(settings.useHttps);
       setWifiSsids(settings.vpnBypassWifiSsids);
+      setIosVpnProvider(settings.iosVpnProvider ?? "external");
       setWifiInput("");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "网络配置保存失败，请重试。");
@@ -759,6 +909,15 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
           placeholder="例如 10.15.53.70" autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={disabled || busy} />
         <small>用于私有 Bridge 地址和 SSH 默认主机；修改后无需重新配对。</small>
       </label>
+      <label className="mobile-connect-network-field" htmlFor="mobile-bridge-protocol">
+        <span>Bridge 协议</span>
+        <select id="mobile-bridge-protocol" value={useHttps ? "https:" : "http:"} disabled={disabled || busy}
+          onChange={(event) => setUseHttps(event.currentTarget.value === "https:")}>
+          <option value="http:">HTTP（默认）</option>
+          <option value="https:">HTTPS</option>
+        </select>
+        <small>Android 默认使用 HTTP；只有手机已安装并信任 Bridge 证书时才选择 HTTPS。</small>
+      </label>
       <div className="mobile-connect-network-field">
         <span>免 VPN 的 Wi‑Fi</span>
         <div className="mobile-connect-network-input-row">
@@ -781,21 +940,35 @@ export function MobileAutoVpnSettings({ disabled = false, onApplied = () => {} }
           </li>)}
         </ul> : <small>尚未添加 Wi‑Fi。手机设置里显示的 Wi‑Fi 名称就是 SSID。</small>}
       </div>
+      {vpnCapability?.platform === "ios" ? <label className="mobile-connect-network-field" htmlFor="mobile-ios-vpn-provider">
+        <span>iOS VPN 连接方式</span>
+        <select id="mobile-ios-vpn-provider" value={iosVpnProvider} disabled={disabled || busy}
+          onChange={(event) => setIosVpnProvider(event.target.value as IosVpnProvider)}>
+          <option value="external">外部 OpenVPN Connect</option>
+          <option value="tunnelkit">内置 TunnelKit</option>
+        </select>
+        <small>保存后用于手动检查和自动恢复；切换到外部方式时，内置 VPN 停止按需自动连接，当前连接可能需要在系统设置中断开。</small>
+      </label> : null}
       {vpnCapability?.platform === "ios" ? <div className="mobile-connect-network-field">
         <span>OpenVPN 配置</span>
         {vpnCapability.profileImport ? <>
           <small>仅通过原生文件选择器导入 .ovpn；配置内容和密钥不会写入网页存储，也不会显示在页面中。</small>
+          <small>首次添加时 iOS 会请求系统 VPN 授权；连接后的设备流量和 DNS 遵循配置及服务器下发的路由。</small>
           <button type="button" className="mobile-connect-secondary mobile-connect-network-save" disabled={disabled || busy || vpnProfileBusy}
             onClick={() => { void importVpnProfile(); }}>
             {vpnProfileBusy ? "正在导入…" : "选择并导入 .ovpn"}
           </button>
-        </> : vpnCapability.externalOpenVPNConnect ? <>
-          <small role="status">当前构建未启用系统 Packet Tunnel；Bridge 不可达时会尝试打开 OpenVPN Connect，但需要你在其中选择已导入的配置并连接。</small>
+        </> : null}
+        {vpnCapability.externalOpenVPNConnect ? <>
+          <small role="status">{vpnCapability.profileImport
+            ? "也可打开已安装的 OpenVPN Connect，在其中选择已有配置并连接。"
+            : "当前构建未启用系统 Packet Tunnel；Bridge 不可达时会尝试打开 OpenVPN Connect，但需要你在其中选择已导入的配置并连接。"}</small>
           <button type="button" className="mobile-connect-secondary mobile-connect-network-save" disabled={disabled || busy || openVPNConnectBusy}
             onClick={() => { void openExternalVpn(); }}>
             {openVPNConnectBusy ? "正在打开…" : "打开 OpenVPN Connect"}
           </button>
-        </> : <small role="status">当前 iOS App 尚未配置 BridgeAutoVpn，自动 VPN 暂未启用；免 VPN Wi‑Fi 和手动输入仍可用，请更新 App 或完成原生 VPN 配置。</small>}
+        </> : null}
+        {!vpnCapability.profileImport && !vpnCapability.externalOpenVPNConnect ? <small role="status">当前 iOS App 尚未配置 BridgeAutoVpn，自动 VPN 暂未启用；免 VPN Wi‑Fi 和手动输入仍可用，请更新 App 或完成原生 VPN 配置。</small> : null}
         {vpnProfileMessage ? <p className="mobile-connect-network-message" role="status">{vpnProfileMessage}</p> : null}
         {vpnProfileError ? <p className="mobile-connect-error" role="alert">{vpnProfileError}</p> : null}
       </div> : null}

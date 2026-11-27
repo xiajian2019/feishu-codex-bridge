@@ -1,5 +1,5 @@
 export const CLIENT_PROTOCOL_VERSION = 1;
-export type BridgeFeature = "tmux" | "codex-history" | "download-uploads" | "mobile-apk-update" | "mobile-ios-ota" | "backups";
+export type BridgeFeature = "tmux" | "composer-transfer-assets" | "codex-history" | "download-uploads" | "mobile-apk-update" | "mobile-ios-ota" | "mobile-ios-testflight" | "mobile-app-management" | "backups" | "remote-desktop";
 export interface BridgeCapabilities {
   schemaVersion: 1;
   protocolVersion: number;
@@ -9,8 +9,8 @@ export interface BridgeCapabilities {
 }
 let current: BridgeCapabilities | null = null;
 const labels: Record<BridgeFeature, string> = {
-  tmux: "终端与 Session 文件", "codex-history": "Codex 历史", "download-uploads": "文件上传",
-  "mobile-apk-update": "App 更新", "mobile-ios-ota": "iOS 安装", backups: "数据备份",
+  tmux: "终端与 Session 文件", "composer-transfer-assets": "手机导入草稿附件", "codex-history": "Codex 历史", "download-uploads": "文件上传",
+  "mobile-apk-update": "App更新", "mobile-ios-ota": "iOS安装", "mobile-ios-testflight": "TestFlight上传", "mobile-app-management": "App管理", backups: "数据备份", "remote-desktop": "远程桌面",
 };
 
 export function parseBridgeCapabilities(value: unknown): BridgeCapabilities | null {
@@ -38,8 +38,11 @@ export function assertBridgeApiSupported(path: string): void {
   else if (path.startsWith("/api/codex/threads") || path === "/api/codex/homes") feature = "codex-history";
   else if (path.startsWith("/api/download-uploads")) feature = "download-uploads";
   else if (path.startsWith("/api/mobile/ios-ota")) feature = "mobile-ios-ota";
+  else if (path.startsWith("/api/mobile/testflight")) feature = "mobile-ios-testflight";
+  else if (path.startsWith("/api/mobile/apps")) feature = "mobile-app-management";
   else if (path.startsWith("/api/mobile/update")) feature = "mobile-apk-update";
   else if (path.startsWith("/api/system/backups")) feature = "backups";
+  else if (path.startsWith("/api/remote-desktop/")) feature = "remote-desktop";
   const message = feature && bridgeFeatureUnavailable(feature);
   if (message) throw new Error(message);
 }

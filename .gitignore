@@ -5,6 +5,9 @@ release/
 tmp/
 .DS_Store
 .playwright-mcp/
+
+# Optional local machine guidance referenced by AGENTS.md.
+/AGENTS.local.md
 runtime/*
 !runtime/
 runtime/logs/*
@@ -44,7 +47,31 @@ ios/**/xcuserdata/
 ios/**/*.xcuserstate
 ios/**/.build/
 ios/**/Package.resolved
-*.mobileprovision
-*.p12
+
+# Upstream TunnelKit repository metadata; retain its license and test fixtures.
+/ios/App/Packages/TunnelKitOpenVPN/.github/
+/ios/App/Packages/TunnelKitOpenVPN/.ruby-version
+/ios/App/Packages/TunnelKitOpenVPN/CHANGELOG.md
+# Private keys and signing material. Already tracked public certificates remain tracked.
+*.key
+*.key.*
+*.pem
 *.p8
+*.pk8
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.keychain
+*.keychain-db
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+id_ecdsa_sk
+id_ed25519_sk
+# OpenVPN profiles may embed private keys and credentials.
+*.ovpn
+*.mobileprovision
 ios/signing.xcconfig
+.env

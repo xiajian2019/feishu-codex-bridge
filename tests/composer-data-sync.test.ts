@@ -62,15 +62,18 @@ describe("Android Composer data synchronization", () => {
   test("copies complete custom shortcuts and skills and preserves them after offline or malformed responses", async () => {
     const state = makeHarness();
     await state.sync(sourceA);
-    expect(state.stored.get(state.key(sourceA.scope, "shortcuts"))?.payload).toEqual({
-      groups: shortcuts.groups, shortcuts: shortcuts.shortcuts, revision: shortcuts.revision,
-    });
+    const initialShortcuts = state.stored.get(state.key(sourceA.scope, "shortcuts"))?.payload;
+    expect(initialShortcuts).toMatchObject({ groups: shortcuts.groups, revision: shortcuts.revision });
+    expect(initialShortcuts?.shortcuts).toEqual(expect.arrayContaining(shortcuts.shortcuts));
+    expect(initialShortcuts?.shortcuts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "composer-phone-transfer", actionKey: "phone-transfer" }),
+    ]));
     expect(state.stored.get(state.key(sourceA.scope, "skills"))?.payload).toEqual(skills);
 
     state.setLoadShortcuts(async () => ({ groups: [], shortcuts: "partial response" }));
     state.setLoadSkills(async () => { throw new Error("offline"); });
     await state.sync(sourceA);
-    expect(state.stored.get(state.key(sourceA.scope, "shortcuts"))?.payload.shortcuts).toEqual(shortcuts.shortcuts);
+    expect(state.stored.get(state.key(sourceA.scope, "shortcuts"))?.payload).toEqual(initialShortcuts);
     expect(state.stored.get(state.key(sourceA.scope, "skills"))?.payload).toEqual(skills);
 
     state.setLoadShortcuts(async () => ({ ...shortcuts, shortcuts: [{ ...shortcuts.shortcuts[0], title: "更新" }] }));
@@ -130,9 +133,8 @@ describe("Android Composer data synchronization", () => {
     expect(state.stored.has(state.key(sourceA.scope, "shortcuts"))).toBe(true);
     await state.sync(sourceB);
     await state.deactivateScope(sourceA.scope);
-    expect(state.readActive("shortcuts")?.payload).toEqual({
-      groups: shortcuts.groups, shortcuts: shortcuts.shortcuts, revision: shortcuts.revision,
-    });
+    expect(state.readActive("shortcuts")?.payload).toMatchObject({ groups: shortcuts.groups, revision: shortcuts.revision });
+    expect(state.readActive("shortcuts")?.payload.shortcuts).toEqual(expect.arrayContaining(shortcuts.shortcuts));
     await state.deactivateScope(null, () => sourceB.scope);
     expect(state.readActive("shortcuts")).toBeDefined();
     await state.deactivateScope(null);
@@ -161,6 +163,16 @@ describe("Android Composer data synchronization", () => {
     });
     expect(old?.groups[0]?.surface).toBe("composer");
     expect(old?.shortcuts[0]?.actionKey).toBe("terminal-enter");
+    expect(old?.shortcuts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "composer-phone-transfer", actionKey: "phone-transfer" }),
+    ]));
+    const disabled = parseComposerShortcuts({
+      groups: [{ id: "composer", enabled: true, surface: "composer" }],
+      shortcuts: [{ id: "composer-phone-transfer", groupId: "composer", enabled: false, sortOrder: 1, actionKey: "phone-transfer" }],
+    });
+    const phoneActions = disabled?.shortcuts.filter((shortcut) => shortcut.id === "composer-phone-transfer");
+    expect(phoneActions).toHaveLength(1);
+    expect(phoneActions?.[0]?.enabled).toBe(false);
   });
 
   test("an old authentication scope cannot be attributed to a newly selected Bridge", () => {

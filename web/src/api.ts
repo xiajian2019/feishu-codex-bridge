@@ -188,6 +188,21 @@ export function fetchCodexUsage(options: { homeId?: string; signal?: AbortSignal
   return getJson<CodexUsageResponse>(`/api/codex/usage${query ? `?${query}` : ""}`, { signal: options.signal });
 }
 
+export async function setCodexAccountRenewalDate(input: {
+  homeId: string;
+  renewalAt: string | null;
+}): Promise<{ homeId: string; renewalAt: string | null }> {
+  const token = await getActionToken();
+  return getJson<{ homeId: string; renewalAt: string | null }>("/api/codex/usage/renewal", {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Bridge-Action-Token": token,
+    },
+    body: JSON.stringify(input),
+  });
+}
+
 export async function consumeCodexResetCredit(input: {
   homeId: string;
   creditId: string;
@@ -386,6 +401,230 @@ export async function updateProject(
     body: JSON.stringify(input),
   });
   return result.project;
+}
+
+export interface IosTestflightApp {
+  id: string;
+  name: string;
+  app_store_name: string;
+  source_path: string;
+  project_path: string;
+  build_directory: string;
+  public_directory: string;
+  bundle_id: string;
+  team_id: string;
+  scheme: string;
+  configuration: string;
+  target_name: string;
+  info_plist_path: string;
+  enabled: boolean;
+  internal_only: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IosTestflightAppInput {
+  name: string;
+  appStoreName: string;
+  sourcePath: string;
+  projectPath: string;
+  buildDirectory: string;
+  publicDirectory: string;
+  bundleId: string;
+  teamId: string;
+  scheme: string;
+  configuration: string;
+  targetName: string;
+  infoPlistPath: string;
+  enabled: boolean;
+  internalOnly: boolean;
+}
+
+export interface IosTestflightStatus {
+  available: boolean;
+  sourceAvailable: boolean;
+  signingConfigured: boolean;
+  apiKeyConfigured: boolean;
+  state: "idle" | "running" | "succeeded" | "failed";
+  buildNumber: number | null;
+  nextBuildNumber: number;
+  betaGroupName: string;
+  betaGroupState: "pending" | "added" | "failed" | null;
+  betaGroupMessage?: string;
+  message?: string;
+  startedAt?: string;
+  finishedAt?: string;
+}
+
+export async function fetchIosTestflightApps(): Promise<IosTestflightApp[]> {
+  const result = await getJson<{ apps: IosTestflightApp[] }>(`/api/mobile/testflight/apps?ts=${Date.now()}`);
+  return result.apps;
+}
+
+export async function createIosTestflightApp(input: IosTestflightAppInput): Promise<IosTestflightApp> {
+  const token = await getActionToken();
+  const result = await getJson<{ app: IosTestflightApp }>("/api/mobile/testflight/apps", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
+    body: JSON.stringify(input),
+  });
+  return result.app;
+}
+
+export async function updateIosTestflightApp(id: string, input: IosTestflightAppInput): Promise<IosTestflightApp> {
+  const token = await getActionToken();
+  const result = await getJson<{ app: IosTestflightApp }>(`/api/mobile/testflight/apps/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token },
+    body: JSON.stringify(input),
+  });
+  return result.app;
+}
+
+export interface MobileIosConfig {
+  app_store_name: string;
+  source_path: string;
+  project_path: string;
+  build_directory: string;
+  public_directory: string;
+  bundle_id: string;
+  team_id: string;
+  scheme: string;
+  configuration: string;
+  target_name: string;
+  info_plist_path: string;
+  internal_only: boolean;
+}
+
+export interface MobileAndroidConfig {
+  package_name: string;
+  apk_path: string;
+  snapshot_directory: string;
+  source_path: string;
+  build_script: string;
+}
+
+export interface MobileAndroidBuildStatus {
+  available: boolean;
+  sourcePath: string | null;
+  scriptPath: string | null;
+  state: "idle" | "running" | "succeeded" | "failed";
+  message?: string;
+  unavailableReason?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  log?: string;
+}
+
+export interface MobileAppRecord {
+  id: string;
+  name: string;
+  enabled: boolean;
+  ios: MobileIosConfig | null;
+  android: MobileAndroidConfig | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MobileIosDeviceInfo {
+  udid: string;
+  identifier: string;
+  name: string;
+  pairing: string;
+  transport: string;
+  connectionState: string;
+  developerMode: string;
+}
+
+export interface MobileIosDeviceInstallStatus {
+  available: boolean;
+  sourceAvailable: boolean;
+  signingConfigured: boolean;
+  usbAvailable: boolean;
+  devices: MobileIosDeviceInfo[];
+  state: "idle" | "running" | "succeeded" | "failed";
+  deviceName?: string;
+  message?: string;
+  startedAt?: string;
+  finishedAt?: string;
+}
+
+export interface MobileApkArtifact {
+  available: true;
+  revision: string;
+  size: number;
+  sha256: string;
+  modifiedAt: string;
+  packageName: string;
+  versionCode: number;
+  versionName: string;
+  downloadUrl: string;
+}
+
+export interface MobileAppView {
+  app: MobileAppRecord;
+  ios: { config: MobileIosConfig; testflight: IosTestflightStatus; deviceInstall: MobileIosDeviceInstallStatus } | null;
+  android: { config: MobileAndroidConfig; build: MobileAndroidBuildStatus; latest: MobileApkArtifact | null; error: string | null } | null;
+}
+
+export interface MobileAppInput {
+  name: string;
+  enabled: boolean;
+  ios: {
+    appStoreName: string;
+    sourcePath: string;
+    projectPath: string;
+    buildDirectory: string;
+    publicDirectory: string;
+    bundleId: string;
+    teamId: string;
+    scheme: string;
+    configuration: string;
+    targetName: string;
+    infoPlistPath: string;
+    internalOnly: boolean;
+  } | null;
+  android: { packageName: string; apkPath: string; snapshotDirectory: string; sourcePath: string; buildScript: string } | null;
+}
+
+export async function fetchMobileApps(): Promise<MobileAppView[]> {
+  const result = await getJson<{ apps: MobileAppView[] }>(`/api/mobile/apps?ts=${Date.now()}`);
+  return result.apps;
+}
+
+export async function createMobileApp(input: MobileAppInput): Promise<MobileAppView> {
+  const token = await getActionToken();
+  return (await getJson<MobileAppView>("/api/mobile/apps", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token }, body: JSON.stringify(input),
+  }));
+}
+
+export async function updateMobileApp(id: string, input: MobileAppInput): Promise<MobileAppView> {
+  const token = await getActionToken();
+  return getJson<MobileAppView>(`/api/mobile/apps/${encodeURIComponent(id)}`, {
+    method: "PATCH", headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token }, body: JSON.stringify(input),
+  });
+}
+
+export async function buildMobileAppOnAndroid(id: string): Promise<MobileAppView> {
+  const token = await getActionToken();
+  return getJson<MobileAppView>(`/api/mobile/apps/${encodeURIComponent(id)}/android/build`, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token }, body: JSON.stringify({}),
+  });
+}
+
+export async function uploadMobileAppToTestflight(id: string): Promise<MobileAppView> {
+  const token = await getActionToken();
+  return getJson<MobileAppView>(`/api/mobile/apps/${encodeURIComponent(id)}/ios/testflight/upload`, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token }, body: JSON.stringify({}),
+  });
+}
+
+export async function installMobileAppOnIos(id: string, device?: string): Promise<MobileAppView> {
+  const token = await getActionToken();
+  return getJson<MobileAppView>(`/api/mobile/apps/${encodeURIComponent(id)}/ios/install`, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Bridge-Action-Token": token }, body: JSON.stringify({ device }),
+  });
 }
 
 export function fetchShortcutConfig(options: { force?: boolean } = {}): Promise<ShortcutStore> {

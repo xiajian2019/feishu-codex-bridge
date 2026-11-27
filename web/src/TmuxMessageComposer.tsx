@@ -9,7 +9,7 @@ import {
   type ChatModelAdapter,
   type ThreadUserMessage,
 } from "@assistant-ui/react";
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type ReactElement } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, useSyncExternalStore, type DragEvent, type FormEvent, type ReactElement } from "react";
 import { createPortal } from "react-dom";
 
 import {
@@ -40,15 +40,33 @@ import {
   type DraftAttachment,
 } from "./tmux-draft-store.js";
 import { readCodexSkillCache, writeCodexSkillCache } from "./skill-cache.js";
-import { getLocalDraftScope } from "./local-draft-scope.js";
+import { getLocalDraftScope, LOCAL_DRAFT_SCOPE_EVENT, LOCAL_DRAFT_SCOPE_WILL_CHANGE_EVENT } from "./local-draft-scope.js";
 import { isMobileApp, shareMobileBlob } from "./mobile-runtime.js";
 import { useMobileBack } from "./use-mobile-back.js";
 import { uploadFileInChunks, type DownloadUploadPhase, type UploadMetric } from "./download-upload.js";
 import { imageSwipeDirection } from "./composer-image-swipe.js";
+import { ComposerTransferReceiver } from "./ComposerTransferReceiver.js";
+import { appendComposerTransferText } from "./composer-transfer-text.js";
+import { ComposerAssetRequestError, acknowledgeComposerAdoption, adoptComposerTransfer, composerAssetAttachment, composerAssetFromAttachment, pendingComposerAdoptions, readComposerAsset, releaseComposerAsset, resolveComposerAssets, supportsComposerAssets, touchComposerAssets, type ComposerAssetAdoption, type ComposerAssetReference } from "./composer-asset-client.js";
+import { applyComposerAssetAdoption, serializeComposerDraftAttachments } from "./composer-asset-draft.js";
+import { shouldAcceptComposerDraftSnapshot } from "./tmux-draft-snapshot-guard.js";
+import { createComposerImeGuard } from "./composer-ime.js";
 
 const TmuxShortcutPalette = lazy(() => import("./TmuxShortcutPalette.js").then((module) => ({ default: module.TmuxShortcutPalette })));
 
 const API_ROOT = "/tmux-dashboard/api";
+type HotDraftRecovery = { callbacks: Set<() => void>; timer: number };
+const hotDraftRecovery: HotDraftRecovery = import.meta.hot?.data.hotDraftRecovery ?? { callbacks: new Set(), timer: 0 };
+if (import.meta.hot) {
+  const hot = import.meta.hot;
+  hot.data.hotDraftRecovery = hotDraftRecovery;
+  const afterUpdate = (): void => {
+    window.clearTimeout(hotDraftRecovery.timer);
+    hotDraftRecovery.timer = window.setTimeout(() => { for (const callback of hotDraftRecovery.callbacks) callback(); }, 250);
+  };
+  hot.on("vite:afterUpdate", afterUpdate);
+  hot.dispose(() => hot.off("vite:afterUpdate", afterUpdate));
+}
 
 function macComposerTerminalShortcut(event: KeyboardEvent, composerEmpty: boolean): TerminalShortcut | null {
   if (
@@ -273,14 +291,56 @@ function ImagePreview({ file, onOpen }: { file: File; onOpen: () => void }): Rea
   );
 }
 
-function ImageLightbox({ file, position, total, onNavigate, onClose }: {
-  file: File;
+type ComposerPreviewItem = { id: string; name: string; file?: File; asset?: ComposerAssetReference };
+
+function RemoteImagePreview({ asset, sessionId, onOpen }: { asset: ComposerAssetReference; sessionId: string; onOpen: () => void }): ReactElement {
+  const [preview, setPreview] = useState<{ id: string; url: string } | null>(null);
+  const [unavailable, setUnavailable] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    let url = "";
+    setPreview(null);
+    setUnavailable(false);
+    const timer = window.setTimeout(() => {
+      void readComposerAsset(sessionId, asset.sessionCreatedAt, asset.assetId, controller.signal, true).then((blob) => {
+        if (controller.signal.aborted || !blob) return;
+        url = URL.createObjectURL(blob);
+        setPreview({ id: asset.assetId, url });
+      }).catch(() => { if (!controller.signal.aborted) setUnavailable(true); });
+    }, 0);
+    return () => { window.clearTimeout(timer); controller.abort(); if (url) URL.revokeObjectURL(url); };
+  }, [asset.assetId, asset.sessionCreatedAt, sessionId]);
+  return <button className="dashboard-composer-image-preview" type="button" aria-label={"Preview " + asset.name} title={unavailable ? "图片暂不可用，点击重试" : "点击放大预览"} onClick={onOpen}>
+    {preview?.id === asset.assetId ? <img src={preview.url} alt={asset.name} /> : <span>{unavailable ? "不可用" : "IMG"}</span>}
+  </button>;
+}
+
+function ImageLightbox({ source, sessionId, position, total, onNavigate, onClose }: {
+  source: ComposerPreviewItem;
+  sessionId: string | null;
   position: number;
   total: number;
   onNavigate: (direction: -1 | 1) => void;
   onClose: () => void;
 }): ReactElement {
   useMobileBack(true, onClose, 500);
+  const [remoteFile, setRemoteFile] = useState<{ id: string; file: File } | null>(null);
+  const [remoteError, setRemoteError] = useState("");
+  useEffect(() => {
+    const controller = new AbortController();
+    setRemoteFile(null);
+    setRemoteError("");
+    const timer = window.setTimeout(() => {
+      if (source.asset && sessionId) {
+        const asset = source.asset;
+        void readComposerAsset(sessionId, asset.sessionCreatedAt, asset.assetId, controller.signal).then((blob) => {
+          if (!controller.signal.aborted && blob) setRemoteFile({ id: asset.assetId, file: new File([blob], asset.name, { type: asset.contentType || blob.type }) });
+        }).catch((error: unknown) => { if (!controller.signal.aborted) setRemoteError(error instanceof Error ? `图片暂不可用：${error.message}` : "图片暂不可用。"); });
+      }
+    }, 0);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [source.id, source.asset?.assetId, source.asset?.sessionCreatedAt, sessionId]);
+  const file = source.file ?? (remoteFile && source.asset && remoteFile.id === source.asset.assetId ? remoteFile.file : null);
   const previewUrl = useFileObjectUrl(file);
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
@@ -293,7 +353,7 @@ function ImageLightbox({ file, position, total, onNavigate, onClose }: {
 
   useEffect(() => {
     if (contentRef.current) contentRef.current.scrollTop = 0;
-  }, [file]);
+  }, [source.id]);
 
   useEffect(() => {
     const previousFocus = document.activeElement;
@@ -329,7 +389,7 @@ function ImageLightbox({ file, position, total, onNavigate, onClose }: {
       className="dashboard-image-lightbox"
       role="dialog"
       aria-modal="true"
-      aria-label={"Preview " + file.name}
+      aria-label={"Preview " + source.name}
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}
@@ -371,11 +431,11 @@ function ImageLightbox({ file, position, total, onNavigate, onClose }: {
         {previewUrl ? (
           <img
             src={previewUrl}
-            alt={file.name}
-            onLoad={(event) => logImagePreviewResult("lightbox-loaded", file, event.currentTarget)}
-            onError={(event) => logImagePreviewResult("lightbox-failed", file, event.currentTarget)}
+            alt={source.name}
+            onLoad={(event) => { if (file) logImagePreviewResult("lightbox-loaded", file, event.currentTarget); }}
+            onError={(event) => { if (file) logImagePreviewResult("lightbox-failed", file, event.currentTarget); }}
           />
-        ) : <span>图片加载中…</span>}
+        ) : <span>{remoteError || "图片加载中…"}</span>}
       </div>
     </div>,
     document.body,
@@ -397,16 +457,22 @@ function downloadDebugLog(file: File): void | Promise<void> {
 
 type ComposerFieldsProps = TmuxMessageComposerProps & {
   preparing: boolean;
+  assetResolving: boolean;
   attachmentProgress: Readonly<Record<string, AttachmentUploadProgress>>;
   onSendStart: () => void;
+  onImportAssets: (adoption: ComposerAssetAdoption) => Promise<void>;
+  onDraftUserAction: () => void;
 };
 
-function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, disabled, sendDisabled, sending, placeholder, preparing, attachmentProgress, onSendStart, onSubmit, onSubmitCommand, onAttachmentError, onOpenFiles, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics }: ComposerFieldsProps): ReactElement {
+function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, disabled, sendDisabled, sending, placeholder, preparing, assetResolving, attachmentProgress, onSendStart, onSubmit, onSubmitCommand, onAttachmentError, onOpenFiles, onTerminalShortcut, onTerminalSequence, onScrollToTop, onScrollToBottom, onExportScrollDiagnostics, onImportAssets, onDraftUserAction }: ComposerFieldsProps): ReactElement {
   const aui = useAui();
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [shortcutCategory, setShortcutCategory] = useState<ShortcutCategory>("favorites");
   const [shortcutStore, setShortcutStore] = useState<ShortcutStore>(() => readShortcutConfigCache() ?? { groups: [], shortcuts: [] });
-  const [preview, setPreview] = useState<{ items: { id: string; file: File }[]; position: number } | null>(null);
+  const [preview, setPreview] = useState<{ items: ComposerPreviewItem[]; position: number } | null>(null);
+  const [phoneTransferOpen, setPhoneTransferOpen] = useState(false);
+  const [draggingFiles, setDraggingFiles] = useState(false);
+  const [addingDroppedFiles, setAddingDroppedFiles] = useState(false);
   useEffect(() => setPreview(null), [sessionId]);
   const [codexSkills, setCodexSkills] = useState<CodexSkillOption[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(false);
@@ -423,10 +489,14 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
   const [debugLogActive, setDebugLogActive] = useState(() => isDebugLogCaptureActive());
   const [debugLogBusy, setDebugLogBusy] = useState(false);
   const inputDisabled = disabled || sending || preparing || debugLogBusy;
-  const controlsDisabled = disabled || sendDisabled || sending || preparing || debugLogBusy;
+  const controlsDisabled = disabled || sendDisabled || sending || preparing || debugLogBusy || addingDroppedFiles;
   const debugLogControlsDisabled = sending || preparing || debugLogBusy || (disabled && !debugLogActive);
+  useEffect(() => {
+    if (controlsDisabled) setDraggingFiles(false);
+  }, [controlsDisabled]);
   const composerFormRef = useRef<HTMLFormElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const imeGuard = useRef(createComposerImeGuard()).current;
   const skillButtonRef = useRef<HTMLButtonElement | null>(null);
   const skillSearchRef = useRef<HTMLInputElement | null>(null);
   const skillPickerRef = useRef<HTMLDivElement | null>(null);
@@ -916,6 +986,8 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
     switch (shortcut.actionKey) {
       case "attachment":
         return <ComposerPrimitive.AddAttachment key={shortcut.id} className="dashboard-keybar-button is-attachment" type="button" multiple disabled={controlsDisabled} onClick={track}>{shortcut.title === "附件" ? "＋" : shortcut.title}</ComposerPrimitive.AddAttachment>;
+      case "phone-transfer":
+        return <button key={shortcut.id} className="dashboard-keybar-button is-phone-transfer" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.detail || shortcut.title} disabled={!sessionId || controlsDisabled} onClick={() => { track(); setShortcutsOpen(false); setPhoneTransferOpen(true); }}>{shortcut.title || "手机"}</button>;
       case "skill-picker":
         return <button key={shortcut.id} ref={skillButtonRef} className="dashboard-keybar-button is-skill-picker" type="button" title={shortcut.detail || shortcut.title} aria-label={shortcut.detail || shortcut.title} aria-haspopup="dialog" aria-expanded={skillsPickerOpen} disabled={!sessionId || controlsDisabled} onPointerDown={rememberComposerSelection} onClick={() => { track(); openSkillsPicker(); }}>{shortcut.title || "$"}</button>;
       case "scroll-top":
@@ -973,11 +1045,39 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
     setSkillsPickerOpen(true);
   };
 
+  const handleFileDrag = (event: DragEvent<HTMLFormElement>): void => {
+    if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = controlsDisabled ? "none" : "copy";
+    if (!controlsDisabled) setDraggingFiles(true);
+  };
+
   return (
     <>
       <ComposerPrimitive.Root
-        className="dashboard-composer"
+        className={"dashboard-composer" + (draggingFiles && !controlsDisabled ? " is-file-dragging" : "")}
         ref={composerFormRef}
+        onDragEnter={handleFileDrag}
+        onDragOver={handleFileDrag}
+        onDragLeave={(event) => {
+          const next = event.relatedTarget;
+          if (!(next instanceof Node) || !event.currentTarget.contains(next)) setDraggingFiles(false);
+        }}
+        onDrop={(event) => {
+          const files = Array.from(event.dataTransfer.files);
+          if (files.length === 0 && !Array.from(event.dataTransfer.types).includes("Files")) return;
+          event.preventDefault();
+          setDraggingFiles(false);
+          if (controlsDisabled || files.length === 0) return;
+          setAddingDroppedFiles(true);
+          void Promise.all(files.map(async (file) => {
+            try {
+              await aui.composer.addAttachment(file);
+            } catch (error) {
+              onAttachmentError(error instanceof Error ? error.message : "添加附件失败。");
+            }
+          })).finally(() => setAddingDroppedFiles(false));
+        }}
         onSubmit={(event: FormEvent<HTMLFormElement>) => {
           if (controlsDisabled) {
             event.preventDefault();
@@ -990,6 +1090,7 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
           onSendStart();
         }}
       >
+        {draggingFiles && !controlsDisabled ? <span className="dashboard-composer-drop-hint" aria-hidden="true">松开以添加附件</span> : null}
         <div className="dashboard-composer-images" aria-label="Attachments to send">
           <ComposerPrimitive.Attachments>
             {({ attachment }) => {
@@ -997,19 +1098,25 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
               const percent = progress && progress.total > 0
                 ? Math.min(100, Math.floor(progress.bytes / progress.total * 100))
                 : 0;
+              const remote = composerAssetFromAttachment(attachment);
+              const isImage = attachment.file?.type.startsWith("image/") || remote?.contentType.startsWith("image/");
+              const openPreview = (): void => {
+                const items = aui.composer.getState().attachments.flatMap((item): ComposerPreviewItem[] => {
+                  if (item.file?.type.startsWith("image/")) return [{ id: item.id, name: item.name, file: item.file }];
+                  const asset = composerAssetFromAttachment(item);
+                  return asset?.contentType.startsWith("image/") ? [{ id: item.id, name: asset.name, asset }] : [];
+                });
+                const position = items.findIndex((item) => item.id === attachment.id);
+                if (position !== -1) setPreview({ items, position });
+              };
               return <AttachmentPrimitive.Root
-                className={"dashboard-composer-image" + (attachment.file?.type.startsWith("image/") ? "" : " is-file")}
+                className={"dashboard-composer-image" + (isImage ? "" : " is-file")}
                 key={attachment.id}
               >
                 {attachment.file?.type.startsWith("image/")
-                  ? <ImagePreview file={attachment.file} onOpen={() => {
-                    const items = aui.composer.getState().attachments.flatMap((item) =>
-                      item.file?.type.startsWith("image/") ? [{ id: item.id, file: item.file }] : [],
-                    );
-                    const position = items.findIndex((item) => item.id === attachment.id);
-                    if (position !== -1) setPreview({ items, position });
-                  }} />
-                  : <span className="dashboard-composer-file-name" title={attachment.name}>{attachment.name}</span>}
+                  ? <ImagePreview file={attachment.file} onOpen={openPreview} />
+                  : remote && isImage && sessionId ? <RemoteImagePreview asset={remote} sessionId={sessionId} onOpen={openPreview} />
+                    : <span className="dashboard-composer-file-name" title={attachment.name}>{attachment.name}</span>}
                 {progress ? <span className="dashboard-composer-upload-progress" role="status" aria-live="polite">
                   <progress max={progress.total || 1} value={Math.min(progress.bytes, progress.total || 1)} aria-label={`${attachment.name} 上传进度`} />
                   <span>{uploadPhaseText(progress.phase)} {percent}%</span>
@@ -1019,6 +1126,7 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
                   type="button"
                   aria-label={"Remove " + attachment.name}
                   disabled={controlsDisabled}
+                  onClick={() => { onDraftUserAction(); if (remote && sessionId) void releaseComposerAsset(sessionId, remote.sessionCreatedAt, remote.assetId).catch(() => {}); }}
                 >×</AttachmentPrimitive.Remove>
               </AttachmentPrimitive.Root>;
             }}
@@ -1034,11 +1142,18 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
             minRows={2}
             maxRows={6}
             disabled={inputDisabled}
-            submitMode={sendDisabled ? "none" : "enter"}
+            submitMode={controlsDisabled ? "none" : "enter"}
             unstable_insertNewlineOnTouchEnter
             unstable_focusOnRunStart={false}
             unstable_focusOnScrollToBottom={false}
             unstable_focusOnThreadSwitched={false}
+            onInputCapture={onDraftUserAction}
+            onCompositionStart={() => imeGuard.start()}
+            onCompositionEnd={(event) => imeGuard.end(event.timeStamp)}
+            onKeyDownCapture={(event) => {
+              // Leave the native IME action intact while keeping it away from the submit handler.
+              if (imeGuard.isImeEnter(event.nativeEvent)) event.stopPropagation();
+            }}
             onKeyDown={(event) => {
               if (isCodexSkillTrigger(event.nativeEvent)) {
                 const input = event.currentTarget;
@@ -1064,6 +1179,7 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
               void onTerminalShortcut(shortcut);
             }}
             onBlur={(event) => {
+              imeGuard.reset();
               inputSelectionRef.current = {
                 start: event.currentTarget.selectionStart,
                 end: event.currentTarget.selectionEnd,
@@ -1167,13 +1283,14 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
             className="dashboard-compose-send"
             type="button"
             disabled={controlsDisabled}
-            aria-label={sendDisabled ? "等待连接恢复后发送" : sending || preparing ? "正在发送" : "发送消息"}
+            aria-label={sendDisabled ? "等待连接恢复后发送" : addingDroppedFiles ? "正在添加附件" : sending || preparing ? "正在发送" : "发送消息"}
             title={sendDisabled ? "连接不可用，恢复后可发送" : undefined}
-          ><span className="dashboard-send-label">{sending || preparing ? "发送中…" : "发送"}</span><span aria-hidden="true">↑</span></ComposerPrimitive.Send>
+          ><span className="dashboard-send-label">{addingDroppedFiles ? "添加附件中…" : assetResolving ? "准备附件…" : sending || preparing ? "发送中…" : "发送"}</span><span aria-hidden="true">↑</span></ComposerPrimitive.Send>
         </div>
       </ComposerPrimitive.Root>
       {preview ? <ImageLightbox
-        file={preview.items[preview.position]!.file}
+        source={preview.items[preview.position]!}
+        sessionId={sessionId}
         position={preview.position}
         total={preview.items.length}
         onNavigate={(direction) => setPreview((current) => current ? {
@@ -1181,6 +1298,18 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
           position: Math.max(0, Math.min(current.items.length - 1, current.position + direction)),
         } : null)}
         onClose={() => setPreview(null)}
+      /> : null}
+      {phoneTransferOpen ? <ComposerTransferReceiver
+        sessionId={sessionId}
+        sessionCreatedAt={sessionCreatedAt}
+        onImportText={(incoming) => {
+          const current = aui.composer.getState().text;
+          const next = appendComposerTransferText(current, incoming);
+          if (next !== current) aui.composer.setText(next);
+        }}
+        onImportFile={(file) => aui.composer.addAttachment(file).then(() => undefined)}
+        onImportAssets={onImportAssets}
+        onClose={() => setPhoneTransferOpen(false)}
       /> : null}
       <Suspense fallback={null}>
         <TmuxShortcutPalette
@@ -1200,11 +1329,46 @@ function ComposerFields({ sessionId, sessionCreatedAt, diagnosticSessionActive, 
   );
 }
 
+function subscribeComposerDraftScope(listener: () => void): () => void {
+  window.addEventListener(LOCAL_DRAFT_SCOPE_EVENT, listener);
+  return () => window.removeEventListener(LOCAL_DRAFT_SCOPE_EVENT, listener);
+}
+
 export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactElement {
+  const scope = useSyncExternalStore(subscribeComposerDraftScope, getLocalDraftScope, () => null);
+  return <ScopedTmuxMessageComposer key={JSON.stringify([scope, props.sessionId, props.sessionCreatedAt])} {...props} />;
+}
+
+function ScopedTmuxMessageComposer(props: TmuxMessageComposerProps): ReactElement {
   const [preparing, setPreparing] = useState(false);
+  const [assetResolving, setAssetResolving] = useState(false);
   const [attachmentProgress, setAttachmentProgress] = useState<Record<string, AttachmentUploadProgress>>({});
   const runtimeRef = useRef<AssistantRuntime | null>(null);
+  const mountedRef = useRef(true);
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
   const attachmentUploads = useRef(new Set<AbortController>());
+  const assetImportState = useRef<{ key: string; imported: Set<string>; operations: Map<string, Promise<void>> }>({ key: "", imported: new Set(), operations: new Map() });
+  const assetTouchAt = useRef(new Map<string, number>());
+  const draftUserAction = useRef(false);
+  const draftUserRevision = useRef(0);
+  const draftResetRevision = useRef(0);
+  const contextKey = JSON.stringify([getLocalDraftScope(), props.sessionId, props.sessionCreatedAt]);
+  const contextKeyRef = useRef(contextKey);
+  contextKeyRef.current = contextKey;
+  if (assetImportState.current.key !== contextKey) assetImportState.current = { key: contextKey, imported: new Set(), operations: new Map() };
+  const importAssets = async (adoption: ComposerAssetAdoption): Promise<void> => {
+    const sessionId = props.sessionId;
+    const sessionCreatedAt = props.sessionCreatedAt;
+    const scope = getLocalDraftScope();
+    const state = assetImportState.current;
+    const composer = runtimeRef.current?.thread.composer;
+    if (!sessionId || sessionCreatedAt === null || !composer || !scope) throw new Error("当前 Session 或设备尚未准备好。");
+    const pending = state.operations.get(adoption.transferId);
+    if (pending) return pending;
+    const operation = applyComposerAssetAdoption(composer, sessionId, sessionCreatedAt, adoption, state.imported, scope, () => mountedRef.current && contextKeyRef.current === state.key);
+    state.operations.set(adoption.transferId, operation);
+    try { await operation; } finally { if (state.operations.get(adoption.transferId) === operation) state.operations.delete(adoption.transferId); }
+  };
   useEffect(() => {
     setAttachmentProgress({});
     return () => {
@@ -1275,68 +1439,138 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
         return { content: [] };
       }
 
-      const messageText = userMessage.content
+      const originalMessageText = userMessage.content
         .filter((part) => part.type === "text")
         .map((part) => part.text)
-        .join("\n")
-        .trim();
-      const uploadedAttachments = userMessage.attachments.flatMap((attachment) =>
-        (attachment.content ?? [])
-          .filter((part) => part.type === "text")
-          .map((part) => ({
-            path: part.text,
-            name: attachment.name,
-            isImage: (attachment.contentType ?? attachment.file?.type ?? "").startsWith("image/"),
-          })),
-      );
-      const imageAttachments = uploadedAttachments.filter((attachment) => attachment.isImage);
-      const fileAttachments = uploadedAttachments.filter((attachment) => !attachment.isImage);
-      const imageNote = imageAttachments.length > 0
-        ? "请打开并查看我附上的图片，再结合上面的文字处理：\n" + imageAttachments
-          .map((attachment, index) => `<image name=[Image #${index + 1}] path="${attachment.path}">`)
-          .join("\n")
-        : "";
-      const fileNote = fileAttachments.length > 0
-        ? "请读取我附上的文件，再结合上面的文字处理：\n" + fileAttachments
-          .map((attachment) => `<file name="${escapePromptAttribute(attachment.name)}" path="${attachment.path}">`)
-          .join("\n")
-        : "";
-      const text = [messageText, imageNote, fileNote].filter(Boolean).join("\n\n");
+        .join("\n");
+      const messageText = originalMessageText.trim();
+      const remoteAssets = userMessage.attachments.flatMap((attachment) => {
+        const asset = composerAssetFromAttachment(attachment);
+        return asset ? [asset] : [];
+      });
+      const draftScopeAtSend = getLocalDraftScope();
+      const contextAtSend = JSON.stringify([draftScopeAtSend, props.sessionId, props.sessionCreatedAt]);
       let result: ComposerSubmissionResult;
       try {
+        if (remoteAssets.length && (!props.sessionId || props.sessionCreatedAt === null
+          || remoteAssets.some((asset) => asset.sessionCreatedAt !== props.sessionCreatedAt))) {
+          throw new Error("草稿附件属于已变化的 Session，请重新添加。");
+        }
+        let resolved = new Map<string, { path: string; name: string; contentType: string }>();
+        if (remoteAssets.length && props.sessionId && props.sessionCreatedAt !== null) {
+          setAssetResolving(true);
+          for (const transferId of new Set(remoteAssets.map((asset) => asset.transferId))) {
+            await acknowledgeComposerAdoption(props.sessionId, props.sessionCreatedAt, transferId);
+          }
+          const items = await resolveComposerAssets(props.sessionId, props.sessionCreatedAt, remoteAssets);
+          if (!mountedRef.current || contextKeyRef.current !== contextAtSend || getLocalDraftScope() !== draftScopeAtSend) throw new Error("Bridge、设备或 Session 已变化，附件未发送。");
+          resolved = new Map(items.map((item) => [item.assetId, item]));
+        }
+        const uploadedAttachments = userMessage.attachments.flatMap((attachment) => {
+          const remote = composerAssetFromAttachment(attachment);
+          if (remote) {
+            const item = resolved.get(remote.assetId);
+            if (!item) throw new Error("草稿附件尚未准备好，请重试。");
+            return [{ path: item.path, name: item.name, isImage: item.contentType.startsWith("image/") }];
+          }
+          return (attachment.content ?? [])
+            .filter((part) => part.type === "text")
+            .map((part) => ({ path: part.text, name: attachment.name, isImage: (attachment.contentType ?? attachment.file?.type ?? "").startsWith("image/") }));
+        });
+        const imageAttachments = uploadedAttachments.filter((attachment) => attachment.isImage);
+        const fileAttachments = uploadedAttachments.filter((attachment) => !attachment.isImage);
+        const imageNote = imageAttachments.length > 0
+          ? "请打开并查看我附上的图片，再结合上面的文字处理：\n" + imageAttachments
+            .map((attachment, index) => `<image name=[Image #${index + 1}] path="${attachment.path}">`)
+            .join("\n")
+          : "";
+        const fileNote = fileAttachments.length > 0
+          ? "请读取我附上的文件，再结合上面的文字处理：\n" + fileAttachments
+            .map((attachment) => `<file name="${escapePromptAttribute(attachment.name)}" path="${attachment.path}">`)
+            .join("\n")
+          : "";
+        const text = [messageText, imageNote, fileNote].filter(Boolean).join("\n\n");
+        if (!mountedRef.current || contextKeyRef.current !== contextAtSend || getLocalDraftScope() !== draftScopeAtSend) throw new Error("Bridge、设备或 Session 已变化，消息未发送。");
         result = await submitRef.current(text);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "草稿附件处理失败，请重试。";
+        attachmentErrorRef.current(message);
+        result = { ok: false, message };
       } finally {
+        setAssetResolving(false);
         setPreparing(false);
       }
 
-      if (result.ok && props.sessionId) {
-        clearDraftMetadata(props.sessionId);
+      if (result.ok && props.sessionId && mountedRef.current && contextKeyRef.current === contextAtSend && getLocalDraftScope() === draftScopeAtSend) {
+        draftResetRevision.current += 1;
+        clearDraftMetadata(props.sessionId, draftScopeAtSend);
         await clearDraftAttachments(props.sessionId);
+        if (assetImportState.current.key === contextAtSend) assetImportState.current.imported.clear();
       }
 
       if (!result.ok) {
         const composer = runtimeRef.current?.thread.composer;
-        composer?.setText(messageText);
-        window.setTimeout(() => {
-          for (const attachment of userMessage.attachments) {
-            if (attachment.file) {
-              void composer?.addAttachment(attachment.file).catch((error: unknown) => {
-                attachmentErrorRef.current(error instanceof Error ? error.message : "Could not restore the image draft.");
-              });
+        if (mountedRef.current && contextKeyRef.current === contextAtSend && getLocalDraftScope() === draftScopeAtSend) {
+          composer?.setText(originalMessageText);
+          window.setTimeout(() => {
+            if (!mountedRef.current || contextKeyRef.current !== contextAtSend || getLocalDraftScope() !== draftScopeAtSend) return;
+            for (const attachment of userMessage.attachments) {
+              const remote = composerAssetFromAttachment(attachment);
+              const source = remote ? composerAssetAttachment(remote) : attachment.file;
+              if (source) {
+                void composer?.addAttachment(source).catch((error: unknown) => {
+                  attachmentErrorRef.current(error instanceof Error ? error.message : "Could not restore the image draft.");
+                });
+              }
             }
-          }
-        }, 0);
+          }, 0);
+        }
       }
 
       return {
         content: [{ type: "text", text: result.ok ? "Delivered to the tmux session." : "Delivery status is uncertain or the message was rejected." }],
       };
     },
-  }), [props.sessionId]);
+  }), [props.sessionId, props.sessionCreatedAt]);
 
   const runtime = useLocalRuntime(chatModel, { adapters: { attachments: attachmentAdapter } });
   runtimeRef.current = runtime;
   const runtimeLoading = useSyncExternalStore(runtime.thread.subscribe, () => runtime.thread.getState().isLoading);
+
+  useEffect(() => {
+    const sessionId = props.sessionId;
+    if (!import.meta.hot || !sessionId) return;
+    let cancelled = false;
+    const recoverAfterUpdate = (): void => {
+      const revision = draftUserRevision.current;
+      const scope = getLocalDraftScope();
+      const key = contextKey;
+      void (async () => {
+          if (cancelled || revision !== draftUserRevision.current || !scope || scope !== getLocalDraftScope() || contextKeyRef.current !== key) return;
+          const currentRuntime = runtimeRef.current;
+          if (!currentRuntime || currentRuntime.thread.getState().isLoading) return;
+          const composer = currentRuntime.thread.composer;
+          const draft = loadDraftMetadata(sessionId);
+          if (!draft || (!draft.text && !draft.attachments.length)) return;
+          if (assetImportState.current.key === key) for (const id of draft.importedTransferIds ?? []) assetImportState.current.imported.add(id);
+          if (draft.text && !composer.getState().text) composer.setText(draft.text);
+          for (const attachment of draft.attachments) {
+            if (cancelled || revision !== draftUserRevision.current || scope !== getLocalDraftScope() || contextKeyRef.current !== key) return;
+            if (attachment.remote) {
+              if (!composer.getState().attachments.some((entry) => composerAssetFromAttachment(entry)?.assetId === attachment.remote!.assetId)) {
+                await composer.addAttachment(composerAssetAttachment(attachment.remote));
+              }
+            } else {
+              const file = await loadDraftAttachment(sessionId, attachment.id);
+              if (cancelled || revision !== draftUserRevision.current || !file) continue;
+              if (!composer.getState().attachments.some((entry) => entry.name === file.name && entry.file?.size === file.size)) await composer.addAttachment(file);
+            }
+          }
+      })().catch((error: unknown) => { if (!cancelled) attachmentErrorRef.current(error instanceof Error ? error.message : "恢复草稿失败。"); });
+    };
+    hotDraftRecovery.callbacks.add(recoverAfterUpdate);
+    return () => { cancelled = true; hotDraftRecovery.callbacks.delete(recoverAfterUpdate); };
+  }, [contextKey, props.sessionId, props.sessionCreatedAt]);
 
   useEffect(() => {
     const sessionId = props.sessionId;
@@ -1350,28 +1584,44 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
     // The runtime can detach before this effect cleans up. Keep the last real
     // composer state rather than reading its temporary empty replacement.
     let latestState = composer.getState();
+    let resetRevision = draftResetRevision.current;
+    let explicitSnapshotPending = false;
 
     const flushDraft = (): void => {
-      if (!restored || cancelled) return;
+      if (!restored || cancelled || resetRevision !== draftResetRevision.current) return;
       const state = latestState;
-      const attachments: DraftAttachment[] = state.attachments
-        .filter((attachment) => attachment.status.type !== "complete")
-        .map((attachment) => ({
-          id: attachment.id,
-          name: attachment.name,
-          contentType: attachment.contentType ?? "application/octet-stream",
-          size: attachment.file?.size ?? 0,
-          lastModified: attachment.file?.lastModified ?? 0,
-        }));
-      if (!state.text && attachments.length === 0) {
+      const attachments: DraftAttachment[] = serializeComposerDraftAttachments(state.attachments);
+      const previous = loadDraftMetadata(sessionId);
+      if (!explicitSnapshotPending && previous && !shouldAcceptComposerDraftSnapshot(previous, { text: state.text, attachments }, false)) return;
+      const imported = assetImportState.current.key === contextKey ? [...assetImportState.current.imported].slice(-1000) : [];
+      if (!state.text && attachments.length === 0 && imported.length === 0) {
         clearDraftMetadata(sessionId, draftScope);
+        explicitSnapshotPending = false;
         return;
       }
-      saveDraftMetadata(sessionId, { text: state.text, attachments }, draftScope);
+      if (saveDraftMetadata(sessionId, { text: state.text, attachments, importedTransferIds: imported }, draftScope)) explicitSnapshotPending = false;
+      const remote = attachments.flatMap((attachment) => attachment.remote ? [attachment.remote] : []);
+      if (supportsComposerAssets() && props.sessionCreatedAt !== null && remote.length && contextKeyRef.current === contextKey
+        && remote.every((asset) => asset.sessionCreatedAt === props.sessionCreatedAt)) {
+        const touchKey = contextKey + ":" + remote.map((asset) => asset.assetId).sort().join(",");
+        if (Date.now() - (assetTouchAt.current.get(touchKey) ?? 0) > 12 * 60 * 60 * 1_000) {
+          assetTouchAt.current.set(touchKey, Date.now());
+          void touchComposerAssets(sessionId, props.sessionCreatedAt, remote).catch(() => { assetTouchAt.current.delete(touchKey); });
+        }
+      }
     };
     const persist = (): void => {
       if (!restored || cancelled || runtime.thread.getState().isLoading) return;
-      latestState = composer.getState();
+      const nextState = composer.getState();
+      if (resetRevision !== draftResetRevision.current) {
+        resetRevision = draftResetRevision.current;
+      } else if (!shouldAcceptComposerDraftSnapshot(latestState, nextState, draftUserAction.current)) {
+        draftUserAction.current = false;
+        return;
+      }
+      explicitSnapshotPending ||= draftUserAction.current;
+      draftUserAction.current = false;
+      latestState = nextState;
       window.clearTimeout(saveTimer);
       saveTimer = window.setTimeout(flushDraft, 180);
     };
@@ -1383,23 +1633,30 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
 
     const unsubscribe = composer.subscribe(persist);
     window.addEventListener("pagehide", flushBeforePageHide);
+    window.addEventListener(LOCAL_DRAFT_SCOPE_WILL_CHANGE_EVENT, flushBeforePageHide);
     document.addEventListener("visibilitychange", flushWhenHidden);
     const restore = async (): Promise<void> => {
       const draft = loadDraftMetadata(sessionId);
       if (cancelled) return;
 
       if (draft) {
+        if (assetImportState.current.key === contextKey) for (const id of draft.importedTransferIds ?? []) assetImportState.current.imported.add(id);
         if (!composer.getState().text && draft.text) composer.setText(draft.text);
-        if (composer.getState().attachments.length === 0) {
-          for (const attachment of draft.attachments) {
-            const file = await loadDraftAttachment(sessionId, attachment.id);
-            if (cancelled || !file) continue;
-            if (composer.getState().attachments.some((current) => current.name === file.name && current.file?.size === file.size)) continue;
-            try {
+        for (const attachment of draft.attachments) {
+          if (cancelled) return;
+          try {
+            if (attachment.remote) {
+              if (!composer.getState().attachments.some((current) => composerAssetFromAttachment(current)?.assetId === attachment.remote!.assetId)) {
+                await composer.addAttachment(composerAssetAttachment(attachment.remote));
+              }
+            } else {
+              const file = await loadDraftAttachment(sessionId, attachment.id);
+              if (cancelled || !file) continue;
+              if (composer.getState().attachments.some((current) => current.name === file.name && current.file?.size === file.size)) continue;
               await composer.addAttachment(file);
-            } catch (error) {
-              attachmentErrorRef.current(error instanceof Error ? error.message : "Could not restore the image draft.");
             }
+          } catch (error) {
+            attachmentErrorRef.current(error instanceof Error ? error.message : "Could not restore the image draft.");
           }
         }
       }
@@ -1442,27 +1699,74 @@ export function TmuxMessageComposer(props: TmuxMessageComposerProps): ReactEleme
       if (!cancelled) {
         restored = true;
         persist();
+        void recoverPendingAssets();
       }
     };
+    let recovering = false;
+    let recoveryTimer = 0;
+    let recoveryAttempts = 0;
+    const recoverPendingAssets = async (): Promise<void> => {
+      if (recovering || cancelled || !restored || document.visibilityState !== "visible" || !supportsComposerAssets() || props.sessionCreatedAt === null) return;
+      recovering = true;
+      let retryPreparing = false;
+      try {
+        const pending = await pendingComposerAdoptions(sessionId, props.sessionCreatedAt);
+        const adoptions = [...pending.adoptions];
+        for (const item of pending.preparing) {
+          if (cancelled || contextKeyRef.current !== contextKey || getLocalDraftScope() !== draftScope) return;
+          try { adoptions.push(await adoptComposerTransfer(sessionId, props.sessionCreatedAt, item.targetId, item.transferId)); }
+          catch (error) {
+            if (error instanceof ComposerAssetRequestError && error.status !== 409 && error.status < 500) throw error;
+            retryPreparing = true;
+          }
+        }
+        for (const adoption of adoptions) {
+          if (cancelled || contextKeyRef.current !== contextKey || getLocalDraftScope() !== draftScope) return;
+          await importAssets(adoption);
+          if (cancelled || contextKeyRef.current !== contextKey || getLocalDraftScope() !== draftScope) return;
+          await acknowledgeComposerAdoption(sessionId, props.sessionCreatedAt, adoption.transferId);
+        }
+      } catch (error) {
+        if (!cancelled && navigator.onLine && contextKeyRef.current === contextKey) {
+          attachmentErrorRef.current(error instanceof Error ? error.message : "恢复手机附件失败，请重试。");
+        }
+      } finally {
+        recovering = false;
+        if (retryPreparing && !cancelled) {
+          const delay = Math.min(30_000, 2_000 * 2 ** Math.min(recoveryAttempts++, 4));
+          recoveryTimer = window.setTimeout(() => { void recoverPendingAssets(); }, delay);
+        } else recoveryAttempts = 0;
+      }
+    };
+    const recoverWhenVisible = (): void => { if (document.visibilityState === "visible") void recoverPendingAssets(); };
+    window.addEventListener("online", recoverWhenVisible);
+    document.addEventListener("visibilitychange", recoverWhenVisible);
     void restore();
 
     return () => {
       window.clearTimeout(saveTimer);
+      window.clearTimeout(recoveryTimer);
       flushDraft();
       cancelled = true;
       forwardImageController.abort();
       unsubscribe();
       window.removeEventListener("pagehide", flushBeforePageHide);
+      window.removeEventListener(LOCAL_DRAFT_SCOPE_WILL_CHANGE_EVENT, flushBeforePageHide);
       document.removeEventListener("visibilitychange", flushWhenHidden);
+      window.removeEventListener("online", recoverWhenVisible);
+      document.removeEventListener("visibilitychange", recoverWhenVisible);
     };
-  }, [props.sessionFileForward, props.sessionId, runtime, runtimeLoading]);
+  }, [props.sessionFileForward, props.sessionId, props.sessionCreatedAt, contextKey, runtime, runtimeLoading]);
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <ComposerFields
         {...props}
         preparing={preparing}
+        assetResolving={assetResolving}
         attachmentProgress={attachmentProgress}
+        onImportAssets={importAssets}
+        onDraftUserAction={() => { draftUserAction.current = true; draftUserRevision.current += 1; }}
         onSendStart={() => {
           if (!runtime.thread.composer.getState().isEmpty) setPreparing(true);
         }}

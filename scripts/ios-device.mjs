@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readIosDevelopmentTeam } from "./ios-signing-config.mjs";
 import {
   disableRenewal, enableRenewal, inspectSignedApp, notifyRenewalIssue, printRenewalStatus, rememberInstallation,
   renewalDue, renewalPaths, runRenewal,
@@ -313,6 +314,9 @@ function main() {
     else devices.forEach(printDevice);
     return;
   }
+  const teamId = readIosDevelopmentTeam(process.env, join(root, "ios/.xcconfig"));
+  if (!teamId) throw new Error("请在 ios/.xcconfig 或运行命令的环境中设置 BRIDGE_IOS_DEVELOPMENT_TEAM（Apple Team ID）。");
+
   const device = options.ip
     ? (options.buildOnly ? null : resolveIpDevice(options.ip, options.wirelessOnly))
     : chooseDevice(devices, options.device, !options.buildOnly);
@@ -336,7 +340,7 @@ function main() {
     if (process.env.BRIDGE_IOS_SPM_CACHE) buildArgs.push("-clonedSourcePackagesDirPath", resolve(process.env.BRIDGE_IOS_SPM_CACHE));
     if (options.allowProvisioningUpdates) buildArgs.push("-allowProvisioningUpdates");
     if (options.buildNumber !== null) buildArgs.push(`CURRENT_PROJECT_VERSION=${options.buildNumber}`);
-    buildArgs.push("-quiet", "build");
+    buildArgs.push(`DEVELOPMENT_TEAM=${teamId}`, "-quiet", "build");
     run("xcodebuild", buildArgs, "[3/4] 编译并签名 iOS App");
     const app = join(derived, `Build/Products/${build.configuration === "Release" ? "Release" : build.configuration === "Debug" ? "Debug" : build.configuration}-iphoneos`, build.product);
     const info = join(app, "Info.plist");

@@ -195,6 +195,7 @@ describe("iOS automatic signing renewal", () => {
       mkdirSync(home);
       copyFileSync(new URL("../scripts/ios-device.mjs", import.meta.url), join(scripts, "ios-device.mjs"));
       copyFileSync(new URL("../scripts/ios-auto-renew.mjs", import.meta.url), join(scripts, "ios-auto-renew.mjs"));
+      copyFileSync(new URL("../scripts/ios-signing-config.mjs", import.meta.url), join(scripts, "ios-signing-config.mjs"));
       const env = { ...process.env, HOME: home };
       delete env.BRIDGE_IOS_SIGNING_LOCK_HELD;
       const result = spawnSync(process.execPath, [join(scripts, "ios-device.mjs"), "--renew-run"], { encoding: "utf8", env });

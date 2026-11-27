@@ -1,0 +1,3 @@
+[submodule "android/app/src/main/cpp/avnc/libvncserver"]
+	path = android/app/src/main/cpp/avnc/libvncserver
+	url = https://github.com/gujjwal00/libvncserver.git

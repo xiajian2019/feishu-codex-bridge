@@ -4,6 +4,9 @@ export type MobileOpenRequest =
   | { id: string; kind: "route"; server: string; route: string; scope?: string }
   | { id: string; kind: "pair"; server: string; code: string };
 
+export const MOBILE_APP_INTENT_ROUTE_EVENT = "bridge:mobile-app-intent-route";
+const PENDING_APP_INTENT_ROUTE_KEY = "bridge.mobile.pending-app-intent-route.v1";
+
 /** Navigation only: never accepts API endpoints, external URLs, credentials, or executable actions. */
 export function safeMobileRoute(value: unknown): string | null {
   if (typeof value !== "string" || value.length > 2048 || !value.startsWith("/") || value.startsWith("//")
@@ -18,13 +21,13 @@ export function safeMobileRoute(value: unknown): string | null {
     }
   } catch { return null; }
   const path = url.pathname;
-  const allowed = ["/", "/mobile-inbox", "/mobile-shares", "/codex-history", "/tmux-dashboard", "/tmux-dashboard/history"];
+  const allowed = ["/", "/tasks", "/mobile-inbox", "/mobile-shares", "/nearby-transfer", "/codex-history", "/tmux-dashboard", "/tmux-dashboard/history"];
   if (!allowed.includes(path) && !/^\/tasks\/(desk|direct|aamp)\/[^/]+$/.test(path)
     && !/^\/codex-history\/[^/]+\/[^/]+$/.test(path)
     && !/^\/tmux-dashboard\/(files|git-changes)\/[^/]+$/.test(path)) return null;
   const keys = path.startsWith("/tmux-dashboard") ? ["session"]
     : path.startsWith("/codex-history") ? ["home", "q", "archived", "status"]
-    : path === "/" ? ["source", "q", "state", "project", "offset"] : [];
+    : path === "/" || path === "/tasks" ? ["source", "q", "state", "project", "offset"] : [];
   for (const key of url.searchParams.keys()) if (!keys.includes(key)) return null;
   return path + url.search;
 }
@@ -99,6 +102,37 @@ export function restoreMobileOpens(): void {
     opens = [...opens]; publish();
   } catch { /* Never restore pairing codes, invalid routes, or executable URLs. */ }
 }
+
+let pendingAppIntentRoute: string | null = null;
+
+/** Queue a local, current-environment route received from an App Intent. */
+export function queueMobileAppIntentRoute(value: unknown): void {
+  const route = safeMobileRoute(value);
+  if (!route) {
+    reportMobileOpenError("App Intent 的打开目标无效；未执行任何操作。");
+    return;
+  }
+  pendingAppIntentRoute = route;
+  try { window.sessionStorage.setItem(PENDING_APP_INTENT_ROUTE_KEY, route); } catch { /* Keep the in-memory handoff. */ }
+  window.dispatchEvent(new Event(MOBILE_APP_INTENT_ROUTE_EVENT));
+}
+
+export function getPendingMobileAppIntentRoute(): string | null {
+  if (pendingAppIntentRoute) return pendingAppIntentRoute;
+  try {
+    const route = safeMobileRoute(window.sessionStorage.getItem(PENDING_APP_INTENT_ROUTE_KEY));
+    pendingAppIntentRoute = route;
+    return route;
+  } catch { return null; }
+}
+
+export function consumeMobileAppIntentRoute(): string | null {
+  const route = getPendingMobileAppIntentRoute();
+  pendingAppIntentRoute = null;
+  try { window.sessionStorage.removeItem(PENDING_APP_INTENT_ROUTE_KEY); } catch { /* Best effort. */ }
+  return route;
+}
+
 export function subscribeMobileOpens(listener: () => void): () => void { listeners.add(listener); return () => { listeners.delete(listener); }; }
 export function getMobileOpens(): MobileOpenRequest[] { return opens; }
 export function getMobileOpenError(): string | null { return handoffError; }

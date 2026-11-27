@@ -1,0 +1,5 @@
+Android native VNC support is adapted from AVNC by Gaurav Ujjwal.
+Source: https://github.com/gujjwal00/avnc
+The bundled Kotlin/JNI adapter files retain their GPL-3.0-or-later headers.
+The bundled LibVNCClient source is the AVNC fork at commit
+cc4be40b5b5a9327974d1eeb52f445db44abf801 and retains its GPL-2.0 license.

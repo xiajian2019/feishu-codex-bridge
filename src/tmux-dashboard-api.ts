@@ -5,9 +5,11 @@ import { homedir, tmpdir } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { Duplex } from "node:stream";
+import { Transform, type Duplex } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { DownloadUploadError, DownloadUploadsService } from "./download-uploads.js";
+import { ComposerTransferError, ComposerTransferStore } from "./composer-transfer.js";
+import { ComposerAssetStore, type ComposerAssetContext } from "./composer-assets.js";
 import { SshFallbackSnapshots } from "./ssh-session-fallback-snapshots.js";
 import {
   tmuxResurrectController,
@@ -20,7 +22,7 @@ import { isNativeAppOrigin } from "./mobile-auth.js";
 import { discoverCodexHistoryHomes, type CodexHistoryHome } from "./codex-history.js";
 import { codexSkillScopeKeys, discoverCodexSkills, type CodexSkillScope } from "./codex-skills.js";
 import { GitWorkspaceError, inspectGitChanges, openGitChangeFile, previewGitChangeFile, inspectTaskSourceDirectory, resolveGitCommonDirectory, resolveGitRoot, verifyTaskWorkspace } from "./git-workspaces.js";
-import type { StateDatabase } from "./db.js";
+import type { StateDatabase, StoredComposerTransfer } from "./db.js";
 import type { Logger, StoredTask, StoredTmuxSession, StoredTmuxSessionAction, WebTaskSubmission } from "./types.js";
 import {
   parseTmuxReviewAnchor,
@@ -343,6 +345,8 @@ export class TmuxDashboardApi {
   private readonly attachmentDirectory: string;
   private readonly attachmentDirectories: string[];
   private readonly attachmentUploads: DownloadUploadsService;
+  private readonly composerTransfers: ComposerTransferStore;
+  private readonly composerAssets: ComposerAssetStore;
 
   constructor(options: TmuxDashboardApiOptions) {
     if (!options.db) throw new Error("TmuxDashboardApi requires the Bridge state database.");
@@ -352,6 +356,8 @@ export class TmuxDashboardApi {
     this.attachmentDirectory = options.attachmentDirectory ?? ATTACHMENT_DIRECTORY;
     this.attachmentDirectories = options.attachmentDirectory ? [this.attachmentDirectory] : [ATTACHMENT_DIRECTORY, LEGACY_ATTACHMENT_DIRECTORY];
     this.attachmentUploads = new DownloadUploadsService({ directory: this.attachmentDirectory });
+    this.composerTransfers = new ComposerTransferStore({ db: this.db, directory: join(this.attachmentDirectory, "composer-transfers") });
+    this.composerAssets = new ComposerAssetStore({ db: this.db, transferDirectory: join(this.attachmentDirectory, "composer-transfers"), attachmentDirectory: this.attachmentDirectory, storageName: attachmentStorageName });
     this.terminalRuntime = options.terminalRuntime;
     this.heartbeatIntervalMs = Number.isSafeInteger(options.heartbeatIntervalMs) && (options.heartbeatIntervalMs ?? 0) >= 10
       ? options.heartbeatIntervalMs!
@@ -420,14 +426,88 @@ export class TmuxDashboardApi {
     })));
   }
 
+  /** Public capability-token API used by the phone upload page. */
+  public async handlePublicComposerTransferRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    const url = new URL(request.url ?? "/", "http://localhost");
+    const transferToken = firstHeaderValue(request.headers["x-bridge-transfer-token"]);
+    try {
+      if (request.method === "POST" && url.pathname === "/api/composer-transfers/claim") {
+        const body = await readJsonBody(request);
+        const code = typeof body.code === "string" ? body.code : firstHeaderValue(request.headers["x-bridge-transfer-code"]);
+        if (!code) throw new ComposerTransferError(400, "接收码不能为空。");
+        sendJson(response, 200, this.composerTransfers.claim(code, firstHeaderValue(request.headers["x-bridge-client"]) ?? null));
+        return;
+      }
+      const textMatch = /^\/api\/composer-transfers\/([^/]+)\/text$/.exec(url.pathname);
+      if (request.method === "POST" && textMatch) {
+        if (!transferToken) throw new ComposerTransferError(401, "缺少手机传输凭证。");
+        const body = await readJsonBody(request);
+        sendJson(response, 200, publicComposerTransfer(this.composerTransfers.setText(decodeURIComponent(textMatch[1]!), transferToken, body.text)));
+        return;
+      }
+      const itemMatch = /^\/api\/composer-transfers\/([^/]+)\/items(?:\/([^/]+))?(?:\/complete)?$/.exec(url.pathname);
+      if (itemMatch) {
+        if (!transferToken) throw new ComposerTransferError(401, "缺少手机传输凭证。");
+        const transferId = decodeURIComponent(itemMatch[1]!);
+        const itemId = itemMatch[2] ? decodeURIComponent(itemMatch[2]) : null;
+        const completing = url.pathname.endsWith("/complete");
+        if (request.method === "POST" && !itemId) {
+          const body = await readJsonBody(request);
+          sendJson(response, 201, publicComposerTransferItem(await this.composerTransfers.createItem(transferId, transferToken, {
+            fileName: body.fileName,
+            contentType: body.contentType,
+            sizeBytes: body.sizeBytes,
+            sha256: body.sha256,
+          })));
+          return;
+        }
+        if (!itemId) throw new DashboardBodyError("文件项无效。", 400);
+        if (request.method === "PUT" && !completing) {
+          const offset = url.searchParams.get("offset");
+          if (offset === null || !/^\d+$/.test(offset)) throw new DashboardBodyError("上传偏移量无效。", 400);
+          sendJson(response, 200, publicComposerTransferItem(await this.composerTransfers.appendItem(transferId, transferToken, itemId, Number(offset), request)));
+          return;
+        }
+        if (request.method === "POST" && completing) {
+          await readJsonBody(request).catch(() => ({}));
+          sendJson(response, 200, publicComposerTransferItem(await this.composerTransfers.completeItem(transferId, transferToken, itemId)));
+          return;
+        }
+      }
+      const finishMatch = /^\/api\/composer-transfers\/([^/]+)\/complete$/.exec(url.pathname);
+      if (request.method === "POST" && finishMatch) {
+        if (!transferToken) throw new ComposerTransferError(401, "缺少手机传输凭证。");
+        await readJsonBody(request).catch(() => ({}));
+        sendJson(response, 200, publicComposerTransfer(this.composerTransfers.finish(decodeURIComponent(finishMatch[1]!), transferToken)));
+        return;
+      }
+      sendJson(response, 404, { error: "手机传输接口不存在。" });
+    } catch (error) {
+      if (!response.destroyed) sendDashboardError(response, error);
+    }
+  }
+
   public async handleRequest(
     request: IncomingMessage,
     response: ServerResponse,
     deviceId: string | null = null,
     isAuthorized: () => boolean = () => true,
+    isConnectionAuthorized: () => boolean = isAuthorized,
   ): Promise<void> {
     const url = new URL(request.url ?? "/", "http://localhost");
     const apiPath = url.pathname.slice(API_PREFIX.length);
+    const transferCreateMatch = /^\/sessions\/([^/]+)\/composer-transfer$/.exec(apiPath);
+    const transferTargetMatch = /^\/sessions\/([^/]+)\/composer-transfer\/([^/]+)$/.exec(apiPath);
+    const transferItemMatch = /^\/sessions\/([^/]+)\/composer-transfer\/([^/]+)\/([^/]+)\/items\/([^/]+)$/.exec(apiPath);
+    const transferConsumeMatch = /^\/sessions\/([^/]+)\/composer-transfer\/([^/]+)\/([^/]+)\/(?:consume|adopt)$/.exec(apiPath);
+    if (transferCreateMatch || transferTargetMatch || transferItemMatch || transferConsumeMatch) {
+      await this.handleComposerTransferSessionRequest(request, response, url, deviceId, isConnectionAuthorized);
+      return;
+    }
+    if (/^\/sessions\/[^/]+\/composer-assets(?:\/|$)/.test(apiPath)) {
+      await this.handleComposerAssetRequest(request, response, url, deviceId, isConnectionAuthorized);
+      return;
+    }
     if (request.method === "POST" && apiPath === "/scroll-diagnostics/export") {
       const contentType = request.headers["content-type"]?.split(";")[0]?.trim().toLowerCase() ?? "";
       if (contentType !== "application/x-www-form-urlencoded") {
@@ -1589,6 +1669,158 @@ export class TmuxDashboardApi {
     sendJson(response, 404, { error: "Not found." });
   }
 
+  private async handleComposerTransferSessionRequest(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    deviceId: string | null,
+    isAuthorized: () => boolean,
+  ): Promise<void> {
+    const apiPath = url.pathname.slice(API_PREFIX.length);
+    const createMatch = /^\/sessions\/([^/]+)\/composer-transfer$/.exec(apiPath);
+    const targetMatch = /^\/sessions\/([^/]+)\/composer-transfer\/([^/]+)$/.exec(apiPath);
+    const itemMatch = /^\/sessions\/([^/]+)\/composer-transfer\/([^/]+)\/([^/]+)\/items\/([^/]+)$/.exec(apiPath);
+    const consumeMatch = /^\/sessions\/([^/]+)\/composer-transfer\/([^/]+)\/([^/]+)\/(consume|adopt)$/.exec(apiPath);
+    let sessionId: string;
+    try {
+      sessionId = decodeURIComponent((createMatch ?? targetMatch ?? itemMatch ?? consumeMatch)![1]!);
+    } catch {
+      sendJson(response, 400, { error: "Invalid tmux session id." });
+      return;
+    }
+    try {
+      const session = await this.operations.findSession(sessionId);
+      if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+      assertExpectedSessionCreatedAt(request, session.createdAt);
+      const record = this.db.observeTmuxSession(session);
+      const targetDeviceId = deviceId ?? "local";
+      if (createMatch && request.method === "POST") {
+        await readJsonBody(request).catch(() => ({}));
+        const result = await this.composerTransfers.createTarget({
+          sessionRecordId: record.record_id,
+          tmuxSessionId: session.id,
+          sessionCreatedAt: session.createdAt,
+          deviceId: targetDeviceId,
+        });
+        sendJson(response, 201, result);
+        return;
+      }
+      if (targetMatch) {
+        const targetId = decodeURIComponent(targetMatch[2]!);
+        if (request.method === "GET") {
+          sendJson(response, 200, {
+            transfers: this.composerTransfers.listForTarget(targetId, session.id, session.createdAt, targetDeviceId).map(publicComposerTransfer),
+          });
+          return;
+        }
+        if (request.method === "DELETE") {
+          await this.composerTransfers.cancelTarget(targetId, session.id, session.createdAt, targetDeviceId);
+          await this.composerAssets.discardCancelledTarget(targetId);
+          sendJson(response, 200, { ok: true });
+          return;
+        }
+      }
+      if (itemMatch && request.method === "GET") {
+        const targetId = decodeURIComponent(itemMatch[2]!);
+        const transferId = decodeURIComponent(itemMatch[3]!);
+        const itemId = decodeURIComponent(itemMatch[4]!);
+        const item = this.composerTransfers.getTargetItem(targetId, session.id, session.createdAt, targetDeviceId, transferId, itemId);
+        const fileInfo = await stat(item.local_path);
+        response.setHeader("Cache-Control", "no-store");
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        response.setHeader("Content-Type", item.content_type);
+        response.setHeader("Content-Length", String(fileInfo.size));
+        response.setHeader("Content-Disposition", `inline; filename="${item.file_name.replace(/[\"\\\r\n]/g, "_")}"`);
+        const stream = createReadStream(item.local_path);
+        stream.on("error", () => { if (!response.headersSent) sendJson(response, 404, { error: "传输文件已不存在。" }); else response.destroy(); });
+        stream.pipe(response);
+        return;
+      }
+      if (consumeMatch && request.method === "POST") {
+        if (consumeMatch[4] === "adopt") {
+          try { await readJsonBody(request); } catch { throw new DashboardBodyError("草稿附件请求无效。", 400); }
+        } else await readJsonBody(request).catch(() => ({}));
+        const targetId = decodeURIComponent(consumeMatch[2]!);
+        const transferId = decodeURIComponent(consumeMatch[3]!);
+        if (consumeMatch[4] === "adopt") {
+          if (expectedSessionCreatedAt(request) !== session.createdAt) throw new DashboardBodyError("缺少或错误的 Session 标识。", 409);
+          const context: ComposerAssetContext = { sessionId: session.id, sessionCreatedAt: session.createdAt, sessionRecordId: record.record_id, deviceId: targetDeviceId };
+          sendJson(response, 200, await this.composerAssets.adopt(context, targetId, transferId, isAuthorized));
+        } else {
+          sendJson(response, 200, publicComposerTransfer(this.composerTransfers.consumeTargetTransfer(
+            targetId, session.id, session.createdAt, targetDeviceId, transferId,
+          )));
+        }
+        return;
+      }
+      sendJson(response, 404, { error: "手机传输接口不存在。" });
+    } catch (error) {
+      if (!response.destroyed) sendDashboardError(response, error);
+    }
+  }
+
+  private async handleComposerAssetRequest(
+    request: IncomingMessage, response: ServerResponse, url: URL, deviceId: string | null, isAuthorized: () => boolean,
+  ): Promise<void> {
+    const apiPath = url.pathname.slice(API_PREFIX.length);
+    const match = /^\/sessions\/([^/]+)\/composer-assets(?:\/(.*))?$/.exec(apiPath);
+    if (!match) return sendJson(response, 404, { error: "草稿附件接口不存在。" });
+    try {
+      if (!isAuthorized()) throw new DashboardBodyError("设备授权已失效。", 401);
+      const sessionId = decodeURIComponent(match[1]!);
+      const session = await this.operations.findSession(sessionId);
+      if (!session) throw new tmux.SessionNotFoundError("tmux session not found.");
+      if (expectedSessionCreatedAt(request) !== session.createdAt) throw new DashboardBodyError("缺少或错误的 Session 标识。", 409);
+      const record = this.db.observeTmuxSession(session);
+      const context: ComposerAssetContext = { sessionId: session.id, sessionCreatedAt: session.createdAt, sessionRecordId: record.record_id, deviceId: deviceId ?? "local" };
+      const action = match[2] ?? "";
+      if (request.method === "GET" && action === "pending") {
+        sendJson(response, 200, this.composerAssets.listPending(context)); return;
+      }
+      const ack = /^adoptions\/([^/]+)\/ack$/.exec(action);
+      if (request.method === "POST" && ack) {
+        try { await readJsonBody(request); } catch { throw new DashboardBodyError("草稿附件请求无效。", 400); }
+        this.composerAssets.acknowledge(context, decodeURIComponent(ack[1]!)); sendJson(response, 200, { ok: true }); return;
+      }
+      if (request.method === "POST" && (action === "resolve" || action === "touch")) {
+        const body = await readJsonBody(request);
+        const ids = body.assetIds;
+        if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) throw new DashboardBodyError("草稿附件引用无效。", 400);
+        if (action === "resolve") sendJson(response, 200, { assets: await this.composerAssets.resolveForSend(context, ids as string[], isAuthorized) });
+        else { this.composerAssets.touch(context, ids as string[]); sendJson(response, 200, { ok: true }); }
+        return;
+      }
+      const content = /^([^/]+)\/content$/.exec(action);
+      if (request.method === "GET" && content) {
+        const assetId = decodeURIComponent(content[1]!);
+        const { path, item } = await this.composerAssets.getFile(context, assetId);
+        const thumbnail = url.searchParams.get("thumbnail") === "1" ? await this.composerAssets.getThumbnail(context, assetId) : null;
+        if (thumbnail) await this.composerAssets.getFile(context, assetId);
+        if (!isAuthorized()) throw new DashboardBodyError("设备授权已失效。", 401);
+        if (url.searchParams.get("thumbnail") === "1" && !thumbnail) { sendEmpty(response, 204); return; }
+        response.setHeader("Cache-Control", "no-store");
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        response.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+        response.setHeader("Content-Type", thumbnail ? "image/jpeg" : item.content_type);
+        response.setHeader("Content-Length", String(thumbnail?.sizeBytes ?? item.size_bytes));
+        response.setHeader("Content-Disposition", "attachment");
+        const gate = new Transform({ transform(chunk: Buffer, _encoding, callback) {
+          if (!isAuthorized()) return callback(new Error("device authorization revoked"));
+          callback(null, chunk);
+        } });
+        try { await pipeline(createReadStream(thumbnail?.path ?? path), gate, response); }
+        catch { if (!response.destroyed) response.destroy(); }
+        return;
+      }
+      if (request.method === "DELETE" && /^[^/]+$/.test(action)) {
+        this.composerAssets.release(context, decodeURIComponent(action)); sendJson(response, 200, { ok: true }); return;
+      }
+      sendJson(response, 404, { error: "草稿附件接口不存在。" });
+    } catch (error) {
+      if (!response.destroyed) sendDashboardError(response, error);
+    }
+  }
+
   private async handleComposerRequest(
     request: IncomingMessage,
     response: ServerResponse,
@@ -1839,6 +2071,8 @@ export class TmuxDashboardApi {
     for (const client of this.clients) client.close(1001, "Server shutting down");
     this.clients.clear();
     this.websocketServer.close();
+    await this.composerAssets.dispose();
+    await this.composerTransfers.dispose();
     await this.attachmentUploads.dispose();
   }
 
@@ -2983,6 +3217,39 @@ export function validateTerminalInput(value: unknown): string | null {
   return Buffer.byteLength(value, "utf8") <= MAX_TERMINAL_INPUT_BYTES ? value : null;
 }
 
+function publicComposerTransfer(transfer: StoredComposerTransfer): Record<string, unknown> {
+  return {
+    transferId: transfer.transfer_id,
+    targetId: transfer.target_id,
+    text: transfer.text,
+    status: transfer.status,
+    error: transfer.error,
+    expiresAt: transfer.expires_at,
+    items: transfer.items.map((item) => ({
+      itemId: item.item_id,
+      fileName: item.file_name,
+      contentType: item.content_type,
+      sizeBytes: item.size_bytes,
+      receivedBytes: item.received_bytes,
+      status: item.status,
+      error: item.error,
+    })),
+  };
+}
+
+function publicComposerTransferItem(item: { item_id: string; file_name: string; content_type: string; size_bytes: number; received_bytes: number; status: string; error: string | null }): Record<string, unknown> {
+  return {
+    itemId: item.item_id,
+    fileName: item.file_name,
+    contentType: item.content_type,
+    sizeBytes: item.size_bytes,
+    receivedBytes: item.received_bytes,
+    offset: item.received_bytes,
+    status: item.status,
+    error: item.error,
+  };
+}
+
 function countOccurrences(value: string, snippet: string): number {
   if (!snippet) return 0;
   return value.split(snippet).length - 1;
@@ -3127,7 +3394,7 @@ function attachmentStorageName(fileName: string, contentType: string): string {
 }
 
 function sendDashboardError(response: ServerResponse, error: unknown): void {
-  const status = error instanceof tmux.TmuxQueryTimeoutError || error instanceof TmuxResurrectUnavailableError ? 503 : error instanceof DownloadUploadError ? error.statusCode : error instanceof DashboardBodyError
+  const status = error instanceof tmux.TmuxQueryTimeoutError || error instanceof TmuxResurrectUnavailableError ? 503 : error instanceof DownloadUploadError ? error.statusCode : error instanceof ComposerTransferError ? error.statusCode : error instanceof DashboardBodyError
     ? error.statusCode
     : error instanceof GitWorkspaceError
       ? error.statusCode

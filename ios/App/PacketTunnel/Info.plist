@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BridgeShareAppGroup</key>
+	<string>$(BRIDGE_SHARE_APP_GROUP)</string>
+	<key>BridgeVpnKeychainAccessGroup</key>
+	<string>$(BRIDGE_VPN_KEYCHAIN_GROUP)</string>
 	<key>CFBundleDisplayName</key>
 	<string>Bridge VPN</string>
 	<key>CFBundleExecutable</key>

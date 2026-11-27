@@ -23,7 +23,7 @@ flowchart LR
 边界说明：
 
 - Dashboard 连接 Bridge 主机上的现有 tmux server，不代表 pane 里通过 SSH 登录的其他机器。
-- Composer 是给所选 Codex session 发送消息；它不提供任意 shell 命令入口。
+- 默认 Composer 给所选 Codex session 发送消息。显式开启“终端输入”后，按键直接发送至该 tmux PTY，可操作其中的 Shell 或终端程序。
 - 文件根目录由服务端按 session 工作目录确定；客户端不能指定任意目录。
 - 网页需要配对会话。若通过局域网访问，按实际 Bridge 配置和公司网络政策开放；不要把配对码或管理页面公开。
 

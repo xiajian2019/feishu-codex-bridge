@@ -102,7 +102,11 @@ describe("iOS OTA installation", () => {
   });
 
   test("can generate a fresh Safari URL and terminal QR for an existing release", () => {
-    const { dir } = fixture();
+    const { dir, revision, metadata } = fixture();
+    // This CLI uses the real clock, unlike the deterministic in-process tests.
+    writeFileSync(join(dir, "releases", revision + ".json"), JSON.stringify({
+      ...metadata, expiresAt: new Date(Date.now() + 7 * 86400_000).toISOString(),
+    }));
     const result = spawnSync(process.execPath, [new URL("../scripts/ios-ota.mjs", import.meta.url).pathname,
       "--link", "--directory", dir, "--base-url", "https://10.0.0.94:18731"], { encoding: "utf8" });
     expect(result.status).toBe(0);

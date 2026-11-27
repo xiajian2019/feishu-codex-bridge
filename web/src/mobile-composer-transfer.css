@@ -1,0 +1,34 @@
+.mobile-composer-transfer-options-note { margin: 0 0 16px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.mobile-composer-transfer-native { margin-top: 10px; }
+
+.mobile-composer-transfer-page { box-sizing: border-box; width: min(100%, 860px); min-height: calc(100dvh - 52px); padding-top: clamp(26px, 7vh, 72px); }
+.mobile-composer-transfer-hero { --transfer-shadow: rgba(22, 101, 52, .12); --transfer-hover: #cbf4d9; position: relative; overflow: hidden; padding: clamp(24px, 6vw, 52px); border: 1px solid var(--line); border-radius: 28px; background: linear-gradient(135deg, var(--card) 0%, var(--paper) 100%); box-shadow: 0 18px 50px #0000000b; }
+.mobile-composer-transfer-hero h1 { position: relative; z-index: 1; max-width: 620px; margin: 0 0 12px; color: var(--ink); font-size: clamp(28px, 3vw, 38px); letter-spacing: -.04em; line-height: 1.18; }
+.mobile-composer-transfer-lead { position: relative; z-index: 1; max-width: 570px; margin: 0; color: var(--muted); font-size: clamp(14px, 2vw, 17px); line-height: 1.7; }
+.mobile-composer-transfer-unavailable { position: relative; z-index: 1; max-width: 520px; margin: 28px 0 0; padding: 13px 15px; border: 1px solid var(--line); border-radius: 12px; color: var(--muted); background: var(--paper); font-size: 13px; line-height: 1.55; }
+.mobile-composer-transfer-cta { position: relative; z-index: 1; display: block; width: min(100%, 500px); margin-top: 30px; padding: 12px 14px; border: 1px solid var(--accent); border-radius: 16px; color: var(--ink); background: var(--accent-soft); text-align: left; box-shadow: 0 6px 18px var(--transfer-shadow); }
+.mobile-composer-transfer-cta:hover, .mobile-composer-transfer-cta:focus-visible { border-color: var(--accent); background: var(--transfer-hover); }
+.mobile-composer-transfer-cta:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.mobile-composer-transfer-cta > span { display: grid; min-width: 0; gap: 3px; }
+.mobile-composer-transfer-cta strong { font-size: 15px; }
+.mobile-composer-transfer-cta small { color: var(--muted); font-size: 11px; line-height: 1.4; }
+.mobile-composer-transfer-steps { position: relative; z-index: 1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 38px; padding-top: 22px; border-top: 1px solid var(--line); }
+.mobile-composer-transfer-steps > div { display: grid; gap: 4px; min-width: 0; }
+.mobile-composer-transfer-steps span { color: var(--accent); font: 800 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mobile-composer-transfer-steps strong { color: var(--ink); font-size: 14px; }
+.mobile-composer-transfer-steps small { color: var(--muted); font-size: 11px; line-height: 1.4; }
+.mobile-composer-transfer-footnote { position: relative; z-index: 1; margin: 27px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+
+@media (max-width: 600px) {
+  .mobile-composer-transfer-page { min-height: calc(100dvh - var(--bridge-safe-height, 0px)); padding: 18px 12px calc(28px + var(--bridge-safe-bottom, 0px)); }
+  .mobile-composer-transfer-hero { padding: 24px 20px; border-radius: 22px; }
+  .mobile-composer-transfer-hero h1 { font-size: clamp(28px, 7.5vw, 34px); }
+  .mobile-composer-transfer-lead { font-size: 14px; line-height: 1.65; }
+  .mobile-composer-transfer-cta { width: 100%; margin-top: 26px; }
+  .mobile-composer-transfer-steps { gap: 8px; margin-top: 30px; padding-top: 18px; }
+  .mobile-composer-transfer-steps small { font-size: 11px; }
+}
+
+:root[data-theme="dark"] .mobile-composer-transfer-hero { --transfer-shadow: rgba(0, 0, 0, .18); --transfer-hover: #244032; background: linear-gradient(135deg, var(--card) 0%, #151e2a 100%); box-shadow: 0 18px 50px #00000030; }
+:root[data-theme="dark"] button.mobile-composer-transfer-cta { border-color: #3c7156; color: var(--ink); background: var(--accent-soft); }
+:root[data-theme="dark"] button.mobile-composer-transfer-cta:hover, :root[data-theme="dark"] button.mobile-composer-transfer-cta:focus-visible { border-color: var(--accent); background: var(--transfer-hover); }

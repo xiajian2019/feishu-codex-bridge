@@ -119,7 +119,7 @@ export function App(): ReactElement {
     if (!oldTaskId) return;
     const backParams = new URLSearchParams(searchParams);
     backParams.delete("task");
-    navigate(`/tasks/direct/${encodeURIComponent(oldTaskId)}`, { replace: true, state: { returnTo: `/${backParams.size ? `?${backParams}` : ""}` } });
+    navigate(`/tasks/direct/${encodeURIComponent(oldTaskId)}`, { replace: true, state: { returnTo: `/tasks${backParams.size ? `?${backParams}` : ""}` } });
   }, [navigate, searchParams]);
   const [createOpen, setCreateOpen] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);

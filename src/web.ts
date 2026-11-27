@@ -1,5 +1,5 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { createReadStream, existsSync, statSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { lstat, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -9,6 +9,7 @@ import type { Duplex } from "node:stream";
 
 import { StateDatabase } from "./db.js";
 import { MobileIosOta } from "./mobile-ios-ota.js";
+import { MobileIosTestflight } from "./mobile-ios-testflight.js";
 import { WorkbenchError, WorkbenchService } from "./workbench.js";
 import {
   checkBridgeBackupUpgradeCompatibility,
@@ -42,7 +43,11 @@ import { JjToolError, JjToolsService } from "./jj-tools.js";
 import { DownloadUploadError, DownloadUploadsService, DOWNLOAD_UPLOAD_CHUNK_BYTES } from "./download-uploads.js";
 import { PairingRateLimitError, WebPairingAuth } from "./web-auth.js";
 import { isNativeAppOrigin, MobileStreamTickets, type MobileStreamAuthorization } from "./mobile-auth.js";
-import { MobileApkStore } from "./mobile-apk.js";
+import { RemoteDesktopProxy, type RemoteDesktopConnector } from "./remote-desktop-proxy.js";
+import { listRemoteDesktopDisplays, type RemoteDesktopDisplay } from "./remote-desktop-displays.js";
+import { MobileApkStore, type MobileApkMetadata } from "./mobile-apk.js";
+import { MobileAndroidBuild } from "./mobile-android-build.js";
+import { MobileIosDeviceInstall } from "./mobile-ios-device-install.js";
 import { DemoBrowserAccess } from "./demo-browser-access.js";
 import {
   WebTaskSubmissionConflictError,
@@ -71,6 +76,10 @@ import {
   type StoredWebTaskAttachment,
   type StoredTask,
   type StoredAampTask,
+  type StoredMobileApp,
+  type StoredMobileAppInput,
+  type StoredMobileIosConfig,
+  type StoredIosTestflightApp,
   type WebTaskSubmission,
 } from "./types.js";
 
@@ -163,6 +172,10 @@ export interface DashboardServerOptions {
   webRoot?: string;
   auth?: WebPairingAuth;
   tmuxDashboard?: TmuxDashboardApi;
+  /** Injectable only by in-process tests; the default target is local Screen Sharing. */
+  remoteDesktopConnector?: RemoteDesktopConnector;
+  /** Injectable only by tests; production reads the local host display layout. */
+  remoteDesktopDisplays?: () => Promise<RemoteDesktopDisplay[]>;
   codexHistory?: CodexHistoryService;
   cleanupExpiredStagedAttachments?: boolean;
   actions?: DashboardActions;
@@ -185,13 +198,18 @@ export class DashboardServer {
   private readonly webRoot: string;
   private readonly taskAttachmentsDirectory: string;
   private readonly mobileApks: MobileApkStore;
+  private readonly managedMobileApkCache = new Map<string, { key: string; latest: MobileApkMetadata | null; error: string | null }>();
+  private readonly mobileAndroidBuild = new MobileAndroidBuild();
   private readonly mobileIosOta: MobileIosOta;
+  private readonly mobileIosTestflight: MobileIosTestflight;
+  private readonly mobileIosDeviceInstall: MobileIosDeviceInstall;
   private readonly linkTools: LinkToolsService;
   private readonly downloadUploads: DownloadUploadsService;
   private readonly jjTools: JjToolsService;
   private readonly workbench: WorkbenchService;
   private readonly eventClients = new Map<ServerResponse, () => boolean>();
   private readonly mobileStreamTickets = new MobileStreamTickets();
+  private readonly remoteDesktop: RemoteDesktopProxy;
   private readonly demoBrowserAccess = new DemoBrowserAccess();
   private server: Server | null = null;
   private unsubscribeFromDatabase: (() => void) | null = null;
@@ -204,6 +222,7 @@ export class DashboardServer {
 
   constructor(options: DashboardServerOptions) {
     this.options = options;
+    this.remoteDesktop = new RemoteDesktopProxy(options.remoteDesktopConnector);
     this.auth = options.auth
       ?? new WebPairingAuth({ db: options.db, allowLocalRequests: true });
     this.webRoot = options.webRoot ?? findWebRoot();
@@ -217,6 +236,8 @@ export class DashboardServer {
     );
     this.mobileApks = new MobileApkStore(mobileApkPath, join(dirname(mobileApkPath), ".bridge-updates"));
     this.mobileIosOta = new MobileIosOta({ directory: options.iosOtaDirectory, source: options.iosOtaSource });
+    this.mobileIosTestflight = new MobileIosTestflight();
+    this.mobileIosDeviceInstall = new MobileIosDeviceInstall();
     this.linkTools = new LinkToolsService({ proxy: options.linkToolProxy });
     this.downloadUploads = new DownloadUploadsService({ directory: options.downloadsDirectory });
     this.jjTools = options.jjTools ?? new JjToolsService();
@@ -298,6 +319,9 @@ export class DashboardServer {
     for (const client of this.eventClients.keys()) client.end();
     this.eventClients.clear();
     this.mobileStreamTickets.clear();
+    this.mobileIosTestflight.stop();
+    this.mobileIosDeviceInstall.stop();
+    this.remoteDesktop.stop();
     await this.options.tmuxDashboard?.stop();
     for (const [id, child] of this.localDemoProcesses) {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
@@ -393,6 +417,22 @@ export class DashboardServer {
       }
       return;
     }
+    if (url.pathname.startsWith("/api/composer-transfers") && this.options.tmuxDashboard) {
+      await this.options.tmuxDashboard.handlePublicComposerTransferRequest(request, response);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/remote-desktop/ticket") {
+      if (!this.requireAuthorization(request, response) || !this.requireActionAuthorization(request, response)) return;
+      try {
+        const authorization = { deviceId: this.auth.currentDeviceId(request) ?? "local", isAuthorized: this.auth.connectionAuthorization(request) };
+        response.setHeader("Cache-Control", "no-store");
+        sendJson(response, 200, this.mobileStreamTickets.issue("/remote-desktop/stream", authorization));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "could not create stream ticket";
+        sendJson(response, message === "too many pending stream tickets" ? 429 : 400, { error: message });
+      }
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/api/auth/status") {
       const status = this.auth.status(request);
       // An admin can extend another device. Refresh that device's own Cookie when
@@ -404,8 +444,8 @@ export class DashboardServer {
         ...(status.authenticated ? { client: {
           schemaVersion: 1, protocolVersion: 1, minimumClientProtocol: 1,
           version: await readBridgeVersion(),
-          features: ["download-uploads", "mobile-apk-update", "mobile-ios-ota", "backups",
-            ...(this.options.tmuxDashboard ? ["tmux"] : []),
+          features: ["download-uploads", "mobile-apk-update", "mobile-ios-ota", "mobile-ios-testflight", "mobile-app-management", "backups", "remote-desktop",
+            ...(this.options.tmuxDashboard ? ["tmux", "composer-transfer-assets"] : []),
             ...(this.options.codexHistory ? ["codex-history"] : [])],
         } } : {}),
       });
@@ -526,6 +566,7 @@ export class DashboardServer {
         response,
         this.auth.currentDeviceId(request),
         () => this.auth.isAuthorized(request),
+        this.auth.connectionAuthorization(request),
       );
       return;
     }
@@ -539,6 +580,7 @@ export class DashboardServer {
         && url.pathname !== "/system-management/devices"
         && url.pathname !== "/system-management/shortcuts"
         && url.pathname !== "/system-management/backups"
+        && url.pathname !== "/composer-transfer"
       ) {
         sendJson(response, 401, { error: "pairing required" });
         return;
@@ -555,6 +597,13 @@ export class DashboardServer {
       response,
       publicWebRequest || url.pathname === "/healthz" || Boolean(scopedDemoAccess),
     )) return;
+    if (request.method === "GET" && url.pathname === "/api/remote-desktop/displays") {
+      response.setHeader("Cache-Control", "no-store");
+      const displays = await (this.options.remoteDesktopDisplays ?? listRemoteDesktopDisplays)();
+      if (!this.requireAuthorization(request, response)) return;
+      sendJson(response, 200, { displays });
+      return;
+    }
     if (url.pathname === "/api/mobile/ios-ota" || url.pathname.startsWith("/api/mobile/ios-ota/")) {
       response.setHeader("Cache-Control", "no-store");
       response.setHeader("Referrer-Policy", "no-referrer");
@@ -569,6 +618,114 @@ export class DashboardServer {
         } else sendJson(response, 404, { error: "iOS OTA 接口不存在。" });
       } catch (error) {
         sendJson(response, 409, { error: error instanceof Error ? error.message : "iOS OTA 操作失败。" });
+      }
+      return;
+    }
+    if (url.pathname === "/api/mobile/apps" || url.pathname.startsWith("/api/mobile/apps/")) {
+      response.setHeader("Cache-Control", "no-store");
+      response.setHeader("Referrer-Policy", "no-referrer");
+      const appMatch = /^\/api\/mobile\/apps\/([^/]+)$/.exec(url.pathname);
+      const androidDownloadMatch = /^\/api\/mobile\/apps\/([^/]+)\/android\/download$/.exec(url.pathname);
+      const appActionMatch = /^\/api\/mobile\/apps\/([^/]+)\/(?:ios\/(?:testflight\/upload|install)|android\/build)$/.exec(url.pathname);
+      if (request.method === "GET" && androidDownloadMatch) {
+        const app = this.options.db.getMobileApp(decodeURIComponent(androidDownloadMatch[1]!));
+        if (!app?.android) { sendJson(response, 404, { error: "Android App 不存在或未配置 APK。" }); return; }
+        await this.downloadManagedMobileApk(app, url.searchParams.get("revision") ?? "", response);
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/mobile/apps") {
+        sendJson(response, 200, { apps: await Promise.all(this.options.db.listMobileApps().map((app) => this.mobileAppPayload(app))) });
+        return;
+      }
+      if (request.method === "GET" && appMatch) {
+        const app = this.options.db.getMobileApp(decodeURIComponent(appMatch[1]!));
+        if (!app) sendJson(response, 404, { error: "App 不存在。" });
+        else sendJson(response, 200, await this.mobileAppPayload(app));
+        return;
+      }
+      if (!this.requireActionAuthorization(request, response)) return;
+      try {
+        if (request.method === "POST" && url.pathname === "/api/mobile/apps") {
+          const app = this.options.db.createMobileApp(parseMobileAppInput(await readJsonBody(request)));
+          sendJson(response, 201, await this.mobileAppPayload(app));
+          return;
+        }
+        if (!appMatch && !appActionMatch) { sendJson(response, 404, { error: "App 管理接口不存在。" }); return; }
+        const app = this.options.db.getMobileApp(decodeURIComponent((appMatch ?? appActionMatch)![1]!));
+        if (!app) { sendJson(response, 404, { error: "App 不存在。" }); return; }
+        if (request.method === "GET") {
+          sendJson(response, 200, await this.mobileAppPayload(app));
+        } else if (request.method === "PATCH" && appMatch) {
+          if (app.android && this.mobileAndroidBuild.status(app).state === "running") {
+            sendJson(response, 409, { error: "Android 构建正在进行中，请完成后再编辑配置。" }); return;
+          }
+          const updated = this.options.db.updateMobileApp(app.id, parseMobileAppPatch(await readJsonBody(request), app));
+          if (!updated) sendJson(response, 404, { error: "App 不存在。" });
+          else sendJson(response, 200, await this.mobileAppPayload(updated));
+        } else if (request.method === "POST" && url.pathname.endsWith("/android/build")) {
+          this.mobileAndroidBuild.start(app);
+          sendJson(response, 202, await this.mobileAppPayload(this.options.db.getMobileApp(app.id)!));
+        } else if (request.method === "POST" && url.pathname.endsWith("/ios/testflight/upload")) {
+          if (!app.ios) { sendJson(response, 409, { error: "该 App 未配置 iOS。" }); return; }
+          this.mobileIosTestflight.startUpload(toIosTestflightApp(app));
+          sendJson(response, 202, await this.mobileAppPayload(this.options.db.getMobileApp(app.id)!));
+        } else if (request.method === "POST" && url.pathname.endsWith("/ios/install")) {
+          if (!app.ios) { sendJson(response, 409, { error: "该 App 未配置 iOS。" }); return; }
+          const body = await readJsonBody(request);
+          this.mobileIosDeviceInstall.startInstall(app, body.device);
+          sendJson(response, 202, await this.mobileAppPayload(this.options.db.getMobileApp(app.id)!));
+        } else sendJson(response, 404, { error: "App 管理接口不存在。" });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "App 管理操作失败。";
+        sendJson(response, /正在进行中|等待内部群组|USB|安装正在|上传正在/.test(message) ? 409 : 422, { error: message });
+      }
+      return;
+    }
+    if (url.pathname === "/api/mobile/testflight/apps" || url.pathname.startsWith("/api/mobile/testflight/apps/")) {
+      response.setHeader("Cache-Control", "no-store");
+      if (request.method === "GET" && url.pathname === "/api/mobile/testflight/apps") {
+        sendJson(response, 200, { apps: this.options.db.listIosTestflightApps() });
+        return;
+      }
+      if (!this.requireActionAuthorization(request, response)) return;
+      try {
+        const body = await readJsonBody(request);
+        if (request.method === "POST" && url.pathname === "/api/mobile/testflight/apps") {
+          const app = this.options.db.createIosTestflightApp(parseIosTestflightAppInput(body));
+          sendJson(response, 201, { app });
+          return;
+        }
+        const match = /^\/api\/mobile\/testflight\/apps\/([^/]+)$/.exec(url.pathname);
+        if (request.method === "PATCH" && match) {
+          const app = this.options.db.updateIosTestflightApp(decodeURIComponent(match[1]), parseIosTestflightAppSettings(body));
+          if (!app) sendJson(response, 404, { error: "TestFlight App 不存在。" });
+          else sendJson(response, 200, { app });
+          return;
+        }
+        sendJson(response, 404, { error: "TestFlight App 接口不存在。" });
+      } catch (error) {
+        sendJson(response, 422, { error: error instanceof Error ? error.message : "TestFlight App 保存失败。" });
+      }
+      return;
+    }
+    if (url.pathname === "/api/mobile/testflight" || url.pathname.startsWith("/api/mobile/testflight/")) {
+      response.setHeader("Cache-Control", "no-store");
+      if (mutating && !this.requireActionAuthorization(request, response)) return;
+      try {
+        if (request.method === "GET" && url.pathname === "/api/mobile/testflight") {
+          const app = this.options.db.getIosTestflightApp(url.searchParams.get("appId")?.trim() ?? "");
+          if (!app) { sendJson(response, 404, { error: "请先选择一个 TestFlight App。" }); return; }
+          sendJson(response, 200, { appId: app.id, status: this.mobileIosTestflight.status(app) });
+        } else if (request.method === "POST" && url.pathname === "/api/mobile/testflight/upload") {
+          const body = await readJsonBody(request);
+          const appId = typeof body.appId === "string" ? body.appId.trim() : "";
+          const app = this.options.db.getIosTestflightApp(appId);
+          if (!app) { sendJson(response, 404, { error: "TestFlight App 不存在。" }); return; }
+          sendJson(response, 202, { appId: app.id, status: this.mobileIosTestflight.startUpload(app) });
+        } else sendJson(response, 404, { error: "TestFlight 接口不存在。" });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "TestFlight 操作失败。";
+        sendJson(response, /正在进行中|等待内部群组|已有/.test(message) ? 409 : 400, { error: message });
       }
       return;
     }
@@ -793,9 +950,68 @@ export class DashboardServer {
       }
       try {
         const homeId = url.searchParams.get("home")?.trim();
-        sendJson(response, 200, await this.options.codexHistory.readUsage(homeId || undefined));
+        const usage = await this.options.codexHistory.readUsage(homeId || undefined);
+        const renewals = new Map(this.options.db.listCodexAccountSubscriptionRenewals()
+          .map((renewal) => [renewal.homeId, renewal.renewalAt]));
+        sendJson(response, 200, {
+          ...usage,
+          accounts: usage.accounts.map((account) => ({
+            ...account,
+            renewalAt: renewals.get(account.homeId) ?? null,
+          })),
+        });
       } catch {
         sendJson(response, 502, { error: "Codex usage could not be loaded" });
+      }
+      return;
+    }
+    if (request.method === "PATCH" && url.pathname === "/api/codex/usage/renewal") {
+      const history = this.options.codexHistory;
+      if (!history) {
+        sendJson(response, 501, { error: "Codex usage is not configured" });
+        return;
+      }
+      if (!this.requireActionAuthorization(request, response)) return;
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonBody(request);
+      } catch (error) {
+        sendJson(response, 400, { error: error instanceof Error ? error.message : "invalid request body" });
+        return;
+      }
+      const homeId = typeof body.homeId === "string" ? body.homeId.trim() : "";
+      if (!homeId || homeId.length > 200) {
+        sendJson(response, 400, { error: "homeId is required" });
+        return;
+      }
+      if (!history.listHomes().some((home) => home.id === homeId)) {
+        sendJson(response, 404, { error: "Codex account not found" });
+        return;
+      }
+
+      const renewalAtInput = body.renewalAt;
+      let renewalAt: string | null;
+      if (renewalAtInput === null) {
+        renewalAt = null;
+      } else if (typeof renewalAtInput === "string") {
+        const parsed = new Date(renewalAtInput);
+        if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00\.000Z$/.test(renewalAtInput)
+          || Number.isNaN(parsed.getTime())
+          || parsed.toISOString() !== renewalAtInput) {
+          sendJson(response, 400, { error: "renewalAt must be a valid UTC date and time with minute precision" });
+          return;
+        }
+        renewalAt = renewalAtInput;
+      } else {
+        sendJson(response, 400, { error: "renewalAt must be a UTC date and time or null" });
+        return;
+      }
+
+      try {
+        this.options.db.setCodexAccountSubscriptionRenewal(homeId, renewalAt);
+        sendJson(response, 200, { homeId, renewalAt });
+      } catch {
+        sendJson(response, 500, { error: "续订时间保存失败。" });
       }
       return;
     }
@@ -1300,6 +1516,59 @@ export class DashboardServer {
     response.setHeader("Content-Type", "application/vnd.android.package-archive");
     response.setHeader("Content-Length", String(artifact.metadata.size));
     response.setHeader("Content-Disposition", 'attachment; filename="bridge-update.apk"');
+    response.statusCode = 200;
+    const stream = createReadStream(artifact.path);
+    stream.once("error", (error) => response.destroy(error));
+    stream.pipe(response);
+  }
+
+  private managedMobileApkStore(app: StoredMobileApp): MobileApkStore {
+    if (!app.android) throw new Error("该 App 未配置 Android APK。");
+    return new MobileApkStore(app.android.apk_path, app.android.snapshot_directory, {
+      expectedPackageName: app.android.package_name,
+      downloadPath: `/api/mobile/apps/${encodeURIComponent(app.id)}/android/download`,
+    });
+  }
+
+  private async mobileAppPayload(app: StoredMobileApp): Promise<Record<string, unknown>> {
+    const ios = app.ios ? {
+      config: app.ios,
+      testflight: this.mobileIosTestflight.status(toIosTestflightApp(app)),
+      deviceInstall: this.mobileIosDeviceInstall.status(app),
+    } : null;
+    let android: Record<string, unknown> | null = null;
+    if (app.android) {
+      const build = this.mobileAndroidBuild.status(app);
+      const key = JSON.stringify([app.android.package_name, app.android.apk_path, app.android.snapshot_directory]);
+      const cached = this.managedMobileApkCache.get(app.id);
+      let artifact: { key: string; latest: MobileApkMetadata | null; error: string | null };
+      if (build.state === "running" && cached?.key === key) {
+        // Gradle may remove or replace the output while building. Keep the last
+        // immutable snapshot available and avoid copying the APK on every poll.
+        artifact = cached;
+      } else {
+        try {
+          artifact = { key, latest: await this.managedMobileApkStore(app).latest(), error: null };
+        } catch (error) {
+          this.options.logger?.warn("managed Android APK metadata is unavailable", { appId: app.id, error: error instanceof Error ? error.message : String(error) });
+          artifact = { key, latest: null, error: "APK 文件或 output-metadata.json 不可用，请检查 App 配置。" };
+        }
+        this.managedMobileApkCache.set(app.id, artifact);
+      }
+      android = { config: app.android, build, latest: artifact.latest, error: artifact.error };
+    }
+    return { app, ios, android };
+  }
+
+  private async downloadManagedMobileApk(app: StoredMobileApp, revision: string, response: ServerResponse): Promise<void> {
+    if (!app.android) { sendJson(response, 404, { error: "Android App 不存在或未配置 APK。" }); return; }
+    const artifact = await this.managedMobileApkStore(app).revision(revision);
+    if (!artifact) { sendJson(response, 404, { error: "Android APK is not available." }); return; }
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Content-Type", "application/vnd.android.package-archive");
+    response.setHeader("Content-Length", String(artifact.metadata.size));
+    response.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(app.name)}.apk"`);
     response.statusCode = 200;
     const stream = createReadStream(artifact.path);
     stream.once("error", (error) => response.destroy(error));
@@ -3301,6 +3570,16 @@ export class DashboardServer {
       return;
     }
     const pathname = url.pathname;
+    if (pathname === "/remote-desktop/stream") {
+      const origin = request.headers.origin;
+      // A ticket requires an authenticated, action-token protected POST. It is
+      // one-use and bound to this path and the issuing device's live session.
+      if (!ticket || (origin && !isNativeAppOrigin(origin) && !this.isSameOrigin(origin, request))) {
+        socket.destroy(); return;
+      }
+      this.remoteDesktop.handleUpgrade(request, socket, head, isAuthorized);
+      return;
+    }
     if (pathname === "/tmux-dashboard/terminal" && this.options.tmuxDashboard) {
       void this.options.tmuxDashboard.handleUpgrade(
         request,
@@ -3379,6 +3658,7 @@ export class DashboardServer {
 
   private revalidateConnections(): void {
     this.options.tmuxDashboard?.revalidateClients();
+    this.remoteDesktop.revalidateClients();
     for (const [client, isAuthorized] of this.eventClients) {
       if (!isAuthorized()) {
         this.eventClients.delete(client);
@@ -3448,7 +3728,7 @@ export class DashboardServer {
     response.setHeader("Access-Control-Expose-Headers", "Content-Disposition, Retry-After");
     if (request.method === "OPTIONS") {
       const methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
-      const headers = ["authorization", "content-type", "x-bridge-action-token", "x-file-name", "x-bridge-client", "x-bridge-ssh-session-id", "x-bridge-session-created-at", "x-bridge-ssh-host", "x-bridge-ssh-port", "x-bridge-ssh-username"];
+      const headers = ["authorization", "content-type", "x-bridge-action-token", "x-bridge-transfer-token", "x-bridge-transfer-code", "x-file-name", "x-bridge-client", "x-bridge-ssh-session-id", "x-bridge-session-created-at", "x-bridge-ssh-host", "x-bridge-ssh-port", "x-bridge-ssh-username"];
       const requestedMethod = firstHeaderValue(request.headers["access-control-request-method"]);
       const requestedHeaders = firstHeaderValue(request.headers["access-control-request-headers"])
         ?.toLowerCase().split(",").map((value) => value.trim()).filter(Boolean) ?? [];
@@ -3463,13 +3743,140 @@ export class DashboardServer {
       response.end();
       return false;
     }
-    const publicRoute = url.pathname === "/api/auth/mobile/pair" || url.pathname === "/api/auth/status" || url.pathname === "/healthz";
+    // Composer transfer links are intentionally usable from a freshly opened
+    // native App. The QR code/one-time transfer token is the capability for
+    // this flow; requiring the App's normal Bearer token here turns a valid
+    // scan into a misleading network failure when the App is not paired to
+    // the same Bridge environment yet.
+    const composerTransferRoute = url.pathname === "/api/composer-transfers/claim"
+      || url.pathname.startsWith("/api/composer-transfers/");
+    const publicRoute = url.pathname === "/api/auth/mobile/pair" || url.pathname === "/api/auth/status"
+      || url.pathname === "/healthz" || composerTransferRoute;
     const streamTicket = request.method === "GET" && url.pathname === "/api/events" && url.searchParams.has("bridgeTicket");
     if (!publicRoute && !streamTicket && !this.auth.isBearerAuthorized(request)) {
       sendJson(response, 401, { error: "bearer token required" });
       return false;
     }
     return true;
+  }
+}
+
+function parseIosTestflightAppInput(body: Record<string, unknown>): {
+  name: string;
+  app_store_name: string;
+  source_path: string;
+  project_path: string;
+  build_directory: string;
+  public_directory: string;
+  bundle_id: string;
+  team_id: string;
+  scheme: string;
+  configuration: string;
+  target_name: string;
+  info_plist_path: string;
+  enabled: boolean;
+  internal_only: boolean;
+} {
+  const text = (key: string): string => typeof body[key] === "string" ? body[key].trim() : "";
+  const projectPath = text("projectPath");
+  const targetName = text("targetName") || "App";
+  const projectDirectory = projectPath.endsWith(".xcodeproj") ? dirname(projectPath) : projectPath;
+  const infoPlistPath = deriveIosTestflightInfoPlist(projectPath, targetName, text("configuration") || "PersonalRelease") || join(targetName, "Info.plist");
+  const publicDirectory = join(projectDirectory, dirname(infoPlistPath), "public");
+  return {
+    name: text("name"),
+    app_store_name: text("appStoreName"),
+    source_path: text("sourcePath"),
+    project_path: projectPath,
+    build_directory: join(projectDirectory, "build", "testflight"),
+    public_directory: publicDirectory,
+    bundle_id: text("bundleId"),
+    team_id: text("teamId"),
+    scheme: text("scheme"),
+    configuration: text("configuration"),
+    target_name: targetName,
+    info_plist_path: infoPlistPath,
+    enabled: body.enabled !== false,
+    internal_only: body.internalOnly !== false,
+  };
+}
+
+function parseIosTestflightAppSettings(body: Record<string, unknown>): {
+  name: string;
+  enabled: boolean;
+  internal_only: boolean;
+} {
+  return {
+    name: typeof body.name === "string" ? body.name.trim() : "",
+    enabled: body.enabled !== false,
+    internal_only: body.internalOnly !== false,
+  };
+}
+
+function parseMobileAppInput(body: Record<string, unknown>): StoredMobileAppInput {
+  const text = (value: unknown): string => typeof value === "string" ? value.trim() : "";
+  const nested = (value: unknown): Record<string, unknown> | null => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  const iosBody = nested(body.ios);
+  const androidBody = nested(body.android);
+  const ios = iosBody ? parseMobileIosConfig(iosBody) : null;
+  const android = androidBody ? {
+    package_name: text(androidBody.packageName ?? androidBody.package_name),
+    apk_path: text(androidBody.apkPath ?? androidBody.apk_path),
+    snapshot_directory: text(androidBody.snapshotDirectory ?? androidBody.snapshot_directory),
+    source_path: text(androidBody.sourcePath ?? androidBody.source_path),
+    build_script: text(androidBody.buildScript ?? androidBody.build_script),
+  } : null;
+  return {
+    name: text(body.name), enabled: body.enabled !== false, ios, android,
+  };
+}
+
+function parseMobileAppPatch(body: Record<string, unknown>, existing: StoredMobileApp): Partial<StoredMobileAppInput> {
+  const input = parseMobileAppInput(body);
+  const android = body.android;
+  if (input.android && existing.android && android && typeof android === "object" && !Array.isArray(android)) {
+    const fields = android as Record<string, unknown>;
+    if (!("sourcePath" in fields) && !("source_path" in fields)) input.android.source_path = existing.android.source_path;
+    if (!("buildScript" in fields) && !("build_script" in fields)) input.android.build_script = existing.android.build_script;
+  }
+  return input;
+}
+
+function parseMobileIosConfig(body: Record<string, unknown>): StoredMobileIosConfig {
+  const text = (key: string): string => typeof body[key] === "string" ? String(body[key]).trim() : "";
+  const projectPath = text("projectPath") || text("project_path");
+  const targetName = text("targetName") || text("target_name") || "App";
+  const configuration = text("configuration") || "PersonalRelease";
+  const projectDirectory = projectPath.endsWith(".xcodeproj") || projectPath.endsWith(".xcworkspace") ? dirname(projectPath) : projectPath;
+  const infoPlistPath = text("infoPlistPath") || text("info_plist_path") || deriveIosTestflightInfoPlist(projectPath, targetName, configuration) || join(targetName, "Info.plist");
+  return {
+    app_store_name: text("appStoreName") || text("app_store_name"), source_path: text("sourcePath") || text("source_path"),
+    project_path: projectPath, build_directory: text("buildDirectory") || text("build_directory") || join(projectDirectory, "build", "testflight"),
+    public_directory: text("publicDirectory") || text("public_directory") || join(projectDirectory, dirname(infoPlistPath), "public"),
+    bundle_id: text("bundleId") || text("bundle_id"), team_id: text("teamId") || text("team_id"),
+    scheme: text("scheme") || "App", configuration, target_name: targetName, info_plist_path: infoPlistPath,
+    internal_only: body.internalOnly !== false && body.internal_only !== false,
+  };
+}
+
+function toIosTestflightApp(app: StoredMobileApp): StoredIosTestflightApp {
+  if (!app.ios) throw new Error("该 App 未配置 iOS。");
+  return {
+    id: app.id, name: app.name, ...app.ios, enabled: app.enabled,
+    created_at: app.created_at, updated_at: app.updated_at,
+  };
+}
+
+function deriveIosTestflightInfoPlist(projectPath: string, targetName: string, configuration: string): string | null {
+  try {
+    const project = readFileSync(join(projectPath, "project.pbxproj"), "utf8");
+    const escaped = configuration.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const blocks = [...project.matchAll(new RegExp(`\\/\\*\\s*${escaped}\\s*\\*\\/\\s*=\\s*\\{\\s*isa = XCBuildConfiguration;[\\s\\S]*?buildSettings = \\{([\\s\\S]*?)\\n\\s*\\};\\s*name = ${escaped};\\s*\\};`, "g"))];
+    const block = blocks.map((match) => match[1]).find((value) => value.includes(`PRODUCT_NAME = ${targetName};`));
+    const info = block?.match(/^\s*INFOPLIST_FILE\s*=\s*"?([^";\n]+)"?;/m)?.[1]?.trim();
+    return info || null;
+  } catch {
+    return null;
   }
 }
 
@@ -3490,14 +3897,20 @@ function isSpaRoute(pathname: string): boolean {
     || pathname === "/system-management/backups"
     || pathname === "/system-management/workspaces"
     || pathname === "/system-management/settings"
+    || pathname === "/system-management/apps"
+    || pathname === "/system-management/app-tools"
+    || pathname === "/system-management/testflight"
     || pathname === "/system-management/automations"
     || pathname === "/system-management/machines"
     || pathname === "/direct-tasks"
     || pathname === "/system-management/projects"
+    || pathname === "/tasks"
+    || pathname === "/composer-transfer"
     || /^\/tasks\/(?:desk|direct|aamp)\/[^/]+$/.test(pathname)
     || pathname === "/codex-history"
     || /^\/codex-history\/[^/]+\/[^/]+$/.test(pathname)
     || pathname === "/demos"
+    || pathname === "/remote-desktop"
     || pathname === "/ssh"
     || pathname.startsWith("/ssh/")
     || pathname === "/link-tools"

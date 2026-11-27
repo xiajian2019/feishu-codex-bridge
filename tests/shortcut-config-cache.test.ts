@@ -4,7 +4,7 @@ import {
   invalidateShortcutConfigCache, loadShortcutConfig, readShortcutConfigCache,
   subscribeShortcutConfigInvalidation, writeShortcutConfigCache,
 } from "../web/src/shortcut-config-cache.js";
-import type { ShortcutStore } from "../web/src/tmux-shortcuts.js";
+import { normalizeShortcutStore, type ShortcutStore } from "../web/src/tmux-shortcuts.js";
 
 const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
 const originalFetch = globalThis.fetch;
@@ -12,7 +12,7 @@ const originalDocument = Object.getOwnPropertyDescriptor(globalThis, "document")
 let origin = "http://bridge.test";
 let values: Map<string, string>;
 let target: EventTarget;
-const store = (title: string): ShortcutStore => ({ groups: [{ id: "composer", title, icon: "K", description: "",
+const store = (title: string): ShortcutStore => normalizeShortcutStore({ groups: [{ id: "composer", title, icon: "K", description: "",
   surface: "composer", layout: "grid", enabled: true, sortOrder: 0 }], shortcuts: [] });
 
 beforeEach(() => {

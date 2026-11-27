@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent, type ReactElement, type ReactNode } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
-import { clearMobileOpenError, consumeMobileOpen, getMobileOpenError, getMobileOpens, queueMobileOpen, safeMobileRoute, subscribeMobileOpens, type MobileOpenRequest } from "./mobile-handoff.js";
+import { clearMobileOpenError, consumeMobileAppIntentRoute, consumeMobileOpen, getMobileOpenError, getMobileOpens, getPendingMobileAppIntentRoute, MOBILE_APP_INTENT_ROUTE_EVENT, queueMobileOpen, safeMobileRoute, subscribeMobileOpens, type MobileOpenRequest } from "./mobile-handoff.js";
 import { getLocalDraftScope, scopedStorageKey } from "./local-draft-scope.js";
 import { getMobileConnection, initializeMobileRuntime, listMobileShares, MOBILE_RESUME_EVENT, openMobileConnectionSettings, pairMobileConnection, switchMobileConnection } from "./mobile-runtime.js";
 import { readMobileNotificationPreferences } from "./mobile-notifications.js";
@@ -100,6 +100,7 @@ export function MobileNavigationBridge(): ReactElement | null {
   const opens = useSyncExternalStore(subscribeMobileOpens, getMobileOpens);
   const request = opens.find((item) => item.kind === "route");
   const started = useRef(false);
+  const [appIntentRevision, setAppIntentRevision] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const server = getMobileConnection()?.server;
@@ -108,9 +109,24 @@ export function MobileNavigationBridge(): ReactElement | null {
   const routeDialog = useHandoffDialog(Boolean(request));
 
   useEffect(() => {
+    const onAppIntentRoute = (): void => setAppIntentRevision((value) => value + 1);
+    window.addEventListener(MOBILE_APP_INTENT_ROUTE_EVENT, onAppIntentRoute);
+    return () => window.removeEventListener(MOBILE_APP_INTENT_ROUTE_EVENT, onAppIntentRoute);
+  }, []);
+
+  useEffect(() => {
+    const route = getPendingMobileAppIntentRoute();
+    if (!route) return;
+    const current = location.pathname + location.search;
+    consumeMobileAppIntentRoute();
+    if (route !== current) navigate(route);
+  }, [appIntentRevision, location.pathname, location.search, navigate]);
+
+  useEffect(() => {
     if (started.current) return;
     started.current = true;
     try {
+      if (getPendingMobileAppIntentRoute()) return;
       const pending = sessionStorage.getItem(PENDING_ROUTE);
       if (pending) {
         sessionStorage.removeItem(PENDING_ROUTE);
@@ -139,7 +155,7 @@ export function MobileNavigationBridge(): ReactElement | null {
     if (getMobileOpens().length) return;
     const route = safeMobileRoute(location.pathname + location.search);
     const key = scopedStorageKey("mobile-last-location");
-    if (!key || !route || ["/", "/mobile-shares", "/mobile-inbox"].includes(location.pathname)) return;
+    if (!key || !route || ["/", "/mobile-shares", "/mobile-inbox", "/nearby-transfer"].includes(location.pathname)) return;
     try { localStorage.setItem(key, route); } catch { /* Explicit navigation remains available. */ }
   }, [location.pathname, location.search, opens, scope]);
 

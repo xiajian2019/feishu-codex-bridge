@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type ReactElement } from "react";
+import { createPortal } from "react-dom";
 
-import { consumeCodexResetCredit, fetchCodexUsage } from "./api.js";
+import { consumeCodexResetCredit, fetchCodexUsage, setCodexAccountRenewalDate } from "./api.js";
 import { preserveLastSuccessfulCodexUsage } from "./codex-usage-utils.js";
 import { useMobileBack } from "./use-mobile-back.js";
 import { startForegroundPolling } from "./foreground-polling.js";
@@ -84,6 +85,130 @@ export function CodexUsage(): ReactElement {
         额度窗口与 Token 数据每次读取 Codex app-server；历史日桶按账号及 UTC 日期保存，并允许服务端回补。
       </p>
     </main>
+  );
+}
+
+function SubscriptionRenewal({ homeId, renewalAt: savedRenewalAt, onRefresh }: {
+  homeId: string;
+  renewalAt: string | null;
+  onRefresh: () => Promise<void>;
+}): ReactElement {
+  const inputId = useId();
+  const titleId = `${inputId}-title`;
+  const [renewalAt, setRenewalAt] = useState<string | null>(savedRenewalAt);
+  const [draft, setDraft] = useState(() => renewalDateToLocalInput(savedRenewalAt));
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    setRenewalAt(savedRenewalAt);
+    setDraft(renewalDateToLocalInput(savedRenewalAt));
+  }, [homeId, savedRenewalAt]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const closeEditor = (): void => {
+    if (saving) return;
+    setDraft(renewalDateToLocalInput(renewalAt));
+    setError(null);
+    setEditing(false);
+  };
+  useMobileBack(editing, closeEditor, 250);
+  useEffect(() => {
+    if (!editing) return;
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape" || saving) return;
+      event.preventDefault();
+      setDraft(renewalDateToLocalInput(renewalAt));
+      setError(null);
+      setEditing(false);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [editing, renewalAt, saving]);
+
+  const expiresAt = renewalAt ? nextMonthlyExpiry(renewalAt) : null;
+  const countdown = expiresAt ? getRenewalCountdown(expiresAt, now) : null;
+  const expiryLabel = expiresAt ? formatRenewalDate(expiresAt) : null;
+  const saveRenewal = async (value: string | null): Promise<void> => {
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await setCodexAccountRenewalDate({ homeId, renewalAt: value });
+      setRenewalAt(result.renewalAt);
+      setDraft(renewalDateToLocalInput(result.renewalAt));
+      setEditing(false);
+      await onRefresh().catch(() => undefined);
+    } catch (requestError: unknown) {
+      setError(requestError instanceof Error ? requestError.message : String(requestError));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <span className={"codex-usage-renewal"
+        + (countdown?.urgent ? " is-urgent" : "")
+        + (countdown?.overdue ? " is-overdue" : "")}
+        aria-label="Codex 订阅到期时间"
+      >
+        {expiresAt && expiryLabel ? (
+          <span className="codex-usage-renewal-main" title={`${expiryLabel} 到期${countdown ? `，${countdown.text}` : ""}`}>
+            {countdown ? <span className="codex-usage-renewal-countdown" role="status">{countdown.shortText}</span> : null}
+            <span>到期</span>
+            <time dateTime={expiresAt} aria-label={expiryLabel}>
+              {expiryLabel}
+            </time>
+          </span>
+        ) : <span className="codex-usage-renewal-empty">未记录续订</span>}
+        <button type="button" className="codex-renewal-edit" disabled={saving} onClick={() => {
+          setDraft(renewalDateToLocalInput(renewalAt));
+          setError(null);
+          setEditing(true);
+        }} aria-label={renewalAt ? "修改上次续订时间" : "设置上次续订时间"} title={renewalAt ? "修改上次续订时间" : "设置上次续订时间"}>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m4 16.5-.8 4.3 4.3-.8L19 8.5 15.5 5z" /><path d="m13.8 6.7 3.5 3.5" /></svg>
+        </button>
+      </span>
+      {editing ? createPortal(
+        <div className="codex-usage-modal-backdrop codex-renewal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) closeEditor();
+        }}>
+          <section className="codex-usage-modal codex-renewal-modal" role="dialog" aria-modal="true" aria-labelledby={titleId}>
+            <header className="codex-usage-modal-header">
+              <div className="codex-usage-modal-title"><h2 id={titleId}>上次续订时间</h2></div>
+              <button className="codex-usage-modal-close" type="button" disabled={saving} onClick={closeEditor} aria-label="关闭">×</button>
+            </header>
+            <form className="codex-renewal-form" onSubmit={(event) => {
+              event.preventDefault();
+              const value = localDateTimeInputToIso(draft);
+              if (!value) {
+                setError("请填写有效的日期和时间。");
+                return;
+              }
+              void saveRenewal(value);
+            }}>
+              <label htmlFor={inputId}>上次续订时间（精确到分钟）</label>
+              <input id={inputId} type="datetime-local" step={60} value={draft}
+                onChange={(event) => setDraft(event.currentTarget.value)} required autoFocus />
+              <p>按本地时间填写，显示的到期时间会自动加一个月。</p>
+              {error ? <div className="codex-usage-inline-error" role="alert">{error}</div> : null}
+              <div className="codex-renewal-actions">
+                <button className="primary" type="submit" disabled={saving || !draft}>{saving ? "保存中…" : "保存"}</button>
+                <button type="button" disabled={saving} onClick={closeEditor}>取消</button>
+                {renewalAt ? <button type="button" disabled={saving} onClick={() => void saveRenewal(null)}>清除时间</button> : null}
+              </div>
+            </form>
+          </section>
+        </div>,
+        document.body,
+      ) : null}
+    </>
   );
 }
 
@@ -180,10 +305,15 @@ function UsageAccountCard({ account, onRefresh, showResetCredits = true, embedde
         <div className="codex-usage-account-heading">
           <div className="codex-usage-account-title">
             {embedded ? <strong className="codex-usage-account-name">{account.label}</strong> : <h2>{account.label}</h2>}
-            <div className="codex-usage-account-badges">
-              {planType ? <span className="codex-usage-plan">{formatPlanType(planType)}</span> : null}
+            {planType ? <span className="codex-usage-plan">{formatPlanType(planType)}</span> : null}
+            <span className="codex-usage-status-with-renewal">
               <span className={`codex-usage-status is-${status.state}`}>{status.label}</span>
-            </div>
+              {account.label === "默认" ? <SubscriptionRenewal
+                homeId={account.homeId}
+                renewalAt={account.renewalAt ?? null}
+                onRefresh={onRefresh}
+              /> : null}
+            </span>
           </div>
           {showResetCredits && typeof resetCreditCount === "number" ? (
             <button
@@ -936,4 +1066,75 @@ function formatPlanType(value: string): string {
 function formatTimestamp(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function renewalDateToLocalInput(value: string | null): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (part: number): string => String(part).padStart(2, "0");
+  return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate())
+    + "T" + pad(date.getHours()) + ":" + pad(date.getMinutes());
+}
+
+function localDateTimeInputToIso(value: string): string | null {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime()) || renewalDateToLocalInput(date.toISOString()) !== value) return null;
+  date.setSeconds(0, 0);
+  return date.toISOString();
+}
+
+function formatRenewalDate(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? "时间无效"
+    : renewalDateToLocalInput(date.toISOString()).slice(5).replace("T", " ");
+}
+
+/** Add one local calendar month, clamping dates such as January 31 to February's last day. */
+function nextMonthlyExpiry(value: string): string | null {
+  const lastRenewal = new Date(value);
+  if (Number.isNaN(lastRenewal.getTime())) return null;
+  const day = lastRenewal.getDate();
+  const expiry = new Date(lastRenewal);
+  // Do calendar arithmetic at noon, then restore the recorded wall time.
+  expiry.setHours(12, 0, 0, 0);
+  expiry.setDate(1);
+  expiry.setMonth(expiry.getMonth() + 2);
+  expiry.setDate(0);
+  expiry.setDate(Math.min(day, expiry.getDate()));
+  expiry.setHours(lastRenewal.getHours(), lastRenewal.getMinutes(),
+    lastRenewal.getSeconds(), lastRenewal.getMilliseconds());
+  return Number.isNaN(expiry.getTime()) ? null : expiry.toISOString();
+}
+
+function getRenewalCountdown(value: string, now: number): { text: string; shortText: string; urgent: boolean; overdue: boolean } | null {
+  const expiryTime = Date.parse(value);
+  if (!Number.isFinite(expiryTime)) return null;
+  const difference = expiryTime - now;
+  if (difference === 0) return { text: "到期时间已到", shortText: "已到期", urgent: true, overdue: false };
+  const minutes = Math.floor(Math.abs(difference) / 60_000);
+  if (minutes === 0) {
+    return {
+      text: difference < 0 ? "已到期，不足 1 分钟" : "距离到期不足 1 分钟",
+      shortText: difference < 0 ? "已到期" : "不足1分钟",
+      urgent: true,
+      overdue: difference < 0,
+    };
+  }
+  const days = Math.floor(minutes / 1_440);
+  const hours = Math.floor((minutes % 1_440) / 60);
+  const remainingMinutes = minutes % 60;
+  const parts = [
+    ...(days > 0 ? [days + " 天"] : []),
+    ...(hours > 0 ? [hours + " 小时"] : []),
+    ...(remainingMinutes > 0 ? [remainingMinutes + " 分钟"] : []),
+  ];
+  const shortDuration = days > 0 ? `${days}天` : hours > 0 ? `${hours}小时` : `${remainingMinutes}分钟`;
+  return {
+    text: (difference < 0 ? "已到期 " : "距离到期还有 ") + parts.join(" "),
+    shortText: (difference < 0 ? "逾期" : "剩") + shortDuration,
+    urgent: difference <= 7 * 86_400_000,
+    overdue: difference < 0,
+  };
 }

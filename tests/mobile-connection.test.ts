@@ -19,12 +19,14 @@ describe("mobile connection configuration", () => {
       setItem: (key: string, value: string) => { values.set(key, value); },
     } as Storage;
     const settings = saveBridgeNetworkSettings({ globalMacHost: "10.15.53.99", vpnBypassWifiSsids: ["Office", "Office", " Home "] }, storage);
-    expect(settings).toEqual({ globalMacHost: "10.15.53.99", vpnBypassWifiSsids: ["Office", "Home"] });
+    expect(settings).toEqual({ globalMacHost: "10.15.53.99", useHttps: false, vpnBypassWifiSsids: ["Office", "Home"] });
     expect(readBridgeNetworkSettings(storage)).toEqual(settings);
     expect(bridgeOriginWithGlobalMacHost("http://10.0.0.17:17310", "10.15.53.99")).toBe("http://10.15.53.99:17310");
     expect(bridgeOriginWithGlobalMacHost("http://10.0.0.17:17310", "2001:db8::17")).toBe("http://[2001:db8::17]:17310");
     expect(normalizeGlobalMacHost("[2001:db8::17]")).toBe("2001:db8::17");
     expect(() => normalizeGlobalMacHost("10.15.53.999")).toThrow();
+    expect(saveBridgeNetworkSettings({ globalMacHost: "10.15.53.99", useHttps: false, vpnBypassWifiSsids: [] }, storage).useHttps).toBe(false);
+    expect(readBridgeNetworkSettings(storage).useHttps).toBe(false);
   });
 
   it("accepts HTTPS and LAN HTTP, rejects public cleartext, credentials and subpaths", () => {

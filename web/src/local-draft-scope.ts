@@ -3,8 +3,10 @@
 const draftScopeState: { value: string | null } = import.meta.hot?.data.draftScopeState ?? { value: null };
 if (import.meta.hot) import.meta.hot.data.draftScopeState = draftScopeState;
 export const LOCAL_DRAFT_SCOPE_EVENT = "bridge:draft-scope-change";
+export const LOCAL_DRAFT_SCOPE_WILL_CHANGE_EVENT = "bridge:draft-scope-will-change";
 function changeScope(next: string | null): void {
   if (next === draftScopeState.value) return;
+  if (typeof window !== "undefined") window.dispatchEvent?.(new Event(LOCAL_DRAFT_SCOPE_WILL_CHANGE_EVENT));
   draftScopeState.value = next;
   if (typeof window !== "undefined") window.dispatchEvent?.(new Event(LOCAL_DRAFT_SCOPE_EVENT));
 }

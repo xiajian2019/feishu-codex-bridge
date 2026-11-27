@@ -1,18 +1,105 @@
 import Capacitor
+import CoreMotion
 import Foundation
 import Network
 @preconcurrency import NetworkExtension
 import UIKit
 import WebKit
 
+@objc(BridgeMotionPlugin)
+public final class BridgeMotionPlugin: CAPPlugin, CAPBridgedPlugin {
+    public let identifier = "BridgeMotionPlugin"
+    public let jsName = "BridgeMotion"
+    public let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "setEnabled", returnType: CAPPluginReturnPromise),
+    ]
+
+    private let motionManager = CMMotionManager()
+    private let motionQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "dev.feishu.codex.bridge.motion"
+        queue.qualityOfService = .userInitiated
+        queue.maxConcurrentOperationCount = 1
+        return queue
+    }()
+    private var enabled = false
+    private var appActive = true
+
+    @objc func setEnabled(_ call: CAPPluginCall) {
+        let requested = call.getBool("enabled") ?? false
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                call.reject("Bridge 运动传感器不可用。", "MOTION_UNAVAILABLE")
+                return
+            }
+            self.enabled = requested
+            // The App owns the shake gesture. Do not let UIKit show its
+            // Undo/Redo sheet on top of the Bridge environment dialog.
+            UIApplication.shared.applicationSupportsShakeToEdit = !requested
+            self.updateMotion()
+            // `startAccelerometerUpdates` may not flip `isAccelerometerActive`
+            // synchronously. Availability describes whether the hardware can
+            // be used; the lifecycle callback will start it again if the App
+            // is still becoming active.
+            let available = self.motionManager.isAccelerometerAvailable
+            call.resolve(["available": available])
+        }
+    }
+
+    func setAppActive(_ active: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.appActive = active
+            self.updateMotion()
+        }
+    }
+
+    private func updateMotion() {
+        guard enabled, appActive, motionManager.isAccelerometerAvailable else {
+            if motionManager.isAccelerometerActive { motionManager.stopAccelerometerUpdates() }
+            return
+        }
+        guard !motionManager.isAccelerometerActive else { return }
+        motionManager.accelerometerUpdateInterval = 1.0 / 60.0
+        motionManager.startAccelerometerUpdates(to: motionQueue) { [weak self] data, _ in
+            guard let data else { return }
+            let acceleration = data.acceleration
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.enabled, self.appActive, self.motionManager.isAccelerometerActive else { return }
+                self.notifyListeners("motion", data: [
+                    "x": acceleration.x,
+                    "y": acceleration.y,
+                    "z": acceleration.z,
+                    "timestampMs": data.timestamp * 1_000.0,
+                ])
+            }
+        }
+    }
+}
+
 class BridgeViewController: CAPBridgeViewController {
+    private var bridgeMotionPlugin: BridgeMotionPlugin?
+
     override func capacitorDidLoad() {
+        let motionPlugin = BridgeMotionPlugin()
+        bridgeMotionPlugin = motionPlugin
+        bridge?.registerPluginInstance(motionPlugin)
+        motionPlugin.setAppActive(UIApplication.shared.applicationState == .active)
+        // The Bridge shake gesture is enabled by default in the Web App.
+        UIApplication.shared.applicationSupportsShakeToEdit = false
         bridge?.registerPluginInstance(BridgeCrashDiagnosticsPlugin())
         bridge?.registerPluginInstance(BridgeCredentialsPlugin())
+        bridge?.registerPluginInstance(BridgeAppIntentPlugin())
         bridge?.registerPluginInstance(BridgeIOSOtaPlugin())
         bridge?.registerPluginInstance(BridgeShareInboxPlugin())
         bridge?.registerPluginInstance(BridgeNativeThemePlugin())
-        bridge?.registerPluginInstance(BridgeConnectBotSSHPlugin())
+        bridge?.registerPluginInstance(BridgeRemoteDesktopPlugin())
+        bridge?.registerPluginInstance(BridgeNearbyTransferPlugin())
+        if let bridge {
+            let sshPlugin = BridgeConnectBotSSHPlugin()
+            bridge.registerPluginInstance(sshPlugin)
+            BridgeConnectBotSSHPlugin.registerAppIntentHost(sshPlugin)
+        }
         bridge?.registerPluginInstance(BridgeOpenVPNConnectPlugin())
 
 #if BRIDGE_APP_ONLY_VPN_POC
@@ -34,6 +121,10 @@ class BridgeViewController: CAPBridgeViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        NotificationCenter.default.addObserver(self, selector: #selector(appDidBecomeActive),
+                                               name: UIApplication.didBecomeActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(appWillResignActive),
+                                               name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keyboardFrameChanged(_:)),
                                                name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillHide),
@@ -42,6 +133,20 @@ class BridgeViewController: CAPBridgeViewController {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        BridgeConnectBotSSHPlugin.deliverPendingAppIntent()
+    }
+
+    @objc private func appDidBecomeActive() {
+        bridgeMotionPlugin?.setAppActive(true)
+        BridgeConnectBotSSHPlugin.deliverPendingAppIntent()
+    }
+
+    @objc private func appWillResignActive() {
+        bridgeMotionPlugin?.setAppActive(false)
     }
 
     @objc private func keyboardFrameChanged(_ notification: Notification) {

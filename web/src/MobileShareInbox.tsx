@@ -89,7 +89,7 @@ export function MobileShareInbox(): ReactElement {
         const description = appendMobileShareText(previous?.description ?? "", text);
         if (description.length > 20_000) throw new Error("此目标任务草稿超过现有 20,000 字符限制，原分享仍保留，可选择其他目标或调整草稿。");
         assertScope();
-        navigate("/", { state: { newTaskDraft: { source: "task", projectKey: target.project, description: description || "请结合分享的附件处理。" },
+        navigate("/tasks", { state: { newTaskDraft: { source: "task", projectKey: target.project, description: description || "请结合分享的附件处理。" },
           mobileShareImport: { id: share.id, project: target.project, scope, server } } });
         return;
       }
@@ -108,7 +108,7 @@ export function MobileShareInbox(): ReactElement {
         const current = previous?.text ?? "";
         const next = text.trim() && current.includes(text.trim()) ? current : appendMobileShareText(current, text);
         await assertSession();
-        saveDraftMetadata(target.sessionId, { text: next, attachments }, scope);
+        saveDraftMetadata(target.sessionId, { text: next, attachments, importedTransferIds: previous?.importedTransferIds }, scope);
         if (loadDraftMetadata(target.sessionId)?.text !== next) throw new Error("文本草稿未能保存，原分享仍保留。");
         navigate("/tmux-dashboard?session=" + encodeURIComponent(target.sessionId));
       } else {
@@ -133,9 +133,9 @@ export function MobileShareInbox(): ReactElement {
   }
 
   return <main className="page-main mobile-share-page">
-    <header className="workbench-page-header"><div><h1>分享收件箱</h1><p>内容保存在本机。选择目标后只加入草稿，不自动发送；原分享继续保留。</p></div><Link to="/">返回工作页</Link></header>
+    <header className="workbench-page-header"><div><h1>分享收件箱</h1><p>内容保存在本机。选择目标后只加入草稿，不自动发送；原分享继续保留。</p></div><Link to="/tasks">返回工作页</Link></header>
     <button type="button" disabled={busy} onClick={() => setRevision((value) => value + 1)}>刷新本机分享</button>
-    <button type="button" disabled={busy} onClick={() => navigate("/", { state: { mobileOpenConnectionSettings: true } })}>连接管理</button>
+    <button type="button" disabled={busy} onClick={() => navigate("/tasks", { state: { mobileOpenConnectionSettings: true } })}>连接管理</button>
     {error ? <p className="workbench-page-error" role="alert">{error}</p> : null}
     {!loaded ? <p role="status">正在读取本机分享…</p> : !shares.length ? <p>从相册、浏览器或文件管理器选择“分享 → Bridge”，内容会出现在这里。</p> : null}
     {shares.map((item) => <article className="mobile-share-card" key={item.id}>

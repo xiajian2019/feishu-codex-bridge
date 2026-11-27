@@ -5,6 +5,11 @@ import Security
 import TunnelKitOpenVPN
 #endif
 
+enum BridgeVpnProvider: String {
+    case external
+    case tunnelkit
+}
+
 enum BridgeVpnProfileStoreError: LocalizedError {
     case appGroupUnavailable
     case profileUnavailable
@@ -219,6 +224,7 @@ final class BridgeVpnProfileStore {
     static let keychainAccessGroupInfoKey = "BridgeVpnKeychainAccessGroup"
     static let profileMetadataKey = "BridgeAutoVpn.profile.metadata.v1"
     static let bypassWifiSsidsKey = "BridgeAutoVpn.settings.bypassWifiSsids.v1"
+    static let providerKey = "BridgeAutoVpn.settings.provider.v1"
     static let defaultProfileID = "default"
 
     private let defaults: UserDefaults?
@@ -270,6 +276,15 @@ final class BridgeVpnProfileStore {
 
     func bypassWifiSsids() -> [String] {
         (defaults?.array(forKey: Self.bypassWifiSsidsKey) as? [String]) ?? []
+    }
+
+    func provider(fallback: BridgeVpnProvider = .external) -> BridgeVpnProvider {
+        defaults?.string(forKey: Self.providerKey).flatMap(BridgeVpnProvider.init(rawValue:)) ?? fallback
+    }
+
+    func saveProvider(_ provider: BridgeVpnProvider) throws {
+        guard let defaults else { throw BridgeVpnProfileStoreError.appGroupUnavailable }
+        defaults.set(provider.rawValue, forKey: Self.providerKey)
     }
 
     @discardableResult

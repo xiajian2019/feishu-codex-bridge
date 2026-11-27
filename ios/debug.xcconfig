@@ -1,1 +1,2 @@
+#include "BridgeSigning.xcconfig"
 CAPACITOR_DEBUG = true

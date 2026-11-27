@@ -16,7 +16,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-        <string>Bridge</string>
+	<string>bjump</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -24,7 +24,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>$(PRODUCT_NAME)</string>
+	<string>bjump</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -34,9 +34,15 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>连接你在局域网中运行的 Bridge，查看 Codex 会话并管理任务和文件。</string>
+	<string>连接局域网中的 Bridge，发现附近 Bridge App 并互传文件。</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_bridge-nearby._tcp</string>
+	</array>
+	<key>NSMotionUsageDescription</key>
+	<string>摇一摇切换 Bridge 环境需要使用设备运动传感器。</string>
 	<key>NSCameraUsageDescription</key>
-	<string>扫描 Mac 上的 Bridge 配对二维码，快速连接此设备。</string>
+	<string>扫描 Bridge 配对二维码或附近设备二维码，快速连接设备。</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

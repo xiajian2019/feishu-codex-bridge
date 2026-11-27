@@ -98,6 +98,13 @@ html.bridge-mobile-app .task-detail-composer { padding-bottom: 7px; }
 .mobile-connect-danger:hover { border-color: #6b4144; background: #2a1d20; }
 .mobile-connect-unavailable { margin: 2px 0 0; padding: 13px 14px; border: 1px solid var(--line); border-radius: 13px; background: var(--paper); }
 .mobile-connect-unavailable-label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 11px; font-weight: 700; }
+.mobile-connect-server-row { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.mobile-connect-server-row .mobile-connect-server { flex: 1 1 auto; min-width: 0; }
+.mobile-connect-server-row select, .mobile-connect-address-input select { box-sizing: border-box; min-height: 34px; padding: 5px 7px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--card); font-size: 12px; }
+.mobile-connect-server-row select { flex: 0 0 auto; width: 78px; }
+.mobile-connect-protocol-help { display: block; margin-top: 7px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.mobile-connect-address-input { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; align-items: center; }
+.mobile-connect-address-input select { width: 78px; min-height: 40px; font-size: 16px; }
 .mobile-connect-server { margin: 0; overflow-wrap: anywhere; color: var(--ink); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .mobile-connect-update { margin-top: 24px; padding: 15px; border: 1px solid var(--line); border-radius: 15px; background: var(--paper); }
 .mobile-connect-update-heading { display: flex; align-items: flex-start; gap: 10px; }
@@ -203,7 +210,7 @@ html.bridge-mobile-app .task-detail-composer { padding-bottom: 7px; }
 .mobile-connection-center h1 { margin: 0; font-size: 20px; letter-spacing: -.03em; line-height: 1.25; }
 .mobile-connection-center .mobile-connect-status { gap: 5px; font-size: 11px; }
 .mobile-connect-return { flex: 0 0 auto; min-height: 36px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--paper); font-size: 12px; }
-.mobile-connection-center .mobile-workspace-switcher { gap: 3px; margin: 0 0 12px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
+.mobile-connection-center .mobile-workspace-switcher { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 3px; margin: 0 0 12px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
 .mobile-connection-center .mobile-workspace-switcher-item { display: flex; min-height: 38px; align-items: center; justify-content: center; padding: 6px 8px; border: 1px solid transparent; border-radius: 7px; color: var(--muted); background: transparent; font-size: 13px; text-align: center; }
 .mobile-connection-center .mobile-workspace-switcher-item.is-active { border-color: #a8c8f2; color: #1d4f91; background: #e4efff; }
 .mobile-connection-center .mobile-workspace-switcher-item:focus-visible, .mobile-ssh-settings-toggle:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }
@@ -223,6 +230,10 @@ html.bridge-mobile-app .task-detail-composer { padding-bottom: 7px; }
 .mobile-connection-center .mobile-connect-code-only { margin-top: 1px; }
 .mobile-connection-center .mobile-connect-code-only summary { min-height: 32px; padding: 6px 0; }
 .mobile-connection-center .mobile-connect-code-only[open] summary { margin-bottom: 3px; }
+.mobile-remote-desktop-panel { display: grid; gap: 10px; margin-top: 4px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); }
+.mobile-remote-desktop-panel h2 { margin: 0; font-size: 16px; }
+.mobile-remote-desktop-panel p { margin: 0; line-height: 1.5; }
+.mobile-remote-desktop-panel .mobile-connect-primary { width: 100%; min-height: 42px; border-radius: 9px; font-size: 13px; }
 .mobile-connect-maintenance { margin-top: 10px; border-top: 1px solid var(--line); }
 .mobile-connect-maintenance > summary, .mobile-ssh-advanced > summary { min-height: 36px; padding: 8px 0; color: var(--muted); cursor: pointer; font-size: 12px; font-weight: 600; }
 .mobile-connect-maintenance .mobile-connect-existing-actions { margin: 8px 0 0; padding: 0; border: 0; }
@@ -240,6 +251,7 @@ html.bridge-mobile-app .task-detail-composer { padding-bottom: 7px; }
 .mobile-connect-card .mobile-connect-network-field small { overflow: visible; overflow-wrap: anywhere; text-overflow: clip; white-space: normal; }
 .mobile-connect-network-field > span { font-size: 12px; font-weight: 650; }
 .mobile-connect-network-field input { width: 100%; min-width: 0; min-height: 40px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--paper); font: inherit; font-size: 16px; line-height: 1.4; }
+.mobile-connect-network-field select { box-sizing: border-box; width: 100%; min-width: 0; min-height: 40px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--paper); font: inherit; font-size: 16px; line-height: 1.4; }
 .mobile-connect-network-input-row { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) 34px; gap: 6px; align-items: center; }
 .mobile-connect-network-input-row input { box-sizing: border-box; min-width: 0; height: 40px; min-height: 40px; }
 .mobile-connect-network-read { display: grid; box-sizing: border-box; width: 40px; height: 40px; min-height: 40px; place-items: center; padding: 0; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--paper); }

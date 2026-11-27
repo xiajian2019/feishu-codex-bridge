@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
+import { useLocation } from "react-router";
 import * as QRCode from "qrcode";
 import { useMobileBack } from "./use-mobile-back.js";
 import { startForegroundPolling, isAppForeground } from "./foreground-polling.js";
@@ -35,6 +36,12 @@ interface PairingInfo {
 }
 
 export function AuthGate({ children }: { children: ReactNode }): ReactElement {
+  const location = useLocation();
+  if (location.pathname === "/composer-transfer" || (isMobileApp() && location.pathname === "/nearby-transfer")) return <>{children}</>;
+  return <AuthenticatedAuthGate>{children}</AuthenticatedAuthGate>;
+}
+
+function AuthenticatedAuthGate({ children }: { children: ReactNode }): ReactElement {
   const initial = readGlobalAuthState<AuthStatus>(getBridgeOrigin(), getLocalDraftScope());
   const [status, setStatus] = useState<AuthStatus | null>(() => initial?.status ?? null);
   const [error, setError] = useState<string | null>(() => initial?.error ?? null);

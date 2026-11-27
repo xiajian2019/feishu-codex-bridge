@@ -534,7 +534,7 @@ export function HistoryWorkbench({
           : `有多个已启用项目匹配此目录（${matches.map((project) => project.name).join("、")}），请先整理项目注册表后再创建草稿。`);
         return;
       }
-      navigate("/", { state: historyTaskDraftNavigationState(matches[0]!.name) });
+      navigate("/tasks", { state: historyTaskDraftNavigationState(matches[0]!.name) });
     } catch (error: unknown) {
       setCloneNotice(error instanceof Error ? error.message : String(error));
     } finally {

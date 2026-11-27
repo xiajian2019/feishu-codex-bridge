@@ -6,6 +6,7 @@ export type ShortcutDisplayMode = "closed" | "expanded" | "both";
 
 export const COMPOSER_ACTION_OPTIONS = [
   { key: "attachment", label: "选择附件" },
+  { key: "phone-transfer", label: "手机导入" },
   { key: "skill-picker", label: "选择 Codex 技能" },
   { key: "scroll-top", label: "滚动到顶部" },
   { key: "scroll-bottom", label: "滚动到底部" },
@@ -218,20 +219,25 @@ export type ShortcutStore = {
 /** Match the Web composer's compatibility handling for older Bridge servers. */
 export function normalizeShortcutStore(result: Partial<ShortcutStore>): ShortcutStore {
   const composerDefaults = new Map(DEFAULT_COMPOSER_SHORTCUTS.map((shortcut) => [shortcut.id, shortcut]));
+  const shortcuts = Array.isArray(result.shortcuts)
+    ? result.shortcuts.map((shortcut) => {
+      const fallback = shortcut.groupId === "composer" && !shortcut.actionKey
+        ? composerDefaults.get(shortcut.id)
+        : undefined;
+      return fallback
+        ? { ...fallback, ...shortcut, actionKey: fallback.actionKey, displayMode: fallback.displayMode }
+        : shortcut;
+    })
+    : [];
+  const existingIds = new Set(shortcuts.map((shortcut) => shortcut.id));
   return {
     groups: Array.isArray(result.groups)
       ? result.groups.map((group) => group.id === "composer" && group.surface !== "composer" ? { ...group, surface: "composer" } : group)
       : [],
-    shortcuts: Array.isArray(result.shortcuts)
-      ? result.shortcuts.map((shortcut) => {
-        const fallback = shortcut.groupId === "composer" && !shortcut.actionKey
-          ? composerDefaults.get(shortcut.id)
-          : undefined;
-        return fallback
-          ? { ...fallback, ...shortcut, actionKey: fallback.actionKey, displayMode: fallback.displayMode }
-          : shortcut;
-      })
-      : [],
+    // Older Bridge databases may not have newly introduced built-ins until
+    // the service has restarted. Add only missing records client-side; an
+    // existing disabled/custom record remains authoritative.
+    shortcuts: [...shortcuts, ...DEFAULT_COMPOSER_SHORTCUTS.filter((shortcut) => !existingIds.has(shortcut.id))],
   };
 }
 
@@ -241,6 +247,7 @@ export const DEFAULT_COMPOSER_SHORTCUTS: readonly ShortcutDefinition[] = [
   { id: "composer-tui-back", groupId: "composer", title: "返回", detail: "Shift+→：返回输入区域", kind: "terminal", value: "codex-prompt-back", enabled: true, builtIn: true, dangerous: false, actionKey: "terminal-prompt-back", displayMode: "expanded", sortOrder: 6, operationCount: 0 },
   { id: "composer-tui-warnings", groupId: "composer", title: "F2", detail: "F2：查看警告", kind: "terminal", value: "codex-warnings", enabled: true, builtIn: true, dangerous: false, actionKey: "terminal-warnings", displayMode: "expanded", sortOrder: 6, operationCount: 0 },
   { id: "composer-attachment", groupId: "composer", title: "附件", detail: "选择文件", kind: "insert", value: "", enabled: true, builtIn: true, dangerous: false, actionKey: "attachment", displayMode: "closed", sortOrder: 0, operationCount: 0 },
+  { id: "composer-phone-transfer", groupId: "composer", title: "手机", detail: "从手机导入文字、图标或文件", kind: "insert", value: "", enabled: true, builtIn: true, dangerous: false, actionKey: "phone-transfer", displayMode: "closed", sortOrder: 1, operationCount: 0 },
   { id: "composer-skill-picker", groupId: "composer", title: "$", detail: "选择 Codex 技能", kind: "insert", value: "", enabled: true, builtIn: true, dangerous: false, actionKey: "skill-picker", displayMode: "expanded", sortOrder: 12, operationCount: 0 },
   { id: "composer-scroll-top", groupId: "composer", title: "顶部", detail: "滚动到顶部", kind: "insert", value: "", enabled: true, builtIn: true, dangerous: false, actionKey: "scroll-top", displayMode: "both", sortOrder: 1, operationCount: 0 },
   { id: "composer-scroll-bottom", groupId: "composer", title: "底部", detail: "滚动到底部", kind: "insert", value: "", enabled: true, builtIn: true, dangerous: false, actionKey: "scroll-bottom", displayMode: "both", sortOrder: 2, operationCount: 0 },

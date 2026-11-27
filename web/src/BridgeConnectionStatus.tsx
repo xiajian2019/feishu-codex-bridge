@@ -18,26 +18,28 @@ export function BridgeConnectionStatus(): ReactElement | null {
 
   const offline = !connection.browserOnline;
   const stale = connection.api === "stale";
-  const title = offline ? "当前设备离线"
-    : connection.failureKind === "target-unreachable" ? "目标主机端口不可达"
-    : connection.failureKind === "api-auth-failed" ? "Bridge 鉴权失败"
-    : connection.failureKind === "api-response-error" ? "Bridge API 返回错误"
-    : stale ? "连接已恢复，页面显示的是最近数据"
-    : connection.api === "checking" ? "正在连接 Bridge…" : "Bridge API 网络不可达";
+  const title = offline ? "设备报告当前离线"
+    : connection.failureKind === "target-unreachable" ? "主机探测暂未收到响应"
+    : connection.failureKind === "api-auth-failed" ? "Bridge 请求被拒绝"
+    : connection.failureKind === "api-response-error" ? "Bridge 请求返回错误"
+    : stale ? "当前显示的是最近数据"
+    : connection.api === "checking" ? "正在连接 Bridge…" : "Bridge 请求暂未完成";
   const detail = offline
-    ? "网络恢复后会自动重试，不会刷新当前页面。"
+    ? "请检查设备网络；网络恢复后会尝试重新连接。"
     : connection.failureKind === "target-unreachable"
-      ? "请检查 Wi‑Fi 和 OpenVPN 连接。网络恢复后会自动重试。"
+      ? "可能是网络较慢或主机暂时繁忙，可以稍后重试。"
     : connection.failureKind === "api-auth-failed"
-      ? "Bridge 已收到请求但拒绝了当前凭据，请重新配对或检查设备授权。"
+      ? "此次请求未获授权，请检查设备授权或相关权限。"
     : connection.failureKind === "api-response-error"
-      ? "Bridge 已收到请求但返回了错误；请检查服务状态。"
+      ? "服务或网关返回了错误，可以稍后重试。"
     : stale
-      ? "新数据会在连接稳定后逐页更新。"
-      : connection.pending > 0
-        ? "正在等待服务响应，当前页面内容会保留。"
-        : "请检查 Bridge 服务、网络和 VPN 状态。";
-  return <div className={`bridge-connection-banner ${offline ? "is-offline" : stale ? "is-stale" : "is-unreachable"}`} role="status" aria-live="polite">
+      ? "最新请求未完成，页面会保留最近的数据。"
+      : connection.api === "checking" || connection.pending > 0
+        ? "正在等待连接或服务响应，当前页面内容会保留。"
+        : "可能是网络较慢或服务暂时繁忙，可以稍后重试。";
+  const responseFailure = connection.failureKind === "api-auth-failed" || connection.failureKind === "api-response-error";
+  const tone = offline ? "is-offline" : responseFailure ? "is-unreachable" : stale ? "is-stale" : "is-checking";
+  return <div className={`bridge-connection-banner ${tone}`} role="status" aria-live="polite">
     <span className="bridge-connection-dot" aria-hidden="true" />
     <span className="bridge-connection-copy"><strong>{title}</strong><small>{detail}</small></span>
     {connection.lastSuccessAt && stale ? <time dateTime={new Date(connection.lastSuccessAt).toISOString()}>最近同步 {new Date(connection.lastSuccessAt).toLocaleTimeString("zh-CN", { hour12: false })}</time> : null}

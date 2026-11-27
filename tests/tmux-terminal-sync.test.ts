@@ -19,8 +19,8 @@ class TerminalPeer extends EventEmitter {
   }
 }
 
-const cleanups: Array<() => void> = [];
-afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
+const cleanups: Array<() => Promise<void>> = [];
+afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
 
 async function waitFor(condition: () => boolean): Promise<void> {
   const deadline = Date.now() + 3_000;
@@ -50,7 +50,7 @@ function terminalFixture(capturePane: NonNullable<TmuxDashboardApiOptions["opera
       }) as NonNullable<TmuxDashboardApiOptions["terminalRuntime"]>["spawn"],
     },
   });
-  cleanups.push(() => { peer.close(); void api.stop(); db.close(); });
+  cleanups.push(async () => { peer.close(); await api.stop(); db.close(); });
   const open = (api as unknown as {
     openTerminal(peer: WebSocket, data: {
       sessionId: string; sessionRecordId: string; deviceId: null; cols: number; rows: number; historyCache: boolean; isAuthorized: () => boolean;
@@ -146,7 +146,7 @@ describe("tmux live output and local history", () => {
         }) as NonNullable<TmuxDashboardApiOptions["terminalRuntime"]>["spawn"],
       },
     });
-    cleanups.push(() => { first.close(); second.close(); void api.stop(); db.close(); });
+    cleanups.push(async () => { first.close(); second.close(); await api.stop(); db.close(); });
     const open = (api as unknown as {
       openTerminal(peer: WebSocket, data: {
         sessionId: string; sessionRecordId: string; deviceId: null; cols: number; rows: number; historyCache: boolean; isAuthorized: () => boolean;

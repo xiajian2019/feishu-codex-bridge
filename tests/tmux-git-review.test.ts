@@ -46,8 +46,8 @@ const temporaryRoots: string[] = [];
 const databases: StateDatabase[] = [];
 const apis: TmuxDashboardApi[] = [];
 
-afterEach(() => {
-  for (const api of apis.splice(0)) api.stop();
+afterEach(async () => {
+  for (const api of apis.splice(0)) await api.stop();
   for (const db of databases.splice(0)) db.close();
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
