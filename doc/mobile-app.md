@@ -59,11 +59,15 @@ Web 端可从顶部导航的“App 管理”进入 `/system-management/apps`，�
 
 ### iOS TestFlight 上传
 
-iOS 签名使用运行命令的进程环境中的 Apple Team ID，不在工程中写死。先在当前 shell 设置 `BRIDGE_IOS_DEVELOPMENT_TEAM`；通过 Bridge 服务触发构建时，需在该服务的环境中设置相同变量。直接调用 `xcodebuild` 时可传入 `"DEVELOPMENT_TEAM=$BRIDGE_IOS_DEVELOPMENT_TEAM"`。不要将个人 Team ID、签名私钥或描述文件提交到仓库。
+iOS 签名团队放在本地 `ios/.xcconfig`，该文件被 Git 忽略；在文件中设置一行不带引号的字面值，Xcode 的 App、AppVpn 和扩展会从共享配置继承它：
 
-```bash
-export BRIDGE_IOS_DEVELOPMENT_TEAM="<10 位 Apple Team ID>"
+```xcconfig
+BRIDGE_IOS_DEVELOPMENT_TEAM = <10 位 Apple Team ID>
 ```
+
+`mobile:ios:install` 和 `mobile:ios:testflight` 也读取这个本地文件。命令进程中的 `BRIDGE_IOS_DEVELOPMENT_TEAM` 非空时优先于本地文件，适用于 CI 或临时切换团队；这两个脚本会将选定团队作为 `DEVELOPMENT_TEAM` 参数传给 Xcode。App 管理入口仍使用所选 App 记录的团队。直接调用 `xcodebuild` 时也可传入 `"DEVELOPMENT_TEAM=$BRIDGE_IOS_DEVELOPMENT_TEAM"` 覆盖本地配置。
+
+在 Xcode 中手动切换 Signing Team 可能重新将具体 Team ID 写入 `project.pbxproj`，提交前检查 diff；自动测试也会检测工程文件中的签名团队设置。不要强制添加本地配置、个人 Team ID、签名私钥或描述文件到仓库。
 
 TestFlight 需要付费 Apple Developer Program 团队、App Store Connect 中已创建的 iOS App 记录，以及与工程一致的 Bundle ID。首次上传前在 App Store Connect 创建 App，选择 `dev.feishu.codex.bridge`；脚本不会代替创建 App 记录、接受 Apple 协议或填写出口合规信息。
 

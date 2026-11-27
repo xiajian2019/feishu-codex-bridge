@@ -111,7 +111,7 @@ export function readAppProjectSettings(source = readFileSync(projectFile, "utf8"
     bundleId: settingValue(block, "PRODUCT_BUNDLE_IDENTIFIER"),
     buildNumber: settingValue(block, "CURRENT_PROJECT_VERSION"),
     marketingVersion: settingValue(block, "MARKETING_VERSION"),
-    teamId: readIosDevelopmentTeam(env),
+    teamId: readIosDevelopmentTeam(env, join(root, "ios/.xcconfig")),
   };
 }
 
@@ -214,7 +214,7 @@ function assertProject() {
   if (!existsSync(projectFile)) throw new Error(`找不到 Xcode 工程配置：${projectFile}`);
   const settings = readAppProjectSettings();
   if (settings.bundleId !== bundleId) throw new Error(`App Bundle ID 应为 ${bundleId}，实际为 ${settings.bundleId ?? "空"}。`);
-  if (!settings.teamId) throw new Error("请在运行命令的环境中设置 BRIDGE_IOS_DEVELOPMENT_TEAM（Apple Team ID）。");
+  if (!settings.teamId) throw new Error("请在 ios/.xcconfig 或运行命令的环境中设置 BRIDGE_IOS_DEVELOPMENT_TEAM（Apple Team ID）。");
   if (!settings.marketingVersion || !settings.buildNumber) throw new Error("App 构建配置缺少版本号或构建号。");
   const schemeFile = join(project, "xcshareddata/xcschemes", `${scheme}.xcscheme`);
   if (!existsSync(schemeFile) || !readFileSync(schemeFile, "utf8").includes(`buildConfiguration = "${configuration}"`)) {

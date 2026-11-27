@@ -314,8 +314,8 @@ function main() {
     else devices.forEach(printDevice);
     return;
   }
-  const teamId = readIosDevelopmentTeam();
-  if (!teamId) throw new Error("请在运行命令的环境中设置 BRIDGE_IOS_DEVELOPMENT_TEAM（Apple Team ID）。");
+  const teamId = readIosDevelopmentTeam(process.env, join(root, "ios/.xcconfig"));
+  if (!teamId) throw new Error("请在 ios/.xcconfig 或运行命令的环境中设置 BRIDGE_IOS_DEVELOPMENT_TEAM（Apple Team ID）。");
 
   const device = options.ip
     ? (options.buildOnly ? null : resolveIpDevice(options.ip, options.wirelessOnly))
