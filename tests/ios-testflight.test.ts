@@ -23,6 +23,29 @@ describe("iOS TestFlight upload", () => {
     });
   });
 
+  test("reads a target configuration with a base xcconfig reference", () => {
+    const source = `
+      000000000000000000000001 /* PersonalRelease */ = {
+        isa = XCBuildConfiguration;
+        baseConfigurationReference = 000000000000000000000099 /* Signing.xcconfig */;
+        buildSettings = {
+          CURRENT_PROJECT_VERSION = 7;
+          INFOPLIST_FILE = App/Info.plist;
+          MARKETING_VERSION = 2.0;
+          PRODUCT_BUNDLE_IDENTIFIER = dev.feishu.codex.bridge;
+          PRODUCT_NAME = "$(TARGET_NAME)";
+        };
+        name = PersonalRelease;
+      };
+    `;
+    expect(readAppProjectSettings(source, { BRIDGE_IOS_DEVELOPMENT_TEAM: "TEAM123456" })).toEqual({
+      bundleId: "dev.feishu.codex.bridge",
+      buildNumber: "7",
+      marketingVersion: "2.0",
+      teamId: "TEAM123456",
+    });
+  });
+
   test("reads the signing team from the environment and rejects invalid values", () => {
     expect(readIosDevelopmentTeam({})).toBeNull();
     expect(readIosDevelopmentTeam({ BRIDGE_IOS_DEVELOPMENT_TEAM: " TEAM123456 " })).toBe("TEAM123456");

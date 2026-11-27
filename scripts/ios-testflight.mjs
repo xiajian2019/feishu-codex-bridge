@@ -103,7 +103,10 @@ function matchesTargetProductName(value, target) {
 
 export function readAppProjectSettings(source = readFileSync(projectFile, "utf8"), env = process.env) {
   const escapedConfiguration = configuration.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const blocks = [...source.matchAll(new RegExp(`\\/\\*\\s*${escapedConfiguration}\\s*\\*\\/\\s*=\\s*\\{\\s*isa = XCBuildConfiguration;\\s*buildSettings = \\{([\\s\\S]*?)\\n\\s*\\};\\s*name = ${escapedConfiguration};\\s*\\};`, "g"))];
+  // Xcode may put baseConfigurationReference and other attributes between
+  // isa and buildSettings. Keep the project-file check tolerant of those
+  // valid XCBuildConfiguration layouts.
+  const blocks = [...source.matchAll(new RegExp(`\\/\\*\\s*${escapedConfiguration}\\s*\\*\\/\\s*=\\s*\\{\\s*isa = XCBuildConfiguration;[\\s\\S]*?buildSettings = \\{([\\s\\S]*?)\\n\\s*\\};\\s*name = ${escapedConfiguration};\\s*\\};`, "g"))];
   const block = blocks.map((match) => match[1]).find((value) =>
     settingValue(value, "INFOPLIST_FILE") === infoPlistPath && matchesTargetProductName(settingValue(value, "PRODUCT_NAME"), targetName));
   if (!block) throw new Error(`找不到 ${scheme}/${configuration} 的 App 构建配置。`);
